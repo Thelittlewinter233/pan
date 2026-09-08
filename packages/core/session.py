@@ -195,6 +195,7 @@ class Session:
     accepted_input_ids: list[str] = field(default_factory=list)
     report_subscriptions: set[str] = field(default_factory=set)  # managed sessions whose completion reports this session subscribes to
     qq_subscriptions: set[str] = field(default_factory=set)  # QQ conversations this session subscribes to ("user:<qq>"/"group:<group_id>")
+    wechat_subscriptions: set[str] = field(default_factory=set)  # 微信会话（WeChat conversations）this session subscribes to ("user:<wxid>")
 
     # ── adapter_config convenience accessors ──
 
@@ -239,7 +240,8 @@ class Session:
                  task_seq: int = 0,
                  accepted_input_ids: list[str] | None = None,
                   report_subscriptions=None,
-                 qq_subscriptions=None):
+                 qq_subscriptions=None,
+                 wechat_subscriptions=None):
         """Manual init so legacy top-level capability kwargs still construct.
 
         ``pan_access`` is the single source of truth for the three capability
@@ -294,6 +296,9 @@ class Session:
         self.accepted_input_ids = accepted_input_ids if accepted_input_ids is not None else []
         self.report_subscriptions = report_subscriptions if report_subscriptions is not None else set()
         self.qq_subscriptions = qq_subscriptions if qq_subscriptions is not None else set()
+        self.wechat_subscriptions = (
+            wechat_subscriptions if wechat_subscriptions is not None else set()
+        )
         self.__post_init__()
 
     # ── pan_access convenience accessors (capability flags) ──
@@ -346,6 +351,8 @@ class Session:
             self.report_subscriptions = set(self.report_subscriptions)
         if isinstance(self.qq_subscriptions, (list, tuple)):
             self.qq_subscriptions = set(self.qq_subscriptions)
+        if isinstance(self.wechat_subscriptions, (list, tuple)):
+            self.wechat_subscriptions = set(self.wechat_subscriptions)
         # pan_access: normalize to a dict with all three capability keys,
         # defaulting to False. Migrate legacy top-level instance attrs (old
         # JSON / old constructor paths) into the nested dict.
@@ -425,6 +432,7 @@ class Session:
             "accepted_input_ids": self.accepted_input_ids,
             "report_subscriptions": sorted(self.report_subscriptions),
             "qq_subscriptions": sorted(self.qq_subscriptions),
+            "wechat_subscriptions": sorted(self.wechat_subscriptions),
         }
 
 
@@ -947,12 +955,15 @@ def handoff_session(
 
     # 2e. QQ postbox 绑定 → B
     b.qq_subscriptions = set(a.qq_subscriptions)
+    # 2f. 微信订阅 → B（与 QQ 平行：handoff 后由 B 继续接收该会话提醒）
+    b.wechat_subscriptions = set(a.wechat_subscriptions)
 
     # ── 3. 解除 A 的原关系网（A.managed_by 保留 = B，见 2b）──
     a.managed = []
     a.managed_by = b.id
     a.report_subscriptions = set()
     a.qq_subscriptions = set()
+    a.wechat_subscriptions = set()
     # Re-check the archive name after relationship work. Another handoff may
     # have archived a session while this one was transferring relationships.
     # Keep allocation and save atomic under the same lock as B creation.
