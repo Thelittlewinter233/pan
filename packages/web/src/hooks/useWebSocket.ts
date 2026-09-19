@@ -624,6 +624,9 @@ function appendEvent(sessionId: string, event: StreamEvent['event']): void {
   if (t === 'system' && event.subtype === 'init') return;
   if (t === 'result') return;
 
+  // 最终 assistant 消息由服务端一次性携带的完成时刻（delta chunk 不带）。
+  const eventTs = typeof event.ts === 'string' ? event.ts : undefined;
+
   for (const b of extractBlocks(event)) {
     const store = useSessionStore.getState();
     const messages = store.currentMessages;
@@ -660,7 +663,7 @@ function appendEvent(sessionId: string, event: StreamEvent['event']): void {
       itemId && aliasedItemId && target?.nativeItemId === aliasedItemId && itemId !== aliasedItemId,
     );
     if (event.replace && target?.role === b.role) {
-      const updated = { ...target, content: b.content };
+      const updated = { ...target, content: b.content, ...(eventTs ? { ts: eventTs } : {}) };
       useSessionStore.setState({
         currentMessages: messages.map((message, index) => index === targetIndex ? updated : message),
       });
@@ -697,6 +700,7 @@ function appendEvent(sessionId: string, event: StreamEvent['event']): void {
           ...target,
           content: b.content,
           ...(nativeItemId && !target.nativeItemId ? { nativeItemId } : {}),
+          ...(eventTs ? { ts: eventTs } : {}),
         };
         useSessionStore.setState({
           currentMessages: messages.map((message, index) => index === targetIndex ? updated : message),
@@ -711,6 +715,7 @@ function appendEvent(sessionId: string, event: StreamEvent['event']): void {
       useSessionStore.getState().addMessage({
         role: 'assistant', content: b.content,
         ...(nativeItemId ? { nativeItemId } : {}),
+        ...(eventTs ? { ts: eventTs } : {}),
       });
     } else if (b.role === 'thinking') {
       store.markUnread(b.content);

@@ -433,7 +433,9 @@ export function InputRow() {
         await steer(currentSessionId, text);
         if (inputRef.current) inputRef.current.value = '';
         setInputDraft(currentSessionId, '');
-        addMessage({ role: 'user', content: text });
+        // Optimistic append; the server stamps the same moment into history
+        // (steer_worker appends + saves right after the control write).
+        addMessage({ role: 'user', content: text, ts: new Date().toISOString() });
       } catch (e) {
         showToast((e as Error).message || 'Steer failed', 'error');
       }
