@@ -76,6 +76,8 @@ Set-Location ../..
 python main.py
 ```
 
+这里的 minimal 层只包含 Core/API/MCP 运行依赖（包括 `httpx` 和 `mcp.server.fastmcp`），不安装 pytest、Memory ML provider 或 QQ。开发测试时另执行 `pip install -r dev-requirements.txt`；启用 Memory 时另执行 `pip install -r memory-requirements.txt`。QQ 始终独立安装 `packages/qq/requirements.txt`。根 `requirements.txt` 是兼容的全量本地开发入口，不作为默认安装方案。
+
 然后打开 <http://127.0.0.1:8768>。已有配置的用户也可以使用 `scripts/setup.bat`、`scripts/start_pan.bat` 和 `scripts/stop_pan.bat`。
 
 macOS/Linux 可使用：
@@ -184,7 +186,7 @@ python -m packages.mcp.server --transport stdio
 
 ## 5. Dashboard 界面操作
 
-左侧 Sidebar 是会话列表；Chat 与当前 Session 对话；Editor 浏览和编辑当前 Session 的 `workdir`；顶栏有 **Start、Restart、Interrupt、Takeover、Kill**。右键会话菜单包含当前可见的 Rename、Branch、Manage、Postbox、Delete 等操作。
+左侧 Sidebar 是会话列表；Chat 与当前 Session 对话；Editor 浏览和编辑当前 Session 的 `workdir`；顶栏有 **Start、Restart、Interrupt、Takeover、Kill**。右键会话菜单包含当前可见的 Rename、Branch、Manage、msgBridge、Delete 等操作。
 
 会话卡片支持**拖拽**：同层拖动改变列表显示顺序（持久化到服务端，等价自定义排序 `POST /api/sessions/order`）；把一张卡片拖到另一张卡片正中会快速建立/解除管理关系（等价 Manage 面板的 Manage/Managed，走 claim/unclaim）。
 
@@ -199,9 +201,9 @@ python -m packages.mcp.server --transport stdio
 
 ![Manage Sessions 面板](../assets/3.png)
 
-### 5.2 Postbox 不等于报告订阅
+### 5.2 msgBridge 不等于报告订阅
 
-右键菜单里的 **Postbox** 是 QQ 会话收件箱订阅：选择 QQ 联系人后，QQ 新消息可以进入该 Session 的队列。它不是 `report_subscribe`，也不会订阅 Worker 完成报告；没有使用 QQ 时不要在这里排查 Pan 编排报告。
+右键菜单里的 **msgBridge** 包含 QQ、System 和 Browser 标签页；QQ 标签页是会话收件箱订阅，选择 QQ 联系人后，QQ 新消息可以进入该 Session 的队列。它不是 `report_subscribe`，也不会订阅 Worker 完成报告；没有使用 QQ 时不要在这里排查 Pan 编排报告。Browser 权限只能在该标签页由用户显式请求。
 
 ---
 

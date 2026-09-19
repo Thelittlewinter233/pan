@@ -1,6 +1,8 @@
 import asyncio
+import errno
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -92,6 +94,42 @@ def test_directory_listing_reports_permission_error(monkeypatch, tmp_path):
     assert error.value.status_code == 403
 
 
+def test_directory_creation_is_explicit_and_stays_inside_the_workdir_root(monkeypatch, tmp_path):
+    import packages.web.server as server
+    from fastapi import HTTPException
+
+    workdirs = tmp_path / "workdirs"
+    workdirs.mkdir()
+    monkeypatch.setattr(server, "WORKDIRS_DIR", workdirs)
+    monkeypatch.setattr(server, "_ALLOWED_WORKDIR_ROOTS", None)
+
+    created = asyncio.run(server.create_directory({"path": str(workdirs / "confirmed") }))
+    assert created == {"ok": True, "path": str((workdirs / "confirmed").resolve())}
+    assert (workdirs / "confirmed").is_dir()
+
+    outside = tmp_path / "outside"
+    with pytest.raises(HTTPException) as denied:
+        asyncio.run(server.create_directory({"path": str(outside)}))
+    assert denied.value.status_code == 400
+    assert not outside.exists()
+
+    with pytest.raises(HTTPException) as traversal:
+        asyncio.run(server.create_directory({"path": ".."}))
+    assert traversal.value.status_code == 400
+
+
+def test_absolute_workdir_creation_is_not_implicit(monkeypatch, tmp_path):
+    import packages.web.server as server
+
+    monkeypatch.setattr(server, "_ALLOWED_WORKDIR_ROOTS", [tmp_path])
+    with pytest.raises(ValueError, match="confirm directory creation first"):
+        server._resolve_workdir(str(tmp_path / "missing"))
+
+    created = asyncio.run(server.create_directory({"path": str(tmp_path / "confirmed") }))
+    assert created["ok"] is True
+    assert server._resolve_workdir(str(tmp_path / "confirmed")) == (tmp_path / "confirmed").resolve()
+
+
 def test_attachment_upload_is_session_isolated_and_avoids_name_collisions(monkeypatch, tmp_path):
     import packages.web.server as server
 
@@ -119,8 +157,8 @@ def test_attachment_upload_is_session_isolated_and_avoids_name_collisions(monkey
         }, receive)
         return await server.upload_session_attachment(session_id, request)
 
-    first = asyncio.run(upload("ses_a", b"one", r"C:\fakepath\same.txt"))
-    second = asyncio.run(upload("ses_a", b"two", r"C:\fakepath\same.txt"))
+    first = asyncio.run(upload("ses_a", b"one", r"C:\fakepath\需求说明 [v1](最终).md"))
+    second = asyncio.run(upload("ses_a", b"two", r"C:\fakepath\需求说明 [v1](最终).md"))
     other_session = asyncio.run(upload("ses_b", b"three", "same.txt"))
 
     assert first["path"] != second["path"]
@@ -129,6 +167,64 @@ def test_attachment_upload_is_session_isolated_and_avoids_name_collisions(monkey
     assert Path(first["path"]).parent != Path(other_session["path"]).parent
     assert Path(other_session["path"]).read_bytes() == b"three"
     assert "fakepath" not in first["path"]
+    assert first["displayName"] == "需求说明 [v1](最终).md"
+    assert first["filename"] == first["displayName"]
+    assert first["storageFilename"].startswith("upload_")
+    assert first["storageFilename"] != first["displayName"]
+    assert first["attachmentId"] == first["storageFilename"]
+    assert first["href"] == (
+        f"/api/attachments/{first['storageFilename']}?session_id=ses_a"
+    )
+    assert first["displayName"] not in first["href"]
+    assert server._attachment_markdown(first["displayName"], first["href"]) == (
+        r"[需求说明 \[v1\]\(最终\).md]("
+        + first["href"]
+        + ")"
+    )
+
+
+def test_legacy_attachment_history_gets_markdown_fallback_without_touching_normal_links(tmp_path, monkeypatch):
+    import packages.web.server as server
+
+    monkeypatch.setattr(server, "ATTACHMENTS_DIR", tmp_path / "attachments")
+    history = [{
+        "role": "user",
+        "content": (
+            '请看 @"D:\\old\\upload_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.md" '
+            "以及 [普通链接](https://example.test/a_(b))"
+        ),
+    }]
+
+    normalized = server._api_history("ses_a", history)
+
+    assert normalized[0]["content"] == (
+        "请看 [upload_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.md]"
+        "(/api/fs/read?session_id=ses_a&path=D%3A%5Cold%5Cupload_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.md&download=1) "
+        "以及 [普通链接](https://example.test/a_(b))"
+    )
+
+
+def test_uploaded_attachment_route_is_session_scoped_and_rejects_path_input(monkeypatch, tmp_path):
+    import packages.web.server as server
+    from fastapi import HTTPException
+
+    monkeypatch.setattr(server, "ATTACHMENTS_DIR", tmp_path / "attachments")
+    monkeypatch.setattr(server.sess, "get", lambda session_id: object() if session_id == "ses_a" else None)
+    storage = "upload_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.md"
+    target_dir = server._attachment_session_dir("ses_a")
+    target_dir.mkdir(parents=True)
+    (target_dir / storage).write_text("body", encoding="utf-8")
+
+    response = asyncio.run(server.download_session_attachment(storage, "ses_a"))
+    assert response.path == target_dir / storage
+
+    with pytest.raises(HTTPException) as traversal:
+        asyncio.run(server.download_session_attachment("../" + storage, "ses_a"))
+    assert traversal.value.status_code == 400
+
+    with pytest.raises(HTTPException) as wrong_session:
+        asyncio.run(server.download_session_attachment(storage, "ses_b"))
+    assert wrong_session.value.status_code == 404
 
 
 def test_attachment_upload_rejects_unknown_session(monkeypatch, tmp_path):
@@ -150,3 +246,222 @@ def test_attachment_upload_rejects_unknown_session(monkeypatch, tmp_path):
     with pytest.raises(HTTPException) as error:
         asyncio.run(run())
     assert error.value.status_code == 404
+
+
+def test_queue_rejects_cross_session_and_stale_attachment_links(monkeypatch, tmp_path):
+    import packages.web.server as server
+
+    monkeypatch.setattr(server, "ATTACHMENTS_DIR", tmp_path / "attachments")
+    workdir_a = tmp_path / "workdir-a"
+    workdir_b = tmp_path / "workdir-b"
+    workdir_a.mkdir()
+    workdir_b.mkdir()
+    fs_file = workdir_a / "existing [file].txt"
+    fs_file.write_text("body", encoding="utf-8")
+    sessions = {
+        "ses_a": SimpleNamespace(workdir=str(workdir_a)),
+        "ses_b": SimpleNamespace(workdir=str(workdir_b)),
+    }
+    monkeypatch.setattr(server.sess, "get", lambda session_id: sessions.get(session_id))
+
+    storage = "upload_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.txt"
+    target_dir = server._attachment_session_dir("ses_a")
+    target_dir.mkdir(parents=True)
+    (target_dir / storage).write_bytes(b"uploaded")
+    valid_upload = f"/api/attachments/{storage}?session_id=ses_a"
+    valid_fs = server._fs_download_href("ses_a", str(fs_file))
+
+    assert server._validate_message_attachment_references("ses_a", f"before [upload]({valid_upload})") is None
+    assert server._validate_message_attachment_references("ses_a", f"before [file]({valid_fs})") is None
+    assert server._validate_message_attachment_references("ses_a", 'legacy @"D:\\old\\file.txt"') is None
+
+    mismatch = server._validate_message_attachment_references(
+        "ses_a", f"[upload](/api/attachments/{storage}?session_id=ses_b)",
+    )
+    assert mismatch == {
+        "code": "attachment_session_mismatch",
+        "message": "Attachment belongs to another session",
+    }
+    stale = server._validate_message_attachment_references(
+        "ses_a", "[stale](/api/attachments/upload_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.txt?session_id=ses_a)",
+    )
+    assert stale == {
+        "code": "attachment_not_found",
+        "message": "Attachment is no longer available",
+    }
+    missing_fs = server._validate_message_attachment_references(
+        "ses_a", "[missing](/api/fs/read?session_id=ses_a&path=missing.txt&download=1)",
+    )
+    assert missing_fs == {
+        "code": "attachment_not_found",
+        "message": "Attachment is no longer available",
+    }
+
+
+def test_queue_route_validates_attachment_links_before_enqueue(monkeypatch, tmp_path):
+    import packages.web.server as server
+
+    monkeypatch.setattr(server, "ATTACHMENTS_DIR", tmp_path / "attachments")
+    target_dir = server._attachment_session_dir("ses_a")
+    target_dir.mkdir(parents=True)
+    storage = "upload_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.txt"
+    (target_dir / storage).write_bytes(b"uploaded")
+    monkeypatch.setattr(server.sess, "get", lambda session_id: object() if session_id == "ses_a" else None)
+    calls = []
+
+    async def fake_enqueue(session_id, text, client_message_id=None):
+        calls.append((session_id, text, client_message_id))
+        return {"status": "queued", "item": {"type": "task", "kind": "task", "id": "q_1", "queueItemId": "q_1", "text": text, "source": "user"}}
+
+    monkeypatch.setattr(server.worker, "enqueue_user_message", fake_enqueue)
+    valid = f"[uploaded.txt](/api/attachments/{storage}?session_id=ses_a)"
+    accepted = asyncio.run(server.api_session_queue_enqueue(
+        "ses_a", {"text": valid, "clientMessageId": "cm-1"},
+    ))
+    assert accepted["ok"] is True
+    assert calls == [("ses_a", valid, "cm-1")]
+
+    invalid = asyncio.run(server.api_session_queue_enqueue(
+        "ses_a", {"text": "[stale](/api/attachments/upload_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.txt?session_id=ses_a)"},
+    ))
+    assert invalid == {"ok": False, "error": {
+        "code": "attachment_not_found",
+        "message": "Attachment is no longer available",
+    }}
+    assert len(calls) == 1
+
+
+def test_fs_rename_does_not_overwrite_target_that_appears_during_operation(monkeypatch, tmp_path):
+    import packages.web.server as server
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    source = workdir / "old.txt"
+    target = workdir / "new.txt"
+    source.write_text("source", encoding="utf-8")
+    monkeypatch.setattr(server.sess, "get", lambda _session_id: SimpleNamespace(workdir=str(workdir)))
+    real_rename = server._rename_no_overwrite
+
+    def target_appears_then_rename(src, dst):
+        # Model the target being created after path checks but before the
+        # filesystem rename commits.
+        dst.write_text("target draft", encoding="utf-8")
+        return real_rename(src, dst)
+
+    monkeypatch.setattr(server, "_rename_no_overwrite", target_appears_then_rename)
+    result = asyncio.run(server.api_fs_rename({
+        "session_id": "ses_editor",
+        "from": "old.txt",
+        "to": "new.txt",
+    }))
+
+    assert "error" in result
+    assert source.read_text(encoding="utf-8") == "source"
+    assert target.read_text(encoding="utf-8") == "target draft"
+
+
+def test_fs_rename_keeps_normal_file_rename_behavior(monkeypatch, tmp_path):
+    import packages.web.server as server
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    (workdir / "old.txt").write_text("content", encoding="utf-8")
+    monkeypatch.setattr(server.sess, "get", lambda _session_id: SimpleNamespace(workdir=str(workdir)))
+
+    result = asyncio.run(server.api_fs_rename({
+        "session_id": "ses_editor",
+        "from": "old.txt",
+        "to": "new.txt",
+    }))
+
+    assert result == {"from": "old.txt", "to": "new.txt"}
+    assert not (workdir / "old.txt").exists()
+    assert (workdir / "new.txt").read_text(encoding="utf-8") == "content"
+
+
+def test_linux_renameat2_enosys_fails_closed_without_link_unlink(monkeypatch, tmp_path):
+    import packages.web.server as server
+
+    source = tmp_path / "old.txt"
+    target = tmp_path / "new.txt"
+    source.write_text("content", encoding="utf-8")
+
+    class RenameAt2:
+        argtypes = None
+        restype = None
+
+        def __call__(self, *_args):
+            return -1
+
+    class FakeLibc:
+        renameat2 = RenameAt2()
+
+    monkeypatch.setattr(server.ctypes, "CDLL", lambda *_args, **_kwargs: FakeLibc())
+    monkeypatch.setattr(server.ctypes, "get_errno", lambda: errno.ENOSYS)
+    monkeypatch.setattr(server.os, "name", "posix")
+    monkeypatch.setattr(server.sys, "platform", "linux")
+
+    def forbidden_fallback(*_args, **_kwargs):
+        raise AssertionError("unsafe link+unlink fallback must not run")
+
+    monkeypatch.setattr(server.os, "link", forbidden_fallback)
+    monkeypatch.setattr(Path, "unlink", forbidden_fallback)
+    with pytest.raises(OSError) as error:
+        server._rename_no_overwrite(source, target)
+
+    assert error.value.errno == errno.ENOTSUP
+    assert source.read_text(encoding="utf-8") == "content"
+    assert not target.exists()
+
+
+def test_directory_rename_fails_closed_when_atomic_no_overwrite_is_unavailable(monkeypatch, tmp_path):
+    import packages.web.server as server
+
+    source = tmp_path / "old-dir"
+    target = tmp_path / "new-dir"
+    source.mkdir()
+    monkeypatch.setattr(server.os, "name", "posix")
+    monkeypatch.setattr(server.sys, "platform", "darwin")
+
+    with pytest.raises(OSError) as error:
+        server._rename_no_overwrite(source, target)
+
+    assert error.value.errno == errno.ENOTSUP
+    assert source.is_dir()
+    assert not target.exists()
+
+
+def test_fs_rename_same_existing_path_is_a_safe_noop(monkeypatch, tmp_path):
+    import packages.web.server as server
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    source = workdir / "same.txt"
+    source.write_text("content", encoding="utf-8")
+    monkeypatch.setattr(server.sess, "get", lambda _session_id: SimpleNamespace(workdir=str(workdir)))
+
+    result = asyncio.run(server.api_fs_rename({
+        "session_id": "ses_editor",
+        "from": "same.txt",
+        "to": "same.txt",
+    }))
+
+    assert result == {"from": "same.txt", "to": "same.txt"}
+    assert source.read_text(encoding="utf-8") == "content"
+
+
+def test_fs_rename_same_missing_path_is_an_error(monkeypatch, tmp_path):
+    import packages.web.server as server
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    monkeypatch.setattr(server.sess, "get", lambda _session_id: SimpleNamespace(workdir=str(workdir)))
+
+    result = asyncio.run(server.api_fs_rename({
+        "session_id": "ses_editor",
+        "from": "missing.txt",
+        "to": "missing.txt",
+    }))
+
+    assert "error" in result
+    assert "missing.txt" in result["error"]

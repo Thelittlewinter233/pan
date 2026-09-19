@@ -11,6 +11,7 @@ Tools exposed:
     - session_managed: List the caller's managed sessions (summary)
     - manager_chain: Return the caller's manager chain (upper-level managers)
     - session_get: Get session details (optional history limit)
+    - session_usage: Get persisted session input/output/cache usage
     - session_update: Update session settings (model/effort/mcp etc.)
     - session_delete: Delete a session
     - session_batch_delete: Delete multiple sessions at once
@@ -27,6 +28,8 @@ Tools exposed:
     - agent_send_force: Force-push to an agent (restart + send; no live worker → queue)
     - agent_notify: Deliver a notification/reminder to an agent (self or managed only;
       persisted queue + immediate auto-spawn when no live worker)
+    - notification_send: Send a Pan system notification to self or managed session
+    - reminder_register/list/cancel: Manage durable one-shot reminders
     - agent_background_start/get/list/cancel/retry: Manage a durable Runner job
     - agent_kill: Kill an agent's worker process (no worker → harmless no-op)
     - agent_list: List all agents (= sessions) — alias of session_list
@@ -36,6 +39,7 @@ Tools exposed:
       to the same implementation as agent_*.
     - session_history: Get paginated conversation history
     - model_list: List available AI models
+    - codex_quota: Query the latest cached/live Codex account quota windows
     - report_subscribe: Subscribe to completion reports (auto-claims the session if unmanaged — 订阅即接管)
     - report_unsubscribe: Unsubscribe from completion reports only (keeps the managed relationship; use session_unclaim to fully release)
     - permission_prompt: Bridge a Claude Code non-interactive permission request to the Pan dashboard
@@ -210,6 +214,14 @@ def _check_access(session_id: str, claim: bool = False) -> dict | None:
                    f"{session_id} is not in its managed list"}}
 
 
+def _require_caller() -> tuple[dict | None, dict | None]:
+    caller = _caller_identity()
+    if not caller:
+        return None, {"ok": False, "error": {"code": "missing_identity",
+            "message": "PAN_AGENT_SESSION_ID is required for notification/reminder tools"}}
+    return caller, None
+
+
 def _auto_claim(session_id: str) -> None:
     """Auto-claim a newly created session for the caller when autoClaimCreated (best-effort)."""
     caller = _caller_identity()
@@ -314,6 +326,8 @@ def session_create(
     system_prompt: str | None = None,
     game_id: str | None = None,
     pan_access: dict | None = None,
+    model_context_window: int | None = None,
+    model_auto_compact_token_limit: int | None = None,
 ) -> dict:
     """Create a new session (persistent conversation container).
 
@@ -333,6 +347,9 @@ def session_create(
         game_id: RuleWhisper game binding.
         pan_access: Capability flags dict, keys: restrictToManaged /
             canClaimUnmanaged / autoClaimCreated (all default False).
+        model_context_window / model_auto_compact_token_limit: Optional
+            positive Codex config overrides. Omitted values are not sent and
+            are not persisted; non-Codex adapters reject explicit values.
 
     Priority (explicit field > sessionTemplate template value > default):
     arguments explicitly passed here override the session_template's values,
@@ -354,12 +371,16 @@ def session_create(
         body["sessionTemplate"] = session_template
     if character_id:
         body["characterId"] = character_id
-    if system_prompt:
+    if system_prompt is not None:
         body["systemPrompt"] = system_prompt
     if game_id:
         body["gameId"] = game_id
     if pan_access:
         body["panAccess"] = pan_access
+    if model_context_window is not None:
+        body["modelContextWindow"] = model_context_window
+    if model_auto_compact_token_limit is not None:
+        body["modelAutoCompactTokenLimit"] = model_auto_compact_token_limit
     result = _strip_usage(_api("POST", "/api/sessions", body))
     # meta-agent 创建的 session 自动归其管理（立项 4.2）
     if isinstance(result, dict) and result.get("id"):
@@ -526,6 +547,57 @@ def session_list(summary: bool = False) -> list[dict] | dict:
 
 
 @mcp.tool()
+def codex_quota(window: str = "all", session_id: str | None = None) -> dict:
+    """Query the latest Codex account quota from Pan's global profile cache.
+
+    Args:
+        window: ``all`` (default), ``first`` for the five-hour window, or
+            ``secondary`` for the weekly window. These are quota window
+            selectors, not adapter fallback names or model selection order.
+          session_id: Used for permission checks and live profile selection;
+              quota is account-scoped and does not belong to that Session.
+              Omitted inside a Pan worker uses ``PAN_AGENT_SESSION_ID``; when
+              there is no live worker, the backend can still return the latest
+              persisted profile snapshot.
+
+    The MCP caller layer applies ``_check_access`` to the target session, so
+    restricted callers can query only their managed graph.  The underlying
+    loopback HTTP endpoint is a separate trusted-admin interface: it has no
+    manager identity authentication or managed isolation.  Do not pass a
+    fabricated manager parameter to HTTP; this MCP-layer check is the
+    isolation boundary.
+
+    The result may be a live app-server push, a persisted last-good snapshot,
+    or an optional read-only WHAM refresh. It does not execute a provider
+    OAuth/refresh flow. The
+    compatibility ``updatedAt`` and explicit ``receivedAt`` are local Pan
+    Worker receive times for ``account/rateLimits/updated``; the provider's
+    original update time is unavailable and is not fabricated.  The current
+    Codex provider normally supplies ``usedPercent``/reset metadata, so
+    absolute used/remaining/limit values are explicitly null when absent.
+    Errors use explicit ``ok:false`` codes: ``invalid_window``,
+    ``session_not_found``, ``unsupported_provider``, ``quota_unavailable``,
+    ``quota_ambiguous``, ``permission_denied``, or ``api_error``.
+
+    完整编排流程见 /pan skill。
+    """
+    if window not in ("all", "first", "secondary"):
+        return {"ok": False, "error": {
+            "code": "invalid_window",
+            "message": "window must be one of 'all', 'first', or 'secondary'",
+        }}
+    target_session_id = session_id or os.environ.get("PAN_AGENT_SESSION_ID")
+    if target_session_id:
+        denied = _check_access(target_session_id)
+        if denied:
+            return denied
+    params = [("window", window)]
+    if target_session_id:
+        params.append(("session_id", target_session_id))
+    return _api("GET", "/api/codex/quota?" + urlencode(params))
+
+
+@mcp.tool()
 def session_managed() -> list[dict] | dict:
     """List the calling session's managed sessions as a summary.
 
@@ -620,6 +692,43 @@ def session_get(session_id: str, limit: int = 0) -> dict:
 
 
 @mcp.tool()
+def session_usage(session_id: str | None = None) -> dict:
+    """Query persisted input/output/cache usage for one Pan Session.
+
+    Args:
+        session_id: Target Pan Session. When omitted, use the current
+            ``PAN_AGENT_SESSION_ID``; explicit and bound targets both pass
+            through the existing managed-session access check.
+
+    Returns a stable view with ``input`` (prompt/input tokens), ``output``
+    (completion/output tokens), ``cache.read`` and ``cache.write`` tokens,
+    plus ``total.tokens`` (input + output only) and ``total.credit``. Cache is
+    not folded into input/output a second time. Missing fields are ``null``;
+    a stored numeric zero remains ``0``. The view projects persisted
+    ``Session.rawUsage`` first and falls back to legacy ``Session.totalUsage``;
+    it does not refresh provider state or return the historical raw payload.
+    ``updatedAt`` is Pan's Session persistence time, not a fabricated provider
+    event timestamp. Errors use ``missing_identity``, ``permission_denied``,
+    ``session_not_found``, or the underlying API error shape.
+
+    完整编排流程见 /pan skill。
+    """
+    target_session_id = session_id or os.environ.get("PAN_AGENT_SESSION_ID")
+    if not target_session_id:
+        return {"ok": False, "error": {
+            "code": "missing_identity",
+            "message": "session_id is required outside a Pan-managed session",
+        }}
+    denied = _check_access(target_session_id)
+    if denied:
+        return denied
+    return _api(
+        "GET",
+        f"/api/sessions/{quote(target_session_id, safe='')}/usage",
+    )
+
+
+@mcp.tool()
 def session_delete(session_id: str) -> dict:
     """Delete a session and kill its worker if running.
 
@@ -691,15 +800,15 @@ def session_handoff(
        mcp_servers 等（**明确不含 system_prompt**；cli_session_id 清空——B 是
        全新会话，不继承 A 的 CLI 上下文）；false 时 B 用默认设置（此时必须显式
        传 adapter，否则报错）。
-    4. **B 的 system_prompt = handoff_prompt 与 A 原 system_prompt 拼接**（分
+    4. **B 的 system_prompt = 本次 handoff_prompt 与 A.original_prompt 拼接**（分
        「交接上下文 / 原 system prompt」两节）。
     5. **重命名**：A → `(archive) <原名>`，B → `<原名>`。
 
     Args:
         session_id: 被交接的 session（A）id
         handoff_prompt: 【必填】交接简报——由 session A 的 agent 编写，让 B 彻底
-            了解现状与重点（重要开发习惯、原 system_prompt 内容、现状、上下文
-            精华等）。将成为 B.system_prompt 的「交接上下文」部分。
+            了解现状与重点（重要开发习惯、现状、上下文精华等）。原始提示会自动
+            保留，无需重复抄入简报。仅本次简报成为 B.handoff_prompt，不叠加旧简报。
         copy_settings: 是否 1:1 复制 A 的设置（见上）。默认 true。
         adapter: 切换 adapter 时传入（copy_settings=false 时必填）
         model: 覆盖模型（copy_settings=true 时优先于复制值）
@@ -861,6 +970,8 @@ def session_readonly(session_id: str, enabled: bool = True) -> dict:
 
     This operation never claims a session: the caller must be its current
     manager. Use ``enabled=False`` to unreadonly it.
+
+    完整编排流程见 /pan skill。
     """
     manager_id = os.environ.get("PAN_AGENT_SESSION_ID")
     if not manager_id:
@@ -880,13 +991,18 @@ def session_update(
     max_thinking_tokens: int | None = None,
     mcp_servers: list[str] | None = None,
     game_id: str | None = None,
+    model_context_window: int | None = None,
+    model_auto_compact_token_limit: int | None = None,
+    clear_model_context_window: bool = False,
+    clear_model_auto_compact_token_limit: bool = False,
 ) -> dict:
     """Update session-level settings without spawning a worker.
 
     Settings persist on the session immediately and take effect when the
     worker next (re)spawns — a managed Agent's mcp_servers can be switched
     mid-session at any time (unlike adapter, which requires session_handoff).
-    Changing mcp_servers always sets requireRestart: true in the response;
+    Changing mcp_servers or either Codex context override always sets
+    requireRestart: true in the response;
     with a live worker, any process-affecting change (model/permission_mode/
     effort/thinking/mcp_servers) sets it too. The restart is automatic:
     idle worker → respawned immediately; running worker → respawned when it
@@ -909,6 +1025,10 @@ def session_update(
              不产生无效配置；模板 mcp_mode=always/never 锁死增删（本工具无
              forceMcp 旁路，仅 HTTP PATCH 带 forceMcp:true 可解锁）。
         game_id: RuleWhisper game binding; pass "" to clear
+        model_context_window / model_auto_compact_token_limit: Optional
+            positive Codex overrides. Omitted values preserve the current
+            setting. Use the matching clear_* flag to persistently remove it
+            and delegate to Codex/model defaults.
 
     权限边界：_check_access 管理隔离——受限 caller（restrictToManaged）只能
     更新自己管理的 session。
@@ -933,6 +1053,14 @@ def session_update(
         body["mcpServers"] = mcp_servers
     if game_id is not None:
         body["gameId"] = game_id or None
+    if model_context_window is not None:
+        body["modelContextWindow"] = model_context_window
+    elif clear_model_context_window:
+        body["modelContextWindow"] = None
+    if model_auto_compact_token_limit is not None:
+        body["modelAutoCompactTokenLimit"] = model_auto_compact_token_limit
+    elif clear_model_auto_compact_token_limit:
+        body["modelAutoCompactTokenLimit"] = None
     return _strip_usage(_api("PATCH", f"/api/sessions/{session_id}", body))
 
 
@@ -1037,6 +1165,8 @@ def permission_prompt(tool_name: str, input: dict | None = None) -> CallToolResu
     This is intentionally a narrow bridge: it resolves the Worker belonging to
     ``PAN_AGENT_SESSION_ID`` and never exposes arbitrary worker controls to the
     Claude process.
+
+    完整编排流程见 /pan skill。
     """
     session_id = os.environ.get("PAN_AGENT_SESSION_ID")
     if not session_id:
@@ -1342,9 +1472,71 @@ def agent_notify(target_session_id: str, text: str = "") -> dict:
 
 
 @mcp.tool()
+def notification_send(title: str, body: str = "", session_id: str | None = None) -> dict:
+    """Send a best-effort Pan system notification; separate from agent_notify.
+
+    完整编排流程见 /pan skill。
+    """
+    caller, error = _require_caller()
+    if error: return error
+    target = session_id or caller["id"]
+    denied = _check_access(target)
+    if denied: return denied
+    return _api("POST", "/api/notifications/send", {
+        "sessionId": target, "title": title, "body": body,
+        "sourceSessionId": caller["id"]})
+
+
+@mcp.tool()
+def reminder_register(due_at: str, title: str, body: str = "", session_id: str | None = None) -> dict:
+    """Register a durable one-shot absolute ISO-8601 reminder.
+
+    完整编排流程见 /pan skill。
+    """
+    caller, error = _require_caller()
+    if error: return error
+    target = session_id or caller["id"]
+    denied = _check_access(target)
+    if denied: return denied
+    return _api("POST", f"/api/sessions/{quote(target, safe='')}/reminders",
+                {"dueAt": due_at, "title": title, "body": body})
+
+
+@mcp.tool()
+def reminder_list(session_id: str | None = None) -> dict:
+    """List pending durable reminders for self or a managed Session.
+
+    完整编排流程见 /pan skill。
+    """
+    caller, error = _require_caller()
+    if error: return error
+    target = session_id or caller["id"]
+    denied = _check_access(target)
+    if denied: return denied
+    return _api("GET", f"/api/sessions/{quote(target, safe='')}/reminders")
+
+
+@mcp.tool()
+def reminder_cancel(reminder_id: str, session_id: str | None = None) -> dict:
+    """Cancel a pending durable reminder for self or a managed Session.
+
+    完整编排流程见 /pan skill。
+    """
+    caller, error = _require_caller()
+    if error: return error
+    target = session_id or caller["id"]
+    denied = _check_access(target)
+    if denied: return denied
+    return _api("DELETE", f"/api/sessions/{quote(target, safe='')}/reminders/{quote(reminder_id, safe='')}")
+
+
+@mcp.tool()
 def agent_background_start(argv: list[str], cwd: str, target_session_id: str | None = None,
                            label: str | None = None) -> dict:
-    """Start a durable background process; target defaults to this Agent Session."""
+    """Start a durable background process; target defaults to this Agent Session.
+
+    完整编排流程见 /pan skill。
+    """
     target = target_session_id or ((_caller_identity() or {}).get("id"))
     if not target:
         return {"ok": False, "error": {"code": "target_session_required", "message": "no current Agent Session"}}
@@ -1362,6 +1554,8 @@ def agent_background_get(job_id: str) -> dict:
     Access is limited to a Job targeting the current Agent Session or one of
     its managed Sessions. This reads Runner state; it does not read or consume
     the target Session's queue_pending.
+
+    完整编排流程见 /pan skill。
     """
     job = _api("GET", f"/api/background-jobs/{quote(job_id, safe='')}")
     target = job.get("targetSessionId") if isinstance(job, dict) else None
@@ -1375,6 +1569,8 @@ def agent_background_list(target_session_id: str | None = None) -> dict:
 
     An explicit target must be the current or a managed Session. Returned Jobs
     are Registry facts and may remain visible after the target Session is gone.
+
+    完整编排流程见 /pan skill。
     """
     if target_session_id:
         denied = _check_access(target_session_id)
@@ -1394,6 +1590,8 @@ def agent_background_cancel(job_id: str) -> dict:
 
     The Runner PID/task PID creation time must be verifiable; otherwise the
     operation returns ``cancel_unsafe`` and never kills an unrelated PID.
+
+    完整编排流程见 /pan skill。
     """
     job = agent_background_get(job_id)
     if not isinstance(job, dict) or job.get("error") or job.get("ok") is False:
@@ -1407,6 +1605,8 @@ def agent_background_retry(job_id: str) -> dict:
 
     Only completed, failed, or cancelled Jobs are retryable. starting/running
     Jobs return ``job_not_retryable`` and must be cancelled first.
+
+    完整编排流程见 /pan skill。
     """
     job = agent_background_get(job_id)
     if not isinstance(job, dict) or job.get("error") or job.get("ok") is False:
@@ -1701,16 +1901,95 @@ def worker_kill(worker_id: str | None = None, session_id: str | None = None) -> 
 # Model / adapter info
 # ---------------------------------------------------------------------------
 
+
+def _adapter_inventory() -> tuple[list[dict], dict | None]:
+    """Return the registered adapter inventory without its misleading default.
+
+    ``/api/adapters`` also returns a top-level ``default`` for session creation.
+    That default is deliberately not copied into model-list responses because
+    it is not the adapter selected by the caller.
+    """
+    result = _api("GET", "/api/adapters")
+    if not isinstance(result, dict) or not isinstance(result.get("adapters"), list):
+        if isinstance(result, dict) and isinstance(result.get("error"), dict):
+            discovery_error = dict(result["error"])
+        else:
+            discovery_error = {
+                "code": "adapter_discovery_failed",
+                "message": "Pan did not return a registered adapter list",
+            }
+        return [], discovery_error
+
+    adapters = []
+    for item in result["adapters"]:
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+            continue
+        adapter_info = {
+            "name": item["name"],
+            "defaultModel": item.get("defaultModel"),
+        }
+        for key in ("supportsResume", "supportsFork"):
+            if key in item:
+                adapter_info[key] = item[key]
+        adapters.append(adapter_info)
+    return adapters, None
+
+
+def _model_list_error(code: str, message: str, available: list[dict]) -> dict:
+    """Build a machine-readable model-list error with an actionable hint."""
+    preferred = next(
+        (item["name"] for item in available if item.get("name") == "codex"),
+        next((item["name"] for item in available if item.get("name")), None),
+    )
+    result = {
+        "ok": False,
+        "error": {"code": code, "message": message},
+        "availableAdapters": available,
+    }
+    if preferred:
+        result["next"] = {"tool": "model_list", "adapter": preferred}
+        result["callHint"] = f"Call model_list(adapter='{preferred}') to list its models."
+    else:
+        result["callHint"] = "Call model_list(adapter='<registered adapter>') after an adapter is available."
+    return result
+
+
 @mcp.tool()
-def model_list(adapter: str = "cbc") -> dict:
-    """List available AI models for an adapter.
+def model_list(adapter: str | None = None) -> dict:
+    """List available AI models for one registered adapter.
 
     Args:
-        adapter: Adapter name ("cbc" or "kimi")
+        adapter: Registered adapter name (for example ``"codex"``). This is
+            required; omitted, empty, or whitespace-only values return the
+            registered adapter inventory instead of selecting an adapter.
 
     完整编排流程见 /pan skill。
     """
-    return _api("GET", f"/api/models?adapter={adapter}")
+    requested = adapter.strip() if isinstance(adapter, str) else ""
+    available, discovery_error = _adapter_inventory()
+    if not requested:
+        result = _model_list_error(
+            "adapter_required",
+            "adapter is required; choose one of the registered adapters in availableAdapters",
+            available,
+        )
+        if discovery_error:
+            result["adapterDiscoveryError"] = discovery_error
+        return result
+
+    available_names = {item["name"] for item in available}
+    if requested not in available_names:
+        result = _model_list_error(
+            "unknown_adapter",
+            f"Unknown adapter {requested!r}; choose a registered adapter from availableAdapters",
+            available,
+        )
+        result["adapter"] = requested
+        if discovery_error:
+            result["adapterDiscoveryError"] = discovery_error
+        return result
+
+    return _api("GET", f"/api/models?{urlencode({'adapter': requested})}")
 
 
 # ---------------------------------------------------------------------------

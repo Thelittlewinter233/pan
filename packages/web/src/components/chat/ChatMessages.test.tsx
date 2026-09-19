@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render, act, fireEvent, cleanup } from '@testing-library/react';
-import { ChatMessages } from './ChatMessages';
+import { ChatMessages, SCROLL_BOTTOM_THRESHOLD } from './ChatMessages';
 import { useSessionStore } from '@/stores/sessionStore';
 import { useUIStore } from '@/stores/uiStore';
 
@@ -11,33 +11,47 @@ import { useUIStore } from '@/stores/uiStore';
 // simulate: (a) history arriving after a session switch, (b) the virtualizer
 // re-measuring items and growing/shrinking the total size.
 const m = vi.hoisted(() => {
-  const state = { totalSize: 0 };
+  const state: {
+    totalSize: number;
+    virtualItems: Array<{ index: number; start: number; size: number }>;
+    options: { getItemKey?: (index: number) => string | number } | null;
+  } = { totalSize: 0, virtualItems: [], options: null };
   return {
     state,
     setTotalSize: (n: number) => {
       state.totalSize = n;
     },
+    setVirtualItems: (items: Array<{ index: number; start: number; size: number }>) => {
+      state.virtualItems = items;
+    },
   };
 });
 
 vi.mock('@tanstack/react-virtual', () => ({
-  useVirtualizer: () => ({
-    getTotalSize: () => m.state.totalSize,
-    getVirtualItems: () => [],
-    measureElement: () => {},
-  }),
+  useVirtualizer: (options: { getItemKey?: (index: number) => string | number }) => {
+    m.state.options = options;
+    return {
+      getTotalSize: () => m.state.totalSize,
+      getVirtualItems: () =>
+        m.state.virtualItems.map((item) => ({
+          ...item,
+          key: options.getItemKey?.(item.index) ?? item.index,
+        })),
+      measureElement: () => {},
+    };
+  },
 }));
 
 // ── jsdom has no layout engine. Give the chat scroll container a realistic
 // scrollHeight (the explicit height ChatMessages sets on the inner virtualizer
-// div) and a fixed clientHeight, so isNearBottom() / scrollToBottom() make
+// div) and a fixed clientHeight, so the bottom-zone / scrollToBottom() make
 // decisions from real numbers. ──
 function mockScrollMetrics() {
   Object.defineProperty(HTMLElement.prototype, 'scrollHeight', {
     configurable: true,
     get(this: HTMLElement) {
       const child = this.firstElementChild as HTMLElement | null;
-      const h = child?.style?.height;
+      const h = child?.style?.height || child?.style?.minHeight;
       if (h) {
         const px = parseFloat(h);
         if (!Number.isNaN(px)) return px;
@@ -75,6 +89,8 @@ beforeEach(() => {
   }) as typeof cancelAnimationFrame;
 
   m.setTotalSize(0);
+  m.setVirtualItems([]);
+  m.state.options = null;
   useSessionStore.setState({
     currentSessionId: null,
     currentMessages: [],
@@ -170,6 +186,67 @@ describe('ChatMessages scroll positioning', () => {
     expect(scrollEl.scrollTop).toBe(2600);
   });
 
+  it('hides the button and follows new messages within the bottom threshold', () => {
+    useSessionStore.setState({ currentSessionId: 's1', currentMessages: msgs(4) });
+    m.setTotalSize(2000);
+    const { container } = render(<ChatMessages />);
+    const scrollEl = container.querySelector('.overflow-auto') as HTMLElement;
+    expect(scrollEl.scrollTop).toBe(2000);
+    expect(container.querySelector('[title="Scroll to bottom"]')).toBeNull();
+
+    // 2000 - (2000 - 400 - threshold) - 400 = threshold.
+    scrollEl.scrollTop = 2000 - 400 - SCROLL_BOTTOM_THRESHOLD;
+    fireEvent.scroll(scrollEl);
+    expect(container.querySelector('[title="Scroll to bottom"]')).toBeNull();
+
+    m.setTotalSize(2200);
+    act(() => {
+      useSessionStore.setState({ currentMessages: [...msgs(4), ...msgs(1, 'new')] });
+    });
+
+    expect(scrollEl.scrollTop).toBe(2200);
+    expect(container.querySelector('[title="Scroll to bottom"]')).toBeNull();
+  });
+
+  it('shows the button and does not follow when the user is beyond the threshold', () => {
+    useSessionStore.setState({ currentSessionId: 's1', currentMessages: msgs(4) });
+    m.setTotalSize(2000);
+    const { container } = render(<ChatMessages />);
+    const scrollEl = container.querySelector('.overflow-auto') as HTMLElement;
+
+    // One pixel beyond the follow zone must opt out.
+    scrollEl.scrollTop = 2000 - 400 - SCROLL_BOTTOM_THRESHOLD - 1;
+    fireEvent.scroll(scrollEl);
+    expect(container.querySelector('[title="Scroll to bottom"]')).not.toBeNull();
+    m.setTotalSize(2600);
+    act(() => {
+      useSessionStore.setState({ currentMessages: [...msgs(4), ...msgs(1, 'new')] });
+    });
+
+    expect(scrollEl.scrollTop).toBe(2000 - 400 - SCROLL_BOTTOM_THRESHOLD - 1);
+    expect(container.querySelector('[title="Scroll to bottom"]')).not.toBeNull();
+  });
+
+  it('does not pull an away-from-bottom user down on measurement changes', () => {
+    useSessionStore.setState({ currentSessionId: 's1', currentMessages: msgs(4) });
+    m.setTotalSize(2000);
+    const { container } = render(<ChatMessages />);
+    const scrollEl = container.querySelector('.overflow-auto') as HTMLElement;
+    expect(scrollEl.scrollTop).toBe(2000);
+
+    // Simulate a layout change occurring after the user has moved well beyond
+    // the follow zone.
+    // No scroll event is dispatched so this specifically covers the
+    // measurement effect's direct bottom check.
+    scrollEl.scrollTop = 700;
+    m.setTotalSize(2400);
+    act(() => {
+      useSessionStore.setState({ currentMessages: [...msgs(4)] });
+    });
+
+    expect(scrollEl.scrollTop).toBe(700);
+  });
+
   it('does NOT yank the user to the bottom when older messages are prepended while scrolled up', () => {
     useSessionStore.setState({ currentSessionId: 's1', currentMessages: msgs(4) });
     m.setTotalSize(2000);
@@ -230,7 +307,7 @@ describe('ChatMessages scroll positioning', () => {
     expect(scrollEl.scrollTop).toBe(700);
   });
 
-  it('resumes following after the user returns near the bottom', () => {
+  it('hides the button and resumes following after the user returns near the bottom', () => {
     useSessionStore.setState({ currentSessionId: 's1', currentMessages: msgs(4) });
     m.setTotalSize(2000);
     const { container } = render(<ChatMessages />);
@@ -238,20 +315,24 @@ describe('ChatMessages scroll positioning', () => {
 
     scrollEl.scrollTop = 500;
     fireEvent.scroll(scrollEl);
+    expect(container.querySelector('[title="Scroll to bottom"]')).not.toBeNull();
     m.setTotalSize(2200);
     act(() => {
       useSessionStore.setState({ currentMessages: [...msgs(4), ...msgs(1, 'paused')] });
     });
     expect(scrollEl.scrollTop).toBe(500);
 
-    // Explicitly returning to the bottom re-enables follow mode.
-    scrollEl.scrollTop = 1800;
+    // Returning within the threshold re-enables follow mode and hides the
+    // button before the next message arrives.
+    scrollEl.scrollTop = 2200 - 400 - SCROLL_BOTTOM_THRESHOLD;
     fireEvent.scroll(scrollEl);
+    expect(container.querySelector('[title="Scroll to bottom"]')).toBeNull();
     m.setTotalSize(2800);
     act(() => {
       useSessionStore.setState({ currentMessages: [...msgs(4), ...msgs(2, 'follow')] });
     });
     expect(scrollEl.scrollTop).toBe(2800);
+    expect(container.querySelector('[title="Scroll to bottom"]')).toBeNull();
   });
 
   it('preserves the viewport anchor when older history is loaded above it', async () => {
@@ -313,5 +394,118 @@ describe('ChatMessages scroll positioning', () => {
     });
     expect(container.querySelector('.animate-spin')).toBeNull();
     expect(container.textContent).toContain('No messages yet. Start a conversation.');
+  });
+
+  it('keeps virtual item identity and DOM order when a preceding stream block appears', () => {
+    const thinking = {
+      role: 'thinking' as const,
+      content: 'planning',
+      nativeItemId: 'thinking-1',
+    };
+    const tool = {
+      role: 'tool' as const,
+      content: 'Command({"command":"true"})',
+      nativeItemId: 'tool-1',
+    };
+    const answer = {
+      role: 'assistant' as const,
+      content: 'answer',
+      nativeItemId: 'answer-1',
+    };
+
+    useSessionStore.setState({ currentSessionId: 's1', currentMessages: [tool, answer] });
+    m.setVirtualItems([
+      { index: 0, start: 0, size: 120 },
+      { index: 1, start: 120, size: 120 },
+    ]);
+    const { container } = render(<ChatMessages />);
+
+    const initialGetItemKey = m.state.options?.getItemKey;
+    expect(initialGetItemKey).toBeTypeOf('function');
+    const toolKey = initialGetItemKey!(0);
+    const answerKey = initialGetItemKey!(1);
+
+    // A late thinking block is a normal history/stream update. The existing
+    // tool and answer must retain their identities after their indexes shift.
+    m.setVirtualItems([
+      { index: 0, start: 0, size: 120 },
+      { index: 1, start: 120, size: 120 },
+      { index: 2, start: 240, size: 120 },
+    ]);
+    act(() => {
+      useSessionStore.setState({ currentMessages: [thinking, tool, answer] });
+    });
+
+    const nextGetItemKey = m.state.options?.getItemKey;
+    expect(nextGetItemKey).toBeTypeOf('function');
+    expect(nextGetItemKey!(1)).toBe(toolKey);
+    expect(nextGetItemKey!(2)).toBe(answerKey);
+    expect(
+      [...container.querySelectorAll('[data-index]')].map((node) =>
+        node.getAttribute('data-index'),
+      ),
+    ).toEqual(['0', '1', '2']);
+    const rows = [...container.querySelectorAll('[data-index]')] as HTMLElement[];
+    expect(rows.map((row) => row.style.position)).toEqual(['', '', '']);
+    expect(rows.map((row) => row.style.marginTop)).toEqual(['0px', '0px', '0px']);
+
+    // A stale measurement can report a later start before the preceding row's
+    // actual streamed height. The flow offset is clamped, so the browser's
+    // normal layout, rather than an absolute transform, keeps rows disjoint.
+    m.setVirtualItems([
+      { index: 0, start: 0, size: 240 },
+      { index: 1, start: 120, size: 120 },
+      { index: 2, start: 240, size: 120 },
+    ]);
+    act(() => {
+      useSessionStore.setState({ currentMessages: [thinking, tool, answer] });
+    });
+    const overlappedRows = [...container.querySelectorAll('[data-index]')] as HTMLElement[];
+    expect(overlappedRows.map((row) => row.style.marginTop)).toEqual(['0px', '0px', '0px']);
+  });
+
+  it('keeps a tall streamed block in document flow while preserving a scrolled-up viewport', () => {
+    const messages = [
+      { role: 'thinking', content: 'planning', nativeItemId: 'thinking-1' },
+      { role: 'tool', content: 'Command({"command":"true"})', nativeItemId: 'tool-1' },
+      { role: 'assistant', content: 'short answer', nativeItemId: 'answer-1' },
+    ];
+    useSessionStore.setState({ currentSessionId: 's1', currentMessages: messages });
+    m.setTotalSize(1800);
+    m.setVirtualItems([
+      { index: 0, start: 0, size: 100 },
+      { index: 1, start: 100, size: 100 },
+      { index: 2, start: 200, size: 100 },
+    ]);
+    const { container } = render(<ChatMessages />);
+    const scrollEl = container.querySelector('.overflow-auto') as HTMLElement;
+    expect(scrollEl.scrollTop).toBe(1800);
+
+    // The user scrolls away from the bottom while the answer is still
+    // streaming. A later, much taller content delta must not auto-scroll or
+    // use an old absolute position to cover the tool/thinking rows.
+    scrollEl.scrollTop = 500;
+    fireEvent.scroll(scrollEl);
+    const tallAnswer = Array.from({ length: 100 }, (_, index) => `line ${index}`).join('\n');
+    m.setTotalSize(2400);
+    act(() => {
+      useSessionStore.setState({
+        currentMessages: [
+          messages[0]!,
+          messages[1]!,
+          { ...messages[2]!, content: tallAnswer },
+        ],
+      });
+    });
+
+    expect(scrollEl.scrollTop).toBe(500);
+    expect(container.textContent).toContain('line 99');
+    const rows = [...container.querySelectorAll('[data-index]')] as HTMLElement[];
+    expect(rows.map((row) => row.getAttribute('data-index'))).toEqual(['0', '1', '2']);
+    // jsdom has no layout engine, so this verifies the structural guarantee:
+    // rows are normal-flow elements and there is no transform/absolute
+    // positioning that could paint the stale virtual coordinates on top of a
+    // newly expanded row. Browser geometry still needs a real-browser check.
+    expect(rows.every((row) => row.style.position === '' && !row.style.transform)).toBe(true);
   });
 });

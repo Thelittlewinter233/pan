@@ -4,11 +4,11 @@
 #
 # 覆盖《可移植性调查报告》(docs/reports/portability-research-2026-08-27.md)
 # §2.1「新环境最简启动清单」第 1-5 步：
-#   1. 仓库根建 .venv + minimal-requirements.txt (start_pan.bat:27 依赖此位置)
+#   1. 仓库根建 .venv + minimal-requirements.txt (仅 Core/API/MCP 运行时)
 #   2. QQ 模块依赖 (packages/qq/requirements.txt，可用 PAN_QQ_PYTHON 覆盖)
 #   3. PATH 检查: node + cbc/kimi/codex/opencode 等 CLI
 #   4. config.json 复制提示 + packages/qq/.env 重建提醒
-#   5. 前端构建: React (pnpm) + legacy (根目录 npx tsc)
+#   5. 前端构建: React (pnpm)
 #
 # 单步失败不中断后续步骤，最后汇总。
 # 用法: bash scripts/setup.sh
@@ -57,7 +57,9 @@ fi
 if [ -n "$VPY" ]; then
     echo "安装 minimal-requirements.txt ..."
     if "$VPY" -m pip install -r "$ROOT/minimal-requirements.txt"; then
-        ok "核心依赖安装完成 (fastapi/uvicorn/websockets/psutil/mcp/pytest)"
+        ok "Core/API/MCP 运行依赖安装完成 (fastapi/uvicorn/websockets/psutil/httpx/mcp)"
+        echo "   测试依赖按需安装: $VPY -m pip install -r $ROOT/dev-requirements.txt"
+        echo "   Memory 可选层按需安装: $VPY -m pip install -r $ROOT/memory-requirements.txt"
     else
         bad "核心依赖安装失败 — Pan Core 无法启动，请检查网络/源后重跑本脚本"
     fi
@@ -166,30 +168,18 @@ fi
 # ------------------------------------------------------------
 # [5/5] 前端构建
 #   React SPA: packages/web/ 内 pnpm install && pnpm build (产物 dist/，gitignored)
-#   Legacy:    根目录 npx tsc (产物 static/js/app.js，gitignored)
 # ------------------------------------------------------------
-step "5/5" "构建前端 (React + legacy)"
+step "5/5" "构建前端 (React)"
 
 if command -v pnpm >/dev/null 2>&1; then
     echo "pnpm install && pnpm build (packages/web/) ..."
     if (cd "$ROOT/packages/web" && pnpm install && pnpm build); then
         ok "React SPA 构建完成 (packages/web/dist/)"
     else
-        warn "React SPA 构建失败 — /react/ 不可用；legacy 前端仍可作为备用"
+        warn "React SPA 构建失败 — /react/ 不可用"
     fi
 else
     warn "未找到 pnpm — 跳过 React 构建。安装: corepack enable  或  npm install -g pnpm"
-fi
-
-if command -v node >/dev/null 2>&1 && [ "$MISSING_REQUIRED" -eq 0 ]; then
-    echo "npx tsc (根目录, legacy 前端) ..."
-    if npx tsc; then
-        ok "Legacy 前端编译完成 (packages/web/static/js/app.js)"
-    else
-        warn "Legacy 前端编译失败 — /vanilla 不可用；React 前端仍可作为主用"
-    fi
-else
-    warn "node 不可用 — 跳过 legacy 编译"
 fi
 
 # ------------------------------------------------------------

@@ -12,8 +12,19 @@
 
 ### Pan
 
-- `http://127.0.0.1:{port}` — 默认 307 重定向到 React Dashboard `/react/`（`frontend: coexist` / `react` 时）
-- `http://127.0.0.1:{port}/vanilla` — 旧版 Vanilla Dashboard
+Pan-owned Python resolution is `config.json` top-level `python` > `PAN_PYTHON` >
+the interpreter running the current Pan process. The usual form is a string,
+for example `"python": "D:\\Tools\\Python 3.14\\python.exe"`. To preserve
+launcher arguments, use an argv object such as
+`"python": {"command": "py", "args": ["-3"]}`. This setting is separate from
+`qq.python` / `PAN_QQ_PYTHON`; an invalid configured path is warned about and
+the next valid source is tried without writing a malformed MCP or worker command.
+`POST /api/config/reload` with `{"scope":"python"}` rereads it and returns only
+non-sensitive source metadata. The running Pan process/CLI worker is unchanged;
+the next worker spawn/respawn and newly generated MCP descriptor use the new value.
+
+- `http://127.0.0.1:{port}` — 307 重定向到唯一的 React Dashboard `/react/`
+- React 构建缺失时根路径和 `/react/` 返回 503，并提示执行 `pnpm --dir packages/web build`
 - `ws://127.0.0.1:{port}/ws` — Dashboard WebSocket
 - `ws://127.0.0.1:{port}/ws/agent` — Meta-Agent WebSocket
 

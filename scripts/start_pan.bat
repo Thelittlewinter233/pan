@@ -34,11 +34,11 @@ REM     also walks data\workdirs, frontend dependencies, and other user data;
 REM     on a busy checkout it can block long enough to make lifecycle restart
 REM     time out before main.py is even launched.
 
-set "PYTHON=%BASE_DIR%\.venv\Scripts\python.exe"
-if not exist "%PYTHON%" (
-    echo [ERROR] Virtual env python not found: %PYTHON%
-    exit /b 1
-)
+REM start_main.ps1 reads config.json python > PAN_PYTHON > .venv > PATH,
+REM probes Core/MCP dependencies, and launches with an argv array so a
+REM configured `py` launcher and paths containing spaces remain intact.
+REM The delegated dependency probe is:
+REM import fastapi, uvicorn, websockets, psutil, httpx; from mcp.server.fastmcp import FastMCP
 
 set "MAIN_PY=%BASE_DIR%\main.py"
 set "PID_MAIN=%BASE_DIR%\data\main_pid.txt"
@@ -56,7 +56,7 @@ if not defined PAN_PORT (
 if not defined PAN_PORT set "PAN_PORT=8768"
 
 REM ---- 2. Start main.py ----
-powershell -NoProfile -File "%SCRIPT_DIR%start_main.ps1" -Python "%PYTHON%" -MainPy "%MAIN_PY%" -WorkDir "%BASE_DIR%" -PidFile "%PID_MAIN%" -StdoutFile "%PAN_STDOUT%" -StderrFile "%PAN_STDERR%"
+powershell -NoProfile -File "%SCRIPT_DIR%start_main.ps1" -MainPy "%MAIN_PY%" -WorkDir "%BASE_DIR%" -PidFile "%PID_MAIN%" -StdoutFile "%PAN_STDOUT%" -StderrFile "%PAN_STDERR%"
 if errorlevel 1 (
     echo [ERROR] Failed to launch Pan Core.
     goto :start_failed
