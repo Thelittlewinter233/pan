@@ -11,6 +11,7 @@ import {
   useAdapterStore,
 } from '@/stores/adapterStore';
 import type { StreamEvent, WorkerEvent, Message, UserInputQuestion } from '@/types';
+import { inheritMessageIdentity, rememberMessageIdentity } from '@/utils/messageIdentity';
 
 // ── Debounced full-list refresh (mirrors legacy app.ts scheduleRefreshSessions) ──
 // WS events can burst (rapid task completions, session updates); firing a full
@@ -133,22 +134,74 @@ export function useWebSocket() {
       wsClient.send({ type: 'sync_interactive' });
     };
 
+    const refreshAuthoritativeState = (): void => {
+      const sessionId = useSessionStore.getState().currentSessionId;
+      void useSessionStore.getState().loadSessions();
+      void useWorkerStore.getState().refresh();
+      if (sessionId) {
+        void useSessionStore.getState().refreshCurrentSessionHistory();
+        void useQueueStore.getState().loadAgentQueue(sessionId);
+      }
+      syncInteractiveRequests();
+    };
+
     // Open handler — refresh sessions and restore live native prompts on connect
     unsubscribers.push(wsClient.on('open', () => {
       useSessionStore.getState().loadSessions();
       useWorkerStore.getState().refresh();
       useAdapterStore.getState().loadAdapterList();
       useAdapterStore.getState().loadConfig('cbc');
+      // An open event is the completion point for a focus-triggered stale
+      // reconnect. Refresh the selected session and queue here so recovery
+      // does not race a new socket with HTTP snapshots.
+      const sessionId = useSessionStore.getState().currentSessionId;
+      if (sessionId) {
+        void useSessionStore.getState().refreshCurrentSessionHistory();
+        void useQueueStore.getState().loadAgentQueue(sessionId);
+      }
       syncInteractiveRequests();
     }));
     // If the singleton was already open before this hook mounted (HMR/route
     // remount), no new `open` event will arrive; sync explicitly as well.
     if (wsClient.isOpen) syncInteractiveRequests();
 
+    // Browser lifecycle events are only signals. The singleton connection
+    // layer remains the single owner of reconnect/open synchronization.
+    let recoveryTimer: ReturnType<typeof setTimeout> | null = null;
+    let recoveryInFlight: Promise<void> | null = null;
+    const recover = (): void => {
+      if (recoveryTimer) clearTimeout(recoveryTimer);
+      recoveryTimer = setTimeout(() => {
+        recoveryTimer = null;
+        if (recoveryInFlight) return;
+        recoveryInFlight = (async () => {
+          const fresh = typeof wsClient.isConnectionFresh === 'function'
+            ? wsClient.isConnectionFresh()
+            : wsClient.isOpen;
+          if (!fresh) {
+            // reconnect() preserves all subscribers and its open handler above
+            // performs the authoritative refresh once the new socket is live.
+            if (typeof wsClient.reconnect === 'function') wsClient.reconnect();
+            else wsClient.connect();
+            return;
+          }
+          refreshAuthoritativeState();
+        })().finally(() => {
+          recoveryInFlight = null;
+        });
+      }, 100);
+    };
+    const onVisibilityChange = (): void => {
+      if (document.visibilityState === 'visible') recover();
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    window.addEventListener('pageshow', recover);
+    window.addEventListener('focus', recover);
+
     // Queue events are convergence hints. The server snapshot remains the
     // business source of truth, so a stale or duplicated event cannot create
     // a second local queue item.
-    for (const eventType of ['queue.item_added', 'queue.item_updated', 'queue.item_removed', 'queue.snapshot']) {
+    for (const eventType of ['queue.item_added', 'queue.item_updated', 'queue.item_removed', 'queue.item_delivered', 'queue.snapshot']) {
       unsubscribers.push(wsClient.on(eventType, (e: StreamEvent) => {
         useQueueStore.getState().applyQueueEvent(e);
         refreshAgentQueue(e.sessionId);
@@ -185,7 +238,7 @@ export function useWebSocket() {
 
     // Worker destroyed / crashed — 除就地更新状态点外触发防抖全量兜底：
     // 崩溃/销毁是低频事件，且流式片段已逐块落盘，刷新让列表吸收已持久化的
-    // 部分回复（镜像 vanilla _applyWorkerUpdate → scheduleRefreshSessions）。
+    // 部分回复（通过防抖刷新会话列表）。
     unsubscribers.push(wsClient.on('worker.destroyed', (e: StreamEvent) => {
       if (!isCurrentWorkerEvent(e, true)) return;
       if (e.sessionId) clearNativeTurnAliases(e.sessionId);
@@ -367,7 +420,21 @@ export function useWebSocket() {
 
     // Result event
     unsubscribers.push(wsClient.on('worker.result', (e: StreamEvent) => {
-      if (!isCurrentWorkerEvent(e)) return;
+      if (!isCurrentWorkerEvent(e)) {
+        // A terminal event attributed to an older worker generation is dropped
+        // (a late result must not clear its replacement), but the drop must not
+        // silently strand the card's status dot either: fall back to the
+        // authoritative list snapshot so the indicator converges.
+        scheduleRefreshSessions();
+        return;
+      }
+      const notification = e.notification as { title?: string; body?: string; browser?: boolean } | undefined;
+      // Permission is explicitly requested from msgBridge; completion events
+      // never prompt in the background.
+      if (notification?.browser && typeof window !== 'undefined' && 'Notification' in window
+        && Notification.permission === 'granted') {
+        new Notification(notification.title || 'Pan:', { body: notification.body || '' });
+      }
       const sessionStore = useSessionStore.getState();
       clearInteractiveRequests(e.sessionId);
       if (e.sessionId === sessionStore.currentSessionId) {
@@ -437,6 +504,10 @@ export function useWebSocket() {
       streamPreviewTimers.clear();
       streamPreviewPending.clear();
       streamPreviewLastFlush.clear();
+      if (recoveryTimer) clearTimeout(recoveryTimer);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      window.removeEventListener('pageshow', recover);
+      window.removeEventListener('focus', recover);
     };
   }, []);
 }
@@ -624,9 +695,13 @@ function appendEvent(sessionId: string, event: StreamEvent['event']): void {
   if (t === 'system' && event.subtype === 'init') return;
   if (t === 'result') return;
 
+  // Stream arrival order is the display order: the first event for a native
+  // item reserves its position, and later deltas/completion replace that item
+  // in place. Thinking/tool blocks therefore stay before or after content
+  // according to the adapter's event semantics, never according to the
+  // render timing or the current viewport position.
   // 最终 assistant 消息由服务端一次性携带的完成时刻（delta chunk 不带）。
   const eventTs = typeof event.ts === 'string' ? event.ts : undefined;
-
   for (const b of extractBlocks(event)) {
     const store = useSessionStore.getState();
     const messages = store.currentMessages;
@@ -664,6 +739,7 @@ function appendEvent(sessionId: string, event: StreamEvent['event']): void {
     );
     if (event.replace && target?.role === b.role) {
       const updated = { ...target, content: b.content, ...(eventTs ? { ts: eventTs } : {}) };
+      inheritMessageIdentity(updated, target);
       useSessionStore.setState({
         currentMessages: messages.map((message, index) => index === targetIndex ? updated : message),
       });
@@ -677,15 +753,18 @@ function appendEvent(sessionId: string, event: StreamEvent['event']): void {
           content,
           ...(nativeItemId && !target?.nativeItemId ? { nativeItemId } : {}),
         };
+        inheritMessageIdentity(updated, target);
         useSessionStore.setState({
           currentMessages: messages.map((message, index) => index === targetIndex ? updated : message),
         });
       } else {
-        useSessionStore.getState().addMessage({
+        const message = {
           role: b.role,
           content: b.content,
           ...(nativeItemId && !target?.nativeItemId ? { nativeItemId } : {}),
-        });
+        };
+        rememberMessageIdentity(message);
+        useSessionStore.getState().addMessage(message);
       }
       continue;
     }
@@ -702,6 +781,7 @@ function appendEvent(sessionId: string, event: StreamEvent['event']): void {
           ...(nativeItemId && !target.nativeItemId ? { nativeItemId } : {}),
           ...(eventTs ? { ts: eventTs } : {}),
         };
+        inheritMessageIdentity(updated, target);
         useSessionStore.setState({
           currentMessages: messages.map((message, index) => index === targetIndex ? updated : message),
         });
@@ -712,23 +792,32 @@ function appendEvent(sessionId: string, event: StreamEvent['event']): void {
       continue;
     }
     if (b.role === 'assistant') {
-      useSessionStore.getState().addMessage({
-        role: 'assistant', content: b.content,
+      const message = {
+        role: 'assistant',
+        content: b.content,
         ...(nativeItemId ? { nativeItemId } : {}),
         ...(eventTs ? { ts: eventTs } : {}),
-      });
+      };
+      rememberMessageIdentity(message);
+      useSessionStore.getState().addMessage(message);
     } else if (b.role === 'thinking') {
       store.markUnread(b.content);
-      useSessionStore.getState().addMessage({
-        role: 'thinking', content: b.content,
+      const message = {
+        role: 'thinking',
+        content: b.content,
         ...(nativeItemId ? { nativeItemId } : {}),
-      });
+      };
+      rememberMessageIdentity(message);
+      useSessionStore.getState().addMessage(message);
     } else if (b.role === 'tool') {
       store.markUnread(b.content);
-      useSessionStore.getState().addMessage({
-        role: 'tool', content: b.content,
+      const message = {
+        role: 'tool',
+        content: b.content,
         ...(nativeItemId ? { nativeItemId } : {}),
-      });
+      };
+      rememberMessageIdentity(message);
+      useSessionStore.getState().addMessage(message);
     }
   }
 }
@@ -800,7 +889,8 @@ function mergeServerMessages(
     k < local.length &&
     k < server.length &&
     local[k]!.role === server[k]!.role &&
-    local[k]!.content === server[k]!.content
+    local[k]!.content === server[k]!.content &&
+    JSON.stringify(local[k]!.parts ?? null) === JSON.stringify(server[k]!.parts ?? null)
   ) {
     k++;
   }
@@ -816,7 +906,8 @@ function mergeServerMessages(
     for (let i = 0; i < n; i++) {
       const a = localTail[i]!;
       const b = serverTail[serverTail.length - n + i]!;
-      if (a.role !== b.role || a.content !== b.content) {
+      if (a.role !== b.role || a.content !== b.content
+          || JSON.stringify(a.parts ?? null) !== JSON.stringify(b.parts ?? null)) {
         match = false;
         break;
       }

@@ -1,5 +1,6 @@
 import type {
   Session,
+  SessionUsageView,
   ApiSessionsResponse,
   ApiSessionResponse,
   ApiSessionHistoryResponse,
@@ -49,6 +50,8 @@ import type {
   ApiMainExitStatusResponse,
   ApiMainExitResponse,
   ApiHealthResponse,
+  AttachmentRef,
+  MessagePart,
   ScheduledTask,
   ScheduledTaskInput,
   ScheduledTaskPatch,
@@ -78,9 +81,27 @@ export interface DirectoryListResponse {
   entries: DirectoryEntry[];
 }
 
+export interface DirectoryCreateResponse {
+  ok: true;
+  path: string;
+}
+
 export interface SessionAttachmentUploadResponse {
   ok: boolean;
+  /** Compatibility alias; new UI labels use displayName. */
   filename: string;
+  /** Stable opaque server reference; currently the storage filename. */
+  attachmentId?: string;
+  displayName?: string;
+  storageFilename?: string;
+  href?: string;
+  /** Legacy absolute storage path, never used as the Markdown label. */
+  path: string;
+  size: number;
+}
+
+export interface ServerFileAttachmentResponse extends AttachmentRef {
+  ok: boolean;
   path: string;
   size: number;
 }
@@ -104,13 +125,34 @@ export async function fetchDirectories(path?: string, includeFiles = false): Pro
   return request<DirectoryListResponse>(`${BASE}/directories${query}`);
 }
 
+export async function createDirectory(path: string): Promise<DirectoryCreateResponse> {
+  const data = await request<DirectoryCreateResponse | { ok: false; error?: string }>(`${BASE}/directories`, {
+    method: 'POST',
+    body: JSON.stringify({ path }),
+  });
+  if (!data.ok) throw new Error(data.error || '目录创建失败');
+  return data as DirectoryCreateResponse;
+}
+
 export async function uploadSessionAttachment(
   sessionId: string,
   file: File,
   onProgress?: (loaded: number, total: number) => void,
+  signal?: AbortSignal,
 ): Promise<SessionAttachmentUploadResponse> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
+    let settled = false;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener('abort', abort);
+      callback();
+    };
+    const abort = () => {
+      xhr.abort();
+      finish(() => reject(new Error('附件上传已取消')));
+    };
     xhr.open('POST', `${BASE}/sessions/${encodeURIComponent(sessionId)}/attachments`);
     xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
     xhr.setRequestHeader('X-Filename', encodeURIComponent(file.name));
@@ -125,20 +167,41 @@ export async function uploadSessionAttachment(
         // The status text below is more useful than exposing a JSON parse error.
       }
       if (xhr.status < 200 || xhr.status >= 300 || !data.ok || !data.path) {
-        reject(new Error(data.detail || `HTTP ${xhr.status}: ${xhr.statusText}`));
+        finish(() => reject(new Error(data.detail || `HTTP ${xhr.status}: ${xhr.statusText}`)));
         return;
       }
-      onProgress?.(data.size ?? file.size, data.size ?? file.size);
-      resolve(data as SessionAttachmentUploadResponse);
+      finish(() => {
+        onProgress?.(data.size ?? file.size, data.size ?? file.size);
+        resolve(data as SessionAttachmentUploadResponse);
+      });
     };
-    xhr.onerror = () => reject(new Error('附件上传失败，请检查网络连接'));
-    xhr.onabort = () => reject(new Error('附件上传已取消'));
+    xhr.onerror = () => finish(() => reject(new Error('附件上传失败，请检查网络连接')));
+    xhr.onabort = () => finish(() => reject(new Error('附件上传已取消')));
+    if (signal?.aborted) {
+      finish(() => reject(new Error('附件上传已取消')));
+      return;
+    }
+    signal?.addEventListener('abort', abort, { once: true });
     try {
       xhr.send(file);
     } catch (error) {
-      reject(error instanceof Error ? error : new Error(String(error)));
+      finish(() => reject(error instanceof Error ? error : new Error(String(error))));
     }
   });
+}
+
+/** Register an existing server-side file without sending a client path back in
+ * the message protocol. Directories are rejected by the server in phase 1. */
+export async function registerServerFileAttachment(
+  sessionId: string,
+  path: string,
+): Promise<ServerFileAttachmentResponse> {
+  const data = await request<ServerFileAttachmentResponse | { ok?: false; detail?: string }>(
+    `${BASE}/sessions/${encodeURIComponent(sessionId)}/attachments/from-server-file`,
+    { method: 'POST', body: JSON.stringify({ path }) },
+  );
+  if (!data.ok) throw new Error('detail' in data ? data.detail || '服务端附件注册失败' : '服务端附件注册失败');
+  return data as ServerFileAttachmentResponse;
 }
 
 // ── Sessions ──
@@ -153,6 +216,12 @@ export async function fetchSessions(summary = false): Promise<Session[]> {
 export async function fetchSession(id: string): Promise<Session> {
   const data = await request<ApiSessionResponse>(`${BASE}/sessions/${id}`);
   if (data.error) throw new Error(data.error);
+  return data;
+}
+
+export async function fetchSessionUsage(id: string): Promise<SessionUsageView> {
+  const data = await request<SessionUsageView>(`${BASE}/sessions/${encodeURIComponent(id)}/usage`);
+  if (data.ok === false) throw new Error(data.error?.message || 'Failed to load session usage');
   return data;
 }
 
@@ -174,6 +243,8 @@ export interface CreateSessionSettings {
   alwaysThinkingEnabled?: boolean;
   effort?: string;
   outputMode?: string;
+  modelContextWindow?: number;
+  modelAutoCompactTokenLimit?: number;
 }
 
 export async function createSession(
@@ -194,6 +265,10 @@ export async function createSession(
     body.alwaysThinkingEnabled = settings.alwaysThinkingEnabled;
   if (settings?.effort) body.effort = settings.effort;
   if (settings?.outputMode) body.outputMode = settings.outputMode;
+  if (settings?.modelContextWindow !== undefined)
+    body.modelContextWindow = settings.modelContextWindow;
+  if (settings?.modelAutoCompactTokenLimit !== undefined)
+    body.modelAutoCompactTokenLimit = settings.modelAutoCompactTokenLimit;
   const data = await request<ApiSessionResponse>(`${BASE}/sessions`, {
     method: 'POST',
     body: JSON.stringify(body),
@@ -277,6 +352,7 @@ export async function enqueueSessionMessage(
   sessionId: string,
   text: string,
   clientMessageId: string,
+  parts?: MessagePart[],
 ): Promise<{ item: AgentQueueItem; queueRevision?: number; duplicate?: boolean }> {
   const data = await request<{
     ok?: boolean;
@@ -286,7 +362,7 @@ export async function enqueueSessionMessage(
     error?: { message?: string } | string;
   }>(`${BASE}/sessions/${sessionId}/queue`, {
     method: 'POST',
-    body: JSON.stringify({ text, clientMessageId }),
+    body: JSON.stringify({ text, clientMessageId, ...(parts ? { parts } : {}) }),
   });
   if (!data.ok || !data.item) {
     const error = typeof data.error === 'string' ? data.error : data.error?.message;

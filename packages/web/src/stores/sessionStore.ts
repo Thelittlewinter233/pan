@@ -41,16 +41,17 @@ interface SessionStore {
   // Incremented on every loadSessions() start so an older in-flight response
   // can never overwrite a newer refresh.
   _loadSeq: number;
-  // Global monotonic touch counter; per-session snapshots of it let
-  // loadSessions() skip reverting workerStatus/workerId that WS events
-  // freshened while its own HTTP request was in flight.
-  _touchSeq: number;
-  // sessionId → touchSeq of the last workerStatus/workerId update (WS events).
+  // sessionId → monotonic sequence of that session's last WS-driven update.
+  // loadSessions() snapshots this map at request time and compares per session,
+  // so it only skips reverting workerStatus/workerId for sessions that WS
+  // events actually freshened *while its own HTTP request was in flight*.
   _sessionWsTouchedSeq: Record<string, number>;
+  _historyRefreshSeq: Record<string, number>;
 
   // Actions
   loadSessions: () => Promise<void>;
   selectSession: (id: string) => Promise<void>;
+  refreshCurrentSessionHistory: () => Promise<void>;
   loadOlderMessages: () => Promise<void>;
   createNewSession: (
     name: string,
@@ -99,12 +100,18 @@ interface SessionStore {
 // (via useSyncExternalStore) triggers infinite re-renders → React #185.
 const EMPTY_UNREAD_SET: Set<string> = new Set();
 
+/** Monotonic sequence stamped onto `_sessionWsTouchedSeq` by updateSession().
+ *  Kept outside the store because only the relative order *per session* matters
+ *  (see loadSessions): a value recorded during a fetch is strictly greater than
+ *  the one captured when that fetch was issued. */
+let wsTouchSeq = 0;
+
 /** True when the server-reported history is a prefix of the locally-rendered
  *  history (element-wise by role+content). A stale snapshot during streaming
  *  is exactly this — the backend persists each streamed block slightly after
  *  broadcasting it, so its history lags what we already show locally. Blindly
  *  overwriting `currentMessages` with such a prefix would wipe the in-flight
- *  assistant reply. Mirrors the legacy frontend's `_isServerHistoryPrefix`. */
+ *  assistant reply. */
 function isServerHistoryPrefix(
   localHistory: Message[],
   serverHistory: Message[],
@@ -113,7 +120,8 @@ function isServerHistoryPrefix(
   for (let i = 0; i < serverHistory.length; i++) {
     const s = serverHistory[i];
     const c = localHistory[i];
-    if (!s || !c || s.role !== c.role || s.content !== c.content) return false;
+    if (!s || !c || s.role !== c.role || s.content !== c.content
+        || JSON.stringify(s.parts ?? null) !== JSON.stringify(c.parts ?? null)) return false;
   }
   return true;
 }
@@ -133,15 +141,16 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
   sessionUnread: {},
   rendering: false,
   _loadSeq: 0,
-  _touchSeq: 0,
   _sessionWsTouchedSeq: {},
+  _historyRefreshSeq: {},
 
   loadSessions: async () => {
-    // Reserve this refresh's sequence + snapshot the touch counter so a stale
-    // in-flight response can neither overwrite a newer refresh nor revert
-    // sessions that were locally freshened while the request was in flight.
+    // Reserve this refresh's sequence + snapshot the per-session WS touch
+    // counters so a stale in-flight response can neither overwrite a newer
+    // refresh nor revert sessions that were locally freshened while THIS
+    // request was in flight.
     const loadSeq = get()._loadSeq + 1;
-    const touchSeqAtStart = get()._touchSeq;
+    const touchedAtStart = get()._sessionWsTouchedSeq;
     set({ _loadSeq: loadSeq, sessionsLoading: true });
     try {
       // summary=1: lean list (no per-session history download). Card preview
@@ -150,21 +159,44 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       const sessions = await fetchSessions(true);
       if (get()._loadSeq !== loadSeq) return; // superseded by a newer refresh
       const { currentSessionId, currentMessages } = get();
-      const wsTouchedSeq = get()._sessionWsTouchedSeq;
 
       set((s) => {
-        // Merge the snapshot with locally-fresher workerStatus/workerId: WS
-        // worker events that landed at/after this fetch began are newer than
-        // the snapshot — don't let a stale snapshot revert the card's status
-        // dot (mirrors legacy `_wsWorkerTs` re-apply). `>=` also protects the
-        // result path, where handleWorkerUpdate sets idle immediately before a
-        // refresh starts, so the backend's transient "done"/"error" status
-        // can't override the local idle WorkerDot.
+        // Merge the snapshot with locally-fresher workerStatus/workerId.
+        //
+        // The comparison is strictly per session: the local value wins only
+        // when this session's own touch counter advanced *while this fetch was
+        // in flight* (that WS write is older than nothing — the response cannot
+        // contain it). Comparing against a global "last touch anywhere" counter
+        // was wrong: it both shielded the most recently touched session from
+        // the authoritative snapshot indefinitely (so a terminal event that was
+        // never delivered could not be corrected by any refresh, including the
+        // reconnect/focus recovery), and made one session's fate depend on an
+        // unrelated session's traffic.
+        //
+        // Two narrow cases keep local state even without an in-flight touch:
+        //  - an explicit local null is the destroy/crash transition the summary
+        //    must not resurrect while it lags behind the event;
+        //  - the backend holds `w.status = "done"` only transiently between the
+        //    worker.result broadcast and its reset to "idle", so a snapshot
+        //    carrying it must not regress a status WS events already settled.
+        // Anything else means the snapshot is authoritative for this session —
+        // including the settled status of a completion event we never received.
         const merged = sessions.map((sess) => {
           const sid = sess.id;
           const cur = s.sessions.find((x) => x.id === sid);
           if (!cur) return sess;
-          if ((wsTouchedSeq[sid] ?? 0) >= touchSeqAtStart) {
+          const touchedBefore = Object.prototype.hasOwnProperty.call(
+            touchedAtStart,
+            sid,
+          );
+          const touchedDuringFetch =
+            (s._sessionWsTouchedSeq[sid] ?? 0) > (touchedAtStart[sid] ?? 0);
+          const snapshotIsTransientDone = sess.workerStatus === 'done';
+          if (
+            touchedDuringFetch ||
+            (touchedBefore &&
+              (cur.workerStatus === null || snapshotIsTransientDone))
+          ) {
             return {
               ...sess,
               // WS state is newer than this snapshot.  Preserve explicit null:
@@ -284,8 +316,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
 
     // 进入 session 后立即拉服务端最新历史替换快照。React 的快照只靠防抖
     // loadSessions 刷新，可能滞后或（在 _loadSeq 超驰/事件丢失时）过期——
-    // 这正是「vanilla 已更新、React 进入的对话历史还是旧的」的根因。
-    // vanilla 因每个 worker 事件都触发 refreshSessions，快照几乎总是新的。
+    // 事件刷新快照可能先于 history 持久化，不能覆盖正在流式显示的回复。
     try {
       const data: ApiSessionHistoryResponse = await fetchSessionHistory(
         id,
@@ -335,6 +366,43 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
         set({ initialLoading: false });
       }
       console.warn('[sessionStore] selectSession fresh-history fetch failed', id);
+    }
+  },
+
+  refreshCurrentSessionHistory: async () => {
+    const sid = get().currentSessionId;
+    if (!sid) return;
+    const requestSeq = (get()._historyRefreshSeq[sid] ?? 0) + 1;
+    set((s) => ({
+      _historyRefreshSeq: { ...s._historyRefreshSeq, [sid]: requestSeq },
+    }));
+    try {
+      const data = await fetchSessionHistory(sid, 0, 50);
+      const current = get();
+      if (
+        current.currentSessionId !== sid ||
+        current._historyRefreshSeq[sid] !== requestSeq
+      ) return;
+      const serverHistory = data.history || [];
+      const keepLocal = isServerHistoryPrefix(current.currentMessages, serverHistory);
+      const lastServerMsg = serverHistory[serverHistory.length - 1];
+      set((s) => ({
+        sessions: s.sessions.map((session) => session.id === sid
+          ? {
+              ...session,
+              history: serverHistory,
+              historyTruncated: data.hasMore,
+              historyTotal: data.total,
+              lastMessage: lastServerMsg ? String(lastServerMsg.content).slice(0, 200) : '',
+            }
+          : session),
+        currentMessages: keepLocal ? s.currentMessages : serverHistory,
+        hasMoreMessages: data.hasMore,
+        historyLoadEnd: data.start,
+        initialLoading: false,
+      }));
+    } catch {
+      // A focus recovery is best effort; retain the stream and local snapshot.
     }
   },
 
@@ -531,49 +599,37 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
   },
 
   rename: async (id: string, name: string) => {
-    try {
-      await renameSession(id, name);
-      set((s) => ({
-        sessions: s.sessions.map((session) =>
-          session.id === id ? { ...session, name } : session,
-        ),
-      }));
-    } catch (e) {
-      throw e;
-    }
+    await renameSession(id, name);
+    set((s) => ({
+      sessions: s.sessions.map((session) =>
+        session.id === id ? { ...session, name } : session,
+      ),
+    }));
   },
 
   branch: async (id: string, name: string) => {
-    try {
-      await branchSession(id, name);
-      await get().loadSessions();
-    } catch (e) {
-      throw e;
-    }
+    await branchSession(id, name);
+    await get().loadSessions();
   },
 
   reimport: async (id: string) => {
     const session = get().sessions.find((s) => s.id === id);
     if (!session?.cliSessionId) return;
 
-    try {
-      const newSession = await reimportSession(
-        id,
-        session.adapter || 'cbc',
-        session.cliSessionId,
-        session.workdir,
-      );
-      set((s) => ({
-        sessions: s.sessions.map((session) =>
-          session.id === id ? newSession : session,
-        ),
-        currentSessionId:
-          s.currentSessionId === id ? newSession.id : s.currentSessionId,
-        initialLoading: false,
-      }));
-    } catch (e) {
-      throw e;
-    }
+    const newSession = await reimportSession(
+      id,
+      session.adapter || 'cbc',
+      session.cliSessionId,
+      session.workdir,
+    );
+    set((s) => ({
+      sessions: s.sessions.map((session) =>
+        session.id === id ? newSession : session,
+      ),
+      currentSessionId:
+        s.currentSessionId === id ? newSession.id : s.currentSessionId,
+      initialLoading: false,
+    }));
   },
 
   setInputDraft: (id: string, draft: string) => {
@@ -661,12 +717,11 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
   },
 
   updateSession: (id: string, data: Partial<Session>) => {
-    const touchSeq = get()._touchSeq + 1;
+    const touchSeq = (wsTouchSeq += 1);
     set((s) => ({
       sessions: s.sessions.map((session) =>
         session.id === id ? { ...session, ...data } : session,
       ),
-      _touchSeq: touchSeq,
       _sessionWsTouchedSeq: { ...s._sessionWsTouchedSeq, [id]: touchSeq },
     }));
   },

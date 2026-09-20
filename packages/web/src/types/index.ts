@@ -1,14 +1,47 @@
 // ── Data types (matching backend API responses) ──
 
+import type { AttachmentLocation } from './attachment';
+
+export type { AttachmentLocation } from './attachment';
+
 export interface Message {
   role: string;
   content: string;
+  /** Server-canonical parts; content remains the adapter/legacy fallback. */
+  parts?: MessagePart[];
   /** 本地 ISO-8601 发送/回复时间（后端写入历史时刻打点）；旧数据缺失则不显示时间。 */
   ts?: string;
   /** Transient native Codex identity used to merge live Codex messages. */
   nativeItemId?: string;
   /** Queue item(s) whose local CLI hand-off produced this user message. */
   queueItemIds?: string[];
+}
+
+export type MessagePart =
+  | { type: 'text'; text: string }
+  | {
+      type: 'attachment';
+      attachmentId: string;
+      displayName: string;
+      mimeType?: string;
+      size?: number;
+      source?: 'upload' | 'server_file';
+      /** Legacy line fields accepted while older parts are reconstructed. */
+      line?: number;
+      endLine?: number;
+      location?: AttachmentLocation;
+    };
+
+/** Session-scoped opaque attachment metadata. href/path are server output only. */
+export interface AttachmentRef {
+  attachmentId: string;
+  displayName: string;
+  mimeType?: string;
+  size?: number;
+  source?: 'upload' | 'server_file';
+  href?: string;
+  /** Compatibility-only server path; never sent back as authority. */
+  path?: string;
 }
 
 /** MCP-only capability flags (backend `pan_access`, camelCase over HTTP). */
@@ -31,7 +64,13 @@ export interface Session {
   alwaysThinkingEnabled: boolean;
   effort: string;
   maxThinkingTokens?: number;
+  /** Explicit Codex override; absent means Codex/model default. */
+  modelContextWindow?: number | null;
+  /** Explicit Codex override; absent means Codex/model default. */
+  modelAutoCompactTokenLimit?: number | null;
   workdir?: string;
+  /** Calculated system prompt used for the current session, when available. */
+  systemPrompt?: string | null;
   workerStatus?: string | null;
   workerId?: string | null;
   /** Last Worker state confirmed through an explicit Pan lifecycle action. */
@@ -46,6 +85,7 @@ export interface Session {
   reportSubscriptions?: string[];
   /** QQ inbox subscriptions, each formatted "user:<uin>" or "group:<uin>". */
   qqSubscriptions?: string[];
+  notificationSettings?: { browser: boolean; system: boolean };
   /** MCP capability flags; only present on the full (non-summary) endpoint. */
   panAccess?: PanAccess;
   /** Whether MCP was ever enabled for this session (mcp_servers non-empty). */
@@ -67,6 +107,40 @@ export interface Session {
   totalUsage?: Record<string, number> | null;
   createdAt?: string;
   updatedAt?: string;
+}
+
+export interface SessionUsageView {
+  ok?: boolean;
+  sessionId: string;
+  adapter: string;
+  input: number | null;
+  output: number | null;
+  cache: { read: number | null; write: number | null; total: number | null };
+  total: { tokens: number | null; credit: number | null };
+  /** Account-scoped Codex quota projection; never part of raw/total usage. */
+  codexQuota?: CodexQuotaProjection | null;
+  updatedAt?: string | null;
+  error?: { code?: string | number; message?: string };
+}
+
+export interface CodexQuotaProjection {
+  ok?: boolean;
+  provider?: string;
+  profileKey?: string;
+  sessionId?: string | null;
+  workerId?: string | null;
+  observedAt?: string | null;
+  receivedAt?: string | null;
+  updatedAt?: string | null;
+  stale?: boolean;
+  cacheMode?: 'live' | 'persisted';
+  source?: Record<string, unknown> | string | null;
+  windows?: Record<string, Record<string, unknown>>;
+  rawSnapshots?: Record<string, unknown>;
+  raw?: Record<string, unknown> | null;
+  refreshError?: string;
+  credentialStatus?: string;
+  error?: { code?: string | number; message?: string };
 }
 
 export interface WorkerEventContent {
@@ -202,6 +276,12 @@ export interface StreamEvent {
   event?: WorkerEvent;
   message?: string;
   status?: string;
+  notification?: {
+    title?: string;
+    body?: string;
+    browser?: boolean;
+    system?: Record<string, unknown> | null;
+  };
   cancelled?: boolean;
   name?: string;
   cliSessionId?: string;
@@ -529,14 +609,16 @@ export interface ApiMainRestartResponse {
 export interface ApiMainExitStatusResponse {
   available: boolean;
   pending: boolean;
-  stage?: 'idle' | 'scheduled' | 'stopping_workers' | 'stopping_service' | 'offline' | 'error' | string;
+  stage?:
+    'idle' | 'scheduled' | 'stopping_workers' | 'stopping_service' | 'offline' | 'error' | string;
   platform: string;
   port?: number;
   reason?: string;
   error?: string | null;
   requestId?: string;
   jobId?: string;
-  phase?: 'requested' | 'stopping_workers' | 'stopping_service' | 'offline' | 'failed' | 'timed_out';
+  phase?:
+    'requested' | 'stopping_workers' | 'stopping_service' | 'offline' | 'failed' | 'timed_out';
   jobStatus?: string;
   root?: string;
   oldPid?: number | null;
@@ -664,7 +746,7 @@ export interface ApiBatchDeleteResponse {
   error?: string;
 }
 
-// ── Send queue types (aligns with vanilla ts/app.ts QueuedMessage) ──
+// ── Send queue types ──
 
 export interface QueuedMessage {
   id: string; // 唯一标识（重排/编辑/删除的 key）
@@ -706,6 +788,7 @@ export interface AgentQueueItem {
   status?: string;
   kind: AgentQueueKind;
   text: string;
+  parts?: MessagePart[];
   createdAt: number | string;
   source?: string;
   meta?: {
@@ -756,6 +839,11 @@ export interface SettingsBody {
   forceMcp?: boolean;
   /** Worker execution mode; empty string clears (→ adapter default). */
   outputMode?: string;
+  /** Codex-only positive integer override; null removes the persisted key. */
+  modelContextWindow?: number | null;
+  /** Codex-only positive integer override; null removes the persisted key. */
+  modelAutoCompactTokenLimit?: number | null;
+  notificationSettings?: { browser?: boolean; system?: boolean };
 }
 
 /** A single MCP server declared in the manifest (no secrets exposed). */

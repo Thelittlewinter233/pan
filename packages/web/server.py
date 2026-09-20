@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
+import errno
 import hashlib
+import inspect
 import json
 import math
 import mimetypes
@@ -19,9 +22,10 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import unquote
+from typing import Annotated
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException, Body
 from fastapi.responses import HTMLResponse, Response, FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -50,21 +54,39 @@ from packages.core.config import (
     DEFAULT_PLUGIN_MANIFESTS,
     load_config,
     read_config_file,
+    resolve_pan_python_info,
     save_config,
 )
 from packages.core.cli_diagnostics import get_cli_diagnostics
 from packages.core.character import CharacterManager
 from packages.core.manifest_loader import SessionTemplate
 from packages.core import background_jobs
+from packages.core.codex_quota import (
+    format_codex_quota_record,
+    validate_quota_window,
+)
+from packages.core.codex_quota_provider import CodexWhamProvider
+from packages.core.codex_quota_store import (
+    CodexProfile,
+    CodexQuotaStore,
+    is_stale,
+    resolve_profile_identity,
+)
 from packages.core import main_lifecycle
+from packages.core import notifications, reminders
 from packages.scheduler import api as scheduler_api
 from packages.scheduler import engine as scheduler_engine
 
 # ── logging ──
 
 def _log(msg: str):
-    """Print with HH:MM:SS prefix."""
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+    """Print with HH:MM:SS prefix without failing on narrow consoles."""
+    stream = sys.stdout
+    line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
+    encoding = getattr(stream, "encoding", None)
+    if encoding:
+        line = line.encode(encoding, errors="backslashreplace").decode(encoding)
+    print(line, file=stream)
 
 
 # Comma-separated path prefixes to skip in request logging.
@@ -91,6 +113,7 @@ async def lifespan(app: FastAPI):
     # queue_pending 非空但没有活 worker 的 session，自动 spawn 恢复。
     worker.start_global_watchdog()
     background_jobs.start_recovery_loop()
+    reminder_task = asyncio.create_task(_reminder_loop())
     # 定时任务调度循环（同 background_jobs：拿不到 leader 锁的实例只服务读请求）
     try:
         await scheduler_engine.start_loop(on_event=scheduler_api.on_event)
@@ -110,6 +133,11 @@ async def lifespan(app: FastAPI):
         _log(f"[Pan] Character manifest not loaded: {e}")
     
     yield
+    reminder_task.cancel()
+    try:
+        await reminder_task
+    except asyncio.CancelledError:
+        pass
     worker.stop_global_watchdog()
     await scheduler_engine.stop_loop()
     await background_jobs.stop_recovery_loop()
@@ -131,6 +159,27 @@ _character_manager: CharacterManager | None = None
 
 
 app = FastAPI(title="Pan", lifespan=lifespan)
+
+
+async def _reminder_loop():
+    """Recover persisted reminders after restart; claim-before-send is once-only."""
+    while True:
+        await _deliver_due_reminders()
+        await asyncio.sleep(1)
+
+
+async def _deliver_due_reminders() -> int:
+    """Claim due records before sending, returning the number of broadcasts."""
+    delivered = 0
+    for item in reminders.claim_due():
+        s = sess.get(item.get("sessionId", ""))
+        if not s:
+            continue
+        payload = notifications.dispatch_reminder(item.get("title", "Reminder"), item.get("body", ""))
+        await broadcast({"type": "notification.reminder", "sessionId": s.id,
+                         "reminderId": item["id"], "notification": payload})
+        delivered += 1
+    return delivered
 
 ws_clients: set[WebSocket] = set()
 agent_clients: set[WebSocket] = set()
@@ -163,8 +212,6 @@ _PROJECT_DIR = _WEB_DIR.parent.parent  # packages/web/ → packages/ → project
 DATA_DIR = _PROJECT_DIR / "data"
 WORKDIRS_DIR = DATA_DIR / "workdirs"
 ATTACHMENTS_DIR = DATA_DIR / "attachments"
-DASHBOARD_FILE = _WEB_DIR / "index.html"
-MOBILE_DASHBOARD_FILE = _WEB_DIR / "mobile.html"
 REACT_DIST_DIR = _WEB_DIR / "dist"
 REACT_DIST_EXISTS = REACT_DIST_DIR.is_dir()
 
@@ -182,6 +229,72 @@ _main_exit_pending = False
 _main_exit_request_id: str | None = None
 _main_exit_stage = "idle"
 _main_exit_error: str | None = None
+
+# Phase-one main lifecycle options are intentionally empty.  Keep the
+# validation at the HTTP boundary so a future option cannot be accepted by
+# one operation and silently ignored by the other.
+_MAIN_LIFECYCLE_REQUEST_FIELDS = frozenset({"options"})
+_MAIN_LIFECYCLE_SUPPORTED_OPTIONS = frozenset()
+
+
+def _parse_main_lifecycle_options(payload: dict | None, operation: str) -> dict:
+    """Validate and freeze the phase-one lifecycle request options once.
+
+    The returned mapping is JSON-shaped and is persisted in the lifecycle Job
+    before any worker gate or detached supervisor is touched.  ``None`` and
+    ``{}`` preserve the historical no-body behavior; ``options`` is the only
+    request envelope accepted for forward compatibility.
+    """
+    if payload is None:
+        return {}
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_lifecycle_request",
+                "operation": operation,
+                "message": "request body must be an object",
+            },
+        )
+
+    unknown_request_fields = sorted(set(payload) - _MAIN_LIFECYCLE_REQUEST_FIELDS)
+    if unknown_request_fields:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "unsupported_lifecycle_request_fields",
+                "operation": operation,
+                "fields": unknown_request_fields,
+                "message": "unsupported lifecycle request field(s)",
+            },
+        )
+
+    options = payload.get("options", {})
+    if not isinstance(options, dict):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_lifecycle_options",
+                "operation": operation,
+                "message": "options must be an object",
+            },
+        )
+    unknown_options = sorted(set(options) - _MAIN_LIFECYCLE_SUPPORTED_OPTIONS)
+    if unknown_options:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "unsupported_lifecycle_options",
+                "operation": operation,
+                "fields": unknown_options,
+                "message": "unsupported lifecycle option(s)",
+            },
+        )
+
+    # JSON request data is already detached from the caller.  Rebuild the
+    # mapping so later phases receive a canonical snapshot, not a live input
+    # object; the Job write is the cross-process source of truth.
+    return json.loads(json.dumps(options, ensure_ascii=False, sort_keys=True))
 
 
 def _main_restart_paths() -> dict[str, Path]:
@@ -216,11 +329,13 @@ def _main_restart_job_view(job: dict | None) -> dict:
         return {}
     return {
         "jobId": job.get("jobId"), "requestId": job.get("requestId"),
+        "operation": job.get("operation"), "options": dict(job.get("options") or {}),
         "phase": job.get("phase"), "jobStatus": job.get("status"),
         "root": job.get("root"), "port": job.get("port"),
         "oldPid": job.get("oldPid"), "oldPidCreatedAt": job.get("oldPidCreatedAt"),
         "newPid": job.get("newPid"), "newPidCreatedAt": job.get("newPidCreatedAt"),
-        "error": job.get("error"), "createdAt": job.get("createdAt"),
+        "error": job.get("error"), "errors": list(job.get("errors") or []),
+        "createdAt": job.get("createdAt"),
         "updatedAt": job.get("updatedAt"),
     }
 
@@ -453,18 +568,6 @@ def _launch_main_exit_supervisor(request_id: str) -> subprocess.Popen:
             creationflags=flags,
         )
 
-# Production switch: config.json frontend 字段
-# "coexist"（默认）→ React SPA / + Vanilla /vanilla/（+ React /react/ 兼容保留）
-# "react" → React SPA / + Vanilla /vanilla/
-# "legacy" → 仅旧前端 /（无 /vanilla、/react）
-FRONTEND_MODE = load_config().get("frontend", "coexist")
-
-_MOBILE_UA_RE = re.compile(
-    r"Mobile|Android|iPhone|iPad|iPod|BlackBerry|Windows Phone|webOS",
-    re.IGNORECASE,
-)
-
-
 async def _send_ws(ws: WebSocket, data: dict):
     """单个客户端发送（带 2s 超时）；超时/失败由 broadcast 统一剔除。
 
@@ -648,11 +751,16 @@ def _session_to_api(s: sess.Session):
         "canClaimUnmanaged": s.can_claim_unmanaged,
         "autoClaimCreated": s.auto_claim_created,
         "sessionTemplate": s.session_template,
+        "originalPrompt": s.original_prompt,
+        "handoffPrompt": s.handoff_prompt,
+        "systemPrompt": s.system_prompt,  # derived, read-only compatibility view
         "alwaysThinkingEnabled": ac.get("always_thinking_enabled", False),
         "effort": ac.get("effort") or config.get("effort", ""),
         "maxThinkingTokens": ac.get("max_thinking_tokens"),
+        "modelContextWindow": ac.get("model_context_window"),
+        "modelAutoCompactTokenLimit": ac.get("model_auto_compact_token_limit"),
         "workdir": s.workdir,
-        "history": s.history,
+        "history": _api_history(s.id, s.history),
         "lastResult": s.last_result,
         "lastLegalWorkerState": s.last_legal_worker_state,
         "rawUsage": s.raw_usage,
@@ -667,6 +775,7 @@ def _session_to_api(s: sess.Session):
         "reportSubscriptions": sorted(s.report_subscriptions),
         "qqSubscriptions": sorted(s.qq_subscriptions),
         "wechatSubscriptions": sorted(s.wechat_subscriptions),
+        "notificationSettings": notifications.normalize_notification_settings(s.notification_settings),
         "workerStatus": w.status if w else None,
         "workerId": w.worker_id if w else None,
         "lastLegalWorkerState": s.last_legal_worker_state,
@@ -712,7 +821,10 @@ def _session_summary(s: sess.Session) -> dict:
     if s.history:
         last = s.history[-1]
         if isinstance(last, dict):
-            last_text = str(last.get("content") or "")[:200]
+            last_text = _normalize_legacy_attachment_links(
+                s.id,
+                str(last.get("content") or ""),
+            )[:200]
     return {
         "id": s.id,
         "name": s.name,
@@ -740,6 +852,8 @@ def _session_summary(s: sess.Session) -> dict:
         "permissionMode": s.permission_mode or config.get("permission_mode") or None,
         "alwaysThinkingEnabled": ac.get("always_thinking_enabled", False),
         "effort": ac.get("effort") or config.get("effort", ""),
+        "modelContextWindow": ac.get("model_context_window"),
+        "modelAutoCompactTokenLimit": ac.get("model_auto_compact_token_limit"),
         "workdir": s.workdir,
     }
 
@@ -790,8 +904,15 @@ _MAX_FILE_BYTES = 5 * 1024 * 1024  # 5 MiB
 _ALLOWED_WORKDIR_ROOTS: list[Path] | None = None
 
 
-def _resolve_workdir(workdir_name: str) -> Path:
-    """Resolve a workdir name to a Path, creating it."""
+def _resolve_workdir(workdir_name: str, *, strict_workdir: bool = False) -> Path:
+    """Resolve a workdir name to a Path.
+
+    Relative session names retain their historical private workdir behavior.
+    Absolute paths must already exist; a caller that wants a new absolute
+    directory must use the explicit directory-creation endpoint after user
+    confirmation. This prevents session creation from silently creating an
+    arbitrary path supplied by a client.
+    """
     p = Path(workdir_name)
     if p.is_absolute():
         if _ALLOWED_WORKDIR_ROOTS is not None:
@@ -806,8 +927,22 @@ def _resolve_workdir(workdir_name: str) -> Path:
                     f"Workdir {workdir_name!r} is outside allowed roots: "
                     f"{[str(r) for r in _ALLOWED_WORKDIR_ROOTS]}"
                 )
-        p.mkdir(parents=True, exist_ok=True)
-        return p
+        try:
+            resolved = p.resolve(strict=True)
+        except FileNotFoundError as exc:
+            raise ValueError(
+                f"Workdir {workdir_name!r} does not exist; confirm directory creation first"
+            ) from exc
+        if not resolved.is_dir():
+            raise ValueError(f"Workdir {workdir_name!r} is not a directory")
+        return resolved
+
+    if strict_workdir:
+        if workdir_name in {".", ".."} or not re.fullmatch(r"[A-Za-z0-9_.-]+", workdir_name):
+            raise ValueError(f"Invalid relative workdir path: {workdir_name!r}")
+        workdir = WORKDIRS_DIR / workdir_name
+        workdir.mkdir(parents=True, exist_ok=True)
+        return workdir.resolve()
 
     # Slug name — resolve under WORKDIRS_DIR
     # 非法字符不抛错：清理成安全 slug（替换为 -），避免合法 session 名
@@ -822,16 +957,158 @@ def _resolve_workdir(workdir_name: str) -> Path:
     return workdir
 
 
+def _path_is_allowed(path: Path, roots: list[Path]) -> bool:
+    resolved = path.resolve(strict=False)
+    return any(
+        resolved == root.resolve(strict=False)
+        or root.resolve(strict=False) in resolved.parents
+        for root in roots
+    )
+
+
+def _create_directory(path: str) -> Path:
+    """Create one explicitly confirmed directory without expanding trust.
+
+    Existing external workspaces remain valid workdirs. New absolute trees are
+    only creatable below the configured allowlist; when no allowlist is
+    configured, only Pan's own workdir root is creatable. The parent must
+    already exist, so a typo cannot cause an arbitrary directory tree to be
+    manufactured.
+    """
+    raw = path.strip()
+    if not raw or "\x00" in raw or any(ord(char) < 32 for char in raw):
+        raise ValueError("Invalid directory path")
+    if sys.platform == "win32":
+        invalid = set('<>"|?*')
+        if any(char in invalid for char in raw):
+            raise ValueError("Invalid directory path")
+        for index, char in enumerate(raw):
+            if char == ":" and not (index == 1 and raw[0].isalpha()):
+                raise ValueError("Invalid directory path")
+    target = Path(raw)
+    if not target.is_absolute():
+        return _resolve_workdir(raw, strict_workdir=True)
+
+    if _ALLOWED_WORKDIR_ROOTS is not None:
+        roots = _ALLOWED_WORKDIR_ROOTS
+    else:
+        roots = [WORKDIRS_DIR]
+    if not _path_is_allowed(target, roots):
+        raise ValueError(f"Workdir {raw!r} is outside allowed roots: {[str(root) for root in roots]}")
+
+    try:
+        if target.exists():
+            if not target.is_dir():
+                raise ValueError(f"Workdir {raw!r} is not a directory")
+            return target.resolve(strict=True)
+        parent = target.parent.resolve(strict=True)
+        if not parent.is_dir() or not _path_is_allowed(parent, roots):
+            raise ValueError("Parent directory is outside allowed roots or does not exist")
+        target.mkdir(exist_ok=False)
+        return target.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise ValueError("Parent directory is outside allowed roots or does not exist") from exc
+    except PermissionError as exc:
+        raise PermissionError("Directory creation permission denied") from exc
+
+
 def _resolve_fs_path(session_id: str, rel_path: str) -> Path:
-    """Resolve a relative path within a session's workdir, rejecting escapes."""
+    """Resolve a session-relative or absolute path on the Pan server.
+
+    The web editor intentionally permits opening files anywhere on the server
+    for now. A future security policy can add containment checks here without
+    changing the client-side link or editor flow.
+    """
     s = sess.get(session_id)
     if not s or not s.workdir:
         raise ValueError("session has no workdir")
-    root = Path(s.workdir).resolve()
-    target = (root / rel_path).resolve()
-    # raises ValueError if rel_path (after resolving .. etc.) escapes root
-    target.relative_to(root)
+    target = Path(rel_path)
+    if not target.is_absolute():
+        target = Path(s.workdir) / target
+    return target.resolve()
+
+
+def _resolve_attachment_source_path(session_id: str, raw_path: str) -> Path:
+    """Resolve an attachment source and reject relative workdir escape."""
+    target = _resolve_fs_path(session_id, raw_path)
+    if not Path(raw_path).is_absolute():
+        session = sess.get(session_id)
+        if not session or not session.workdir:
+            raise ValueError("session has no workdir")
+        try:
+            target.relative_to(Path(session.workdir).resolve())
+        except ValueError as exc:
+            raise ValueError("Attachment path escapes the Session workdir") from exc
     return target
+
+
+def _rename_no_overwrite(src: Path, dst: Path) -> None:
+    """Rename without replacing a target which appears concurrently.
+
+    ``os.replace`` is intentionally not used here: it unconditionally
+    replaces on POSIX and could destroy a draft created after the UI's
+    advisory target-state check. Windows MoveFileEx without
+    MOVEFILE_REPLACE_EXISTING and Linux renameat2(RENAME_NOREPLACE) provide
+    atomic no-overwrite behavior. Platforms without a proven atomic
+    no-overwrite primitive fail closed.
+    """
+    if src == dst:
+        if not src.exists():
+            raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), str(src))
+        return
+
+    if os.name == "nt":
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        move_file_ex = kernel32.MoveFileExW
+        move_file_ex.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
+        move_file_ex.restype = ctypes.c_int
+        # MOVEFILE_WRITE_THROUGH; omitting MOVEFILE_REPLACE_EXISTING is the
+        # no-overwrite guarantee and works for local and UNC paths.
+        if not move_file_ex(str(src), str(dst), 0x8):
+            error = ctypes.get_last_error()
+            raise OSError(error, os.strerror(error), str(dst))
+        return
+
+    if sys.platform.startswith("linux"):
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is not None:
+            renameat2.argtypes = [
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            ]
+            renameat2.restype = ctypes.c_int
+            result = renameat2(
+                -100,
+                os.fsencode(src),
+                -100,
+                os.fsencode(dst),
+                1,  # AT_FDCWD, RENAME_NOREPLACE
+            )
+            if result == 0:
+                return
+            error = ctypes.get_errno()
+            # Some Linux architectures expose renameat2 but return ENOSYS at
+            # runtime (for example under an older kernel/container). A
+            # link+unlink fallback is not safe: another actor can remove the
+            # source inode between those operations, and it cannot provide
+            # the same no-overwrite guarantee for directories. Fail closed.
+            if error != errno.ENOSYS:
+                raise OSError(error, os.strerror(error), str(dst))
+            raise OSError(
+                errno.ENOTSUP,
+                "atomic no-overwrite rename is unavailable on this Linux system",
+                str(dst),
+            )
+
+    raise OSError(
+        errno.ENOTSUP,
+        "atomic no-overwrite rename is unavailable on this platform",
+        str(dst),
+    )
 
 
 def _guarded_model(a, value) -> str | None:
@@ -886,8 +1163,13 @@ def _build_session_params(
     external session from being recorded; normal session creation remains
     strict so a configured MCP server can never disappear silently.
     """
+    _normalize_context_setting_keys(data)
+    for key in ("originalPrompt", "handoffPrompt", "systemPrompt"):
+        if key in data and data[key] is not None and not isinstance(data[key], str):
+            raise ValueError(f"{key} must be a string or null")
     name = data.get("name", "default")
-    workdir_name = data.get("workdir") or name
+    explicit_workdir = data.get("workdir")
+    workdir_name = explicit_workdir or name
 
     # Resolve session_template first: the template's adapter participates in
     # the final adapter resolution (explicit request > template > "cbc"), so
@@ -991,6 +1273,9 @@ def _build_session_params(
         explicit_settings["maxThinkingTokens"] = data["maxThinkingTokens"]
     if data.get("alwaysThinkingEnabled"):
         explicit_settings["alwaysThinkingEnabled"] = data["alwaysThinkingEnabled"]
+    for api_key, _native_key in _CODEX_CONTEXT_SETTING_KEYS:
+        if api_key in data and data[api_key] is not None:
+            explicit_settings[api_key] = data[api_key]
     if explicit_settings:
         validate_session_settings(adapter_name, explicit_settings, current_model=_final_model)
 
@@ -1030,7 +1315,7 @@ def _build_session_params(
         or _guarded_permission_mode(a, template.permission_mode)
         or _guarded_permission_mode(a, config.get("permission_mode"))
         or None,
-        "workdir": str(_resolve_workdir(workdir_name)) if resolve_workdir else "",
+        "workdir": str(_resolve_workdir(workdir_name, strict_workdir=bool(explicit_workdir))) if resolve_workdir else "",
         "adapter_config": {
             "always_thinking_enabled": _thinking,
             "effort": _effort,
@@ -1041,9 +1326,15 @@ def _build_session_params(
         },
         "session_template": template_name,
         "pan_access": pan_access,
-        "system_prompt": data.get("systemPrompt") or template.system_prompt,
+        "original_prompt": data.get("originalPrompt", data.get("systemPrompt", template.system_prompt)),
+        "handoff_prompt": data.get("handoffPrompt"),
         "game_id": data.get("gameId") or None,
     }
+    # These are deliberately added only when explicitly supplied.  In
+    # particular, do not synthesize a model/default value into Session JSON.
+    for api_key, native_key in _CODEX_CONTEXT_SETTING_KEYS:
+        if api_key in data and data[api_key] is not None:
+            params["adapter_config"][native_key] = data[api_key]
     # Optional worker execution mode ("stream" | "oneshot"); validated against
     # the adapter's execution_modes. Unset/"auto" = automatic (existing behaviour).
     raw_mode = data.get("outputMode")
@@ -1187,7 +1478,28 @@ def _safe_adapter(adapter_name: str):
 _PROCESS_AFFECTING_FIELDS = {
     "model", "permissionMode", "alwaysThinkingEnabled", "effort",
     "maxThinkingTokens", "mcpServers", "outputMode",
+    "modelContextWindow", "modelAutoCompactTokenLimit",
 }
+
+_CODEX_CONTEXT_SETTING_ALIASES = {
+    # HTTP/MCP use camelCase like the rest of the session settings; accepting
+    # the native names as a compatibility bridge keeps hand-authored API
+    # requests and persisted migration tooling unambiguous.
+    "model_context_window": "modelContextWindow",
+    "model_auto_compact_token_limit": "modelAutoCompactTokenLimit",
+}
+_CODEX_CONTEXT_SETTING_KEYS = (
+    ("modelContextWindow", "model_context_window"),
+    ("modelAutoCompactTokenLimit", "model_auto_compact_token_limit"),
+)
+
+
+def _normalize_context_setting_keys(data: dict) -> None:
+    """Normalize native snake_case aliases into the public API spelling."""
+    for native_key, api_key in _CODEX_CONTEXT_SETTING_ALIASES.items():
+        if native_key in data:
+            data.setdefault(api_key, data[native_key])
+            data.pop(native_key, None)
 
 
 def _apply_session_updates(s: sess.Session, data: dict):
@@ -1196,10 +1508,19 @@ def _apply_session_updates(s: sess.Session, data: dict):
     Validate-first：所有显式设置先整体通过 adapter 能力校验，任一非法即抛
     AdapterCapabilityError 且 **不修改** session（避免半套写入的脏配置）。
     """
+    _normalize_context_setting_keys(data)
+    # systemPrompt was not a supported settings field. Reject effective-prompt
+    # writes explicitly so a detail response cannot become a recursive baseline.
+    if "systemPrompt" in data:
+        raise ValueError("systemPrompt is read-only; update originalPrompt or handoffPrompt")
+    for key in ("originalPrompt", "handoffPrompt"):
+        if key in data and data[key] is not None and not isinstance(data[key], str):
+            raise ValueError(f"{key} must be a string or null")
     _explicit = {
         key: data[key]
         for key in ("model", "permissionMode", "alwaysThinkingEnabled",
-                    "effort", "maxThinkingTokens", "outputMode")
+                    "effort", "maxThinkingTokens", "outputMode",
+                    "modelContextWindow", "modelAutoCompactTokenLimit")
         if key in data
     }
     if _explicit:
@@ -1222,6 +1543,9 @@ def _apply_session_updates(s: sess.Session, data: dict):
         s.set_adapter_field("effort", data["effort"])
     if "maxThinkingTokens" in data:
         s.set_adapter_field("max_thinking_tokens", data["maxThinkingTokens"])
+    for api_key, native_key in _CODEX_CONTEXT_SETTING_KEYS:
+        if api_key in data:
+            s.set_adapter_field(native_key, data[api_key])
     if "mcpServers" in data:
         # forceMcp:true（UI 强制解除模板锁确认后携带）跳过 always/never 校验。
         _apply_mcp_servers(s, data["mcpServers"], force=bool(data.get("forceMcp")))
@@ -1234,6 +1558,20 @@ def _apply_session_updates(s: sess.Session, data: dict):
         # plugin to bind a RuleWhisper game_id to a group-scoped session so
         # LLM-driven MCP tool calls can pass it through.
         s.game_id = data["gameId"] or None
+    if "notificationSettings" in data:
+        if not isinstance(data["notificationSettings"], dict):
+            raise ValueError("notificationSettings must be an object")
+        current = notifications.normalize_notification_settings(s.notification_settings)
+        current.update({k: bool(data["notificationSettings"][k])
+                        for k in ("browser", "system") if k in data["notificationSettings"]})
+        s.notification_settings = current
+    # Apply prompts after the other settings have accepted the request. These
+    # affect future fresh workers/handoffs; resumed CLI context already contains
+    # its prompt. Do not imply that respawning rewrites that context.
+    if "originalPrompt" in data:
+        s.original_prompt = data["originalPrompt"]
+    if "handoffPrompt" in data:
+        s.handoff_prompt = data["handoffPrompt"]
 
 
 _PAN_ACCESS_FIELDS = (
@@ -1360,7 +1698,7 @@ async def api_main_restart_status():
 
 
 @app.post("/api/main/restart")
-async def api_main_restart():
+async def api_main_restart(payload: Annotated[dict | None, Body()] = None):
     """Accept a durable detached restart of this Pan instance.
 
     Returning before the supervisor stops this process is essential: waiting
@@ -1369,6 +1707,8 @@ async def api_main_restart():
     stop/start chain and uses this checkout's scripts only.
     """
     global _main_restart_pending, _main_restart_request_id
+
+    options = _parse_main_lifecycle_options(payload, "restart")
 
     status = _main_restart_status()
     if not status["available"]:
@@ -1397,7 +1737,7 @@ async def api_main_restart():
         job = background_jobs.create_service_job(
             request_id=request_id, operation="restart", root=str(_PROJECT_DIR), port=port,
             old_pid=old_pid, old_pid_created_at=old_pid_created_at,
-            registry_root=registry_root,
+            registry_root=registry_root, options=options,
         )
     except background_jobs.ServiceJobBusy as exc:
         existing = exc.job
@@ -1473,7 +1813,7 @@ async def _perform_main_exit(request_id: str) -> None:
     try:
         background_jobs.transition_service_job(
             job["jobId"], "stopping_service", registry_root=registry_root,
-            error=_main_exit_error,
+            **({"error": _main_exit_error} if _main_exit_error else {}),
         )
     except (OSError, ValueError) as exc:
         _log(f"[main-exit] failed to record service-stop phase: {exc}")
@@ -1501,7 +1841,7 @@ async def api_main_exit_status():
 
 
 @app.post("/api/main/exit")
-async def api_main_exit():
+async def api_main_exit(payload: Annotated[dict | None, Body()] = None):
     """Schedule a legal, stop-only shutdown of this Pan instance.
 
     The HTTP response is returned before Worker draining and service stop.  No
@@ -1509,6 +1849,8 @@ async def api_main_exit():
     service unavailable.
     """
     global _main_exit_pending, _main_exit_request_id, _main_exit_stage, _main_exit_error
+
+    options = _parse_main_lifecycle_options(payload, "exit")
 
     status = _main_exit_status()
     if not status["available"]:
@@ -1545,7 +1887,7 @@ async def api_main_exit():
         job = background_jobs.create_service_job(
             request_id=request_id, operation="exit", root=str(_PROJECT_DIR), port=port,
             old_pid=old_pid, old_pid_created_at=old_pid_created_at,
-            registry_root=registry_root,
+            registry_root=registry_root, options=options,
         )
     except background_jobs.ServiceJobBusy as exc:
         existing = exc.job
@@ -1611,10 +1953,642 @@ def _attachment_session_dir(session_id: str) -> Path:
 
 
 def _attachment_filename(raw_name: str | None) -> str:
-    """Normalize a browser filename without treating it as a server path."""
+    """Return the original basename for display, never as a storage path.
+
+    The browser may send a URL-encoded name and, on some browsers, a legacy
+    fakepath.  Keep the user's basename (including spaces, Unicode and
+    Markdown punctuation) for the link label, while removing only path/control
+    characters that cannot safely be displayed as one filename.
+    """
     name = unquote(raw_name or "").replace("\\", "/").rsplit("/", 1)[-1]
-    name = re.sub(r"[<>:\"|?*\x00-\x1f]", "_", name).strip(" .")
-    return name or "attachment"
+    name = "".join(c for c in name if ord(c) >= 32 and c not in "\x7f")
+    return name if name.strip(" .") else "attachment"
+
+
+def _attachment_storage_filename(display_name: str) -> str:
+    """Create an opaque storage filename, retaining only a safe extension."""
+    suffix = Path(display_name).suffix
+    suffix = re.sub(r"[^A-Za-z0-9._-]", "", suffix)[:32]
+    return f"upload_{uuid.uuid4().hex}{suffix}"
+
+
+_ATTACHMENT_ID_RE = re.compile(
+    r"(?:upload_[A-Za-z0-9]{32}(?:\.[A-Za-z0-9._-]{1,32})?|att_[A-Za-z0-9]{32})"
+)
+
+
+def _attachment_registry_path(session_id: str) -> Path:
+    """Return the durable, session-scoped attachment metadata sidecar."""
+    return _attachment_session_dir(session_id) / ".attachments.json"
+
+
+def _read_attachment_registry(session_id: str) -> dict[str, dict]:
+    try:
+        raw = json.loads(_attachment_registry_path(session_id).read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError, TypeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        str(key): value for key, value in raw.items()
+        if isinstance(key, str) and isinstance(value, dict)
+    }
+
+
+def _write_attachment_registry(session_id: str, registry: dict[str, dict]) -> None:
+    target = _attachment_registry_path(session_id)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    temporary.write_text(json.dumps(registry, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temporary, target)
+
+
+def _attachment_record(session_id: str, attachment_id: str) -> dict | None:
+    """Resolve an id without accepting client supplied href/path metadata.
+
+    Old uploads used their opaque storage filename as ``attachmentId`` and did
+    not have a sidecar.  They remain readable through the conservative
+    filename/path fallback; all new server-file references are sidecar-backed.
+    """
+    if not isinstance(attachment_id, str) or not _ATTACHMENT_ID_RE.fullmatch(attachment_id):
+        return None
+    record = _read_attachment_registry(session_id).get(attachment_id)
+    if record is not None:
+        return dict(record)
+    if attachment_id.startswith("upload_"):
+        root = _attachment_session_dir(session_id).resolve()
+        target = (root / attachment_id).resolve()
+        try:
+            target.relative_to(root)
+        except ValueError:
+            return None
+        if target.is_file():
+            return {
+                "source": "upload",
+                "displayName": attachment_id,
+                "storageFilename": attachment_id,
+                "path": str(target),
+                "size": target.stat().st_size,
+                "mimeType": mimetypes.guess_type(attachment_id)[0] or "application/octet-stream",
+                "completed": True,
+            }
+    # A message may be dragged from another Session.  The opaque id is the
+    # bearer reference; the registry owner, never a browser-supplied path, is
+    # the authority for the source file.  The queue boundary imports this
+    # record into the target Session before persisting the message reference.
+    try:
+        candidates = list(ATTACHMENTS_DIR.iterdir())
+    except OSError:
+        candidates = []
+    for directory in candidates:
+        if not directory.is_dir():
+            continue
+        try:
+            registry = json.loads(
+                (directory / ".attachments.json").read_text(encoding="utf-8")
+            )
+        except (FileNotFoundError, OSError, ValueError, TypeError):
+            registry = {}
+        if isinstance(registry, dict):
+            record = registry.get(attachment_id)
+            if isinstance(record, dict):
+                return dict(record)
+    return None
+
+
+def _attachment_owner_dir(attachment_id: str) -> Path | None:
+    """Find an id in another session directory for a useful mismatch error."""
+    if not _ATTACHMENT_ID_RE.fullmatch(attachment_id or ""):
+        return None
+    try:
+        candidates = list(ATTACHMENTS_DIR.iterdir())
+    except OSError:
+        return None
+    for directory in candidates:
+        if not directory.is_dir():
+            continue
+        registry_path = directory / ".attachments.json"
+        try:
+            registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, ValueError, TypeError):
+            registry = {}
+        if isinstance(registry, dict) and attachment_id in registry:
+            return directory
+        if attachment_id.startswith("upload_") and (directory / attachment_id).is_file():
+            return directory
+    return None
+
+
+def _register_attachment(session_id: str, attachment_id: str, record: dict) -> None:
+    registry = _read_attachment_registry(session_id)
+    registry[attachment_id] = {
+        **record,
+        "completed": record.get("completed", True),
+        "sessionId": session_id,
+    }
+    _write_attachment_registry(session_id, registry)
+
+
+def _attachment_href(session_id: str, storage_filename: str) -> str:
+    """Build the only public href accepted for an uploaded attachment."""
+    return (
+        f"/api/attachments/{quote(storage_filename, safe='')}"
+        f"?session_id={quote(session_id, safe='')}"
+    )
+
+
+def _attachment_ref_href(session_id: str, attachment_id: str) -> str:
+    """Build an opaque download href that never embeds a filesystem path."""
+    return (
+        f"/api/attachments/ref/{quote(attachment_id, safe='')}"
+        f"?session_id={quote(session_id, safe='')}"
+    )
+
+
+def _editor_attachment_href(
+    session_id: str, attachment_id: str, line: int | None = None,
+    end_line: int | None = None,
+) -> str:
+    href = _attachment_ref_href(session_id, attachment_id).replace(
+        "/api/attachments/ref/", "/api/attachments/editor/", 1)
+    if line is not None:
+        suffix = f"#L{line}" if end_line is None else f"#L{line}-L{end_line}"
+        href += suffix
+    return href
+
+
+def _fs_download_href(session_id: str, path: str) -> str:
+    """Build a safe download href for an existing server-side file."""
+    return (
+        "/api/fs/read?"
+        f"session_id={quote(session_id, safe='')}&"
+        f"path={quote(path, safe='')}&download=1"
+    )
+
+
+def _markdown_label(display_name: str) -> str:
+    """Escape Markdown label punctuation without changing rendered text."""
+    return re.sub(r"([\\\[\]\(\)])", r"\\\1", display_name)
+
+
+def _attachment_markdown(display_name: str, href: str) -> str:
+    """Return a standard Markdown link for a trusted, server-built href."""
+    return f"[{_markdown_label(display_name)}]({href})"
+
+
+_LEGACY_ATTACHMENT_RE = re.compile(r'@"([^"\r\n]+)"')
+_MESSAGE_ATTACHMENT_HREF_RE = re.compile(
+    r"\[(?:\\.|[^\]\\\r\n])*\]\((?P<href>/api/(?:attachments/(?:ref/|editor/|[^)\s]+)|fs/read\?[^)\s]+))\)"
+)
+
+
+def _legacy_attachment_href(session_id: str, raw_path: str) -> str:
+    """Map an old absolute attachment path to a validated download route."""
+    try:
+        target = Path(raw_path).resolve()
+        attachment_root = _attachment_session_dir(session_id).resolve()
+        relative = target.relative_to(attachment_root)
+        if len(relative.parts) == 1 and relative.name:
+            return _attachment_href(session_id, relative.name)
+    except (OSError, RuntimeError, ValueError):
+        pass
+    # This preserves the existing fs/read permission and path validation for
+    # older server-file attachments whose original name was not persisted.
+    return _fs_download_href(session_id, raw_path)
+
+
+def _normalize_legacy_attachment_links(session_id: str, content: str) -> str:
+    """Make pre-Metadata ``@\"path\"`` history entries renderable Markdown."""
+    def replace(match: re.Match[str]) -> str:
+        raw_path = match.group(1)
+        display_name = _attachment_filename(raw_path)
+        return _attachment_markdown(
+            display_name,
+            _legacy_attachment_href(session_id, raw_path),
+        )
+
+    return _LEGACY_ATTACHMENT_RE.sub(replace, content)
+
+
+_MARKDOWN_LINK_RE = re.compile(
+    r"(?P<label>\[(?:\\.|[^\]\\\r\n])*\])\((?P<href>[^)\s]+)\)"
+)
+
+
+def _parse_editor_destination(raw_href: str) -> tuple[str, int | None, int | None] | None:
+    """Parse a local Markdown destination without accepting web URLs."""
+    hash_index = raw_href.find("#")
+    raw_path = unquote(raw_href if hash_index < 0 else raw_href[:hash_index])
+    fragment = "" if hash_index < 0 else unquote(raw_href[hash_index + 1:])
+    if not raw_path or raw_href.startswith("#"):
+        return None
+    lower = raw_path.lower()
+    if lower.startswith("file://"):
+        uri = urlsplit(raw_path)
+        if uri.netloc and uri.netloc.lower() != "localhost":
+            path = f"//{uri.netloc}{uri.path}"
+        else:
+            path = uri.path[1:] if re.match(r"^/[A-Za-z]:[\\/]", uri.path) else uri.path
+    else:
+        if re.match(r"^[A-Za-z][A-Za-z\d+.-]*:", raw_path) and not re.match(
+            r"^[A-Za-z]:[\\/]", raw_path
+        ):
+            return None
+        path = raw_path
+    path = path.replace("\\", "/")
+    if re.match(r"^/[A-Za-z]:/", path):
+        path = path[1:]
+
+    line = end_line = None
+    colon_match = re.match(r"^(.*):(\d+)(?:-(\d+))?$", path)
+    if colon_match and not re.match(r"^[A-Za-z]$", colon_match.group(1)):
+        line = int(colon_match.group(2))
+        end_line = int(colon_match.group(3)) if colon_match.group(3) else None
+        if end_line is not None and end_line < line:
+            line = end_line = None
+        else:
+            path = colon_match.group(1)
+    fragment_match = re.fullmatch(r"L(\d+)(?:-L(\d+))?", fragment, re.IGNORECASE)
+    if fragment_match:
+        fragment_line = int(fragment_match.group(1))
+        fragment_end = int(fragment_match.group(2)) if fragment_match.group(2) else None
+        if fragment_line > 0 and (fragment_end is None or fragment_end >= fragment_line):
+            line, end_line = fragment_line, fragment_end
+    if line is not None and line < 1:
+        line = end_line = None
+    return path, line, end_line
+
+
+def _editor_reference_id(session_id: str, path: str, line: int | None, end_line: int | None) -> str:
+    canonical_path = str(Path(path).resolve())
+    registry = _read_attachment_registry(session_id)
+    for attachment_id, record in registry.items():
+        if (
+            isinstance(record, dict)
+            and record.get("source") == "server_file"
+            and str(Path(str(record.get("path", ""))).resolve()) == canonical_path
+            and record.get("line") == line
+            and record.get("endLine") == end_line
+            and record.get("completed", True) is True
+        ):
+            return attachment_id
+    attachment_id = "att_" + uuid.uuid4().hex
+    _register_attachment(session_id, attachment_id, {
+        "source": "server_file",
+        "displayName": _attachment_filename(Path(canonical_path).name),
+        "path": canonical_path,
+        "size": Path(canonical_path).stat().st_size,
+        "mimeType": mimetypes.guess_type(canonical_path)[0],
+        "line": line,
+        "endLine": end_line,
+    })
+    return attachment_id
+
+
+def _project_editor_links(session_id: str, content: str) -> str:
+    """Give existing local Markdown links opaque editor/download identities.
+
+    This is intentionally best-effort for old history: an existing file can
+    be upgraded to a draggable opaque reference; missing or ambiguous legacy
+    links remain ordinary editor links and retain click-only compatibility.
+    """
+    def replace(match: re.Match[str]) -> str:
+        parsed = _parse_editor_destination(match.group("href"))
+        if parsed is None:
+            return match.group(0)
+        raw_path, line, end_line = parsed
+        if raw_path.startswith("/api/"):
+            return match.group(0)
+        try:
+            target = _resolve_attachment_source_path(session_id, raw_path)
+            if not target.is_file():
+                return match.group(0)
+            attachment_id = _editor_reference_id(session_id, str(target), line, end_line)
+            return f"{match.group('label')}({_editor_attachment_href(session_id, attachment_id, line, end_line)})"
+        except (OSError, RuntimeError, ValueError):
+            return match.group(0)
+
+    return _MARKDOWN_LINK_RE.sub(replace, content)
+
+
+def _attachment_reference_error(session_id: str, href: str) -> dict | None:
+    """Validate one server-generated attachment href for a target session.
+
+    The browser still submits the established Markdown text protocol.  This
+    check makes that protocol authoritative at the queue boundary: a client
+    cannot submit another session's upload or a file that disappeared after
+    the UI's pre-send check.  Ordinary external Markdown links and legacy
+    ``@"path"`` markers are intentionally outside this validator.
+    """
+    parsed = urlsplit(href)
+    if parsed.scheme or parsed.netloc:
+        return {"code": "invalid_attachment_reference", "message": "Attachment link is invalid"}
+    if parsed.fragment and not parsed.path.startswith("/api/attachments/editor/"):
+        return {"code": "invalid_attachment_reference", "message": "Attachment link is invalid"}
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    if query.get("session_id", [None]) != [session_id]:
+        return {
+            "code": "attachment_session_mismatch",
+            "message": "Attachment belongs to another session",
+        }
+
+    if parsed.path.startswith("/api/attachments/"):
+        if parsed.path.startswith("/api/attachments/ref/"):
+            attachment_id = unquote(parsed.path.rsplit("/", 1)[-1])
+            return _attachment_id_error(
+                session_id, attachment_id, allow_cross_session=True,
+            )
+        if parsed.path.startswith("/api/attachments/editor/"):
+            attachment_id = unquote(parsed.path.rsplit("/", 1)[-1])
+            return _attachment_id_error(
+                session_id, attachment_id, allow_cross_session=True,
+            )
+        storage_filename = unquote(parsed.path.rsplit("/", 1)[-1])
+        if not re.fullmatch(
+            r"upload_[A-Za-z0-9]{32}(?:\.[A-Za-z0-9._-]{1,32})?",
+            storage_filename,
+        ):
+            return {"code": "invalid_attachment_reference", "message": "Attachment link is invalid"}
+        root = _attachment_session_dir(session_id).resolve()
+        target = (root / storage_filename).resolve()
+        try:
+            target.relative_to(root)
+        except ValueError:
+            return {"code": "invalid_attachment_reference", "message": "Attachment link is invalid"}
+        if not target.is_file():
+            return {
+                "code": "attachment_not_found",
+                "message": "Attachment is no longer available",
+            }
+        return None
+
+    if parsed.path == "/api/fs/read":
+        if query.get("download", [None]) != ["1"] or query.get("path", [None])[0] is None:
+            return {"code": "invalid_attachment_reference", "message": "Attachment link is invalid"}
+        try:
+            target = _resolve_attachment_source_path(session_id, query["path"][0])
+        except (ValueError, OSError):
+            return {"code": "invalid_attachment_reference", "message": "Attachment link is invalid"}
+        if not target.is_file():
+            return {
+                "code": "attachment_not_found",
+                "message": "Attachment is no longer available",
+            }
+        return None
+
+    return {"code": "invalid_attachment_reference", "message": "Attachment link is invalid"}
+
+
+def _validate_message_attachment_references(session_id: str, text: str) -> dict | None:
+    """Return the first invalid internal attachment reference in message text."""
+    # Preserve the queue endpoint's established session-not-found response;
+    # worker.enqueue_user_message remains authoritative for that case.
+    if sess.get(session_id) is None:
+        return None
+    for match in _MESSAGE_ATTACHMENT_HREF_RE.finditer(text):
+        error = _attachment_reference_error(session_id, match.group("href"))
+        if error is not None:
+            return error
+    return None
+
+
+# DEC-002 separates two cross-Session rules.  A pending chip or inline
+# composer node is Session-owned, so a queued structured part must not adopt an
+# opaque id that another Session registered.  A server-file reference (the
+# editor/正文 link projection of a real server file) may still be dragged into
+# another Session: the target imports a registry receipt and no bytes are
+# copied.  Client uploads own their bytes inside the registering Session, so
+# only ``server_file`` keeps the reuse path.
+_CROSS_SESSION_STRUCTURED_SOURCES = frozenset({"server_file"})
+
+
+def _attachment_id_error(
+    session_id: str,
+    attachment_id: str,
+    *,
+    allow_cross_session: bool = False,
+    cross_session_sources: frozenset[str] | None = None,
+) -> dict | None:
+    """Validate one opaque AttachmentRef at the session boundary.
+
+    ``cross_session_sources`` narrows a cross-Session allowance to the registry
+    ``source`` values that may be reused.  ``None`` keeps the historical
+    "any source" allowance used by the read-only download/editor endpoints.
+    """
+    if not isinstance(attachment_id, str) or not _ATTACHMENT_ID_RE.fullmatch(attachment_id):
+        return {"code": "invalid_attachment_id", "message": "Attachment id is invalid"}
+    record = _attachment_record(session_id, attachment_id)
+    if record is None:
+        owner = _attachment_owner_dir(attachment_id)
+        if owner is not None and owner != _attachment_session_dir(session_id).resolve():
+            return {
+                "code": "attachment_session_mismatch",
+                "message": "Attachment belongs to another session",
+            }
+        return {"code": "attachment_not_found", "message": "Attachment is no longer available"}
+    owner_session_id = record.get("sessionId")
+    if owner_session_id not in (None, session_id):
+        reusable_source = (
+            cross_session_sources is None
+            or record.get("source") in cross_session_sources
+        )
+        if not allow_cross_session or not reusable_source:
+            return {
+                "code": "attachment_session_mismatch",
+                "message": "Attachment belongs to another session",
+            }
+    if record.get("completed") is not True:
+        return {"code": "attachment_incomplete", "message": "Attachment upload is not complete"}
+    try:
+        target = Path(str(record.get("path", ""))).resolve()
+        if not target.is_file():
+            return {"code": "attachment_not_found", "message": "Attachment is no longer available"}
+    except (OSError, RuntimeError, ValueError):
+        return {"code": "attachment_not_found", "message": "Attachment is no longer available"}
+    return None
+
+
+def _import_attachment_reference(session_id: str, attachment_id: str, record: dict) -> None:
+    """Persist a source-owned opaque reference in the target registry.
+
+    No bytes are copied.  Keeping a target-side receipt makes the target
+    message independently recoverable while retaining the source owner for
+    href generation and permission/stale checks.
+    """
+    owner = record.get("sessionId")
+    if owner in (None, session_id):
+        return
+    registry = _read_attachment_registry(session_id)
+    if attachment_id in registry:
+        return
+    registry[attachment_id] = {
+        **record,
+        "sessionId": session_id,
+        "sourceSessionId": owner,
+        "sourceAttachmentId": attachment_id,
+    }
+    _write_attachment_registry(session_id, registry)
+
+
+def _canonical_attachment_ref(session_id: str, attachment_id: str) -> dict | None:
+    """Return server-owned metadata used by structured parts and Markdown fallback."""
+    if _attachment_id_error(session_id, attachment_id) is not None:
+        return None
+    record = _attachment_record(session_id, attachment_id)
+    if record is None:
+        return None
+    source = record.get("source") if record.get("source") in {"upload", "server_file"} else "upload"
+    path = str(record.get("path", ""))
+    owner_session_id = str(record.get("sourceSessionId") or record.get("sessionId") or session_id)
+    href = (
+        _attachment_href(owner_session_id, str(record.get("storageFilename")))
+        if source == "upload" and record.get("storageFilename")
+        else _attachment_ref_href(owner_session_id, attachment_id)
+    )
+    display_name = _attachment_filename(record.get("displayName"))
+    return {
+        "type": "attachment",
+        "attachmentId": attachment_id,
+        "displayName": display_name,
+        "mimeType": record.get("mimeType") or mimetypes.guess_type(display_name)[0] or "application/octet-stream",
+        "size": int(record.get("size", 0) or 0),
+        "source": source,
+        "href": href,
+        **({"line": record["line"]} if isinstance(record.get("line"), int) else {}),
+        **({"endLine": record["endLine"]} if isinstance(record.get("endLine"), int) else {}),
+        # Internal-only field consumed by packages.core.worker.  API/history
+        # serializers remove it before returning data to the browser.
+        "__serverPath": str(Path(path).resolve()),
+    }
+
+
+def _normalize_message_parts(session_id: str, raw_parts) -> tuple[list[dict] | None, str | None, dict | None]:
+    """Validate parts and generate the adapter-compatible Markdown fallback.
+
+    Client supplied labels, hrefs and paths are deliberately ignored.  Only the
+    opaque id is authoritative; the registry supplies all attachment metadata.
+    A structured part never adopts another Session's upload: only a
+    server-file reference keeps the cross-Session reuse path.
+    """
+    if not isinstance(raw_parts, list) or not raw_parts or len(raw_parts) > 512:
+        return None, None, {"code": "invalid_parts", "message": "parts must be a non-empty array"}
+    normalized: list[dict] = []
+    fallback: list[str] = []
+    for part in raw_parts:
+        if not isinstance(part, dict) or not isinstance(part.get("type"), str):
+            return None, None, {"code": "invalid_parts", "message": "message part is invalid"}
+        kind = part["type"]
+        if kind == "text":
+            value = part.get("text", part.get("value"))
+            if not isinstance(value, str):
+                return None, None, {"code": "invalid_parts", "message": "text part must contain text"}
+            normalized.append({"type": "text", "text": value})
+            fallback.append(value)
+            continue
+        if kind != "attachment":
+            return None, None, {"code": "invalid_parts", "message": "unknown message part type"}
+        attachment_id = part.get("attachmentId")
+        error = _attachment_id_error(
+            session_id, attachment_id,
+            allow_cross_session=True,
+            cross_session_sources=_CROSS_SESSION_STRUCTURED_SOURCES,
+        )
+        if error is not None:
+            return None, None, error
+        record = _attachment_record(session_id, attachment_id)
+        if record is None:
+            return None, None, {"code": "attachment_not_found", "message": "Attachment is no longer available"}
+        _import_attachment_reference(session_id, attachment_id, record)
+        canonical = _canonical_attachment_ref(session_id, attachment_id)
+        if canonical is None:
+            return None, None, {"code": "attachment_not_found", "message": "Attachment is no longer available"}
+        normalized.append({key: value for key, value in canonical.items() if key != "href"})
+        fallback.append(_attachment_markdown(canonical["displayName"], canonical["href"]))
+    return normalized, "".join(fallback), None
+
+
+def _normalize_text_attachment_parts(
+    session_id: str, content: str,
+) -> tuple[list[dict] | None, str | None, dict | None]:
+    """Upgrade legacy internal Markdown links to durable parts.
+
+    This keeps old text/Markdown callers compatible while ensuring a Worker
+    never receives an API href as the file target.  External links and all
+    ordinary prose remain text parts; each validated Pan attachment becomes a
+    registry-backed part with the same internal path projection as a new
+    structured request.
+    """
+    content = _normalize_legacy_attachment_links(session_id, content)
+    matches = list(_MESSAGE_ATTACHMENT_HREF_RE.finditer(content))
+    if not matches:
+        return None, content, None
+    normalized: list[dict] = []
+    fallback: list[str] = []
+    cursor = 0
+    for match in matches:
+        prefix = content[cursor:match.start()]
+        if prefix:
+            normalized.append({"type": "text", "text": prefix})
+            fallback.append(prefix)
+        href = match.group("href")
+        error = _attachment_reference_error(session_id, href)
+        if error is not None:
+            return None, None, error
+        parsed = urlsplit(href)
+        if parsed.path == "/api/fs/read":
+            raw_path = parse_qs(parsed.query, keep_blank_values=True).get("path", [""])[0]
+            try:
+                target = _resolve_attachment_source_path(session_id, raw_path)
+            except (OSError, RuntimeError, ValueError):
+                return None, None, {
+                    "code": "attachment_not_found",
+                    "message": "Attachment is no longer available",
+                }
+            attachment_id = _editor_reference_id(session_id, str(target), None, None)
+        else:
+            attachment_id = unquote(parsed.path.rsplit("/", 1)[-1])
+        canonical = _canonical_attachment_ref(session_id, attachment_id)
+        if canonical is None:
+            return None, None, {
+                "code": "attachment_not_found",
+                "message": "Attachment is no longer available",
+            }
+        normalized.append({key: value for key, value in canonical.items() if key != "href"})
+        fallback.append(_attachment_markdown(canonical["displayName"], canonical["href"]))
+        cursor = match.end()
+    suffix = content[cursor:]
+    if suffix:
+        normalized.append({"type": "text", "text": suffix})
+        fallback.append(suffix)
+    return normalized, "".join(fallback), None
+
+
+def _api_history(session_id: str, history: list[dict]) -> list[dict]:
+    """Serialize history with a compatibility view for old attachment text."""
+    normalized: list[dict] = []
+    for message in history:
+        if not isinstance(message, dict) or not isinstance(message.get("content"), str):
+            if isinstance(message, dict) and isinstance(message.get("parts"), list):
+                normalized.append({
+                    **message,
+                    "parts": [
+                        {key: value for key, value in part.items() if key != "__serverPath"}
+                        for part in message["parts"] if isinstance(part, dict)
+                    ],
+                })
+            else:
+                normalized.append(message)
+            continue
+        content = _normalize_legacy_attachment_links(session_id, message["content"])
+        content = _project_editor_links(session_id, content)
+        safe_message = {**message, "content": content}
+        if isinstance(message.get("parts"), list):
+            safe_message["parts"] = [
+                {key: value for key, value in part.items() if key != "__serverPath"}
+                for part in message["parts"] if isinstance(part, dict)
+            ]
+        normalized.append(safe_message)
+    return normalized
 
 
 @app.post("/api/sessions/{session_id}/attachments")
@@ -1628,10 +2602,11 @@ async def upload_session_attachment(session_id: str, request: Request, filename:
     if sess.get(session_id) is None:
         raise HTTPException(status_code=404, detail="Session not found")
     raw_name = request.headers.get("x-filename") or filename
-    safe_name = _attachment_filename(raw_name)
+    display_name = _attachment_filename(raw_name)
     target_dir = _attachment_session_dir(session_id)
     temp_path = target_dir / f".upload-{uuid.uuid4().hex}.tmp"
-    target_path = target_dir / f"{uuid.uuid4().hex}_{safe_name}"
+    storage_filename = _attachment_storage_filename(display_name)
+    target_path = target_dir / storage_filename
     total = 0
     try:
         target_dir.mkdir(parents=True, exist_ok=True)
@@ -1642,9 +2617,26 @@ async def upload_session_attachment(session_id: str, request: Request, filename:
                 output.write(chunk)
                 total += len(chunk)
         os.replace(temp_path, target_path)
+        _register_attachment(session_id, storage_filename, {
+            "source": "upload",
+            "displayName": display_name,
+            "storageFilename": storage_filename,
+            "path": str(target_path.resolve()),
+            "size": total,
+            "mimeType": request.headers.get("content-type") or mimetypes.guess_type(display_name)[0],
+        })
         return {
             "ok": True,
-            "filename": safe_name,
+            # filename is retained as a compatibility alias for old clients;
+            # new clients must use displayName for the label and href for the
+            # download target.
+            "filename": display_name,
+            # The opaque storage filename is the stable server-side identity;
+            # keep it separate from the client-local composer node id.
+            "attachmentId": storage_filename,
+            "displayName": display_name,
+            "storageFilename": storage_filename,
+            "href": _attachment_href(session_id, storage_filename),
             "path": str(target_path.resolve()),
             "size": total,
         }
@@ -1657,6 +2649,128 @@ async def upload_session_attachment(session_id: str, request: Request, filename:
             temp_path.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+@app.post("/api/sessions/{session_id}/attachments/from-server-file")
+async def register_server_file_attachment(session_id: str, data: dict):
+    """Register one existing server file as an opaque AttachmentRef.
+
+    The path is used only for this server-side lookup and is never accepted as
+    the message reference.  Directories are intentionally rejected in phase 1.
+    """
+    if sess.get(session_id) is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    raw_path = data.get("path") if isinstance(data, dict) else None
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise HTTPException(status_code=400, detail="path is required")
+    try:
+        target = _resolve_attachment_source_path(session_id, raw_path)
+    except (ValueError, OSError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid server file path") from exc
+    if target.is_dir():
+        raise HTTPException(status_code=400, detail="Directories cannot be attached yet")
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="Server file not found")
+    attachment_id = "att_" + uuid.uuid4().hex
+    display_name = _attachment_filename(target.name)
+    _register_attachment(session_id, attachment_id, {
+        "source": "server_file",
+        "displayName": display_name,
+        "path": str(target.resolve()),
+        "size": target.stat().st_size,
+        "mimeType": mimetypes.guess_type(target.name)[0],
+    })
+    canonical = _canonical_attachment_ref(session_id, attachment_id)
+    return {
+        "ok": True,
+        "attachmentId": attachment_id,
+        "displayName": display_name,
+        "href": canonical["href"] if canonical else _fs_download_href(session_id, str(target)),
+        "path": str(target),
+        "size": target.stat().st_size,
+    }
+
+
+@app.get("/api/attachments/ref/{attachment_id}")
+async def download_attachment_reference(attachment_id: str, session_id: str):
+    """Download a server file through an opaque, session-checked reference."""
+    if sess.get(session_id) is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    error = _attachment_id_error(session_id, attachment_id, allow_cross_session=True)
+    if error is not None:
+        status = 404 if error["code"] in {"attachment_not_found", "attachment_incomplete"} else 400
+        raise HTTPException(status_code=status, detail=error["message"])
+    record = _attachment_record(session_id, attachment_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Attachment is no longer available")
+    target = Path(str(record.get("path", ""))).resolve()
+    safe_name = "".join(c for c in target.name if ord(c) >= 32 and c not in '"\\').strip() or "download"
+    return FileResponse(
+        target,
+        filename=safe_name,
+        media_type=record.get("mimeType") or mimetypes.guess_type(target.name)[0] or "application/octet-stream",
+    )
+
+
+@app.get("/api/attachments/editor/{attachment_id}")
+async def resolve_editor_attachment(attachment_id: str, session_id: str):
+    """Resolve an opaque editor reference for a click, never for drag data."""
+    if sess.get(session_id) is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    error = _attachment_id_error(session_id, attachment_id, allow_cross_session=True)
+    if error is not None:
+        status = 404 if error["code"] in {"attachment_not_found", "attachment_incomplete"} else 400
+        raise HTTPException(status_code=status, detail=error["message"])
+    record = _attachment_record(session_id, attachment_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Attachment is no longer available")
+    return {
+        "ok": True,
+        "attachmentId": attachment_id,
+        "displayName": _attachment_filename(record.get("displayName") or Path(str(record.get("path", ""))).name),
+        "path": str(Path(str(record.get("path", ""))).resolve()),
+        "line": record.get("line"),
+        "endLine": record.get("endLine"),
+    }
+
+
+@app.get("/api/attachments/{storage_filename}")
+async def download_session_attachment(storage_filename: str, session_id: str):
+    """Download an uploaded attachment without exposing arbitrary filesystem paths."""
+    if sess.get(session_id) is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if (
+        storage_filename != Path(storage_filename).name
+        or "/" in storage_filename
+        or "\\" in storage_filename
+        or not re.fullmatch(r"upload_[A-Za-z0-9]{32}(?:\.[A-Za-z0-9._-]{1,32})?", storage_filename)
+    ):
+        raise HTTPException(status_code=400, detail="Invalid attachment name")
+    attachment_root = _attachment_session_dir(session_id).resolve()
+    target = (attachment_root / storage_filename).resolve()
+    try:
+        target.relative_to(attachment_root)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid attachment path") from exc
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    media_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+    return FileResponse(target, filename=target.name, media_type=media_type)
+
+
+@app.post("/api/directories")
+async def create_directory(data: dict):
+    """Create a directory only after the UI has obtained explicit consent."""
+    try:
+        path = data.get("path") if isinstance(data, dict) else None
+        if not isinstance(path, str):
+            raise ValueError("path is required")
+        created = _create_directory(path)
+        return {"ok": True, "path": str(created)}
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/directories")
@@ -1722,44 +2836,22 @@ async def favicon():
     return Response(content=svg, media_type="image/svg+xml")
 
 
-@app.get("/", response_class=HTMLResponse)
-async def dashboard(request: Request):
-    # react / coexist → redirect root to /react/ so the React SPA basename
-    # ("/react") matches the URL path and actually renders. Serving index.html
-    # directly at "/" left the router with a non-matching basename → blank.
-    if FRONTEND_MODE in ("react", "coexist") and REACT_DIST_EXISTS:
-        return RedirectResponse("/react/", status_code=307)
-
-    # legacy 模式（或 dist 缺失）→ Vanilla，保留移动端分流
-    ua = request.headers.get("user-agent", "")
-    if _MOBILE_UA_RE.search(ua):
-        return HTMLResponse(
-            content=MOBILE_DASHBOARD_FILE.read_text(encoding="utf-8"),
-            headers={"Cache-Control": "no-cache"},
-        )
+def _react_unavailable_response() -> HTMLResponse:
     return HTMLResponse(
-        content=DASHBOARD_FILE.read_text(encoding="utf-8"),
-        headers={"Cache-Control": "no-cache"},
+        content=(
+            "React frontend is unavailable: packages/web/dist is missing. "
+            "Build it with `pnpm --dir packages/web build`."
+        ),
+        status_code=503,
     )
 
 
-# Vanilla 前端入口：coexist / react 模式下旧前端移至 /vanilla。
-# legacy 模式根路径即旧前端，无需 /vanilla。
-if FRONTEND_MODE != "legacy":
-
-    @app.get("/vanilla", response_class=HTMLResponse)
-    async def vanilla_dashboard(request: Request):
-        """Serve legacy Vanilla frontend (with mobile UA split) at /vanilla."""
-        ua = request.headers.get("user-agent", "")
-        if _MOBILE_UA_RE.search(ua):
-            return HTMLResponse(
-                content=MOBILE_DASHBOARD_FILE.read_text(encoding="utf-8"),
-                headers={"Cache-Control": "no-cache"},
-            )
-        return HTMLResponse(
-            content=DASHBOARD_FILE.read_text(encoding="utf-8"),
-            headers={"Cache-Control": "no-cache"},
-        )
+@app.get("/", response_class=HTMLResponse)
+async def dashboard():
+    """Redirect to the React SPA, or explain that its build is unavailable."""
+    if not REACT_DIST_EXISTS:
+        return _react_unavailable_response()
+    return RedirectResponse("/react/", status_code=307)
 
 
 # ── WebSocket: Dashboard ──
@@ -1848,7 +2940,39 @@ async def ws_endpoint(ws: WebSocket):
             if msg_type == "user_inject":
                 session_id = msg.get("sessionId")
                 text = msg.get("text")
-                if session_id and text:
+                parts = msg.get("parts")
+                normalized_parts = None
+                if session_id and (text or parts is not None):
+                    if parts is not None:
+                        normalized_parts, generated_text, parts_error = _normalize_message_parts(
+                            session_id, parts)
+                        if parts_error is not None:
+                            await ws.send_json({
+                                "type": "user_inject.rejected",
+                                "sessionId": session_id,
+                                "message": parts_error["message"],
+                                "error": parts_error,
+                            })
+                            continue
+                        text = generated_text
+                    elif isinstance(text, str):
+                        attachment_error = _validate_message_attachment_references(session_id, text)
+                        if attachment_error is not None:
+                            await ws.send_json({
+                                "type": "user_inject.rejected",
+                                "sessionId": session_id,
+                                "message": attachment_error["message"],
+                                "error": attachment_error,
+                            })
+                            continue
+                    if not isinstance(text, str) or not text.strip():
+                        await ws.send_json({
+                            "type": "user_inject.rejected",
+                            "sessionId": session_id,
+                            "message": "text is required",
+                            "error": {"code": "text_required", "message": "text is required"},
+                        })
+                        continue
                     client_message_id = msg.get("clientMessageId")
                     if client_message_id is not None and not isinstance(client_message_id, str):
                         await ws.send_json({"type": "user_inject.rejected",
@@ -1865,8 +2989,12 @@ async def ws_endpoint(ws: WebSocket):
                     # enter the canonical server queue, independent of worker
                     # liveness; the ack means durable enqueue, not Provider
                     # completion.
-                    result = await worker.enqueue_user_message(
-                        session_id, text, client_message_id)
+                    if normalized_parts is None:
+                        result = await worker.enqueue_user_message(
+                            session_id, text, client_message_id)
+                    else:
+                        result = await worker.enqueue_user_message(
+                            session_id, text, client_message_id, parts=normalized_parts)
                     if result.get("status") == "error":
                         await ws.send_json({"type": "user_inject.rejected",
                                             "sessionId": session_id,
@@ -2042,6 +3170,44 @@ async def ws_agent_endpoint(ws: WebSocket):
 
 # ── Session API ──
 
+@app.post("/api/notifications/send")
+async def api_notification_send(data: dict):
+    """Send a best-effort Pan system notification for an accessible Session."""
+    session_id = data.get("sessionId")
+    s = sess.get(session_id) if isinstance(session_id, str) else None
+    if not s:
+        return {"ok": False, "error": {"code": "session_not_found", "message": "Session not found"}}
+    payload = notifications.dispatch_reminder(data.get("title", "Notification"), data.get("body", ""))
+    return {"ok": True, "notification": payload}
+
+
+@app.post("/api/sessions/{session_id}/reminders")
+async def api_register_reminder(session_id: str, data: dict):
+    if not sess.get(session_id):
+        return {"ok": False, "error": {"code": "session_not_found", "message": "Session not found"}}
+    try:
+        item = reminders.register(session_id, data.get("dueAt"), data.get("title", "Reminder"), data.get("body", ""))
+    except ValueError as exc:
+        return {"ok": False, "error": {"code": "invalid_due_at", "message": str(exc)}}
+    return {"ok": True, "reminder": item}
+
+
+@app.get("/api/sessions/{session_id}/reminders")
+async def api_list_reminders(session_id: str):
+    if not sess.get(session_id):
+        return {"ok": False, "error": {"code": "session_not_found", "message": "Session not found"}}
+    return {"ok": True, "reminders": reminders.list_for_session(session_id)}
+
+
+@app.delete("/api/sessions/{session_id}/reminders/{reminder_id}")
+async def api_cancel_reminder(session_id: str, reminder_id: str):
+    if not sess.get(session_id):
+        return {"ok": False, "error": {"code": "session_not_found", "message": "Session not found"}}
+    item = reminders.cancel(session_id, reminder_id)
+    if not item:
+        return {"ok": False, "error": {"code": "reminder_not_found", "message": "Reminder not found or already delivered"}}
+    return {"ok": True, "reminder": item}
+
 @app.get("/api/sessions")
 async def api_list_sessions(summary: int = 0):
     """List all sessions (includes worker status if active).
@@ -2133,6 +3299,27 @@ async def api_get_session(session_id: str):
     return _session_to_api(s)
 
 
+@app.get("/api/sessions/{session_id}/usage")
+async def api_get_session_usage(session_id: str):
+    """Return the stable persisted input/output/cache usage projection.
+
+    This is a read-only view over Session.raw_usage / Session.total_usage. It
+    does not refresh provider state and, unlike the full session response, does
+    not expose the historical raw payload.
+    """
+    s = sess.get(session_id)
+    if not s:
+        return {"ok": False, "error": {
+            "code": "session_not_found",
+            "message": f"Session {session_id} not found",
+        }}
+    result = sess.session_usage_view(s)
+    if s.adapter == "codex":
+        quota = await api_codex_quota(session_id=session_id)
+        result["codexQuota"] = quota if quota.get("ok") else None
+    return result
+
+
 @app.get("/api/sessions/{session_id}/managers")
 async def api_session_managers(session_id: str):
     """Manager chain of a session, topmost first (level 1 = top).
@@ -2191,7 +3378,7 @@ async def api_session_history(session_id: str, before: int = 0, limit: int = 50)
     if before <= 0:
         before = total
     start = max(0, before - limit)
-    page = s.history[start:before]
+    page = _api_history(session_id, s.history[start:before])
     return {
         "history": page,
         "total": total,
@@ -2263,6 +3450,11 @@ def _serialize_queue_item(item, session=None) -> dict | None:
             "queueItemId": _queue_item_id(item),
             "kind": "task",
             "text": item.get("text") if isinstance(item.get("text"), str) else "",
+            **({"parts": [
+                    {key: value for key, value in part.items() if key != "__serverPath"}
+                    for part in item["parts"] if isinstance(part, dict)
+                ]}
+               if isinstance(item.get("parts"), list) else {}),
             "createdAt": item.get("createdAt", 0),
             "source": source,
             "meta": meta,
@@ -2367,14 +3559,58 @@ async def api_session_queue_enqueue(session_id: str, data: dict):
     source=user/kind=task are fixed by the server-side entry point.
     """
     text = data.get("text")
+    original_text = text
+    parts = data.get("parts")
+    normalized_parts = None
+    if parts is not None:
+        normalized_parts, generated_text, parts_error = _normalize_message_parts(session_id, parts)
+        if parts_error is not None:
+            return {"ok": False, "error": parts_error}
+        text = generated_text
+    elif isinstance(text, str):
+        # Upgrade old text/Markdown attachment links before the queue item is
+        # persisted, so retry/restart delivery has the same canonical path
+        # projection as a new structured request.
+        normalized_parts, generated_text, parts_error = _normalize_text_attachment_parts(
+            session_id, text)
+        if parts_error is not None:
+            return {"ok": False, "error": parts_error}
+        if normalized_parts is not None:
+            text = generated_text
     if not isinstance(text, str) or not text.strip():
         return {"ok": False, "error": {"code": "text_required",
                                          "message": "text is required"}}
+    if normalized_parts is None:
+        attachment_error = _validate_message_attachment_references(session_id, text)
+        if attachment_error is not None:
+            return {"ok": False, "error": attachment_error}
     client_id = data.get("clientMessageId")
     if client_id is not None and (not isinstance(client_id, str) or len(client_id) > 512):
         return {"ok": False, "error": {"code": "invalid_client_message_id",
                                          "message": "clientMessageId must be a string of at most 512 characters"}}
-    result = await worker.enqueue_user_message(session_id, text, client_id)
+    if normalized_parts is None:
+        # Keep the exact legacy call shape for embedders and test doubles that
+        # still implement the text-only queue contract.
+        result = await worker.enqueue_user_message(session_id, text, client_id)
+    else:
+        # Older embedders may still expose the three-argument queue function.
+        # Production Worker accepts parts; a legacy replacement gets the
+        # canonical fallback text and keeps its established call shape.
+        parameters = inspect.signature(worker.enqueue_user_message).parameters
+        supports_parts = (
+            "parts" in parameters
+            or any(parameter.kind == inspect.Parameter.VAR_KEYWORD
+                   for parameter in parameters.values())
+        )
+        if supports_parts:
+            result = await worker.enqueue_user_message(
+                session_id, text, client_id, parts=normalized_parts)
+        else:
+            # A legacy replacement cannot consume the private path projection;
+            # preserve its established text-only input after server-side
+            # validation rather than changing its call semantics.
+            legacy_text = original_text if parts is None else text
+            result = await worker.enqueue_user_message(session_id, legacy_text, client_id)
     if result.get("status") == "error":
         return {"ok": False, "error": {"code": "enqueue_failed",
                                          "message": result.get("result", "enqueue failed")}}
@@ -2421,6 +3657,18 @@ async def api_session_queue_update(session_id: str, item_id: str, data: dict):
             return _queue_error("queue_item_not_editable", "Queue item is no longer queued", s)
         if not isinstance(text, str) or not text.strip():
             return _queue_error("text_required", "text is required", s)
+        if isinstance(target.get("parts"), list):
+            normalized_parts, canonical_text, parts_error = _normalize_message_parts(
+                session_id, target["parts"])
+            if parts_error is not None:
+                return _queue_error(parts_error["code"], parts_error["message"], s)
+            if text != canonical_text:
+                return _queue_error(
+                    "parts_text_conflict",
+                    "Queued message text must match its structured attachment parts",
+                    s,
+                )
+            target["parts"] = normalized_parts
         current_revision = int(target.get("revision", 1))
         if expected is not None and expected != current_revision:
             return _queue_error("queue_revision_conflict", "Queue item revision conflict", s)
@@ -2705,6 +3953,9 @@ async def api_branch_session(session_id: str, data: dict):
         "effort": s.adapter_config.get("effort", ""),
         "max_thinking_tokens": s.adapter_config.get("max_thinking_tokens"),
     }
+    for _api_key, _native_key in _CODEX_CONTEXT_SETTING_KEYS:
+        if _native_key in s.adapter_config:
+            new_adapter_config[_native_key] = s.adapter_config[_native_key]
     if s.adapter_config.get("mcp_servers"):
         new_adapter_config["mcp_servers"] = s.adapter_config["mcp_servers"]
 
@@ -2722,9 +3973,11 @@ async def api_branch_session(session_id: str, data: dict):
         workdir=s.workdir,
         history=history,
         character_id=s.character_id,
-        system_prompt=s.system_prompt,
+        original_prompt=s.original_prompt,
+        handoff_prompt=s.handoff_prompt,
         adapter_config=new_adapter_config,
         pan_access=dict(s.pan_access),
+        notification_settings=dict(s.notification_settings),
     )
 
     await broadcast({
@@ -2745,8 +3998,8 @@ async def api_session_handoff(session_id: str, data: dict):
            "permissionMode"?}
 
     行为见 ``sess.handoff_session``：关系网接替 + B 自动 manage A + 可选设置
-    复制（不含 system_prompt）+ B.system_prompt = handoffPrompt 与 A 原
-    system_prompt 拼接 + 重命名（A → "(archive) <原名>"，B → "<原名>"）。
+    复制（不含旧交接简报）+ B.system_prompt = 本次 handoffPrompt 与 A.original_prompt
+    拼接 + 重命名（A → "(archive) <原名>"，B → "<原名>"）。
     """
     handoff_prompt = (data.get("handoffPrompt") or "").strip()
     if not handoff_prompt:
@@ -3318,7 +4571,7 @@ async def api_codex_refresh_official_models():
 
 @app.post("/api/config/reload")
 async def api_config_reload(data: dict | None = None):
-    """Force a config.json hot-reload (adapters / worker / plugin / memory).
+    """Force a config.json hot-reload (adapters / worker / plugin / memory / python).
 
     config.json is re-read from disk on every load_config() call, but a few
     things are read once and then cached: the adapters' class-level model-list
@@ -3330,19 +4583,28 @@ async def api_config_reload(data: dict | None = None):
     same style as POST /api/manifest/reload.
 
     Body (optional): ``{"scope": "adapters" | "worker" | "plugin" | "memory"
-    | "all"}`` — default "all". Idempotent: repeated calls just re-read the
+    | "python" | "all"}`` — default "all". Idempotent: repeated calls just re-read the
     same config. Per-item failures are collected into ``errors`` and reported
     with ``reloaded: false`` instead of a 500. The response always carries
     ``requiresRestart`` — fields that are startup-frozen by nature and can
-    never hot-apply (frontend route mounting, bound port, logging handlers, the
-    Windows startup console window, and the external remote tunnel process).
+    never hot-apply (the bound port, logging handlers, the Windows startup
+    console window, and the external remote tunnel process).
     """
     scope = (data or {}).get("scope") or "all"
-    if scope not in ("adapters", "worker", "plugin", "memory", "all"):
+    if scope not in ("adapters", "worker", "plugin", "memory", "python", "all"):
         return {"reloaded": False, "error": f"Unknown scope: {scope}"}
 
     result: dict = {"reloaded": True}
     errors: list[str] = []
+
+    if scope in ("python", "all"):
+        # The resolver is intentionally uncached.  This metadata proves the
+        # fresh choice without returning a configured path or environment
+        # value, either of which could contain sensitive information.
+        try:
+            result["python"] = resolve_pan_python_info()
+        except Exception as e:
+            errors.append(f"python: {e}")
 
     if scope in ("adapters", "all"):
         adapters_out, adapter_errors = _reload_adapter_models()
@@ -3387,7 +4649,7 @@ async def api_config_reload(data: dict | None = None):
             result["plugin"] = plugin_entry
 
     # Startup-frozen fields a config.json edit can never hot-apply.
-    result["requiresRestart"] = ["frontend", "port", "logging", "remote", "startup"]
+    result["requiresRestart"] = ["port", "logging", "remote", "startup"]
 
     if errors:
         result["reloaded"] = False
@@ -4147,7 +5409,7 @@ async def api_readonly(data: dict):
 @app.post("/api/kill/{worker_id}")
 async def api_kill(worker_id: str):
     """Kill a Worker process. Does NOT delete the Session."""
-    err = await worker.kill_worker(worker_id)
+    err = await worker.kill_worker(worker_id, report_abnormal=True)
     if err:
         return {"error": err}
     return {"workerId": worker_id, "status": "killed"}
@@ -4178,6 +5440,194 @@ async def api_cli_status():
         "available": [entry["name"] for entry in adapters if entry["available"]],
         "hasAvailable": any(entry["available"] for entry in adapters),
     }
+
+
+def _is_codex_worker(w) -> bool:
+    """Match only live workers backed by the Codex adapter."""
+    return getattr(getattr(w, "adapter", None), "name", "") == "codex"
+
+
+_codex_wham_provider = CodexWhamProvider()
+
+
+def _codex_worker_profile_key(w, default_key: str) -> str:
+    """Return a live Worker's profile identity without persisting Worker IDs."""
+    value = getattr(w, "codex_profile_key", None)
+    if isinstance(value, str) and value:
+        return value
+    # Hand-built test/compat workers have no profile metadata. Treat each as
+    # unknown rather than silently claiming that two account snapshots share a
+    # profile.
+    worker_id = getattr(w, "worker_id", None)
+    return f"unknown-worker:{worker_id or id(w)}"
+
+
+async def _persist_live_codex_quota(w, store: CodexQuotaStore) -> bool:
+    rate_limits = getattr(w, "native_rate_limits", None)
+    if not isinstance(rate_limits, dict) or not rate_limits:
+        return False
+    observed_at = (
+        getattr(w, "native_rate_limits_updated_at", None)
+        or getattr(w, "native_rate_limits_received_at", None)
+    )
+    _, updated = await asyncio.to_thread(
+        store.update,
+        rate_limits,
+        observed_at=observed_at,
+        received_at=getattr(w, "native_rate_limits_received_at", None) or observed_at,
+        source="app-server-push",
+    )
+    return updated
+
+
+async def _codex_quota_for_request(
+    *,
+    session_id: str,
+    target_worker=None,
+    candidates: list | None = None,
+    requested_window: str = "all",
+) -> dict:
+    base_profile = resolve_profile_identity()
+    live_worker = target_worker
+    live_workers = candidates or []
+    selected_profile_key = base_profile.profile_key
+    live_snapshot_updated = False
+    if live_worker is not None:
+        worker_profile_key = getattr(live_worker, "codex_profile_key", None)
+        if isinstance(worker_profile_key, str) and worker_profile_key:
+            selected_profile_key = worker_profile_key
+    elif live_workers:
+        groups: dict[str, list] = {}
+        for candidate in live_workers:
+            groups.setdefault(_codex_worker_profile_key(candidate, base_profile.profile_key), []).append(candidate)
+        if len(groups) > 1:
+            return {
+                "ok": False,
+                "error": {
+                    "code": "quota_ambiguous",
+                    "message": "More than one Codex profile is available; pass session_id",
+                    "candidates": [
+                        {"profileKey": key, "sessionIds": [w.session_id for w in values]}
+                        for key, values in groups.items()
+                    ],
+                },
+            }
+        same_profile = next(iter(groups.values()))
+        live_worker = max(
+            same_profile,
+            key=lambda value: (
+                getattr(value, "native_rate_limits_updated_at", None) or "",
+                getattr(value, "worker_id", None) or "",
+            ),
+        )
+        worker_profile_key = getattr(live_worker, "codex_profile_key", None)
+        if isinstance(worker_profile_key, str) and worker_profile_key:
+            selected_profile_key = worker_profile_key
+    else:
+        cached_profiles = CodexQuotaStore.available_profile_keys()
+        if len(cached_profiles) > 1:
+            return {
+                "ok": False,
+                "error": {
+                    "code": "quota_ambiguous",
+                    "message": "More than one cached Codex profile is available; pass session_id",
+                    "candidates": [{"profileKey": key} for key in cached_profiles],
+                },
+            }
+
+    profile = base_profile if selected_profile_key == base_profile.profile_key else CodexProfile(
+        home=base_profile.home,
+        account_id=base_profile.account_id,
+        chatgpt_account_id=base_profile.chatgpt_account_id,
+        profile_key=selected_profile_key,
+    )
+    store = CodexQuotaStore(profile)
+    if live_worker is not None:
+        live_snapshot_updated = await _persist_live_codex_quota(live_worker, store)
+
+    record = store.load()
+    refresh = await _codex_wham_provider.maybe_refresh(store)
+    if refresh.record is not None:
+        record = refresh.record
+    if record is None:
+        error = {
+            "code": "quota_unavailable",
+            "message": "No Codex quota snapshot is available",
+            "provider": "codex",
+            "sessionId": session_id,
+        }
+        if refresh.error_code:
+            error["refresh"] = refresh.error_code
+        if refresh.credential_status:
+            error["credentialStatus"] = refresh.credential_status
+        return {"ok": False, "error": error}
+
+    stale = is_stale(record, _codex_wham_provider.ttl_seconds)
+    result = format_codex_quota_record(
+        record,
+        session_id=session_id or None,
+        worker_id=getattr(live_worker, "worker_id", None) if live_worker else None,
+        requested_window=requested_window,
+        stale=stale,
+    )
+    result["cacheMode"] = "live" if live_snapshot_updated else "persisted"
+    result["profileKey"] = profile.profile_key
+    if refresh.error_code and refresh.error_code != "feature_disabled":
+        result["refreshError"] = refresh.error_code
+        if refresh.credential_status:
+            result["credentialStatus"] = refresh.credential_status
+    return result
+
+
+@app.get("/api/codex/quota")
+async def api_codex_quota(session_id: str = "", window: str = "all"):
+    """Query global Codex account windows, preferring live push data.
+
+    ``first`` is the five-hour window and ``secondary`` is the weekly window;
+    neither name selects an adapter fallback or a model. Without a session id
+    one Codex profile must be selected when multiple profiles are live. The
+    quota belongs to that provider profile rather than to a Pan Session.
+
+    This is a loopback HTTP trusted-admin interface.  It has no manager
+    identity authentication and does not apply managed-session isolation;
+    callers must not invent or pass a manager parameter.  Managed isolation
+    is enforced by the MCP caller layer before it calls this endpoint.
+
+    The response may be a live app-server push, a persisted last-good value, or
+    an optional WHAM refresh. ``observedAt``/``receivedAt`` are local Pan
+    times; the provider's original update time is not fabricated or exposed.
+    """
+    if not validate_quota_window(window):
+        return {"ok": False, "error": {
+            "code": "invalid_window",
+            "message": "window must be one of 'all', 'first', or 'secondary'",
+        }}
+
+    if session_id:
+        target = sess.get(session_id)
+        if target is None:
+            return {"ok": False, "error": {
+                "code": "session_not_found",
+                "message": f"Session {session_id} not found",
+            }}
+        if target.adapter != "codex":
+            return {"ok": False, "error": {
+                "code": "unsupported_provider",
+                "message": f"Session {session_id} uses adapter {target.adapter!r}; Codex quota requires adapter 'codex'",
+            }}
+        selected = worker.find_alive_worker_by_session(session_id)
+        return await _codex_quota_for_request(
+            session_id=session_id,
+            target_worker=selected,
+            requested_window=window,
+        )
+    else:
+        candidates = [w for w in worker.list_live_workers() if _is_codex_worker(w)]
+    return await _codex_quota_for_request(
+        session_id="",
+        candidates=candidates,
+        requested_window=window,
+    )
 
 
 # ── cbc Session Import ──
@@ -4420,6 +5870,12 @@ async def _import_session(provider, adapter: str, data: dict) -> dict:
                 "name": name,
                 "sessionTemplate": data.get("sessionTemplate"),
                 **({"panAccess": data["panAccess"]} if "panAccess" in data else {}),
+                **({key: data[key] for key in (
+                    "modelContextWindow", "modelAutoCompactTokenLimit",
+                    "model_context_window", "model_auto_compact_token_limit",
+                ) if key in data}),
+                **{key: data[key] for key in ("originalPrompt", "handoffPrompt", "systemPrompt")
+                   if key in data},
             },
             resolve_workdir=False,
             strict_mcp=False,
@@ -4444,6 +5900,8 @@ async def _import_session(provider, adapter: str, data: dict) -> dict:
         model=model,
         permission_mode=params.get("permission_mode"),
         session_template=params.get("session_template"),
+        original_prompt=params.get("original_prompt"),
+        handoff_prompt=params.get("handoff_prompt"),
         pan_access=params.get("pan_access"),
         adapter_config=params.get("adapter_config"),
     )
@@ -4507,7 +5965,7 @@ async def api_restart_or_start(session_id: str):
 @app.post("/api/sessions/{session_id}/worker/kill")
 async def api_session_kill(session_id: str):
     """Kill the session's live worker; workerId is response detail only."""
-    result = await worker.kill_session_worker(session_id)
+    result = await worker.kill_session_worker(session_id, report_abnormal=True)
     if isinstance(result, str):
         return {"error": result}
     if result is None:
@@ -5386,7 +6844,7 @@ async def api_fs_rename(data: dict):
     except ValueError as e:
         return {"error": str(e)}
     try:
-        os.replace(str(src), str(dst))
+        _rename_no_overwrite(src, dst)
         return {"from": frm, "to": to}
     except PermissionError:
         return {"error": f"Permission denied"}
@@ -5417,9 +6875,8 @@ async def api_fs_delete(data: dict):
         return {"error": str(e)}
 
 
-# ── React SPA (coexist: / + /react/* 均为 React) ──
-# Mount React at /react/ unless FRONTEND_MODE=legacy（/react 保留作兼容入口）
-if REACT_DIST_EXISTS and FRONTEND_MODE != "legacy":
+# ── React SPA ──
+if REACT_DIST_EXISTS:
     react_name = (
         "react"
         if not app.routes or not any(
@@ -5431,6 +6888,12 @@ if REACT_DIST_EXISTS and FRONTEND_MODE != "legacy":
     @app.get(f"/{react_name}/", response_class=HTMLResponse)
     async def react_index_html():
         """Serve React index.html with no-cache so new builds are picked up on refresh."""
+        # The route table is built at import time, but the dist availability
+        # flag can change while the process is alive (and is intentionally
+        # patchable for startup/error-path checks). Do not let the static
+        # mount turn a missing build into a misleading 200 response.
+        if not REACT_DIST_EXISTS:
+            return _react_unavailable_response()
         return HTMLResponse(
             content=(REACT_DIST_DIR / "index.html").read_text(encoding="utf-8"),
             headers={"Cache-Control": "no-cache"},
@@ -5452,6 +6915,12 @@ if REACT_DIST_EXISTS and FRONTEND_MODE != "legacy":
             REACT_DIST_DIR / "index.html",
             headers={"Cache-Control": "no-cache"},
         )
+else:
+
+    @app.get("/react/", response_class=HTMLResponse)
+    async def react_unavailable():
+        """Return an actionable error when the React build is missing."""
+        return _react_unavailable_response()
 
 
 # ── Static files ──

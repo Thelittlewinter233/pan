@@ -16,7 +16,10 @@ const wsMock = vi.hoisted(() => {
   const handlers: Record<string, Array<(e: unknown) => void>> = {};
   return {
     handlers,
+    connect: vi.fn(),
     send: vi.fn(() => true),
+    reconnect: vi.fn(),
+    isConnectionFresh: vi.fn(() => true),
     on: vi.fn((type: string, h: (e: unknown) => void) => {
       (handlers[type] ??= []).push(h);
       return () => {
@@ -31,10 +34,12 @@ const wsMock = vi.hoisted(() => {
 
 vi.mock('@/services/ws', () => ({
   wsClient: {
-    connect: vi.fn(),
+    connect: wsMock.connect,
+    reconnect: wsMock.reconnect,
     on: wsMock.on,
     send: wsMock.send,
     isOpen: true,
+    isConnectionFresh: wsMock.isConnectionFresh,
   },
 }));
 
@@ -42,12 +47,16 @@ vi.mock('@/services/ws', () => ({
 // the server "has persisted" (the injected user message lives only server-side).
 const apiMock = vi.hoisted(() => ({
   fetchSessionHistory: vi.fn(),
+  fetchSessions: vi.fn(),
+  listWorkers: vi.fn(),
   fetchSessionQueue: vi.fn(),
   updateUiSettings: vi.fn(),
 }));
 
 vi.mock('@/services/api', () => ({
   fetchSessionHistory: apiMock.fetchSessionHistory,
+  fetchSessions: apiMock.fetchSessions,
+  listWorkers: apiMock.listWorkers,
   fetchSessionQueue: apiMock.fetchSessionQueue,
   updateUiSettings: apiMock.updateUiSettings,
 }));
@@ -73,6 +82,12 @@ describe('useWebSocket worker.result wiring', () => {
   beforeEach(() => {
     for (const k of Object.keys(wsMock.handlers)) delete wsMock.handlers[k];
     wsMock.send.mockClear();
+    wsMock.connect.mockClear();
+    wsMock.reconnect.mockClear();
+    wsMock.isConnectionFresh.mockReturnValue(true);
+    apiMock.fetchSessions.mockReset().mockRejectedValue(new Error('not mocked'));
+    apiMock.listWorkers.mockReset().mockRejectedValue(new Error('not mocked'));
+    apiMock.fetchSessionHistory.mockReset();
     useSessionStore.setState({
       sessions: [
         mk('B', 'B', { history: [msg('user', 'u1')], historyTotal: 1 }),
@@ -86,8 +101,8 @@ describe('useWebSocket worker.result wiring', () => {
       sessionsLoading: false,
       historyLoadEnd: 0,
       _loadSeq: 0,
-      _touchSeq: 0,
       _sessionWsTouchedSeq: {},
+      _historyRefreshSeq: {},
     });
     useUIStore.setState({ terminalInteractions: [], toastQueue: [] });
     useAppSettingsStore.setState({ ...DEFAULT_SETTINGS, loaded: true });
@@ -96,6 +111,76 @@ describe('useWebSocket worker.result wiring', () => {
     apiMock.fetchSessionQueue.mockResolvedValue([]);
     apiMock.updateUiSettings.mockReset();
     apiMock.updateUiSettings.mockResolvedValue({});
+  });
+
+  // Never let a failing test leak fake timers into the rest of the file.
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('coalesces visible, focus, and pageshow into one authoritative recovery', async () => {
+    vi.useFakeTimers();
+    apiMock.fetchSessions.mockResolvedValue([
+      mk('B', 'B', { history: [msg('user', 'u1')], historyTotal: 1 }),
+      mk('A', 'A', { history: [msg('user', 'u0')] }),
+    ]);
+    apiMock.fetchSessionHistory.mockResolvedValue({
+      history: [msg('user', 'u0'), msg('assistant', 'fresh')],
+      total: 2, hasMore: false, start: 0,
+    });
+    renderHook(() => useWebSocket());
+    Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true });
+
+    act(() => {
+      document.dispatchEvent(new Event('visibilitychange'));
+      window.dispatchEvent(new Event('focus'));
+      window.dispatchEvent(new PageTransitionEvent('pageshow'));
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(100);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(apiMock.fetchSessions).toHaveBeenCalledTimes(2); // initial load + recovery
+    expect(apiMock.listWorkers).toHaveBeenCalledTimes(2);
+    expect(apiMock.fetchSessionHistory).toHaveBeenCalledWith('A', 0, 50);
+    expect(useSessionStore.getState().currentMessages.at(-1)?.content).toBe('fresh');
+    apiMock.fetchSessions.mockReset().mockRejectedValue(new Error('not mocked'));
+    vi.useRealTimers();
+  });
+
+  it('reconnects a stale socket and lets the open path refresh state', () => {
+    vi.useFakeTimers();
+    wsMock.isConnectionFresh.mockReturnValue(false);
+    renderHook(() => useWebSocket());
+    wsMock.reconnect.mockClear();
+    act(() => {
+      window.dispatchEvent(new Event('focus'));
+      vi.advanceTimersByTime(100);
+    });
+    expect(wsMock.reconnect).toHaveBeenCalled();
+    vi.useRealTimers();
+  });
+
+  it('drops recovery history that completes after the selected session changes', async () => {
+    let resolveHistory!: (value: unknown) => void;
+    apiMock.fetchSessionHistory.mockReturnValueOnce(new Promise((resolve) => { resolveHistory = resolve; }));
+    const recovery = useSessionStore.getState().refreshCurrentSessionHistory();
+    useSessionStore.setState({
+      currentSessionId: 'B',
+      currentMessages: [msg('user', 'new-session')],
+    });
+    resolveHistory({ history: [msg('assistant', 'old-session')], total: 1, hasMore: false, start: 0 });
+    await recovery;
+    expect(useSessionStore.getState().currentSessionId).toBe('B');
+    expect(useSessionStore.getState().currentMessages).toEqual([msg('user', 'new-session')]);
   });
 
   it('requests pending native interactions when the singleton is already open', () => {
@@ -366,6 +451,24 @@ describe('useWebSocket worker.result wiring', () => {
     expect(useSessionStore.getState().currentMessages).toEqual([]);
   });
 
+  it('constructs a browser Notification from a granted Pan completion payload without requesting permission', () => {
+    const BrowserNotification = vi.fn();
+    Object.defineProperty(BrowserNotification, 'permission', { value: 'granted', configurable: true });
+    vi.stubGlobal('Notification', BrowserNotification);
+    renderHook(() => useWebSocket());
+
+    act(() => {
+      wsMock.trigger('worker.result', {
+        type: 'worker.result', sessionId: 'A', workerId: 'w1', status: 'done', result: 'reply',
+        notification: { title: 'Pan: demo completed', body: 'reply', browser: true },
+      });
+    });
+
+    expect(BrowserNotification).toHaveBeenCalledWith('Pan: demo completed', { body: 'reply' });
+    expect(BrowserNotification).not.toHaveProperty('requestPermission');
+    vi.unstubAllGlobals();
+  });
+
   it('appends the [DONE] notice for the current session without duplicating history', () => {
     renderHook(() => useWebSocket());
 
@@ -407,6 +510,119 @@ describe('useWebSocket worker.result wiring', () => {
       .toBe('[CANCELLED] Task completed');
     expect(useSessionStore.getState().sessions.find((x) => x.id === 'A')?.lastResult?.status)
       .toBe('cancelled');
+  });
+
+  it('keeps the dot settled when the idle worker.status follows worker.result', () => {
+    renderHook(() => useWebSocket());
+
+    act(() => {
+      wsMock.trigger('worker.result', {
+        type: 'worker.result',
+        sessionId: 'B',
+        workerId: 'w1',
+        status: 'done',
+        result: 'reply',
+      });
+    });
+    expect(
+      useSessionStore.getState().sessions.find((x) => x.id === 'B')?.workerStatus,
+    ).toBe('idle');
+
+    act(() => {
+      wsMock.trigger('worker.status', {
+        type: 'worker.status',
+        sessionId: 'B',
+        workerId: 'w1',
+        status: 'idle',
+      });
+    });
+    expect(
+      useSessionStore.getState().sessions.find((x) => x.id === 'B')?.workerStatus,
+    ).toBe('idle');
+  });
+
+  it('ignores an out-of-order running status from an older worker generation', () => {
+    useWorkerStore.setState({
+      workers: { A: { id: 'w2', sessionId: 'A', status: 'idle', generation: 5 } },
+      currentWorkerId: 'w2',
+      currentWorker: { id: 'w2', sessionId: 'A', status: 'idle', generation: 5 },
+    });
+    act(() => {
+      useSessionStore.getState().updateSession('A', { workerStatus: 'idle', workerId: 'w2' });
+    });
+    renderHook(() => useWebSocket());
+
+    // A late "running" from the previous worker generation must not flip the
+    // settled dot back to running.
+    act(() => {
+      wsMock.trigger('worker.status', {
+        type: 'worker.status',
+        sessionId: 'A',
+        workerId: 'w1',
+        generation: 4,
+        status: 'running',
+      });
+    });
+    expect(
+      useSessionStore.getState().sessions.find((x) => x.id === 'A')?.workerStatus,
+    ).toBe('idle');
+
+    // ...while a current-generation "running" (a genuinely new turn) does apply.
+    act(() => {
+      wsMock.trigger('worker.status', {
+        type: 'worker.status',
+        sessionId: 'A',
+        workerId: 'w2',
+        generation: 5,
+        status: 'running',
+      });
+    });
+    expect(
+      useSessionStore.getState().sessions.find((x) => x.id === 'A')?.workerStatus,
+    ).toBe('running');
+  });
+
+  it('falls back to the authoritative list when a worker.result is dropped by the generation guard', async () => {
+    useWorkerStore.setState({
+      workers: { A: { id: 'w2', sessionId: 'A', status: 'idle', generation: 5 } },
+      currentWorkerId: 'w2',
+      currentWorker: { id: 'w2', sessionId: 'A', status: 'idle', generation: 5 },
+    });
+    apiMock.fetchSessions.mockResolvedValue([
+      mk('B', 'B', { history: [msg('user', 'u1')], historyTotal: 1 }),
+      mk('A', 'A', { history: [msg('user', 'u0')] }),
+    ]);
+    vi.useFakeTimers();
+    renderHook(() => useWebSocket());
+    await act(async () => {
+      await Promise.resolve();
+    });
+    apiMock.fetchSessions.mockClear();
+
+    act(() => {
+      wsMock.trigger('worker.result', {
+        type: 'worker.result',
+        sessionId: 'A',
+        workerId: 'w1',
+        generation: 4,
+        status: 'done',
+        result: 'stale',
+      });
+    });
+    // Dropped: the stale terminal event writes nothing, so the dot would stay on
+    // its old value forever if this were the only signal.
+    expect(
+      useSessionStore.getState().sessions.find((x) => x.id === 'A')?.workerStatus,
+    ).toBe('running');
+    expect(apiMock.fetchSessions).not.toHaveBeenCalled();
+
+    // The debounced authoritative refresh still converges the card.
+    await act(async () => {
+      vi.advanceTimersByTime(300);
+      await Promise.resolve();
+    });
+    expect(apiMock.fetchSessions).toHaveBeenCalled();
+    vi.useRealTimers();
   });
 
   it('clears the card status on worker crash and keeps history intact', () => {
@@ -616,9 +832,22 @@ describe('useWebSocket worker.result wiring', () => {
   });
 });
 
+describe('useWebSocket mock mode recovery', () => {
+  it('does not create a real socket in mock mode', async () => {
+    wsMock.connect.mockClear();
+    window.history.pushState({}, '', '/?mock=1');
+    apiMock.fetchSessions.mockResolvedValue([]);
+    renderHook(() => useWebSocket());
+    await Promise.resolve();
+    expect(wsMock.connect).not.toHaveBeenCalled();
+    window.history.pushState({}, '', '/');
+  });
+});
+
 describe('useWebSocket agent-injected message sync', () => {
   beforeEach(() => {
     for (const k of Object.keys(wsMock.handlers)) delete wsMock.handlers[k];
+    apiMock.fetchSessions.mockReset().mockRejectedValue(new Error('not mocked'));
     apiMock.fetchSessionHistory.mockReset();
     apiMock.fetchSessionHistory.mockResolvedValue({
       history: [],
@@ -636,7 +865,6 @@ describe('useWebSocket agent-injected message sync', () => {
       sessionsLoading: false,
       historyLoadEnd: 0,
       _loadSeq: 0,
-      _touchSeq: 0,
       _sessionWsTouchedSeq: {},
     });
   });
@@ -958,6 +1186,7 @@ describe('useWebSocket agent-injected message sync', () => {
 describe('useWebSocket worker.stream lastMessage preview', () => {
   beforeEach(() => {
     for (const k of Object.keys(wsMock.handlers)) delete wsMock.handlers[k];
+    apiMock.fetchSessions.mockReset().mockRejectedValue(new Error('not mocked'));
     useSessionStore.setState({
       sessions: [
         mk('B', 'B', { history: [msg('user', 'u1')], historyTotal: 1 }),
@@ -971,7 +1200,6 @@ describe('useWebSocket worker.stream lastMessage preview', () => {
       sessionsLoading: false,
       historyLoadEnd: 0,
       _loadSeq: 0,
-      _touchSeq: 0,
       _sessionWsTouchedSeq: {},
     });
     vi.useFakeTimers();
@@ -1398,6 +1626,82 @@ describe('useWebSocket worker.stream lastMessage preview', () => {
 
     expect(useSessionStore.getState().currentMessages.map((m) => m.content)).toEqual([
       'first-final', 'second-final',
+    ]);
+  });
+
+  it('keeps thinking, tools, and content in arrival order across interleaved stream updates', () => {
+    renderHook(() => useWebSocket());
+
+    const stream = (event: Record<string, unknown>) => {
+      wsMock.trigger('worker.stream', {
+        type: 'worker.stream', sessionId: 'A', workerId: 'w1', event,
+      });
+    };
+
+    act(() => {
+      // This is the shape emitted by the Codex app-server adapter: reasoning
+      // and command items can be visible before the answer text exists.
+      stream({
+        type: 'content.part', role: 'thinking', delta: true,
+        turn_id: 'turn-interleaved', item_id: 'thinking-1',
+        part: { type: 'think', think: 'plan ' },
+      });
+      stream({
+        type: 'assistant', role: 'assistant', delta: true,
+        turn_id: 'turn-interleaved', item_id: 'tool-1',
+        message: { content: [{ type: 'tool_use', name: 'Command', input: { command: 'one' } }] },
+      });
+      stream({
+        type: 'content.part', role: 'thinking', delta: true,
+        turn_id: 'turn-interleaved', item_id: 'thinking-2',
+        part: { type: 'think', think: 'subplan ' },
+      });
+      stream({
+        type: 'assistant', role: 'assistant', delta: true,
+        turn_id: 'turn-interleaved', item_id: 'tool-2',
+        message: { content: [{ type: 'tool_use', name: 'Command', input: { command: 'two' } }] },
+      });
+      stream({
+        type: 'content.part', role: 'assistant', delta: true,
+        turn_id: 'turn-interleaved', item_id: 'answer-1',
+        part: { type: 'text', text: 'Answer ' },
+      });
+      stream({
+        type: 'assistant', role: 'assistant', delta: true, replace: true,
+        turn_id: 'turn-interleaved', item_id: 'tool-2',
+        message: { content: [{ type: 'tool_use', name: 'Command', input: { command: 'two', output: 'done' } }] },
+      });
+      stream({
+        type: 'content.part', role: 'thinking', delta: true,
+        turn_id: 'turn-interleaved', item_id: 'thinking-1',
+        part: { type: 'think', think: 'done' },
+      });
+      stream({
+        type: 'content.part', role: 'assistant', delta: true,
+        turn_id: 'turn-interleaved', item_id: 'answer-1',
+        part: { type: 'text', text: 'body' },
+      });
+      stream({
+        type: 'thinking', role: 'thinking', final: true,
+        turn_id: 'turn-interleaved', item_id: 'thinking-2', content: 'subplan done',
+      });
+      stream({
+        type: 'thinking', role: 'thinking', final: true,
+        turn_id: 'turn-interleaved', item_id: 'thinking-1', content: 'plan done',
+      });
+      stream({
+        type: 'assistant', role: 'assistant', delta: true, replace: true,
+        turn_id: 'turn-interleaved', item_id: 'tool-1',
+        message: { content: [{ type: 'tool_use', name: 'Command', input: { command: 'one', output: 'done' } }] },
+      });
+    });
+
+    expect(useSessionStore.getState().currentMessages).toEqual([
+      { role: 'thinking', content: 'plan done', nativeItemId: 'thinking-1' },
+      { role: 'tool', content: 'Command({"command":"one","output":"done"})', nativeItemId: 'tool-1' },
+      { role: 'thinking', content: 'subplan done', nativeItemId: 'thinking-2' },
+      { role: 'tool', content: 'Command({"command":"two","output":"done"})', nativeItemId: 'tool-2' },
+      { role: 'assistant', content: 'Answer body', nativeItemId: 'answer-1' },
     ]);
   });
 

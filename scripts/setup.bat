@@ -14,25 +14,33 @@ cd /d "%ROOT%"
 echo Pan setup - 仓库根: %ROOT%
 echo.
 
-REM ---- [1/5] .venv + minimal-requirements.txt (start_pan.bat:27 依赖此位置) ----
-echo ========== [1/5] .venv + minimal-requirements.txt ==========
+REM ---- [1/5] .venv + minimal-requirements.txt (runtime only) ----
+echo ========== [1/5] .venv + minimal-requirements.txt (runtime only) ==========
 set "VPY=%ROOT%\.venv\Scripts\python.exe"
-if exist "%VPY%" (
-    echo [OK] .venv 已存在，复用
+set "VENV_READY="
+if exist "%VPY%" if exist "%ROOT%\.venv\pyvenv.cfg" (
+    "%VPY%" -c "import fastapi, uvicorn, websockets, psutil, httpx; from mcp.server.fastmcp import FastMCP" >nul 2>&1
+    if not errorlevel 1 set "VENV_READY=1"
+)
+if defined VENV_READY (
+    echo [OK] .venv 已存在且核心/MCP 依赖可用，复用
 ) else (
+    if exist "%VPY%" echo [WARN] .venv 不完整或缺少核心/MCP 依赖，正在重建
     where py >nul 2>&1
     if !ERRORLEVEL! NEQ 0 (
         echo [FAIL] 未找到 py 启动器，也未存在 .venv — 请先安装 Python 3.10+
         set "VPY="
     ) else (
-        echo 用 py -3 创建 .venv ...
-        py -3 -m venv "%ROOT%\.venv"
+        echo 用 py -3 重建 .venv ...
+        py -3 -m venv --clear "%ROOT%\.venv"
         if exist "%VPY%" (echo [OK] .venv 创建成功) else (echo [FAIL] .venv 创建失败 & set "VPY=")
     )
 )
 if defined VPY (
     "%VPY%" -m pip install -r "%ROOT%\minimal-requirements.txt"
-    if %ERRORLEVEL% EQU 0 (echo [OK] 核心依赖安装完成) else (echo [FAIL] 核心依赖安装失败 — Pan Core 无法启动)
+    if %ERRORLEVEL% EQU 0 (echo [OK] Core/API/MCP 运行依赖安装完成) else (echo [FAIL] 核心依赖安装失败 — Pan Core 无法启动)
+    echo [INFO] 测试依赖按需安装: "%VPY%" -m pip install -r "%ROOT%\dev-requirements.txt"
+    echo [INFO] Memory 可选层按需安装: "%VPY%" -m pip install -r "%ROOT%\memory-requirements.txt"
 )
 echo.
 
@@ -104,22 +112,13 @@ if %ERRORLEVEL% EQU 0 (
     call pnpm install
     if !ERRORLEVEL! EQU 0 (
         call pnpm build
-        if !ERRORLEVEL! EQU 0 (echo [OK] React SPA 构建完成) else (echo [WARN] React 构建失败 — legacy 仍可用)
+        if !ERRORLEVEL! EQU 0 (echo [OK] React SPA 构建完成) else (echo [WARN] React 构建失败 — /react/ 不可用)
     ) else (
         echo [WARN] pnpm install 失败 — 跳过 React 构建
     )
     popd
 ) else (
     echo [WARN] 未找到 pnpm — 跳过 React 构建。安装: corepack enable 或 npm i -g pnpm
-)
-where npx >nul 2>&1
-if %ERRORLEVEL% EQU 0 (
-    pushd "%ROOT%"
-    call npx tsc
-    if !ERRORLEVEL! EQU 0 (echo [OK] Legacy 前端编译完成) else (echo [WARN] Legacy 编译失败)
-    popd
-) else (
-    echo [WARN] 未找到 npx/node — 跳过 legacy 编译
 )
 echo.
 

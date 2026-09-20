@@ -7,6 +7,16 @@ agent_* 工具、/api/send）以 Session 为寻址目标。
 
 Each session is stored as data/sessions/<id>.json.
 The ID format is ses_<16-hex-chars> (e.g. ses_a1b2c3d4e5f67890).
+
+Prompt schema: JSON persists original_prompt and handoff_prompt. system_prompt
+is a computed compatibility property and to_dict() export alias. Constructors
+still accept the legacy keyword. If original_prompt is absent, legacy text is
+preserved verbatim as the baseline, even if it already contains old handoffs;
+there is no reliable way to recover its author-intended original by splitting
+headings. Explicit original_prompt (including null/empty) takes precedence.
+Loading never rewrites files; the next save migrates to the canonical fields.
+New JSON requires a reader supporting this schema; old Pan versions that reject
+unknown Session fields cannot read it. No lossy downgrade is attempted.
 """
 
 from __future__ import annotations
@@ -18,9 +28,11 @@ import os
 import re
 import secrets
 import threading
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+
+from packages.core.notifications import normalize_notification_settings
 
 SESSION_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "sessions"
 
@@ -145,6 +157,7 @@ def _strip_delivery_marks(history: list[dict]) -> list[dict]:
 # The three capability flags are stored nested under ``pan_access``. Old JSON
 # wrote them as top-level fields; migration lives in _from_data / __post_init__.
 _PAN_ACCESS_KEYS = ("restrict_to_managed", "can_claim_unmanaged", "auto_claim_created")
+_PROMPT_UNSET = object()  # distinguish an omitted original from explicit None/""
 
 # Queue receipts written by the previous queue implementation are retained as
 # compatibility metadata.  They are not a second queue: ``queue_pending`` is
@@ -164,7 +177,8 @@ class Session:
     adapter_config: dict = field(default_factory=dict)  # adapter-specific settings
     character_id: str | None = None   # bound character ID (for memory + assets)
     session_template: str | None = None  # session_template name this session was configured with (None = built-in default)
-    system_prompt: str | None = None  # injected at Worker spawn
+    original_prompt: str | None = None  # stable instructions, never a generated handoff
+    handoff_prompt: str | None = None  # only the latest handoff brief
     game_id: str | None = None        # RuleWhisper game identifier for MCP tool calls
     raw_usage: dict | None = None
     total_usage: dict | None = None
@@ -196,6 +210,7 @@ class Session:
     report_subscriptions: set[str] = field(default_factory=set)  # managed sessions whose completion reports this session subscribes to
     qq_subscriptions: set[str] = field(default_factory=set)  # QQ conversations this session subscribes to ("user:<qq>"/"group:<group_id>")
     wechat_subscriptions: set[str] = field(default_factory=set)  # 微信会话（WeChat conversations）this session subscribes to ("user:<wxid>")
+    notification_settings: dict = field(default_factory=dict)  # Pan completion notifications
 
     # ── adapter_config convenience accessors ──
 
@@ -241,7 +256,9 @@ class Session:
                  accepted_input_ids: list[str] | None = None,
                   report_subscriptions=None,
                  qq_subscriptions=None,
-                 wechat_subscriptions=None):
+                 wechat_subscriptions=None, notification_settings=None, *,
+                 original_prompt: str | None | object = _PROMPT_UNSET,
+                 handoff_prompt: str | None = None):
         """Manual init so legacy top-level capability kwargs still construct.
 
         ``pan_access`` is the single source of truth for the three capability
@@ -264,7 +281,11 @@ class Session:
         self.adapter_config = adapter_config if adapter_config is not None else {}
         self.character_id = character_id
         self.session_template = session_template
-        self.system_prompt = system_prompt
+        # Legacy prompts are opaque: even text resembling our handoff headings
+        # may be user-authored. Preserve it verbatim; never guess a split.
+        # Explicit canonical values (including None/"") beat the legacy alias.
+        self.original_prompt = system_prompt if original_prompt is _PROMPT_UNSET else original_prompt
+        self.handoff_prompt = handoff_prompt
         self.game_id = game_id
         self.raw_usage = raw_usage
         self.total_usage = total_usage
@@ -299,7 +320,38 @@ class Session:
         self.wechat_subscriptions = (
             wechat_subscriptions if wechat_subscriptions is not None else set()
         )
+        self.notification_settings = normalize_notification_settings(notification_settings)
         self.__post_init__()
+
+    @property
+    def system_prompt(self) -> str | None:
+        """Effective worker prompt; a compatibility view, never an inheritance source.
+
+        Keep stored text verbatim. Empty/whitespace-only briefs add no wrapper;
+        sessions without a brief retain their original prompt exactly.
+        """
+        brief = self.handoff_prompt
+        original = self.original_prompt
+        if not brief or not brief.strip():
+            return original
+        if not original or not original.strip():
+            return brief
+        return (
+            "【交接上下文（由被交接 session A 的 agent 编写）】\n"
+            f"{brief}\n\n"
+            "【原 session 的 system prompt】\n"
+            f"{original}"
+        )
+
+    @system_prompt.setter
+    def system_prompt(self, value: str | None):
+        """Legacy full-prompt replacement starts a new baseline without a brief.
+
+        Inheritance must copy the two canonical fields instead. Settings editors
+        should edit original_prompt to retain the current brief.
+        """
+        self.original_prompt = value
+        self.handoff_prompt = None
 
     # ── pan_access convenience accessors (capability flags) ──
 
@@ -412,6 +464,8 @@ class Session:
             "character_id": self.character_id,
             "session_template": self.session_template,
             "system_prompt": self.system_prompt,
+            "original_prompt": self.original_prompt,
+            "handoff_prompt": self.handoff_prompt,
             "game_id": self.game_id,
             "raw_usage": self.raw_usage,
             "total_usage": self.total_usage,
@@ -433,6 +487,7 @@ class Session:
             "report_subscriptions": sorted(self.report_subscriptions),
             "qq_subscriptions": sorted(self.qq_subscriptions),
             "wechat_subscriptions": sorted(self.wechat_subscriptions),
+            "notification_settings": normalize_notification_settings(self.notification_settings),
         }
 
 
@@ -458,11 +513,14 @@ def create(name: str, model: str | None = None,
            restrict_to_managed: bool = False,
            can_claim_unmanaged: bool = False,
            auto_claim_created: bool = False,
+           notification_settings: dict | None = None,
            # backward-compat kwargs (migrated to adapter_config)
            cli_session_id: str | None = None,
            always_thinking_enabled: bool = False,
            effort: str = "",
-           max_thinking_tokens: int | None = None) -> Session:
+           max_thinking_tokens: int | None = None, *,
+           original_prompt: str | None | object = _PROMPT_UNSET,
+           handoff_prompt: str | None = None) -> Session:
     # build adapter_config
     ac = dict(adapter_config) if adapter_config else {}
     if cli_session_id and "cli_session_id" not in ac:
@@ -491,7 +549,10 @@ def create(name: str, model: str | None = None,
         character_id=character_id,
         session_template=session_template,
         system_prompt=system_prompt,
+        original_prompt=original_prompt,
+        handoff_prompt=handoff_prompt,
         game_id=game_id,
+        notification_settings=notification_settings,
         raw_usage=raw_usage,
         total_usage=total_usage,
         workdir=workdir,
@@ -538,6 +599,10 @@ def _from_data_with_history(sid: str, data: dict) -> Session:
     - 新格式（增量）：jsonl 存在 → history 以 jsonl 为准（可能比主文件新）。
     同时设置进程内增量游标 s._hist_persisted（已在 jsonl 中的条数）。
     """
+    migrate_prompt = (
+        "original_prompt" not in data or "handoff_prompt" not in data
+        or "system_prompt" in data
+    )
     s = Session._from_data(data)
     _migrate_legacy_fields(s)
     _migrate_session_usage(s)
@@ -547,7 +612,9 @@ def _from_data_with_history(sid: str, data: dict) -> Session:
     else:
         _strip_delivery_marks(s.history)
     s._hist_persisted = len(s.history)
-    s._last_meta_sig = _meta_signature(s)
+    # Loading is read-only. The next explicit save writes canonical prompts,
+    # even when no other metadata changed (including old JSONL-backed stores).
+    s._last_meta_sig = None if migrate_prompt else _meta_signature(s)
     return s
 
 
@@ -639,6 +706,7 @@ def _save_sync(s: Session, force_full: bool = False):
         # （history 真源在 jsonl，主文件只是元数据镜像 + 存在标记）。
         if force_full or meta_sig != getattr(s, "_last_meta_sig", None):
             d = s.to_dict()
+            d.pop("system_prompt")  # derived API/export alias is not durable state
             d["history"] = s.history[-_MAIN_HISTORY_TAIL:]
             main_path = _path(s.id)
             tmp_path = main_path.with_suffix(".json.tmp")
@@ -860,8 +928,8 @@ def handoff_session(
        adapter_config、model、permission_mode、session_template、pan_access、
        mcp_servers 等，**明确不含 system_prompt**；cli_session_id 清空——B 是
        全新会话）；false 时 B 用默认设置（此时调用方应显式传 adapter）。
-    4. **B.system_prompt = handoff_prompt（A 新写）与 A 原 system_prompt 拼接**，
-       用「交接上下文 / 原 system prompt」两个分节引导。
+    4. **B.original_prompt = A.original_prompt，B.handoff_prompt = 本次简报**。
+       B.system_prompt 仅计算本次简报 + original_prompt，不继承旧简报。
     5. **重命名**：A → `(archive) <原名>`，B → `<原名>`。
     6. **解除 A 的原关系网**：A.managed / report_subscriptions / qq_subscriptions
        清空（A.managed_by 保留 = B，见第 2 条）。
@@ -887,6 +955,7 @@ def handoff_session(
         new_character_id = a.character_id
         new_template = a.session_template
         new_game_id = a.game_id
+        new_notification_settings = copy.deepcopy(a.notification_settings)
     else:
         new_adapter = adapter or "cbc"
         new_model = model
@@ -896,16 +965,7 @@ def handoff_session(
         new_character_id = None
         new_template = None
         new_game_id = None
-
-    # B 的 system_prompt = 交接 prompt（A 新写） + A 原 system_prompt 拼接
-    b_prompt = handoff_prompt.strip()
-    if a.system_prompt and a.system_prompt.strip():
-        b_prompt = (
-            "【交接上下文（由被交接 session A 的 agent 编写）】\n"
-            f"{b_prompt}\n\n"
-            "【原 session 的 system prompt】\n"
-            f"{a.system_prompt.strip()}"
-        )
+        new_notification_settings = None
 
     # Allocate and persist B while holding the same lock used by save().
     # This closes the check/create window between concurrent handoffs. A is
@@ -919,8 +979,10 @@ def handoff_session(
             adapter_config=new_adapter_config,
             character_id=new_character_id,
             session_template=new_template,
-            system_prompt=b_prompt,
+            original_prompt=a.original_prompt,
+            handoff_prompt=handoff_prompt.strip(),
             game_id=new_game_id,
+            notification_settings=new_notification_settings,
             pan_access=new_pan_access,
             workdir=a.workdir,
         )
@@ -1123,11 +1185,184 @@ def compute_total_usage(raw_usage: dict | None) -> dict | None:
     for entry in raw_usage.values():
         ru = entry.get("rawUsage", {})
         total["prompt_tokens"] += ru.get("prompt_tokens", 0)
-        total["cache_hit_tokens"] += ru.get("prompt_cache_hit_tokens", 0)
-        total["cache_miss_tokens"] += ru.get("prompt_cache_miss_tokens", 0)
+        # Adapters historically used several names for the same cache
+        # counters. Prefer the canonical prompt_cache_* spelling when it is
+        # present; otherwise bridge provider-specific aliases. This prevents
+        # Codex/Claude/OpenCode cache reads from remaining stranded in
+        # raw_usage while totalUsage reports cache_hit_tokens=0, and avoids
+        # double-counting when both spellings are present.
+        total["cache_hit_tokens"] += next(
+            (ru[key] for key in (
+                "prompt_cache_hit_tokens", "cache_read_tokens",
+                "cached_input_tokens",
+            ) if key in ru and ru[key] is not None),
+            0,
+        )
+        total["cache_miss_tokens"] += next(
+            (ru[key] for key in (
+                "prompt_cache_miss_tokens", "cache_write_tokens",
+                "cache_write_input_tokens",
+            ) if key in ru and ru[key] is not None),
+            0,
+        )
         total["completion_tokens"] += ru.get("completion_tokens", 0)
         total["credit"] += ru.get("credit", 0) + ru.get("cost", 0)
     return total
+
+
+# Keep this projection separate from ``compute_total_usage``: the latter is
+# the long-standing billing-compatible aggregate, while this view also reads
+# re-imported provider snapshots such as Codex input_tokens/output_tokens.
+_USAGE_VIEW_ALIASES = {
+    "input": ("prompt_tokens", "input_tokens"),
+    "output": ("completion_tokens", "output_tokens"),
+    "cache_read": (
+        "prompt_cache_hit_tokens", "cache_read_tokens", "cached_input_tokens",
+    ),
+    "cache_write": (
+        "prompt_cache_miss_tokens", "cache_write_tokens",
+        "cache_write_input_tokens",
+    ),
+    "credit": ("credit", "cost"),
+}
+
+
+def _usage_view_entries(raw_usage) -> list[dict]:
+    """Return model entries from current and legacy raw usage shapes."""
+    if isinstance(raw_usage, dict):
+        return [entry for entry in raw_usage.values() if isinstance(entry, dict)]
+    if isinstance(raw_usage, list):
+        return [entry for entry in raw_usage if isinstance(entry, dict)]
+    return []
+
+
+def _usage_view_number(value):
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def _usage_view_sum(entries: list[dict], aliases: tuple[str, ...]):
+    """Sum one field, selecting at most one alias per model entry.
+
+    ``None`` means no entry carried a numeric value. An explicit numeric zero
+    remains zero. Selecting one alias prevents compatibility names from being
+    counted twice when a provider payload contains more than one spelling.
+    """
+    found = False
+    total = 0
+    for entry in entries:
+        raw = entry.get("rawUsage")
+        if not isinstance(raw, dict):
+            raw = entry if any(key in entry for key in aliases) else None
+        if not isinstance(raw, dict):
+            continue
+        value = next(
+            (raw[key] for key in aliases
+             if key in raw and raw[key] is not None),
+            None,
+        )
+        value = _usage_view_number(value)
+        if value is not None:
+            total += value
+            found = True
+    return total if found else None
+
+
+def session_usage_view(s: Session) -> dict:
+    """Project persisted Session usage into a stable input/output/cache view.
+
+    This read-only view never refreshes provider state or mutates the session.
+    Non-empty ``raw_usage`` is primary; ``total_usage`` is a compatibility
+    fallback for old sessions that only have the derived aggregate. Cache is
+    reported separately and is not added to input/output again. Thus
+    ``total.tokens`` is ``input + output`` only.
+    """
+    raw_entries = _usage_view_entries(s.raw_usage)
+    if raw_entries:
+        values = {
+            name: _usage_view_sum(raw_entries, aliases)
+            for name, aliases in _USAGE_VIEW_ALIASES.items()
+        }
+        source_kind = "Session.rawUsage"
+        source_fields = {
+            "input": "rawUsage.prompt_tokens|input_tokens",
+            "output": "rawUsage.completion_tokens|output_tokens",
+            "cache.read": (
+                "rawUsage.prompt_cache_hit_tokens|cache_read_tokens|"
+                "cached_input_tokens"
+            ),
+            "cache.write": (
+                "rawUsage.prompt_cache_miss_tokens|cache_write_tokens|"
+                "cache_write_input_tokens"
+            ),
+            "credit": "rawUsage.credit|cost",
+        }
+    elif isinstance(s.total_usage, dict):
+        total_usage = s.total_usage
+        values = {
+            "input": _usage_view_number(total_usage.get("prompt_tokens"))
+                if "prompt_tokens" in total_usage else None,
+            "output": _usage_view_number(total_usage.get("completion_tokens"))
+                if "completion_tokens" in total_usage else None,
+            "cache_read": _usage_view_number(total_usage.get("cache_hit_tokens"))
+                if "cache_hit_tokens" in total_usage else None,
+            "cache_write": _usage_view_number(total_usage.get("cache_miss_tokens"))
+                if "cache_miss_tokens" in total_usage else None,
+            "credit": _usage_view_number(total_usage.get("credit"))
+                if "credit" in total_usage else None,
+        }
+        source_kind = "Session.totalUsage"
+        source_fields = {
+            "input": "totalUsage.prompt_tokens",
+            "output": "totalUsage.completion_tokens",
+            "cache.read": "totalUsage.cache_hit_tokens",
+            "cache.write": "totalUsage.cache_miss_tokens",
+            "credit": "totalUsage.credit",
+        }
+    else:
+        values = {name: None for name in _USAGE_VIEW_ALIASES}
+        source_kind = None
+        source_fields = {}
+
+    input_tokens = values["input"]
+    output_tokens = values["output"]
+    cache_read = values["cache_read"]
+    cache_write = values["cache_write"]
+    cache_total = (
+        cache_read + cache_write
+        if _usage_view_number(cache_read) is not None
+        and _usage_view_number(cache_write) is not None else None
+    )
+    total_tokens = (
+        input_tokens + output_tokens
+        if _usage_view_number(input_tokens) is not None
+        and _usage_view_number(output_tokens) is not None else None
+    )
+    return {
+        "ok": True,
+        "sessionId": s.id,
+        "adapter": s.adapter,
+        "input": input_tokens,
+        "output": output_tokens,
+        "cache": {
+            "read": cache_read,
+            "write": cache_write,
+            "total": cache_total,
+        },
+        "total": {
+            "tokens": total_tokens,
+            "credit": values["credit"],
+        },
+        "source": {
+            "kind": source_kind,
+            "fields": source_fields,
+            "updatedAt": "Session.updatedAt",
+            "updatedAtMeaning": (
+                "Pan session persistence time; provider event time is not "
+                "retained by the aggregate view"
+            ),
+        },
+        "updatedAt": s.updated_at or None,
+    }
 
 
 def _migrate_session_usage(s: Session):

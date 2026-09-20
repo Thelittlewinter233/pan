@@ -24,12 +24,14 @@ import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import psutil
 
 from . import session as _sess
+from . import notifications as _notifications
+from . import codex_quota_store as _codex_quota_store
 
 READONLY_SESSION_ERROR = (
     "该 session 当前为只读，必须先取消对该 session 的 readonly 设置后才能发送信息、任务或回报"
@@ -40,12 +42,16 @@ from .adapters import (
     CliAdapter,
     resolve_execution_mode,
 )
+from .adapters.base import SYSTEM_PROMPT_ARG_MAX_CHARS
 from .config import load_config
 from .cli_diagnostics import format_cli_spawn_error
+from .attachment_projection import project_message_parts, public_message_parts
 
 _log = logging.getLogger(__name__)
 
-
+# Keep provider prompt bodies out of Windows CreateProcess command lines.  The
+# conservative boundary also leaves room for the rest of an adapter's argv;
+# short prompts retain the existing native flag path for compatibility.
 # ── Worker 生命周期配置（启动时读取一次，缓存）──
 
 _WORKER_TIMEOUT_SEC: float = 300.0       # 静默超时：queued 无输出 / MCP 读取超时超过该值 → kill
@@ -219,6 +225,15 @@ class Worker:
     # survives a completed turn, but it is still process-local and must be
     # cleared when the app-server is respawned.
     native_rate_limits: dict | None = None
+    # Local receive time for the latest rate-limit event.  The provider event
+    # does not carry a trustworthy original-update timestamp in this path.
+    native_rate_limits_received_at: str | None = None
+    # Compatibility alias retained for existing callers/API fields.
+    native_rate_limits_updated_at: str | None = None
+    # The selected Codex auth profile is account-level metadata, not a
+    # persisted Worker identity. It is used only to route live updates to the
+    # matching global quota store.
+    codex_profile_key: str | None = None
     # Current turn's native plan/diff snapshots for dashboard reconnect replay.
     native_plan: dict | None = None
     native_diff: dict | None = None
@@ -549,7 +564,7 @@ def _interaction_key(event: dict) -> str | None:
     return None
 
 
-def _update_pending_interactions(w: Worker, event: dict) -> None:
+def _update_pending_interactions(w: Worker, event: dict) -> dict | None:
     """Track or retire a native interactive event for dashboard replay.
 
     This is deliberately worker-local and ephemeral.  If the native process
@@ -560,44 +575,55 @@ def _update_pending_interactions(w: Worker, event: dict) -> None:
     if event_type == "codex.thread_status":
         native_status = event.get("native_status")
         w.native_status = dict(native_status) if isinstance(native_status, dict) else None
-        return
+        return None
     if event_type == "codex.token_usage":
         token_usage = event.get("token_usage")
         w.native_usage = dict(token_usage) if isinstance(token_usage, dict) else None
-        return
+        return None
     if event_type == "codex.rate_limits":
         rate_limits = event.get("rate_limits")
-        w.native_rate_limits = dict(rate_limits) if isinstance(rate_limits, dict) else None
-        return
+        if not isinstance(rate_limits, dict) or not rate_limits:
+            w.native_rate_limits = None
+            w.native_rate_limits_received_at = None
+            w.native_rate_limits_updated_at = None
+            return None
+        w.native_rate_limits = dict(rate_limits)
+        received_at = (
+            datetime.now(timezone.utc).isoformat()
+            if isinstance(rate_limits, dict) else None
+        )
+        w.native_rate_limits_received_at = received_at
+        w.native_rate_limits_updated_at = received_at
+        return {"rate_limits": dict(rate_limits), "received_at": received_at}
     if event_type == "codex.plan":
         plan = event.get("plan")
         if isinstance(plan, list):
             w.native_plan = dict(event)
-        return
+        return None
     if event_type == "codex.diff":
         diff = event.get("diff")
         w.native_diff = dict(event) if isinstance(diff, str) and diff else None
-        return
+        return None
     if event_type in _PENDING_INTERACTION_TYPES:
         key = _interaction_key(event)
         if key is not None:
             w.pending_interactions[key] = dict(event)
-        return
+        return None
     if event_type == "codex.request_resolved":
         request_id = event.get("request_id")
         if request_id is not None:
             w.pending_interactions.pop(f"request:{request_id}", None)
-        return
+        return None
     if event_type == "claude.permission_resolved":
         request_id = event.get("request_id")
         if request_id is not None:
             w.pending_interactions.pop(f"request:{request_id}", None)
-        return
+        return None
     if event_type == "codex.item.completed":
         item_id = event.get("item_id")
         if item_id is not None:
             w.pending_interactions.pop(f"terminal:{item_id}", None)
-        return
+        return None
     if event_type == "result":
         w.pending_interactions.clear()
         w.native_status = None
@@ -657,6 +683,8 @@ def clear_native_runtime_state(w: Worker) -> None:
     w.native_status = None
     w.native_usage = None
     w.native_rate_limits = None
+    w.native_rate_limits_received_at = None
+    w.native_rate_limits_updated_at = None
     w.native_plan = None
     w.native_diff = None
 
@@ -858,7 +886,7 @@ async def _flush_history_now(w: Worker) -> None:
     if task is not None and not task.done():
         w._hist_flush_event.set()
         await asyncio.shield(task)  # 防抖任务独立完成落盘；调用方取消照常传播
-        return
+        return None
     s = _session(w)
     if s is None:
         w._hist_force_flush = False
@@ -891,7 +919,18 @@ async def _read_stdout(w: Worker):
         # Keep only native interactive prompts in the worker-local replay
         # cache.  The cache is consumed by the dashboard after a WS reconnect;
         # normal stream events remain live-only to avoid retaining history.
-        _update_pending_interactions(w, event)
+        quota_update = _update_pending_interactions(w, event)
+        if quota_update is not None:
+            try:
+                await asyncio.to_thread(
+                    _codex_quota_store.update_current_profile,
+                    quota_update["rate_limits"],
+                    observed_at=quota_update["received_at"],
+                    received_at=quota_update["received_at"],
+                    source="app-server-push",
+                )
+            except Exception:  # quota persistence must not kill the Worker stream
+                _log.exception("failed to persist Codex quota snapshot")
 
         # 提取 session_id + model 并写入 Session
         # 注意：stream 模式（--input-format stream-json）启动时无 init 事件，
@@ -984,6 +1023,7 @@ async def _read_stdout(w: Worker):
             task_seq = w._current_seq
             task_source_session_id = w._current_source_session_id
             result_text = adapter.extract_result_text(event)
+            completion_notification = _notifications.dispatch_completion(s, w.status, result_text) if s else None
             await _bcast({
                 "type": "worker.result",
                 "workerId": w.worker_id,
@@ -993,6 +1033,7 @@ async def _read_stdout(w: Worker):
                 "result": result_text,
                 "taskSeq": task_seq,
                 "sourceSessionId": task_source_session_id,
+                **({"notification": completion_notification} if completion_notification else {}),
             })
             # 订阅制报告：完成 → 若被订阅则 append 到 manager 的落盘队列（立项 4.3）
             await _enqueue_report(w.session_id, w.status, result_text, w._current_task_id, w.worker_id)
@@ -1351,6 +1392,8 @@ async def _reserve_queue_unit(w: Worker, s, items: list[dict], text: str) -> boo
                 entry["taskId"] = item.get("taskId")
             if item.get("clientMessageId"):
                 entry["clientMessageId"] = item["clientMessageId"]
+            if isinstance(item.get("parts"), list):
+                entry["parts"] = [dict(part) for part in item["parts"] if isinstance(part, dict)]
         else:
             entry = {
                 "role": "user",
@@ -1474,10 +1517,18 @@ async def _commit_queue_handoff(w: Worker, s, items: list[dict]) -> bool:
         "type": "queue.item_delivered",
         "sessionId": s.id,
         "queueItemIds": delivered_ids,
+        # The delivery event is the first client-visible proof that the
+        # pending rows crossed the provider hand-off boundary.  Include the
+        # post-removal revision so a delayed GET /queue cannot overwrite the
+        # delivered snapshot with an older response.
+        "queueRevision": getattr(s, "queue_revision", 0),
         "messages": [{
             "role": "user",
             "content": delivered_text,
             "queueItemIds": delivered_ids,
+            **({"parts": public_message_parts(items[0].get("parts"))}
+               if _queue_item_kind(items[0]) == "task" and isinstance(items[0].get("parts"), list)
+               else {}),
         }],
     })
     await _bcast({
@@ -1502,19 +1553,26 @@ async def _deliver_queue_unit(w: Worker, s, items: list[dict]) -> None:
         w._current_seq = items[0].get("seq")
         w._current_task_id = items[0].get("taskId")
         w._current_source_session_id = items[0].get("sourceSessionId")
-        text = await _maybe_inject_memory(s, items[0]["text"])
+        history_text = items[0]["text"]
     else:
         source = "report"
         w._current_seq = None
         w._current_task_id = None
         w._current_source_session_id = None
-        text = await _maybe_inject_memory(s, _format_report_batch(items))
+        history_text = _format_report_batch(items)
     w._current_queue_item = items[0] if kind == "task" else None
     w._current_report_items = list(items) if kind == "report" else []
     w._current_handoff_acked = False
     history_added = False
     try:
-        history_added = await _reserve_queue_unit(w, s, items, text)
+        projected_text = (
+            project_message_parts(items[0].get("parts"), history_text)
+            if kind == "task" else history_text
+        )
+        text = await _maybe_inject_memory(s, projected_text)
+        # History/UI keeps the safe Markdown fallback, while only the adapter
+        # receives the server-path projection in ``text``.
+        history_added = await _reserve_queue_unit(w, s, items, history_text)
         if not history_added and any(_delivery_state(item) == _DELIVERY_QUEUED
                                      for item in items):
             # A failed reservation has already placed the item back in queue.
@@ -3750,6 +3808,7 @@ async def _consumer_oneshot(w: Worker, text: str, source: str, s, *, on_handoff=
     w.status = "idle"
     _maybe_restart_pending(w)
     task_seq = w._current_seq
+    completion_notification = _notifications.dispatch_completion(s, status, result)
     await _bcast({
         "type": "worker.result",
         "workerId": w.worker_id,
@@ -3758,6 +3817,7 @@ async def _consumer_oneshot(w: Worker, text: str, source: str, s, *, on_handoff=
         "status": status,
         "result": result,
         "taskSeq": task_seq,
+        **({"notification": completion_notification} if completion_notification else {}),
     })
     # 订阅制报告：完成 → 若被订阅则 append 到 manager 的落盘队列（立项 4.3）
     await _enqueue_report(w.session_id, status, result, w._current_task_id, w.worker_id)
@@ -3924,6 +3984,12 @@ def _spawn_system_prompt_args(
             path = _write_system_prompt_file(s, s.system_prompt)
             prompt_file_sink.append(path)
             return ["--system-prompt-file", path]
+        # Adapters without a file-aware wrapper must fall back to the existing
+        # first-message stdin injection for long prompts.  In particular this
+        # covers native cbc/claude CLIs: passing the body as --system-prompt
+        # would put it back across the Windows CreateProcess argv boundary.
+        if len(s.system_prompt) > SYSTEM_PROMPT_ARG_MAX_CHARS:
+            return None
         return ["--system-prompt", s.system_prompt]
     return None
 
@@ -3993,7 +4059,11 @@ async def _create_worker(session_id: str) -> Worker | str:
                system_prompt_file=prompt_files[0] if prompt_files else None,
                _task_done=asyncio.Event(),
                _hist_flush_event=asyncio.Event(),
-               generation=_next_worker_generation(session_id))
+               generation=_next_worker_generation(session_id),
+               codex_profile_key=(
+                   _codex_quota_store.resolve_profile_identity().profile_key
+                   if getattr(adapter, "name", "") == "codex" else None
+               ))
     w.last_activity = time.monotonic()
     workers[worker_id] = w
     _register_worker(w)
@@ -4196,13 +4266,24 @@ async def _takeover_worker_unlocked(worker_id: str) -> str | None:
 
 async def _kill_worker_unlocked(
     worker_id: str, *, recover: bool = False,
+    report_abnormal: bool = False,
 ) -> str | None:
-    """Kill the Worker process. Does NOT touch the Session."""
+    """Kill the Worker process. Does NOT touch the Session.
+
+    ``report_abnormal`` is reserved for an explicit user kill request.  The
+    watchdog and internal restart paths already have their own lifecycle
+    semantics (including watchdog zombie reporting), so they leave it false.
+    The report must be queued before cancelling the consumer: cancellation
+    unwinds the in-flight queue unit and clears ``_current_task_id``.
+    """
     w = workers.get(worker_id)
     if not w:
         return "Worker not found"
 
     abnormal = w.status in {"running", "queued"}
+
+    if report_abnormal and abnormal:
+        await _enqueue_zombie_report(w, "worker killed")
 
     _cancel_claude_permission_requests(worker_id, "Claude worker was stopped")
 
@@ -4254,7 +4335,8 @@ async def _kill_worker_unlocked(
     return None
 
 
-async def kill_worker(worker_id: str, *, recover: bool = False) -> str | None:
+async def kill_worker(worker_id: str, *, recover: bool = False,
+                      report_abnormal: bool = False) -> str | None:
     """Serialized compatibility wrapper for worker-id callers."""
     w = workers.get(worker_id)
     if not w:
@@ -4266,10 +4348,13 @@ async def kill_worker(worker_id: str, *, recover: bool = False) -> str | None:
         if current is not w or w.generation != generation:
             # A concurrent restart already owns this lifecycle transition.
             return None
-        return await _kill_worker_unlocked(worker_id, recover=recover)
+        return await _kill_worker_unlocked(
+            worker_id, recover=recover, report_abnormal=report_abnormal,
+        )
 
 
-async def kill_session_worker(session_id: str) -> Worker | str | None:
+async def kill_session_worker(session_id: str, *,
+                              report_abnormal: bool = False) -> Worker | str | None:
     """Kill the live worker for a session, if present."""
     if _sess.get(session_id) is None:
         return f"Session {session_id} not found"
@@ -4278,7 +4363,9 @@ async def kill_session_worker(session_id: str) -> Worker | str | None:
         w = find_alive_worker_by_session(session_id)
         if w is None:
             return None
-        error = await _kill_worker_unlocked(w.worker_id)
+        error = await _kill_worker_unlocked(
+            w.worker_id, report_abnormal=report_abnormal,
+        )
         return error or w
 
 
@@ -4663,7 +4750,8 @@ async def branch_worker(worker_id: str, new_session_id: str) -> Worker | str:
         if orig.cli_session_id and not s.cli_session_id:
             s.cli_session_id = orig.cli_session_id
         if not s.system_prompt:
-            s.system_prompt = orig.system_prompt
+            s.original_prompt = orig.original_prompt
+            s.handoff_prompt = orig.handoff_prompt
         if not s.character_id:
             s.character_id = orig.character_id
         if not s.session_template:
@@ -4717,7 +4805,8 @@ async def branch_worker(worker_id: str, new_session_id: str) -> Worker | str:
                    status="idle", process=proc, pending_signal=asyncio.Queue(),
                    _task_done=asyncio.Event(),
                    _hist_flush_event=asyncio.Event(),
-                   generation=_next_worker_generation(new_session_id))
+                   generation=_next_worker_generation(new_session_id),
+                   codex_profile_key=getattr(w, "codex_profile_key", None))
     # 注意：branch 不设 _replaying（与 create_worker/restart_worker 一致，现全局恒
     # False）。原注释假设"cbc --resume --fork-session 会把父会话历史重放到 stdout
     # 供 branch 空 history 填充"——worker-resume-replay 实测 fork+prompt **不重放**
@@ -4902,7 +4991,8 @@ def _durable_task_id_seen(s, task_id: str | None) -> bool:
 async def _persist_task_item(s, text: str, source: str, seq: int | None,
                              task_id: str | None,
                              client_message_id: str | None,
-                             source_session_id: str | None = None) -> tuple[dict | None, str | None]:
+                             source_session_id: str | None = None,
+                             parts: list[dict] | None = None) -> tuple[dict | None, str | None]:
     """Durably append one task, atomically with the browser receipt ledger."""
     if _shutdown_started:
         return None, "Pan main service is shutting down"
@@ -4952,6 +5042,11 @@ async def _persist_task_item(s, text: str, source: str, seq: int | None,
     item["queueItemId"] = item["id"]
     if source_sid is not None:
         item["sourceSessionId"] = source_sid
+    if parts is not None:
+        # The web boundary has already validated and canonicalized these parts.
+        # Keep them beside the text fallback so history/retry/restart can restore
+        # attachment identity and editor position even for text-only adapters.
+        item["parts"] = [dict(part) for part in parts]
     if client_message_id:
         item["clientMessageId"] = client_message_id
         s.accepted_input_ids.append(client_message_id)
@@ -4976,12 +5071,17 @@ async def _persist_task_item(s, text: str, source: str, seq: int | None,
     await _bcast({"type": "queue.item_added", "sessionId": s.id,
                   "queueItemId": item["id"],
                   "queueRevision": s.queue_revision,
-                  "item": dict(item)})
+                  "item": {
+                      **item,
+                      **({"parts": public_message_parts(item.get("parts"))}
+                         if isinstance(item.get("parts"), list) else {}),
+                  }})
     return item, None
 
 
 async def enqueue_user_message(session_id: str, text: str,
-                               client_message_id: str | None = None) -> dict:
+                               client_message_id: str | None = None,
+                               parts: list[dict] | None = None) -> dict:
     """Canonical durable entry point for browser/user queue messages.
 
     The queue item and receipt are written before acknowledging the request.
@@ -5008,8 +5108,12 @@ async def enqueue_user_message(session_id: str, text: str,
                 "item": dict(existing),
                 "duplicate": True,
             }
-        item, error = await _persist_task_item(
-            s, text, "user", None, None, client_message_id, None)
+        if parts is None:
+            item, error = await _persist_task_item(
+                s, text, "user", None, None, client_message_id, None)
+        else:
+            item, error = await _persist_task_item(
+                s, text, "user", None, None, client_message_id, None, parts)
         if error:
             return {"status": "error", "result": error}
         if item is None:

@@ -54,10 +54,13 @@ def test_steer_worker_persists_only_after_control_write(monkeypatch):
         model="gpt-5.4-mini",
         permission_mode="workspace-write",
         workdir="C:/workspace",
-        system_prompt="Be concise.",
+        original_prompt="Be concise.",
+        handoff_prompt="Latest brief.",
         adapter_config={
             "cli_session_id": "thread-parent",
             "effort": "low",
+            "model_context_window": 64000,
+            "model_auto_compact_token_limit": 60800,
             "mcp_servers": {"pan": {"command": "node"}},
         },
     )
@@ -118,8 +121,12 @@ def test_steer_worker_persists_only_after_control_write(monkeypatch):
     assert child.history == [{"role": "user", "content": "old"}]
     assert child.model == "gpt-5.4-mini"
     assert child.permission_mode == "workspace-write"
-    assert child.system_prompt == "Be concise."
+    assert child.original_prompt == "Be concise."
+    assert child.handoff_prompt == "Latest brief."
+    assert child.system_prompt == parent.system_prompt
     assert child.adapter_config["mcp_servers"] == {"pan": {"command": "node"}}
+    assert child.adapter_config["model_context_window"] == 64000
+    assert child.adapter_config["model_auto_compact_token_limit"] == 60800
     assert [item[0] for item in calls] == ["fork", "history", "usage"]
 
     worker.workers.clear()
