@@ -52,7 +52,9 @@ interface SessionStore {
   loadSessions: () => Promise<void>;
   selectSession: (id: string) => Promise<void>;
   refreshCurrentSessionHistory: () => Promise<void>;
-  loadOlderMessages: () => Promise<void>;
+  loadOlderMessages: (limit?: number) => Promise<void>;
+  /** Load pages until the stable fromEnd target is present in currentMessages. */
+  ensureMessageLoaded: (fromEnd: number, total: number) => Promise<Message | null>;
   createNewSession: (
     name: string,
     workdir?: string | null,
@@ -124,6 +126,36 @@ function isServerHistoryPrefix(
         || JSON.stringify(s.parts ?? null) !== JSON.stringify(c.parts ?? null)) return false;
   }
   return true;
+}
+
+function sameMessage(a: Message | undefined, b: Message | undefined): boolean {
+  return !!a && !!b && a.role === b.role && a.content === b.content
+    && JSON.stringify(a.parts ?? null) === JSON.stringify(b.parts ?? null);
+}
+
+/**
+ * Focus recovery asks for the newest page, while the chat may already contain
+ * older pages loaded for a navigation jump. Keep that local window when the
+ * server page is its tail, and append only genuinely new messages when the
+ * tail advanced while the browser was away.
+ */
+function mergeRefreshedHistory(
+  localHistory: Message[],
+  serverHistory: Message[],
+): Message[] | null {
+  if (isServerHistoryPrefix(localHistory, serverHistory)) return localHistory;
+  if (serverHistory.length === 0) return localHistory;
+
+  const maxOverlap = Math.min(localHistory.length, serverHistory.length);
+  for (let overlap = maxOverlap; overlap > 0; overlap -= 1) {
+    const localStart = localHistory.length - overlap;
+    if (serverHistory.every((message, index) => sameMessage(localHistory[localStart + index], message))) {
+      return overlap === serverHistory.length
+        ? localHistory
+        : [...localHistory, ...serverHistory.slice(overlap)];
+    }
+  }
+  return null;
 }
 
 export const useSessionStore = create<SessionStore>((set, get) => ({
@@ -384,7 +416,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
         current._historyRefreshSeq[sid] !== requestSeq
       ) return;
       const serverHistory = data.history || [];
-      const keepLocal = isServerHistoryPrefix(current.currentMessages, serverHistory);
+      const mergedHistory = mergeRefreshedHistory(current.currentMessages, serverHistory);
       const lastServerMsg = serverHistory[serverHistory.length - 1];
       set((s) => ({
         sessions: s.sessions.map((session) => session.id === sid
@@ -396,9 +428,9 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
               lastMessage: lastServerMsg ? String(lastServerMsg.content).slice(0, 200) : '',
             }
           : session),
-        currentMessages: keepLocal ? s.currentMessages : serverHistory,
+        currentMessages: mergedHistory ?? serverHistory,
         hasMoreMessages: data.hasMore,
-        historyLoadEnd: data.start,
+        historyLoadEnd: mergedHistory ? s.historyLoadEnd : data.start,
         initialLoading: false,
       }));
     } catch {
@@ -406,7 +438,33 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
     }
   },
 
-  loadOlderMessages: async () => {
+  ensureMessageLoaded: async (fromEnd: number, total: number) => {
+    const absoluteIndex = total - 1 - fromEnd;
+    if (absoluteIndex < 0) return null;
+    let previousEnd = Number.POSITIVE_INFINITY;
+    for (let attempt = 0; attempt < 400; attempt += 1) {
+      const state = get();
+      if (!state.currentSessionId) return null;
+      if (state.historyLoadEnd <= absoluteIndex || !state.hasMoreMessages) break;
+      if (state.historyLoading) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        continue;
+      }
+      if (state.historyLoadEnd >= previousEnd) break;
+      previousEnd = state.historyLoadEnd;
+      // A navigation jump knows the absolute span it still needs. Fetch that
+      // span in one bounded request instead of replaying 50-message pages;
+      // normal scroll pagination keeps its 50-message default below.
+      const needed = state.historyLoadEnd - absoluteIndex;
+      await state.loadOlderMessages(Math.min(Math.max(needed, 50), 1000));
+    }
+    const state = get();
+    if (!state.currentSessionId || state.historyLoadEnd > absoluteIndex) return null;
+    const localIndex = absoluteIndex - state.historyLoadEnd;
+    return state.currentMessages[localIndex] ?? null;
+  },
+
+  loadOlderMessages: async (limit = 50) => {
     const { currentSessionId, historyLoading, historyLoadEnd } = get();
     if (
       historyLoading ||
@@ -422,7 +480,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       const data: ApiSessionHistoryResponse = await fetchSessionHistory(
         sid,
         historyLoadEnd,
-        50,
+        limit,
       );
       if (get().currentSessionId !== sid) return;
 

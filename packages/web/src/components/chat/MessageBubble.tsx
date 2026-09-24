@@ -3,6 +3,7 @@ import { MarkdownRenderer } from './MarkdownRenderer';
 import { ThinkingBlock } from './ThinkingBlock';
 import { ToolGroup } from './ToolGroup';
 import type { ToolGroupDisplayItem } from '@/utils/messageIdentity';
+import { getQuickJumpKind } from './messageFilter';
 
 export type GroupedItem = Message | ToolGroupDisplayItem;
 type PrevRole = Message['role'] | 'tool' | null;
@@ -68,6 +69,10 @@ function MessageTimestamp({ ts }: { ts?: string }) {
 export function MessageBubble({ message, prevRole = null }: MessageBubbleProps) {
   const role = message.role;
   const mt = marginTopClass(role, prevRole);
+  const isWorkerReport = getQuickJumpKind(message) === 'worker';
+  const workerReportLabel = isWorkerReport ? (
+    <span className="worker-report-label" aria-label="Worker report">Worker report</span>
+  ) : null;
 
   // Thinking blocks get their own component
   if (role === 'thinking') {
@@ -94,12 +99,13 @@ export function MessageBubble({ message, prevRole = null }: MessageBubbleProps) 
     );
   }
 
-  // Retained TUI-style view: full-width green user box (3px green left bar +
-  // green top/bottom separator + ">" prefix), styled via .msg.user CSS.
+  // TUI-style message rows use flex alignment so the virtualized row can keep
+  // its full width without changing the measured wrapper's layout.
   if (role === 'user') {
     return (
-      <div className={`${mt} px-3 sm:px-6 lg:px-8`}>
-        <div className="msg user w-full text-sm">
+      <div className={`message-row message-row-user ${isWorkerReport ? 'message-row-worker-report' : ''} ${mt} px-3 sm:px-6 lg:px-8`}>
+        {workerReportLabel}
+        <div className="msg user text-sm">
           <MarkdownRenderer
             content={message.content}
             attachmentIds={message.parts?.flatMap((part) => part.type === 'attachment' ? [part.attachmentId] : [])}
@@ -113,7 +119,8 @@ export function MessageBubble({ message, prevRole = null }: MessageBubbleProps) 
 
   // Assistant messages — no bubble, left-aligned, full-width markdown flow
   return (
-    <div className={`${mt} px-3 sm:px-6 lg:px-8`}>
+    <div className={`message-row message-row-assistant ${isWorkerReport ? 'message-row-worker-report' : ''} ${mt} px-3 sm:px-6 lg:px-8`}>
+      {workerReportLabel}
       <div className="msg assistant text-sm leading-relaxed">
         <MarkdownRenderer
           content={message.content}

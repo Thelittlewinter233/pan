@@ -1,6 +1,8 @@
 import { useWebSocket } from '@/hooks/useWebSocket';
 import { ChatLayout } from '@/components/layout/ChatLayout';
-import { ChatMessages } from '@/components/chat/ChatMessages';
+import { ChatMessages, type ChatMessagesHandle } from '@/components/chat/ChatMessages';
+import { MessageNavigationRail } from '@/components/chat/MessageNavigationRail';
+import { useRef } from 'react';
 import { InputRow } from '@/components/chat/InputRow';
 import { ApprovalBanner } from '@/components/chat/ApprovalBanner';
 import { UserInputBanner } from '@/components/chat/UserInputBanner';
@@ -10,6 +12,7 @@ import { TerminalInteractionBanner } from '@/components/chat/TerminalInteraction
 export default function ChatView() {
   // Initialize WebSocket connection and event routing
   useWebSocket();
+  const chatRef = useRef<ChatMessagesHandle>(null);
 
   return (
     <ChatLayout>
@@ -18,7 +21,10 @@ export default function ChatView() {
         <UserInputBanner />
         <ElicitationBanner />
         <TerminalInteractionBanner />
-        <ChatMessages />
+        <div className="flex flex-1 min-h-0 min-w-0">
+          <ChatMessages ref={chatRef} />
+          <MessageNavigationRail chatRef={chatRef} />
+        </div>
         <InputRow />
       </div>
     </ChatLayout>
