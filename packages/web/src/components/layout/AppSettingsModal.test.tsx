@@ -12,7 +12,6 @@ const {
   fetchHealthMock,
   fetchMainExitStatusMock,
   exitMainServiceMock,
-  updateUiSettingsMock,
 } = vi.hoisted(() => ({
   fetchCodexModelsMock: vi.fn(),
   refreshCodexOfficialModelsMock: vi.fn(),
@@ -21,13 +20,11 @@ const {
   fetchHealthMock: vi.fn(),
   fetchMainExitStatusMock: vi.fn(),
   exitMainServiceMock: vi.fn(),
-  updateUiSettingsMock: vi.fn(),
 }));
 vi.mock('@/services/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/services/api')>();
   return {
     ...actual,
-    updateUiSettings: updateUiSettingsMock,
     fetchRemoteStatus: vi.fn().mockResolvedValue({
       available: false,
       enabled: false,
@@ -102,8 +99,6 @@ describe('AppSettingsModal', () => {
     fetchHealthMock.mockClear();
     fetchMainExitStatusMock.mockClear();
     exitMainServiceMock.mockClear();
-    updateUiSettingsMock.mockReset();
-    updateUiSettingsMock.mockResolvedValue({});
   });
 
   it('renders nothing when closed', () => {
@@ -115,84 +110,9 @@ describe('AppSettingsModal', () => {
     render(<AppSettingsModal open onClose={() => {}} />);
     const card = cardEl();
     expect(card.textContent).toContain('Default group by');
+    expect(card.querySelectorAll('[role="switch"]')).toHaveLength(3);
     expect(card.textContent).toContain('Reset to defaults');
-    fireEvent.click(document.getElementById('app-settings-tab-appearance')!);
-    expect(card.querySelectorAll('[role="switch"]')).toHaveLength(4);
     expect(card.textContent).toContain('Notification');
-  });
-
-  it('shows message visibility on the Appearance tab and keeps its settings and persistence', () => {
-    useAppSettingsStore.setState({
-      ...DEFAULT_SETTINGS,
-      showMetaAgent: false,
-      showTaskAgent: true,
-      showQQ: false,
-    });
-    render(<AppSettingsModal open onClose={() => {}} />);
-
-    const tabs = document.body.querySelectorAll<HTMLButtonElement>('[role="tab"]');
-    const generalTab = document.getElementById('app-settings-tab-general') as HTMLButtonElement;
-    const appearanceTab = document.getElementById(
-      'app-settings-tab-appearance',
-    ) as HTMLButtonElement;
-
-    expect(tabs).toHaveLength(4);
-    expect(appearanceTab.getAttribute('aria-selected')).toBe('false');
-    expect(cardEl().textContent).not.toContain('Message visibility');
-    expect(cardEl().textContent).not.toContain('Show meta-agent info');
-
-    fireEvent.keyDown(generalTab, { key: 'ArrowRight' });
-
-    expect(appearanceTab.getAttribute('aria-selected')).toBe('true');
-    expect(document.getElementById('app-settings-tabpanel')?.getAttribute('aria-labelledby')).toBe(
-      'app-settings-tab-appearance',
-    );
-    expect(cardEl().textContent).toContain('Message visibility');
-    expect(cardEl().textContent).toContain('Message grouping');
-    const metaSwitch = Array.from(
-      document.body.querySelectorAll<HTMLElement>('[role="switch"]'),
-    ).find((element) => element.textContent?.includes('Show meta-agent info'))!;
-    const taskSwitch = Array.from(
-      document.body.querySelectorAll<HTMLElement>('[role="switch"]'),
-    ).find((element) => element.textContent?.includes('Show task-agent info'))!;
-    const qqSwitch = Array.from(
-      document.body.querySelectorAll<HTMLElement>('[role="switch"]'),
-    ).find((element) => element.textContent?.includes('Show QQ messages'))!;
-    expect(metaSwitch.getAttribute('aria-checked')).toBe('false');
-    expect(taskSwitch.getAttribute('aria-checked')).toBe('true');
-    expect(qqSwitch.getAttribute('aria-checked')).toBe('false');
-
-    fireEvent.click(metaSwitch);
-    expect(useAppSettingsStore.getState().showMetaAgent).toBe(true);
-    expect(updateUiSettingsMock).toHaveBeenCalledWith({ showMetaAgent: true });
-
-    fireEvent.click(generalTab);
-    expect(cardEl().textContent).not.toContain('Message visibility');
-    fireEvent.click(appearanceTab);
-    expect(
-      Array.from(document.body.querySelectorAll<HTMLElement>('[role="switch"]')).find(
-        (element) => element.textContent?.includes('Show meta-agent info'),
-      )?.getAttribute('aria-checked'),
-    ).toBe('true');
-  });
-
-  it('toggles merged tool/thinking groups on the Appearance tab and persists the setting', () => {
-    render(<AppSettingsModal open onClose={() => {}} />);
-    fireEvent.click(document.getElementById('app-settings-tab-appearance')!);
-
-    const mergeSwitch = Array.from(
-      document.body.querySelectorAll<HTMLElement>('[role="switch"]'),
-    ).find((element) =>
-      element.textContent?.includes('Group consecutive tool and thinking blocks'),
-    )!;
-    expect(mergeSwitch.getAttribute('aria-checked')).toBe('false');
-    expect(mergeSwitch.textContent).toContain('disabled by default');
-
-    fireEvent.click(mergeSwitch);
-
-    expect(useAppSettingsStore.getState().mergeConsecutiveNonBodyBlocks).toBe(true);
-    expect(updateUiSettingsMock).toHaveBeenCalledWith({ mergeConsecutiveNonBodyBlocks: true });
-    expect(mergeSwitch.getAttribute('aria-checked')).toBe('true');
   });
 
   it('shows the Codex warning Toast option on the Notification tab', () => {
@@ -203,10 +123,8 @@ describe('AppSettingsModal', () => {
     fireEvent.click(notificationTab);
     expect(cardEl().textContent).toContain('Codex warnings via Toast');
     expect(cardEl().textContent).toContain('CBC warnings via Toast');
-    expect(cardEl().querySelectorAll('[role="switch"]')).toHaveLength(2);
-    const codexWarningSwitch = Array.from(cardEl().querySelectorAll<HTMLElement>('[role="switch"]'))
-      .find((element) => element.textContent?.includes('Codex warnings via Toast'))!;
-    fireEvent.click(codexWarningSwitch);
+    expect(cardEl().querySelectorAll('[role="switch"]')).toHaveLength(1);
+    fireEvent.click(cardEl().querySelector('[role="switch"]')!);
     expect(useAppSettingsStore.getState().notifications.codexWarningToast).toBe(false);
   });
 
@@ -225,25 +143,6 @@ describe('AppSettingsModal', () => {
     );
     await waitFor(() => expect(cardEl().textContent).toContain('after: gpt-5.1-codex, gpt-5-mini'));
     expect(refreshCodexOfficialModelsMock).toHaveBeenCalledTimes(1);
-  });
-
-  it('shows a readable Codex refresh error in the Adapter tab', async () => {
-    const message = 'HTTP 502: codex debug models failed: authentication required';
-    refreshCodexOfficialModelsMock.mockRejectedValueOnce(new Error(message));
-    render(<AppSettingsModal open onClose={() => {}} />);
-    fireEvent.click(
-      Array.from(document.body.querySelectorAll<HTMLButtonElement>('button')).find((button) =>
-        button.textContent?.includes('Adapter'),
-      )!,
-    );
-
-    await waitFor(() => expect(cardEl().textContent).toContain('替换为官方模型目录'));
-    fireEvent.click(
-      Array.from(document.body.querySelectorAll<HTMLButtonElement>('button')).find((button) =>
-        button.textContent?.includes('替换为官方模型目录'),
-      )!,
-    );
-    await waitFor(() => expect(cardEl().textContent).toContain(message));
   });
 
   it('toggles the Codex terminal input popup option and persists it', () => {
@@ -296,9 +195,8 @@ describe('AppSettingsModal', () => {
 
   it('toggles a setting through a switch and writes the store', () => {
     render(<AppSettingsModal open onClose={() => {}} />);
-    fireEvent.click(document.getElementById('app-settings-tab-appearance')!);
     const switches = Array.from(document.body.querySelectorAll<HTMLElement>('[role="switch"]'));
-    expect(switches).toHaveLength(4);
+    expect(switches).toHaveLength(3);
     // meta-agent is on by default; toggle it off.
     expect(switches[0]!.getAttribute('aria-checked')).toBe('true');
     fireEvent.click(switches[0]!);
@@ -320,7 +218,7 @@ describe('AppSettingsModal', () => {
       showMetaAgent: false,
       showTaskAgent: false,
       showQQ: false,
-      notifications: { codexWarningToast: false, confirmCrossWorkspaceManagement: true },
+      notifications: { codexWarningToast: false },
     });
     render(<AppSettingsModal open onClose={() => {}} />);
     const resetBtn = Array.from(document.body.querySelectorAll<HTMLElement>('button')).find((b) =>
@@ -333,7 +231,6 @@ describe('AppSettingsModal', () => {
     expect(s.showTaskAgent).toBe(true);
     expect(s.showQQ).toBe(true);
     expect(s.notifications.codexWarningToast).toBe(true);
-    expect(s.notifications.confirmCrossWorkspaceManagement).toBe(true);
   });
 
   it('requires confirmation and reports successful main-service recovery', async () => {

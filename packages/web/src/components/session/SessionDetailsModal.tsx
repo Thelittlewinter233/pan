@@ -1,36 +1,15 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { ChevronDown, ChevronUp, Copy } from 'lucide-react';
 import { Modal } from '@/components/ui/Modal';
-import { fetchCodexQuota, fetchSession, fetchSessionUsage } from '@/services/api';
+import { fetchSession, fetchSessionUsage } from '@/services/api';
 import { useUIStore } from '@/stores/uiStore';
 import type { Session, SessionUsageView } from '@/types';
 import { copyText } from '@/utils/clipboard';
 import { normalizeCodexQuotaProjection, type CodexQuotaWindow } from '@/utils/codexRateLimits';
-import { getSessionUsageCache, setSessionUsageCache } from './sessionUsageCache';
-import { FreshnessSkeleton, FreshnessStatus, type FreshnessState } from './FreshnessStatus';
 
 interface SessionDetailsModalProps {
   session: Session | null;
   onClose: () => void;
-}
-
-// Session Details is mounted across close/open transitions. Keep the last
-// successful projection by Session so a slow provider refresh cannot blank an
-// already-known Usage view on the next open. Every open still starts a fresh
-// request; this cache is a render fast path, not an offline truth source.
-function usageWithQuotaRefreshError(
-  usage: SessionUsageView,
-  message: string,
-): SessionUsageView {
-  if (!usage.codexQuota) return usage;
-  return {
-    ...usage,
-    codexQuota: {
-      ...usage.codexQuota,
-      stale: true,
-      refreshError: message,
-    },
-  };
 }
 
 function displayValue(value: string | null | undefined, empty = '暂无 / 未建立'): string {
@@ -102,125 +81,45 @@ export function SessionDetailsModal({ session, onClose }: SessionDetailsModalPro
   const [usageExpanded, setUsageExpanded] = useState(false);
   const [usage, setUsage] = useState<SessionUsageView | null>(null);
   const [usageLoading, setUsageLoading] = useState(false);
-  const [usageRefreshing, setUsageRefreshing] = useState(false);
-  const [quotaLoading, setQuotaLoading] = useState(false);
   const [usageError, setUsageError] = useState<string | null>(null);
   const [systemPromptExpanded, setSystemPromptExpanded] = useState(false);
   const [detailSession, setDetailSession] = useState<Session | null>(null);
-  const usageRequestId = useRef(0);
-  const detailRequestId = useRef(0);
-  const detailCache = useRef(new Map<string, Session>());
-  const [detailLoading, setDetailLoading] = useState(false);
-  const [detailRefreshing, setDetailRefreshing] = useState(false);
-  const [detailError, setDetailError] = useState<string | null>(null);
-  const [detailRetrySeq, setDetailRetrySeq] = useState(0);
-  const [usageRetrySeq, setUsageRetrySeq] = useState(0);
 
   useEffect(() => {
-    usageRequestId.current += 1;
-    const cached = sessionId ? getSessionUsageCache(sessionId) : undefined;
     setUsageExpanded(false);
-    setUsage(cached?.usage ?? null);
+    setUsage(null);
     setUsageLoading(false);
-    setUsageRefreshing(false);
-    setQuotaLoading(false);
     setUsageError(null);
     setSystemPromptExpanded(false);
-    setDetailSession(sessionId ? detailCache.current.get(sessionId) ?? null : null);
-    setDetailLoading(false);
-    setDetailRefreshing(false);
-    setDetailError(null);
+    setDetailSession(null);
   }, [sessionId]);
 
   useEffect(() => {
     if (!sessionId) return;
-    const requestId = ++detailRequestId.current;
-    const cached = detailCache.current.get(sessionId);
     let active = true;
-    setDetailLoading(!cached);
-    setDetailRefreshing(Boolean(cached));
-    setDetailError(null);
     fetchSession(sessionId)
       .then((full) => {
-        if (!active || detailRequestId.current !== requestId || full.id !== sessionId) return;
-        detailCache.current.set(sessionId, full);
-        setDetailSession(full);
-        setDetailLoading(false);
-        setDetailRefreshing(false);
+        if (active) setDetailSession(full);
       })
-      .catch((error) => {
-        if (!active || detailRequestId.current !== requestId) return;
-        setDetailLoading(false);
-        setDetailRefreshing(false);
-        setDetailError(error instanceof Error ? error.message : 'Session details unavailable');
-      });
-    return () => {
-      active = false;
-    };
-  }, [sessionId, detailRetrySeq]);
-
-  useEffect(() => {
-    if (!usageExpanded || !sessionId) return;
-    const requestId = ++usageRequestId.current;
-    const cached = getSessionUsageCache(sessionId);
-    let active = true;
-    const isCurrent = () => active && usageRequestId.current === requestId;
-    setUsageLoading(!cached);
-    setUsageRefreshing(Boolean(cached));
-    setQuotaLoading(false);
-    setUsageError(null);
-
-    fetchSessionUsage(sessionId)
-      .then((result) => {
-        if (!isCurrent() || result.sessionId !== sessionId) return;
-        // Do not discard a last-known quota if a cache-only backend read is
-        // temporarily unavailable while the independent refresh is running.
-        const merged = result.codexQuota || !cached?.usage.codexQuota
-          ? result
-          : { ...result, codexQuota: cached.usage.codexQuota };
-        setSessionUsageCache(sessionId, merged);
-        setUsage(merged);
-        setUsageLoading(false);
-        setUsageRefreshing(false);
-
-        if (result.adapter !== 'codex') return;
-        setQuotaLoading(true);
-        fetchCodexQuota(sessionId)
-          .then((quota) => {
-            if (!isCurrent()) return;
-            setUsage((current) => {
-              if (!current || current.sessionId !== sessionId) return current;
-              const refreshed = { ...current, codexQuota: quota };
-              setSessionUsageCache(sessionId, refreshed);
-              return refreshed;
-            });
-          })
-          .catch((error) => {
-            if (!isCurrent()) return;
-            const message = error instanceof Error ? error.message : 'Quota 刷新失败';
-            setUsage((current) => {
-              if (!current || current.sessionId !== sessionId) return current;
-              const stale = usageWithQuotaRefreshError(current, message);
-              setSessionUsageCache(sessionId, stale);
-              return stale;
-            });
-            setUsageError(`Quota 刷新失败：${message}`);
-          })
-          .finally(() => {
-            if (isCurrent()) setQuotaLoading(false);
-          });
-      })
-      .catch((error) => {
-        if (!isCurrent()) return;
-        setUsageError(error instanceof Error ? error.message : 'Usage 加载失败');
-        setUsageLoading(false);
-        setUsageRefreshing(false);
-      })
-      .finally(() => {
-        if (isCurrent()) setUsageLoading(false);
+      .catch(() => {
+        // The summary session remains the fallback when the detail request
+        // fails, so opening Details is still useful during a transient error.
       });
     return () => { active = false; };
-  }, [sessionId, usageExpanded, usageRetrySeq]);
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (!usageExpanded || !sessionId || usage) return;
+    let active = true;
+    setUsageLoading(true);
+    fetchSessionUsage(sessionId)
+      .then((result) => { if (active) setUsage(result); })
+      .catch((error) => {
+        if (active) setUsageError(error instanceof Error ? error.message : 'Usage 加载失败');
+      })
+      .finally(() => { if (active) setUsageLoading(false); });
+    return () => { active = false; };
+  }, [sessionId, usageExpanded, usage]);
 
   if (!session) return null;
 
@@ -229,36 +128,6 @@ export function SessionDetailsModal({ session, onClose }: SessionDetailsModalPro
   // the complete session fetched for this open modal once it arrives.
   const displayedSession = detailSession ?? session;
   const usageView = usage ?? fallbackUsage(displayedSession);
-  const quotaRefreshError = usageView.codexQuota?.refreshError;
-  const detailFreshness: FreshnessState = detailError
-    ? 'error'
-    : detailLoading
-      ? 'loading'
-      : detailRefreshing
-        ? 'refreshing'
-        : detailSession
-          ? 'updated'
-          : 'cached';
-  const detailSource = detailSession ? 'session metadata' : 'session summary cache';
-  const usageCache = sessionId ? getSessionUsageCache(sessionId) : undefined;
-  const usageFreshness: FreshnessState = usageError
-    ? 'error'
-    : usageLoading
-      ? usageRefreshing
-        ? 'refreshing'
-        : 'loading'
-      : usage
-        ? 'updated'
-        : 'unknown';
-  const usageSource = usage
-    ? typeof usage.source === 'string'
-      ? usage.source
-      : (usage.source as { kind?: string } | null | undefined)?.kind || 'persisted usage projection'
-    : usageCache
-      ? 'session usage cache'
-      : 'unknown';
-  const usageUpdatedAt = usage?.updatedAt ?? usageCache?.cachedAt ?? null;
-  const retryUsage = () => setUsageRetrySeq((value) => value + 1);
   const copyValue = (label: string, value: string | undefined) => {
     if (!value) {
       showToast(`${label} 暂无可复制内容`, 'error');
@@ -303,13 +172,6 @@ export function SessionDetailsModal({ session, onClose }: SessionDetailsModalPro
     // of a centered window (< md breakpoint only). Desktop keeps size="lg".
     <Modal open title="Session Details" onClose={onClose} size="lg" mobileFullscreen>
       <div className="space-y-3">
-        <FreshnessStatus
-          state={detailFreshness}
-          updatedAt={displayedSession.updatedAt}
-          source={detailSource}
-          error={detailError}
-          onRetry={detailError ? () => setDetailRetrySeq((value) => value + 1) : undefined}
-        />
         {rows.map((row) => {
           const copyable = true;
           return (
@@ -371,23 +233,13 @@ export function SessionDetailsModal({ session, onClose }: SessionDetailsModalPro
           >
             <span className="font-medium">Usage</span>
             <span className="flex items-center gap-1 text-xs text-text-tertiary">
-              {usageLoading ? '加载中…' : usageRefreshing || quotaLoading ? '更新中…' : usageExpanded ? '收起' : '展开'}
+              {usageLoading ? '加载中…' : usageExpanded ? '收起' : '展开'}
               {usageExpanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
             </span>
           </button>
           {usageExpanded && (
             <div id="session-usage-details" role="region" aria-label="Usage details" className="space-y-3 border-t border-border-default px-3 py-3">
-              <FreshnessStatus
-                state={usageFreshness}
-                updatedAt={usageUpdatedAt}
-                source={usageSource}
-                error={null}
-                onRetry={usageError || quotaRefreshError ? retryUsage : undefined}
-              />
-              {usageLoading && !usage && displayedSession.totalUsage == null && (
-                <FreshnessSkeleton label="Loading usage" />
-              )}
-              {usageError && !quotaRefreshError && <div className="text-xs text-text-tertiary">{usageError}，当前显示已有数据</div>}
+              {usageError && <div className="text-xs text-text-tertiary">{usageError}，当前显示已有数据</div>}
               {isCodex ? (
                 <div className="space-y-3" role="region" aria-label="Codex quota">
                   <div className="text-xs text-text-tertiary">
@@ -395,14 +247,7 @@ export function SessionDetailsModal({ session, onClose }: SessionDetailsModalPro
                       ? `Quota${usageView.codexQuota?.stale ? '（最近缓存，可能已过期）' : '（最近缓存）'}`
                       : 'Quota'}
                   </div>
-                  {quotaRefreshError && (
-                    <div className="text-xs text-text-tertiary">
-                      Quota 刷新失败：{quotaRefreshError}，当前显示缓存
-                    </div>
-                  )}
-                  {quotaLoading && !quotaIsCached ? (
-                    <div className="text-sm text-text-tertiary">Quota 加载中…</div>
-                  ) : quotaWindows.fiveHour || quotaWindows.weekly || quotaWindows.monthly ? (
+                  {quotaWindows.fiveHour || quotaWindows.weekly || quotaWindows.monthly ? (
                     <>
                       {quotaWindows.fiveHour && renderQuotaWindow('五小时额度', quotaWindows.fiveHour)}
                       {quotaWindows.weekly && renderQuotaWindow('周额度', quotaWindows.weekly)}

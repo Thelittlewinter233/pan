@@ -11,7 +11,6 @@ import { render, fireEvent, act, waitFor } from '@testing-library/react';
 import { SessionList } from './SessionList';
 import { useSessionStore } from '@/stores/sessionStore';
 import { useUIStore } from '@/stores/uiStore';
-import { useAppSettingsStore, DEFAULT_SETTINGS } from '@/stores/appSettingsStore';
 import type { Session } from '@/types';
 
 const apiMocks = vi.hoisted(() => ({
@@ -106,7 +105,6 @@ describe('SessionList drag → real backend APIs (no ?mock=1)', () => {
   ];
 
   beforeEach(() => {
-    useAppSettingsStore.setState({ ...DEFAULT_SETTINGS, loaded: true });
     localStorage.clear(); // no pan:mockDemo → real mode
     const sessions = seed();
     serverSessions = sessions.map((s) => ({ ...s }));
@@ -243,58 +241,6 @@ describe('SessionList drag → real backend APIs (no ?mock=1)', () => {
     await flushAsync();
 
     expect(useSessionStore.getState().sessions.find((s) => s.id === 'A')!.managedBy).toBe('B');
-  });
-
-  it('cancelling a cross-workspace reparent sends no relationship request', async () => {
-    useSessionStore.setState({ sessions: [
-      mk('A', 'Alpha', { workspaceIds: ['workspace-a'], updatedAt: new Date().toISOString() }),
-      mk('B', 'Bravo', { workspaceIds: ['workspace-b'], updatedAt: new Date().toISOString() }),
-      mk('C', 'Charlie', { workspaceIds: ['workspace-a'] }),
-      mk('D', 'Delta', { workspaceIds: ['workspace-b'] }),
-    ] });
-    const confirmation = new Promise<void>((resolve) => {
-      window.addEventListener('pan:confirm-workspace-manager-change', ((event: Event) => {
-        const detail = (event as CustomEvent<{ changeType: string; sessionName: string; subtreeCount: number; resolve: (accepted: boolean) => void }>).detail;
-        expect(detail.changeType).toBe('attach');
-        expect(detail.sessionName).toBe('Alpha');
-        expect(detail.subtreeCount).toBe(1);
-        detail.resolve(false);
-        resolve();
-      }) as EventListener, { once: true });
-    });
-    const { container } = render(<SessionList />);
-    const handle = container.querySelector('[data-testid="drag-handle"]')!;
-    fireEvent.pointerDown(handle, { button: 0, clientX: 10, clientY: 10 });
-    pointerMove(96);
-    pointerUp();
-
-    await confirmation;
-    await flushAsync();
-    expect(apiMocks.claim).not.toHaveBeenCalled();
-    expect(apiMocks.unclaim).not.toHaveBeenCalled();
-  });
-
-  it('reparents across workspaces without a prompt when confirmation is disabled', async () => {
-    useAppSettingsStore.setState({
-      notifications: { codexWarningToast: true, confirmCrossWorkspaceManagement: false },
-    });
-    useSessionStore.setState({ sessions: [
-      mk('A', 'Alpha', { workspaceIds: ['workspace-a'], updatedAt: new Date().toISOString() }),
-      mk('B', 'Bravo', { workspaceIds: ['workspace-b'], updatedAt: new Date().toISOString() }),
-      mk('C', 'Charlie', { workspaceIds: ['workspace-a'] }),
-      mk('D', 'Delta', { workspaceIds: ['workspace-b'] }),
-    ] });
-    const prompt = vi.fn();
-    window.addEventListener('pan:confirm-workspace-manager-change', prompt);
-    const { container } = render(<SessionList />);
-    const handle = container.querySelector('[data-testid="drag-handle"]')!;
-    fireEvent.pointerDown(handle, { button: 0, clientX: 10, clientY: 10 });
-    pointerMove(96);
-    pointerUp();
-
-    await waitFor(() => expect(apiMocks.claim).toHaveBeenCalledWith('B', 'A'));
-    window.removeEventListener('pan:confirm-workspace-manager-change', prompt);
-    expect(prompt).not.toHaveBeenCalled();
   });
 
   it('edge drop calls POST /api/sessions/order with the full new order and adopts custom sort', async () => {

@@ -1,11 +1,11 @@
-import { useRef, useCallback, useEffect, useMemo, useState } from 'react';
+import { forwardRef, useRef, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useState } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { useSessionStore } from '@/stores/sessionStore';
 import { useUIStore } from '@/stores/uiStore';
 import { useAppSettingsStore } from '@/stores/appSettingsStore';
 import { groupMessages, MessageDisplayItem, getItemRole } from './MessageBubble';
 import { filterVisibleMessages } from './messageFilter';
-import { getDisplayItemKey } from '@/utils/messageIdentity';
+import { getDisplayItemKey, getMessageIdentity } from '@/utils/messageIdentity';
 import { ArrowDown, Loader2 } from 'lucide-react';
 
 // Keep the follow zone small enough that scrolling up to read older content
@@ -13,17 +13,42 @@ import { ArrowDown, Loader2 } from 'lucide-react';
 // rounding near the end of the list.
 export const SCROLL_BOTTOM_THRESHOLD = 48;
 
-// Scroll events do not carry portable source attribution. Keep an explicit
-// user-input activity window instead: input starts it, subsequent scrolls
-// refresh it, and scrollend/timer expiry ends it. The window is long enough
-// for wheel/touch inertia to deliver scrolls over several animation frames,
-// but bounded so a stale gesture cannot swallow a later real gesture.
-const USER_SCROLL_QUIET_MS = 320;
-const USER_SCROLLEND_GRACE_MS = 240;
-const PROGRAMMATIC_SETTLE_FRAMES = 2;
-const PROGRAMMATIC_SETTLE_TIMEOUT_MS = 120;
+// ── Scroll memory across route round-trips ─────────────────────────────────
+// Leaving Chat (Editor / Tasks / Manage / any route) unmounts ChatView, so
+// coming back remounts ChatMessages with an unchanged sessionId. Every mount
+// effect ran again, and the "new session" path pushed whoever was reading an
+// older message back to the bottom. Remember one anchor row per session — the
+// row the user was actually looking at, expressed in virtual-content
+// coordinates — and restore it before the browser paints on the way back.
+interface ScrollSnapshot {
+  /** Guards the restore against a history that changed while away. */
+  fingerprint: string;
+  identity: string;
+  /** Row top relative to the scroll container's top (px). */
+  anchorOffset: number;
+  /** Row top inside the virtual content (px). */
+  contentOffset: number;
+}
 
-export function ChatMessages() {
+const scrollSnapshots = new Map<string, ScrollSnapshot>();
+/** sessionId → measured row height by virtual item key, for the next mount. */
+const measuredHeights = new Map<string, Map<string, number>>();
+let activeSessionId: string | null = null;
+
+function listFingerprint(items: DisplayItem[]): string {
+  if (items.length === 0) return 'empty';
+  const last = items.length - 1;
+  return `${items.length}:${getDisplayItemKey(items[0], 0)}:${getDisplayItemKey(items[last], last)}`;
+}
+
+type DisplayItem = ReturnType<typeof groupMessages>[number];
+
+export interface ChatMessagesHandle {
+  /** Scroll to a currently loaded message and briefly highlight its row. */
+  scrollToMessage: (message: import('@/types').Message, historyIndex?: number) => boolean;
+}
+
+export const ChatMessages = forwardRef<ChatMessagesHandle>(function ChatMessages(_, ref) {
   const parentRef = useRef<HTMLDivElement>(null);
   const currentMessages = useSessionStore((s) => s.currentMessages);
   const hasMoreMessages = useSessionStore((s) => s.hasMoreMessages);
@@ -37,7 +62,6 @@ export function ChatMessages() {
   const showMetaAgent = useAppSettingsStore((s) => s.showMetaAgent);
   const showTaskAgent = useAppSettingsStore((s) => s.showTaskAgent);
   const showQQ = useAppSettingsStore((s) => s.showQQ);
-  const mergeConsecutiveNonBodyBlocks = useAppSettingsStore((s) => s.mergeConsecutiveNonBodyBlocks);
 
   // Frontend-only display filter — currentMessages in the store is never
   // mutated; hidden messages reappear when their toggle is switched back on.
@@ -51,25 +75,49 @@ export function ChatMessages() {
     [currentMessages, showMetaAgent, showTaskAgent, showQQ],
   );
 
-  // Preserve the existing separate tool/thinking rows unless the user opts in
-  // to one parent disclosure for each adjacent non-body run.
-  const grouped = useMemo(
-    () => groupMessages(visibleMessages, mergeConsecutiveNonBodyBlocks),
-    [visibleMessages, mergeConsecutiveNonBodyBlocks],
-  );
+  // Group messages: consecutive tool messages become ToolGroup
+  const grouped = groupMessages(visibleMessages);
+
+  const [highlightedTarget, setHighlightedTarget] = useState<{ identity: string; historyIndex?: number } | null>(null);
+
+  // Latest render value the module-level helper below needs. It must hold a
+  // stable identity because the scroll effects depend on that helper.
+  const groupedRef = useRef(grouped);
+  groupedRef.current = grouped;
+
+  // Route round-trip: adopt the position this session was left at, but only for
+  // a remount of the *same* session whose message list did not change.
+  const restoreRef = useRef<ScrollSnapshot | null | undefined>(undefined);
+  const restoreSessionRef = useRef<string | null | undefined>(undefined);
+  if (restoreRef.current === undefined) {
+    restoreSessionRef.current = currentSessionId;
+    // A session can keep loading/prepending while it is off-screen (for
+    // example, the user leaves immediately after a navigation jump). In that
+    // case the list fingerprint is expected to change; the stable message
+    // identity is the useful part of the snapshot.
+    restoreRef.current = currentSessionId
+      ? scrollSnapshots.get(currentSessionId) ?? null
+      : null;
+    // Consume once: the next mount/visit of this session is a fresh restore.
+    if (currentSessionId) scrollSnapshots.delete(currentSessionId);
+  }
+  const isRestoringRef = useRef(restoreRef.current !== null);
 
   const virtualizer = useVirtualizer({
     count: grouped.length,
     getScrollElement: () => parentRef.current,
-    estimateSize: () => 100,
+    // Rows measured during the previous visit. Without them the remounted
+    // virtualizer starts from the flat estimate, whose total size differs from
+    // the one the remembered content offset was taken against.
+    estimateSize: (index) =>
+      measuredHeights
+        .get(currentSessionId ?? '')
+        ?.get(getDisplayItemKey(grouped[index], index)) ?? 100,
     overscan: 5,
     // The default key is the array index. Streaming replaces message objects,
     // prepending history shifts indexes, and tool grouping changes row shapes;
     // an index key lets Virtualizer reuse another row's height/DOM node.
-    // Local expansion state and measured row heights are Session-scoped even
-    // when two Sessions happen to expose the same native/message identity.
-    getItemKey: (index) =>
-      `${currentSessionId ?? 'no-session'}:${getDisplayItemKey(grouped[index], index)}`,
+    getItemKey: (index) => getDisplayItemKey(grouped[index], index),
   });
   // Virtualized content height. Changes when messages are added/removed or
   // when items get measured after layout. Re-scrolling on this (while the user
@@ -77,46 +125,119 @@ export function ChatMessages() {
   // the virtualizer's measurements settle, instead of the initial estimate.
   const totalSize = virtualizer.getTotalSize();
   const virtualItems = virtualizer.getVirtualItems();
+  const virtualizerRef = useRef(virtualizer);
+  virtualizerRef.current = virtualizer;
+
+  // Remember where the reader is, for the route round-trip above. Rows are
+  // virtualized, so keep the visible anchor row's offset inside the virtual
+  // content: it is independent of the virtualization window and survives a
+  // re-measurement of everything above it. No layout (jsdom) yields no anchor —
+  // and therefore no snapshot — which keeps this inert under unit tests.
+  const rememberScrollPosition = useCallback((el: HTMLElement) => {
+    // Use the render's session id rather than a module-level value updated by
+    // a passive effect. Route unmounts can run before that effect has painted,
+    // which otherwise loses the only round-trip snapshot.
+    const sid = currentSessionId;
+    if (!sid) return;
+    const viewport = el.getBoundingClientRect();
+    const anchor = [...el.querySelectorAll<HTMLElement>('[data-message-identity]')].find((node) => {
+      const rect = node.getBoundingClientRect();
+      return rect.bottom > viewport.top && rect.top < viewport.bottom;
+    });
+    const identity = anchor?.dataset.messageIdentity;
+    const debugSnapshot = (globalThis as { __panSnapshotDebug?: unknown[] }).__panSnapshotDebug ??= [];
+    debugSnapshot.push({ sid, st: el.scrollTop, sh: el.scrollHeight, nodes: el.querySelectorAll('[data-message-identity]').length, identity: identity ?? null });
+    if (!anchor || !identity) return;
+    const rect = anchor.getBoundingClientRect();
+    const snap = {
+      fingerprint: listFingerprint(groupedRef.current),
+      identity,
+      anchorOffset: rect.top - viewport.top,
+      contentOffset: rect.top - viewport.top + el.scrollTop,
+    };
+    scrollSnapshots.set(sid, snap);
+  }, [currentSessionId]);
+
+  const scrollToMessage = useCallback((message: import('@/types').Message, historyIndex?: number): boolean => {
+    const identity = getMessageIdentity(message);
+    const itemIndex = grouped.findIndex((item) => {
+      if ('type' in item && item.type === 'tool_group') return false;
+      return getMessageIdentity(item as import('@/types').Message) === identity;
+    });
+    if (itemIndex < 0) return false;
+    virtualizer.scrollToIndex(itemIndex, { align: 'center', behavior: 'auto' });
+    setHighlightedTarget({ identity, historyIndex });
+    // A jump moves the viewport without touching the scroll listener (and may
+    // not even change totalSize), so refresh the round-trip anchor once the
+    // targeted row has landed. Otherwise leaving right after a jump would
+    // remember the position from before it.
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        const el = parentRef.current;
+        if (el) rememberScrollPosition(el);
+      });
+    });
+    return true;
+  }, [grouped, virtualizer, rememberScrollPosition]);
+
+  useImperativeHandle(ref, () => ({ scrollToMessage }), [scrollToMessage]);
+
+  useEffect(() => {
+    if (!highlightedTarget) return;
+    const timer = window.setTimeout(() => setHighlightedTarget(null), 1400);
+    return () => window.clearTimeout(timer);
+  }, [highlightedTarget]);
 
   // Whether the user wants the view to follow the bottom. This is deliberately
   // state held outside React rendering: a streaming delta can arrive between
   // renders, and a render must not infer "follow" from a transient scrollTop.
   // Starts true so the first message load of a session scrolls down; a user
   // scroll away from the follow zone opts out until they return to it (or
-  // explicitly press the scroll-to-bottom button).
-  const shouldFollowBottomRef = useRef(true);
+  // explicitly press the scroll-to-bottom button). A restore must NOT start in
+  // follow mode: that was what dragged a reader back to the bottom.
+  const shouldFollowBottomRef = useRef(!isRestoringRef.current);
   // Scroll events happen outside React rendering. Keep a renderable copy so
   // the button appears/disappears immediately when the user crosses the
   // follow boundary.
   const [isNearBottom, setIsNearBottom] = useState(true);
   // A newly selected session starts with an empty/unlaid-out container. Allow
   // its first history render to establish the initial bottom position even
-  // though scrollTop is 0 before the content is mounted.
-  const initialScrollPendingRef = useRef(true);
+  // though scrollTop is 0 before the content is mounted. On a restore the
+  // position is already known, so nothing may override it.
+  const initialScrollPendingRef = useRef(!isRestoringRef.current);
+
+  // Unlike a route round-trip, selecting another session reuses this mounted
+  // component. Pick up that session's saved anchor during render so the
+  // layout restore runs before the auto-scroll effect can pin it to the end.
+  if (restoreSessionRef.current !== currentSessionId) {
+    restoreSessionRef.current = currentSessionId;
+    restoreRef.current = currentSessionId
+      ? scrollSnapshots.get(currentSessionId) ?? null
+      : null;
+    if (currentSessionId) scrollSnapshots.delete(currentSessionId);
+    isRestoringRef.current = restoreRef.current !== null;
+    shouldFollowBottomRef.current = !isRestoringRef.current;
+    initialScrollPendingRef.current = !isRestoringRef.current;
+  }
+
   const lastScrollMetricsRef = useRef<{
     height: number;
     top: number;
     clientHeight: number;
   } | null>(null);
-  const paginationAnchorRef = useRef<{ top: number; height: number } | null>(null);
-  // A browser may emit a scroll event when a measured row changes the scroll
-  // range, even though the user did not scroll. Keep that event separate from
-  // the user-input state machine below. The generation and bounded settle
-  // window suppress the next layout/virtualizer correction without using a
-  // browser trust flag as a source-of-intent heuristic.
-  const layoutChangePendingRef = useRef(false);
-  const layoutChangeRafRef = useRef<number | null>(null);
-  const programmaticGenerationRef = useRef(0);
-  const programmaticSuppressionRef = useRef<{
-    generation: number;
-    raf: number | null;
-    timer: ReturnType<typeof setTimeout> | null;
+  const paginationAnchorRef = useRef<{
+    top: number;
+    scrollTop: number;
+    height: number;
+    element: HTMLElement | null;
+    measurable: boolean;
+    // Route restores must follow the logical row, not a DOM node that the
+    // virtualizer may recycle after history is prepended.
+    identity?: string;
   } | null>(null);
-  const userScrollStateRef = useRef<{
-    active: boolean;
-    generation: number;
-    timer: ReturnType<typeof setTimeout> | null;
-  }>({ active: false, generation: 0, timer: null });
+  const paginationRestoreRafRef = useRef<number | null>(null);
+  const historyLoadingRef = useRef(historyLoading);
+  historyLoadingRef.current = historyLoading;
 
   // Clamp only negative browser rounding artefacts to zero, then use the
   // small follow zone below instead of requiring exact geometry equality.
@@ -138,109 +259,108 @@ export function ChatMessages() {
       top: el.scrollTop,
       clientHeight: el.clientHeight,
     };
-  }, []);
-
-  const clearProgrammaticSuppression = useCallback(() => {
-    const suppression = programmaticSuppressionRef.current;
-    if (!suppression) return;
-    if (suppression.raf !== null) cancelAnimationFrame(suppression.raf);
-    if (suppression.timer !== null) clearTimeout(suppression.timer);
-    programmaticSuppressionRef.current = null;
-  }, []);
-
-  const markProgrammaticChange = useCallback(() => {
-    clearProgrammaticSuppression();
-    const generation = ++programmaticGenerationRef.current;
-    const suppression = {
-      generation,
-      raf: null as number | null,
-      timer: null as ReturnType<typeof setTimeout> | null,
-    };
-    programmaticSuppressionRef.current = suppression;
-
-    let frames = 0;
-    const settle = () => {
-      if (programmaticSuppressionRef.current?.generation !== generation) return;
-      if (++frames >= PROGRAMMATIC_SETTLE_FRAMES) {
-        clearProgrammaticSuppression();
-        return;
-      }
-      suppression.raf = requestAnimationFrame(settle);
-    };
-    suppression.raf = requestAnimationFrame(settle);
-    suppression.timer = setTimeout(() => {
-      if (programmaticSuppressionRef.current?.generation === generation) {
-        clearProgrammaticSuppression();
-      }
-    }, PROGRAMMATIC_SETTLE_TIMEOUT_MS);
-  }, [clearProgrammaticSuppression]);
-
-  const clearUserScrollActivity = useCallback(() => {
-    const state = userScrollStateRef.current;
-    if (state.timer !== null) clearTimeout(state.timer);
-    state.timer = null;
-    state.active = false;
-  }, []);
-
-  const scheduleUserScrollExpiry = useCallback((delay = USER_SCROLL_QUIET_MS) => {
-    const state = userScrollStateRef.current;
-    if (state.timer !== null) clearTimeout(state.timer);
-    const generation = state.generation;
-    state.timer = setTimeout(() => {
-      const current = userScrollStateRef.current;
-      if (current.generation === generation) {
-        current.timer = null;
-        current.active = false;
-      }
-    }, delay);
-  }, []);
-
-  const markUserScrollInput = useCallback(() => {
-    // A new explicit input always wins over an older layout suppression. This
-    // prevents a bounded correction window from swallowing the next gesture.
-    clearProgrammaticSuppression();
-    const state = userScrollStateRef.current;
-    state.generation += 1;
-    state.active = true;
-    scheduleUserScrollExpiry();
-  }, [clearProgrammaticSuppression, scheduleUserScrollExpiry]);
-
-  const refreshUserScrollActivity = useCallback(() => {
-    if (!userScrollStateRef.current.active) return false;
-    scheduleUserScrollExpiry();
-    return true;
-  }, [scheduleUserScrollExpiry]);
+    rememberScrollPosition(el);
+  }, [rememberScrollPosition]);
 
   const scrollToBottom = useCallback(() => {
     const el = parentRef.current;
     if (el) {
       shouldFollowBottomRef.current = true;
-      markProgrammaticChange();
       el.scrollTop = el.scrollHeight;
       setIsNearBottom(true);
       captureScrollMetrics();
     }
-  }, [captureScrollMetrics, markProgrammaticChange]);
+  }, [captureScrollMetrics]);
 
-  const recoverToBottom = useCallback(() => {
-    // Explicit recovery ends the previous input sequence. Automatic pinning
-    // keeps the sequence alive so a delayed inertia scroll cannot be lost to
-    // a same-frame session/layout rAF.
-    clearUserScrollActivity();
-    scrollToBottom();
-  }, [clearUserScrollActivity, scrollToBottom]);
+  const restorePaginationAnchor = useCallback(() => {
+    const el = parentRef.current;
+    const anchor = paginationAnchorRef.current;
+    if (!el || !anchor) return;
 
-  const markLayoutChange = useCallback(() => {
-    layoutChangePendingRef.current = true;
-    markProgrammaticChange();
-    if (layoutChangeRafRef.current !== null) {
-      cancelAnimationFrame(layoutChangeRafRef.current);
+    // A virtualized row can stay connected while React has recycled it for a
+    // different message. Resolve route anchors by stable message identity on
+    // every correction instead of trusting the old DOM reference.
+    if (anchor.identity) {
+      const current = [...el.querySelectorAll<HTMLElement>('[data-message-identity]')].find(
+        (node) => node.dataset.messageIdentity === anchor.identity,
+      );
+      if (current) {
+        anchor.element = current;
+        anchor.measurable = current.getBoundingClientRect().height > 0;
+      } else {
+        anchor.element = null;
+        anchor.measurable = false;
+        const anchorIndex = groupedRef.current.findIndex((item) => {
+          if ('type' in item && item.type === 'tool_group') return false;
+          return getMessageIdentity(item as import('@/types').Message) === anchor.identity;
+        });
+        if (anchorIndex >= 0) {
+          virtualizerRef.current.scrollToIndex(anchorIndex, { align: 'center', behavior: 'auto' });
+          return;
+        }
+      }
     }
-    layoutChangeRafRef.current = requestAnimationFrame(() => {
-      layoutChangeRafRef.current = null;
-      layoutChangePendingRef.current = false;
-    });
-  }, [markProgrammaticChange]);
+
+    if (anchor.element?.isConnected && anchor.measurable) {
+      // The identity check above makes this safe even when the virtualizer
+      // reuses a connected element for another index.
+      const delta = anchor.element.getBoundingClientRect().top - anchor.top;
+      if (Math.abs(delta) > 0.5) {
+        el.scrollTop += delta;
+      }
+      return;
+    }
+
+    // jsdom and a detached non-route virtual row have no usable geometry. Keep
+    // the existing height-delta fallback for that case and for the test seam.
+    if (!anchor.identity) el.scrollTop = anchor.scrollTop + el.scrollHeight - anchor.height;
+  }, []);
+
+
+  const schedulePaginationRestore = useCallback(() => {
+    if (paginationRestoreRafRef.current !== null) return;
+
+    let stableFrames = 0;
+    let frameCount = 0;
+    let previousSignature = '';
+    const tick = () => {
+      paginationRestoreRafRef.current = null;
+      const el = parentRef.current;
+      const anchor = paginationAnchorRef.current;
+      if (!el || !anchor) return;
+
+      restorePaginationAnchor();
+      const anchorTop = anchor.element?.isConnected
+        ? anchor.element.getBoundingClientRect().top
+        : null;
+      const signature = `${el.scrollHeight}:${el.scrollTop}:${anchorTop}`;
+      stableFrames = signature === previousSignature ? stableFrames + 1 : 0;
+      previousSignature = signature;
+      frameCount += 1;
+
+      // A route can be re-entered while the jump is still fetching several
+      // pages. Keep the same logical anchor pinned for the whole in-flight
+      // load; otherwise the short settle window can end between pages and
+      // each prepend visibly moves the reader before the next render. A few
+      // quiet frames are retained after a request completes because
+      // ensureMessageLoaded starts the next page immediately after the prior
+      // response, while React may render the intermediate state first.
+      const routeRestore = Boolean(restoreRef.current);
+      const quietLimit = routeRestore ? 12 : 2;
+      if (!historyLoadingRef.current && stableFrames >= quietLimit) {
+        paginationAnchorRef.current = null;
+        if (routeRestore) restoreRef.current = null;
+        return;
+      }
+      if (!routeRestore && frameCount >= 30) {
+        paginationAnchorRef.current = null;
+        return;
+      }
+      paginationRestoreRafRef.current = requestAnimationFrame(tick);
+    };
+
+    paginationRestoreRafRef.current = requestAnimationFrame(tick);
+  }, [historyLoading, restorePaginationAnchor]);
 
   // Auto-scroll on new messages / measurement-driven size changes — but only
   // when the user hasn't scrolled away from the bottom. This is ALSO what
@@ -252,9 +372,7 @@ export function ChatMessages() {
   // render.
   useEffect(() => {
     const el = parentRef.current;
-    markLayoutChange();
     const previous = lastScrollMetricsRef.current;
-    const layoutDrivenUpdate = layoutChangePendingRef.current;
     const grewWhilePinned = Boolean(
       el &&
         previous &&
@@ -267,7 +385,7 @@ export function ChatMessages() {
     let followedBottom = false;
     if (
       shouldFollowBottomRef.current &&
-      (initialScrollPendingRef.current || nearBottom || grewWhilePinned || layoutDrivenUpdate)
+      (initialScrollPendingRef.current || nearBottom || grewWhilePinned)
     ) {
       initialScrollPendingRef.current = false;
       scrollToBottom();
@@ -275,7 +393,122 @@ export function ChatMessages() {
     }
     setIsNearBottom(followedBottom || nearBottom || grewWhilePinned);
     captureScrollMetrics();
-  }, [currentMessages, totalSize, captureScrollMetrics, isNearBottomPosition, markLayoutChange, scrollToBottom]);
+  }, [currentMessages, totalSize, captureScrollMetrics, isNearBottomPosition, scrollToBottom]);
+
+  // Coming back from another route: put the remembered row back under the
+  // reader's eyes before the first paint, then hand the anchor to the shared
+  // restore loop so the virtualizer's re-measurement cannot move it either.
+  const restoreAttemptsRef = useRef(0);
+  useLayoutEffect(() => {
+    const memory = restoreRef.current;
+    const el = parentRef.current;
+    const debugRestore = (globalThis as { __panRestoreDebug?: unknown[] }).__panRestoreDebug ??= [];
+    debugRestore.push({ phase: 'layout', memory: memory?.identity ?? null, grouped: grouped.length, st: el?.scrollTop ?? null, sh: el?.scrollHeight ?? null, loading: historyLoading, more: hasMoreMessages });
+    if (!memory || !el || grouped.length === 0) return;
+    if (restoreAttemptsRef.current > 8) {
+      restoreRef.current = null;
+      return;
+    }
+    restoreAttemptsRef.current += 1;
+    const fingerprintMatches = memory.fingerprint === listFingerprint(grouped);
+
+    const desiredTop = el.getBoundingClientRect().top + memory.anchorOffset;
+    const anchorRow = [...el.querySelectorAll<HTMLElement>('[data-message-identity]')].find(
+      (node) => node.dataset.messageIdentity === memory.identity,
+    ) ?? null;
+    debugRestore.push({ phase: 'anchor', memory: memory.identity, found: Boolean(anchorRow), index: grouped.findIndex((item) => {
+      if ('type' in item && item.type === 'tool_group') return false;
+      return getMessageIdentity(item as import('@/types').Message) === memory.identity;
+    }), st: el.scrollTop, sh: el.scrollHeight });
+    if (!anchorRow) {
+      // The virtualizer has not rendered that window yet. If history changed
+      // while away, the old content offset is no longer meaningful; use the
+      // stable message identity to bring the row into the render window.
+      const anchorIndex = fingerprintMatches
+        ? -1
+        : grouped.findIndex((item) => {
+            if ('type' in item && item.type === 'tool_group') return false;
+            return getMessageIdentity(item as import('@/types').Message) === memory.identity;
+          });
+      if (anchorIndex >= 0) {
+        virtualizer.scrollToIndex(anchorIndex, { align: 'center', behavior: 'auto' });
+        paginationAnchorRef.current = {
+          top: desiredTop,
+          scrollTop: el.scrollTop,
+          height: el.scrollHeight,
+          element: null,
+          measurable: false,
+          identity: memory.identity,
+        };
+        schedulePaginationRestore();
+      } else {
+        el.scrollTop = Math.max(0, memory.contentOffset - memory.anchorOffset);
+      }
+      return;
+    }
+
+    const delta = anchorRow.getBoundingClientRect().top - desiredTop;
+    if (Math.abs(delta) > 0.5) el.scrollTop += delta;
+    // Keep correcting the same identity while an off-screen history jump is
+    // still loading pages. Clearing this after the first stable frame would
+    // allow the next prepend to move the reader before the next render.
+    const keepRouteRestore = hasMoreMessages || historyLoading || memory.fingerprint !== listFingerprint(grouped);
+    if (!keepRouteRestore) restoreRef.current = null;
+    paginationAnchorRef.current = {
+      top: desiredTop,
+      scrollTop: el.scrollTop,
+      height: el.scrollHeight,
+      element: anchorRow,
+      measurable: true,
+      identity: memory.identity,
+    };
+    schedulePaginationRestore();
+
+    const nearBottom = isNearBottomPosition();
+    shouldFollowBottomRef.current = nearBottom;
+    setIsNearBottom(nearBottom);
+    captureScrollMetrics();
+  }, [
+    grouped,
+    captureScrollMetrics,
+    hasMoreMessages,
+    historyLoading,
+    isNearBottomPosition,
+    schedulePaginationRestore,
+    virtualizer,
+  ]);
+
+  // Prepending first commits estimated rows, then the virtualizer measures
+  // them. Restore before paint and keep correcting for the short measurement
+  // window so neither phase can visibly move the user's anchor.
+  useLayoutEffect(() => {
+    if (!paginationAnchorRef.current) return;
+    restorePaginationAnchor();
+    schedulePaginationRestore();
+  }, [currentMessages, totalSize, restorePaginationAnchor, schedulePaginationRestore]);
+
+  // Keep this session's measured row heights for the next mount, and track which
+  // session this mounted instance belongs to.
+  useEffect(() => {
+    return () => {
+      // The user can leave in the same tick as a navigation jump. Capture at
+      // unmount as a final safety net instead of relying only on scroll events
+      // or the jump's delayed rAF callback.
+      const sid = activeSessionId;
+      if (parentRef.current && (!sid || !scrollSnapshots.has(sid))) {
+        rememberScrollPosition(parentRef.current);
+      }
+      const cache = virtualizerRef.current.measurementsCache;
+      if (!sid || !Array.isArray(cache)) return;
+      const heights = new Map<string, number>();
+      for (const measurement of cache) heights.set(String(measurement.key), measurement.size);
+      if (heights.size > 0) measuredHeights.set(sid, heights);
+    };
+  }, [rememberScrollPosition]);
+
+  useEffect(() => {
+    activeSessionId = currentSessionId;
+  }, [currentSessionId]);
 
   // Lazy load older messages on scroll to top
   useEffect(() => {
@@ -283,35 +516,12 @@ export function ChatMessages() {
     if (!el) return;
     let timer: ReturnType<typeof setTimeout> | null = null;
 
-    const markUserScrollKey = (event: KeyboardEvent) => {
-      if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)) {
-        markUserScrollInput();
-      }
-    };
-    const markPointerScrollInput = (event: PointerEvent) => {
-      // Do not treat ordinary mouse hover or a body click as scroll intent.
-      // A pressed mouse/pen pointer can drag a scrollbar or drive a custom
-      // pointer scroller; touch remains covered by the touch listeners above.
-      if ((event.pointerType === 'mouse' || event.pointerType === 'pen') && event.buttons !== 0) {
-        markUserScrollInput();
-      }
-    };
     const handler = () => {
+      // Scrolling beyond the follow zone opts out. Programmatic scrolls
+      // (scrollToBottom) also fire scroll events and re-pin at the bottom.
       initialScrollPendingRef.current = false;
       const nearBottom = isNearBottomPosition();
-      const programmaticSuppressed = programmaticSuppressionRef.current !== null;
-      if (programmaticSuppressed) {
-        // Consume the correction window on the first resulting scroll. A new
-        // wheel/touch/pointer/key input cancels this suppression first, so a
-        // later genuine gesture can never be permanently ignored.
-        clearProgrammaticSuppression();
-      } else if (refreshUserScrollActivity()) {
-        shouldFollowBottomRef.current = nearBottom;
-      } else if (nearBottom) {
-        // Returning to the bottom is an explicit recovery path even when the
-        // browser emits the final scroll without another input event.
-        shouldFollowBottomRef.current = nearBottom;
-      }
+      shouldFollowBottomRef.current = nearBottom;
       setIsNearBottom(nearBottom);
       captureScrollMetrics();
 
@@ -319,110 +529,75 @@ export function ChatMessages() {
       timer = setTimeout(() => {
         timer = null;
         if (el.scrollTop <= 200 && hasMoreMessages && !historyLoading) {
-          // Keep the message currently under the user's eyes in place. The
-          // old code used only the height delta, which was correct at exactly
-          // scrollTop=0 but jumped down when pagination began at any other
-          // position. Disable native scroll anchoring so this is the only
-          // restoration applied after the prepend.
+          // Keep a real rendered row under the user's eyes. Its geometry is
+          // more reliable than a virtualizer estimate while prepended rows
+          // are being measured.
+          const viewport = el.getBoundingClientRect();
+          const anchorElement = [...el.querySelectorAll<HTMLElement>('[data-index]')].find(
+            (node) => {
+              const rect = node.getBoundingClientRect();
+              return rect.bottom > viewport.top && rect.top < viewport.bottom;
+            },
+          );
+          const anchorRect = anchorElement?.getBoundingClientRect();
           paginationAnchorRef.current = {
-            top: el.scrollTop,
+            top: anchorRect?.top ?? 0,
+            scrollTop: el.scrollTop,
             height: el.scrollHeight,
+            element: anchorElement ?? null,
+            measurable: Boolean(anchorRect && anchorRect.height > 0),
           };
           loadOlderMessages().then(() => {
-            // Preserve scroll position after DOM has updated
-            requestAnimationFrame(() => {
-              const anchor = paginationAnchorRef.current;
-              if (!anchor) return;
-              markProgrammaticChange();
-              el.scrollTop = anchor.top + el.scrollHeight - anchor.height;
-              paginationAnchorRef.current = null;
-            });
+            restorePaginationAnchor();
+            schedulePaginationRestore();
           });
         }
       }, 150);
     };
 
-    const handleScrollEnd = () => {
-      // Chromium/WebKit expose scrollend, but Firefox and older browsers do
-      // not. Keep a bounded grace period after scrollend because touch/wheel
-      // inertia can still deliver a late scroll task; the normal scroll
-      // handler expands it back to USER_SCROLL_QUIET_MS when that happens.
-      if (userScrollStateRef.current.active) {
-        scheduleUserScrollExpiry(USER_SCROLLEND_GRACE_MS);
-      }
-    };
-
-    el.addEventListener('wheel', markUserScrollInput, { passive: true });
-    el.addEventListener('touchstart', markUserScrollInput, { passive: true });
-    el.addEventListener('touchmove', markUserScrollInput, { passive: true });
-    el.addEventListener('pointermove', markPointerScrollInput, { passive: true });
-    el.addEventListener('keydown', markUserScrollKey);
     el.addEventListener('scroll', handler);
-    el.addEventListener('scrollend', handleScrollEnd);
     return () => {
-      el.removeEventListener('wheel', markUserScrollInput);
-      el.removeEventListener('touchstart', markUserScrollInput);
-      el.removeEventListener('touchmove', markUserScrollInput);
-      el.removeEventListener('pointermove', markPointerScrollInput);
-      el.removeEventListener('keydown', markUserScrollKey);
       el.removeEventListener('scroll', handler);
-      el.removeEventListener('scrollend', handleScrollEnd);
       if (timer) clearTimeout(timer);
     };
   }, [
     captureScrollMetrics,
-    clearProgrammaticSuppression,
-    clearUserScrollActivity,
-    grouped.length,
     hasMoreMessages,
     historyLoading,
     isNearBottomPosition,
     loadOlderMessages,
-    markProgrammaticChange,
-    markUserScrollInput,
-    refreshUserScrollActivity,
-    scheduleUserScrollExpiry,
+    restorePaginationAnchor,
+    schedulePaginationRestore,
   ]);
-
-  // A viewport resize changes the meaning of "bottom" without changing the
-  // message array or virtualizer total size. Re-pin only while follow mode is
-  // active; a reader who opted out keeps their viewport.
-  useEffect(() => {
-    const el = parentRef.current;
-    if (!el || typeof ResizeObserver === 'undefined') return;
-    let raf: number | null = null;
-    const observer = new ResizeObserver(() => {
-      markLayoutChange();
-      if (!shouldFollowBottomRef.current) {
-        captureScrollMetrics();
-        return;
-      }
-      if (raf !== null) cancelAnimationFrame(raf);
-      raf = requestAnimationFrame(() => {
-        raf = null;
-        if (shouldFollowBottomRef.current) scrollToBottom();
-      });
-    });
-    observer.observe(el);
-    return () => {
-      observer.disconnect();
-      if (raf !== null) cancelAnimationFrame(raf);
-    };
-  }, [captureScrollMetrics, grouped.length, markLayoutChange, scrollToBottom]);
 
   // Scroll to bottom when the session changes. Reset the pinned anchor first
   // so the auto-scroll effect above forces us down once this session's history
   // loads (async) and again after the virtualizer measures the real heights.
   // The rAF re-scroll covers the same-frame layout of the freshly swapped DOM.
+  const handledSessionRef = useRef<string | null>(isRestoringRef.current ? currentSessionId : null);
   useEffect(() => {
+    // Same session and no session switch: this run is the mount of a route
+    // re-entry, whose restored position must not be reset to the newest message.
+    if (handledSessionRef.current === currentSessionId) return;
+    handledSessionRef.current = currentSessionId;
+    // A session selected from the sidebar may have a saved anchor. The layout
+    // restore already handled it; do not let this effect undo that restore.
+    if (isRestoringRef.current) {
+      isRestoringRef.current = false;
+      return;
+    }
+    // A genuine session switch without a saved anchor starts at the newest
+    // message. Do not discard snapshots belonging to other sessions.
+    if (currentSessionId) measuredHeights.delete(currentSessionId);
     shouldFollowBottomRef.current = true;
     setIsNearBottom(true);
     initialScrollPendingRef.current = true;
     lastScrollMetricsRef.current = null;
     paginationAnchorRef.current = null;
-    layoutChangePendingRef.current = false;
-    clearUserScrollActivity();
-    clearProgrammaticSuppression();
+    if (paginationRestoreRafRef.current !== null) {
+      cancelAnimationFrame(paginationRestoreRafRef.current);
+      paginationRestoreRafRef.current = null;
+    }
     scrollToBottom();
     // If this session already has a mounted message container, the session
     // switch itself performed the initial positioning. Keep later updates
@@ -432,18 +607,8 @@ export function ChatMessages() {
       initialScrollPendingRef.current = false;
     }
     const raf = requestAnimationFrame(scrollToBottom);
-    return () => {
-      cancelAnimationFrame(raf);
-      if (layoutChangeRafRef.current !== null) cancelAnimationFrame(layoutChangeRafRef.current);
-      clearUserScrollActivity();
-      clearProgrammaticSuppression();
-    };
-  }, [
-    clearProgrammaticSuppression,
-    clearUserScrollActivity,
-    currentSessionId,
-    scrollToBottom,
-  ]);
+    return () => cancelAnimationFrame(raf);
+  }, [currentSessionId, scrollToBottom]);
 
   // Empty state — but ONLY after the initial history fetch has settled. While
   // it is in flight (currentMessages empty + initialLoading) show a spinner so
@@ -466,30 +631,13 @@ export function ChatMessages() {
     );
   }
 
-  // A tail can be entirely hidden by the Meta/Task/QQ filters while older
-  // canonical pages still contain visible messages. Scroll-to-top cannot
-  // fire when there are no rendered rows, so expose an explicit bounded page
-  // load entry instead of presenting a permanent blank state.
-  if (grouped.length === 0) {
-    return (
-      <div className="flex-1 flex flex-col items-center justify-center gap-3 text-text-tertiary text-sm">
-        <span>当前尾页消息已被过滤</span>
-        {hasMoreMessages && (
-          <button
-            type="button"
-            onClick={() => void loadOlderMessages()}
-            disabled={historyLoading}
-            className="rounded border border-border px-3 py-1.5 text-text-secondary hover:bg-bg-hover disabled:opacity-50"
-          >
-            {historyLoading ? 'Loading older messages...' : 'Load older messages'}
-          </button>
-        )}
-      </div>
-    );
-  }
-
   return (
-    <div className="flex-1 flex flex-col min-h-0 relative">
+    // `min-w-0` is load-bearing. As a flex item this column defaults to
+    // `min-width: auto`, so a row holding a long unbreakable token (URL, path,
+    // inline code) can stretch the column to its min-content width. The bubble's
+    // `max-width: 75%/85%` then resolves against that inflated row instead of
+    // the real viewport, painting the bubble past the right screen edge.
+    <div className="flex-1 flex flex-col min-h-0 min-w-0 relative">
       <div
         ref={parentRef}
         className={`flex-1 min-h-0 overflow-auto ${!tuiViewEnabled ? 'bubble-mode' : ''}`}
@@ -523,6 +671,11 @@ export function ChatMessages() {
               <div
                 key={vItem.key}
                 data-index={vItem.index}
+                data-message-identity={
+                  'type' in item && item.type === 'tool_group'
+                    ? undefined
+                    : getMessageIdentity(item as import('@/types').Message)
+                }
                 ref={virtualizer.measureElement}
                 style={{
                   width: '100%',
@@ -533,7 +686,17 @@ export function ChatMessages() {
                   display: 'flow-root',
                 }}
               >
-                <MessageDisplayItem item={item} prevRole={prevRole} />
+                {!('type' in item && item.type === 'tool_group') &&
+                highlightedTarget?.identity === getMessageIdentity(item as import('@/types').Message) ? (
+                  <div
+                    className="chat-message-jump-highlight"
+                    data-index={highlightedTarget.historyIndex ?? vItem.index}
+                  >
+                    <MessageDisplayItem item={item} prevRole={prevRole} />
+                  </div>
+                ) : (
+                  <MessageDisplayItem item={item} prevRole={prevRole} />
+                )}
               </div>
             );
           })}
@@ -543,7 +706,7 @@ export function ChatMessages() {
       {/* Scroll-to-bottom button */}
       {!isNearBottom && (
         <button
-          onClick={recoverToBottom}
+          onClick={scrollToBottom}
           className="absolute bottom-2 right-4 rounded-full bg-accent text-white p-2 shadow-lg hover:bg-accent-hover transition-colors z-10"
           title="Scroll to bottom"
         >
@@ -559,4 +722,4 @@ export function ChatMessages() {
       )}
     </div>
   );
-}
+});

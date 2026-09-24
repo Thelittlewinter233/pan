@@ -31,8 +31,6 @@ Tools exposed:
     - notification_send: Send a Pan system notification to self or managed session
     - reminder_register/list/cancel: Manage durable one-shot reminders
     - agent_background_start/get/list/cancel/retry: Manage a durable Runner job
-    - agent_message_job_create/get/list/update/cancel: Schedule Session messages or broadcasts
-    - agent_send_many: Send one message to selected Sessions
     - scheduler_create/list/get/update/delete/pause/resume/run_now/runs:
       Scheduled tasks (闹钟式定时任务：设定任务文本 + 触发时间/重复规则，到点自动派给目标 session)
     - agent_kill: Kill an agent's worker process (no worker → harmless no-op)
@@ -688,8 +686,13 @@ def session_get(session_id: str, limit: int = 0) -> dict:
     denied = _check_access(session_id)
     if denied:
         return denied
-    query = f"?historyLimit={int(limit)}" if limit else ""
-    result = _api("GET", f"/api/sessions/{session_id}{query}")
+    result = _api("GET", f"/api/sessions/{session_id}")
+    if limit and "history" in result and isinstance(result["history"], list):
+        history = result["history"]
+        result = dict(result)
+        result["history"] = history[-limit:]
+        result["historyTruncated"] = len(history) > limit
+        result["historyTotal"] = len(history)
     return _strip_usage(result)
 
 
@@ -1376,9 +1379,7 @@ def agent_send(session_id: str, text: str = "") -> dict:
     pendingSpawn=true），由全局 watchdog 自动 spawn worker 后分发
     （「send = 写给 agent，进程是顺带的」）。
 
-    Pan 内 session 发送时自动加 ////by agent 身份前缀（立项 4.8）。若目标
-    Session 有持久活动 taskId，消息入队时继承它用于 report 配对；没有活动
-    任务时保持 taskId=null，连续 send 不会因共享 taskId 被幂等去重。
+    Pan 内 session 发送时自动加 ////by agent 身份前缀（立项 4.8）。
 
     Args:
         session_id: Agent（= session）ID
@@ -1399,32 +1400,6 @@ def agent_send(session_id: str, text: str = "") -> dict:
 
 
 @mcp.tool()
-def agent_send_many(session_ids: list[str], text: str = "") -> dict:
-    """Send one message to several selected Sessions immediately.
-
-    This is the backend fan-out counterpart to selecting Sessions in the
-    Dashboard.  Each target uses the ordinary ``agent_send`` queue semantics;
-    use ``agent_message_job_create`` with ``target_session_ids`` for a durable
-    scheduled fan-out.
-
-    完整编排流程见 /pan skill。
-    """
-    if not isinstance(session_ids, list) or not session_ids:
-        return {"ok": False, "error": {"code": "missing_session_ids",
-                                         "message": "session_ids must be non-empty"}}
-    for session_id in dict.fromkeys(session_ids):
-        denied = _check_access(session_id, claim=True)
-        if denied:
-            return denied
-    caller = _caller_identity()
-    body = {"sessionIds": list(dict.fromkeys(session_ids)),
-            "text": _agent_message_prefix(text), "source": "agent"}
-    if caller and caller.get("id"):
-        body["sourceSessionId"] = caller["id"]
-    return _api("POST", "/api/sessions/broadcast", body)
-
-
-@mcp.tool()
 def agent_send_force(session_id: str, text: str = "") -> dict:
     """Force-push a message to an agent: restart the worker, then send.
 
@@ -1437,9 +1412,7 @@ def agent_send_force(session_id: str, text: str = "") -> dict:
     无活 worker 时**不报错**——restart 无从谈起，消息入该 agent 的持久队列，
     由全局 watchdog 自动 spawn 后分发。
 
-    Pan 内 session 发送时自动加 ////by agent 身份前缀（立项 4.8）。重启后的
-    入队同样继承目标 Session 的活动 taskId；该值只用于 report 配对，不新增
-    业务编号。
+    Pan 内 session 发送时自动加 ////by agent 身份前缀（立项 4.8）。
 
     Args:
         session_id: Agent（= session）ID
@@ -1460,8 +1433,7 @@ def agent_send_force(session_id: str, text: str = "") -> dict:
     if not isinstance(result, dict) or result.get("error"):
         return result
     caller = _caller_identity()
-    body = {"sessionId": session_id, "text": text, "source": "agent",
-            "inheritTaskId": True}
+    body = {"sessionId": session_id, "text": text, "source": "agent"}
     if caller and caller.get("id"):
         body["sourceSessionId"] = caller["id"]
     return _api("POST", "/api/task", body)
@@ -1568,158 +1540,16 @@ def agent_background_start(argv: list[str], cwd: str, target_session_id: str | N
                            label: str | None = None) -> dict:
     """Start a durable background process; target defaults to this Agent Session.
 
-    ``creatorSessionId`` is recorded from the calling Agent Session, while
-    ``targetSessionId`` is the only Session that receives the terminal Job
-    notice.  A Job may therefore be created by Agent A for Agent B without
-    copying the notice back to A.
-
     完整编排流程见 /pan skill。
     """
-    caller = _caller_identity()
-    creator = (caller or {}).get("id")
-    target = target_session_id or creator
+    target = target_session_id or ((_caller_identity() or {}).get("id"))
     if not target:
         return {"ok": False, "error": {"code": "target_session_required", "message": "no current Agent Session"}}
     denied = _check_access(target, claim=False)
     if denied:
         return denied
-    body = {
-        "targetSessionId": target, "argv": argv, "cwd": cwd, "label": label,
-    }
-    if creator:
-        body["creatorSessionId"] = creator
-    return _api("POST", "/api/background-jobs", body)
-
-
-@mcp.tool()
-def agent_message_job_create(text: str, schedule: dict,
-                             target_session_id: str | None = None,
-                             description: str | None = None,
-                             target_session_ids: list[str] | None = None) -> dict:
-    """Create a durable time-based message Job for one or many Sessions.
-
-    ``schedule`` is one of: ``{"type":"once","at":ISO}``,
-    ``{"type":"once","delaySeconds":N}``,
-    ``{"type":"interval","intervalSeconds":N}``, or
-    ``{"type":"weekly","weekday":0..6,"time":"HH:MM"}``.
-    Set ``target_session_ids`` for a scheduled broadcast; IDs are deduplicated
-    in stable order. The text is sent through normal agent-send semantics,
-    never executed as an operating-system command. The caller identity and
-    Pan ``////by agent`` prefix are persisted for later delivery.
-
-    完整编排流程见 /pan skill。
-    """
-    caller = _caller_identity()
-    if target_session_id is not None and target_session_ids is not None:
-        return {"ok": False, "error": {"code": "invalid_job",
-                                         "message": "provide target_session_id or target_session_ids, not both"}}
-    targets = target_session_ids
-    if targets is None:
-        target = target_session_id or (caller or {}).get("id")
-        targets = [target] if target else None
-    if not targets:
-        return {"ok": False, "error": {"code": "target_session_required",
-                                         "message": "no current Agent Session"}}
-    for target in targets:
-        denied = _check_access(target, claim=True)
-        if denied:
-            return denied
-    body = {"text": _agent_message_prefix(text), "schedule": schedule, "source": "agent"}
-    if target_session_ids is None:
-        body["targetSessionId"] = targets[0]
-    else:
-        body["targetSessionIds"] = targets
-    if description is not None:
-        body["description"] = description
-    if caller and caller.get("id"):
-        body["sourceSessionId"] = caller["id"]
-        body["creatorSessionId"] = caller["id"]
-    return _api("POST", "/api/session-message-jobs", body)
-
-
-@mcp.tool()
-def agent_message_job_get(job_id: str) -> dict:
-    """Read one durable Session-message or scheduled broadcast Job.
-
-    完整编排流程见 /pan skill。
-    """
-    job = _api("GET", f"/api/background-jobs/{quote(job_id, safe='')}")
-    if (isinstance(job, dict) and not job.get("error")
-            and job.get("kind") not in {"session-message", "session-broadcast"}):
-        return {"ok": False, "error": {"code": "not_message_job",
-                                         "message": f"Job {job_id} is not a message Job"}}
-    targets = []
-    if isinstance(job, dict):
-        targets = list(job.get("targetSessionIds") or [])
-        if job.get("targetSessionId"):
-            targets.append(job["targetSessionId"])
-    for target in dict.fromkeys(targets):
-        denied = _check_access(target)
-        if denied:
-            return denied
-    return job
-
-
-@mcp.tool()
-def agent_message_job_list(target_session_id: str | None = None) -> dict:
-    """List durable Session-message Jobs for self or a managed Session.
-
-    完整编排流程见 /pan skill。
-    """
-    caller = _caller_identity()
-    target = target_session_id or (caller or {}).get("id")
-    if target:
-        denied = _check_access(target)
-        if denied:
-            return denied
-    path = "/api/background-jobs"
-    if target:
-        path += "?targetSessionId=" + quote(target, safe="")
-    result = _api("GET", path)
-    if isinstance(result, dict) and isinstance(result.get("jobs"), list):
-        result["jobs"] = [job for job in result["jobs"]
-                           if job.get("kind") in {"session-message", "session-broadcast"}]
-    return result
-
-
-@mcp.tool()
-def agent_message_job_update(job_id: str, schedule: dict | None = None,
-                             text: str | None = None,
-                             description: str | None = None,
-                             target_session_ids: list[str] | None = None) -> dict:
-    """Adjust a pending/recurring Session-message or broadcast Job.
-
-    完整编排流程见 /pan skill。
-    """
-    job = agent_message_job_get(job_id)
-    if not isinstance(job, dict) or job.get("error") or job.get("ok") is False:
-        return job
-    body = {}
-    if schedule is not None:
-        body["schedule"] = schedule
-    if text is not None:
-        body["text"] = _agent_message_prefix(text)
-    if description is not None:
-        body["description"] = description
-    if target_session_ids is not None:
-        for target in target_session_ids:
-            denied = _check_access(target, claim=True)
-            if denied:
-                return denied
-        body["targetSessionIds"] = target_session_ids
-    return _api("PATCH", f"/api/background-jobs/{quote(job_id, safe='')}", body)
-
-
-@mcp.tool()
-def agent_message_job_cancel(job_id: str) -> dict:
-    """Cancel a pending or recurring Session-message Job.
-
-    完整编排流程见 /pan skill。
-    """
-    job = agent_message_job_get(job_id)
-    if not isinstance(job, dict) or job.get("error") or job.get("ok") is False:
-        return job
-    return _api("POST", f"/api/background-jobs/{quote(job_id, safe='')}/cancel")
+    return _api("POST", "/api/background-jobs", {
+        "targetSessionId": target, "argv": argv, "cwd": cwd, "label": label})
 
 
 @mcp.tool()

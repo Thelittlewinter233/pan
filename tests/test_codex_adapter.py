@@ -245,32 +245,19 @@ def test_parse_agent_message():
     # live stdout 用 snake_case
     event = {"type": "item.completed", "item": {"id": "i1", "type": "agent_message", "text": "PONG"}}
     assert a.is_assistant_event(event)
-    assert a.extract_assistant_blocks(event) == [{
-        "role": "assistant", "content": "PONG", "nativeItemId": "i1",
-    }]
+    assert a.extract_assistant_blocks(event) == [{"role": "assistant", "content": "PONG"}]
     # 持久化 thread_items 用 camelCase
     event2 = {"type": "item.completed", "item": {"id": "i1", "type": "agentMessage", "text": "PONG2"}}
-    assert a.extract_assistant_blocks(event2) == [{
-        "role": "assistant", "content": "PONG2", "nativeItemId": "i1",
-    }]
+    assert a.extract_assistant_blocks(event2) == [{"role": "assistant", "content": "PONG2"}]
     print("PASS: parse agent_message (snake + camel)")
 
 
 def test_parse_reasoning():
     a = _adapter()
     event = {"type": "item.completed", "item": {"id": "i2", "type": "reasoning", "summary": ["think hard"]}}
-    assert a.extract_assistant_blocks(event) == [{
-        "role": "thinking", "content": "think hard", "nativeItemId": "i2",
-    }]
+    assert a.extract_assistant_blocks(event) == [{"role": "thinking", "content": "think hard"}]
     event2 = {"type": "item.completed", "item": {"id": "i3", "type": "reasoning", "text": "direct"}}
-    assert a.extract_assistant_blocks(event2) == [{
-        "role": "thinking", "content": "direct", "nativeItemId": "i3",
-    }]
-    assert a.extract_assistant_blocks({
-        "type": "thinking", "item_id": "i4", "content": "live reasoning",
-    }) == [{
-        "role": "thinking", "content": "live reasoning", "nativeItemId": "i4",
-    }]
+    assert a.extract_assistant_blocks(event2) == [{"role": "thinking", "content": "direct"}]
     print("PASS: parse reasoning")
 
 
@@ -329,7 +316,6 @@ def test_app_server_canonical_events_are_persistable():
     a = _adapter()
     final = {
         "type": "assistant",
-        "item_id": "native-item",
         "message": {"content": [
             {"type": "text", "text": "answer"},
             {"type": "tool_use", "name": "Command", "input": {"command": "dir"}},
@@ -337,9 +323,8 @@ def test_app_server_canonical_events_are_persistable():
     }
     assert a.is_assistant_event(final)
     assert a.extract_assistant_blocks(final) == [
-        {"role": "assistant", "content": "answer", "nativeItemId": "native-item"},
-        {"role": "tool", "content": 'Command({"command":"dir"})',
-         "nativeItemId": "native-item"},
+        {"role": "assistant", "content": "answer"},
+        {"role": "tool", "content": 'Command({"command": "dir"})'},
     ]
     delta = {
         "type": "content.part", "role": "assistant", "delta": True,
@@ -357,8 +342,7 @@ def test_codex_unknown_native_item_is_preserved_as_tool():
     })
     assert blocks == [{
         "role": "tool",
-        "content": 'futureNativeItem({"summary":"kept"})',
-        "nativeItemId": "item-1",
+        "content": 'futureNativeItem({"summary": "kept"})',
     }]
     print("PASS: unknown native item fallback")
 
@@ -412,54 +396,6 @@ def test_app_server_run_turn_message_loop(monkeypatch):
                            "cancelled": False, "turn_status": "completed",
                            "result": "complete", "usage": None}
     print("PASS: app-server run_turn message loop")
-
-
-def test_app_server_cumulative_text_is_item_local(monkeypatch):
-    """Interleaved native items never inherit another item's cumulative text."""
-    app = app_server_wrapper.AppServer("node", "codex.js", "C:/work", [])
-    emitted: list[dict] = []
-    monkeypatch.setattr(app_server_wrapper, "_write_stdout", emitted.append)
-    state = {"item_cumulative": {}, "turn_id": "turn-1"}
-
-    for item_id, delta in (("item-a", "A"), ("item-b", "B"), ("item-b", "C")):
-        app._handle_server_message({
-            "method": "item/agentMessage/delta",
-            "params": {
-                "turnId": "turn-1", "itemId": item_id, "delta": delta,
-            },
-        }, state)
-
-    assert [event["stream_text"] for event in emitted] == ["A", "B", "BC"]
-    print("PASS: item-local cumulative text")
-
-
-def test_codex_tool_live_and_canonical_projection_match():
-    adapter = _adapter()
-    args = {
-        "command": "echo 中文😀",
-        "nested": {"values": [1, 2]},
-    }
-    live = adapter.extract_assistant_blocks({
-        "type": "assistant",
-        "item_id": "tool-一致",
-        "message": {"content": [{
-            "type": "tool_use",
-            "name": "MCP",
-            "input": {**args, "result": "完成😀"},
-        }]},
-    })
-    canonical = codex_sessions._item_to_block({
-        "id": "tool-一致",
-        "type": "mcpToolCall",
-        "tool": "MCP",
-        "arguments": args,
-        "result": "完成😀",
-    })
-
-    assert live == [canonical]
-    assert live[0]["nativeItemId"] == "tool-一致"
-    assert r'"command":"echo \u4e2d\u6587\ud83d\ude00"' in live[0]["content"]
-    print("PASS: live/canonical tool projection")
 
 
 def test_app_server_interrupted_turn_is_not_an_error(monkeypatch):
@@ -1317,18 +1253,18 @@ def test_item_to_block_mapping():
     assert codex_sessions._item_to_block({"type": "agentMessage", "text": "a"}) == {"role": "assistant", "content": "a"}
     assert codex_sessions._item_to_block({"type": "reasoning", "summary": ["r"]}) == {"role": "thinking", "content": "r"}
     assert codex_sessions._item_to_block({"type": "plan", "text": "inspect"}) == {"role": "thinking", "content": "inspect"}
-    assert codex_sessions._item_to_block({"type": "commandExecution", "command": "cmd", "aggregated_output": "out"}) == {"role": "tool", "content": 'Command({"command":"cmd","output":"out"})'}
-    assert codex_sessions._item_to_block({"type": "commandExecution", "command": "cmd", "aggregatedOutput": "out"}) == {"role": "tool", "content": 'Command({"command":"cmd","output":"out"})'}
-    assert codex_sessions._item_to_block({"type": "mcpToolCall", "tool": "pan_probe", "arguments": {"x": 1}, "result": "ok"}) == {"role": "tool", "content": 'pan_probe({"x":1,"result":"ok"})'}
+    assert codex_sessions._item_to_block({"type": "commandExecution", "command": "cmd", "aggregated_output": "out"}) == {"role": "tool", "content": "cmd\n→ out"}
+    assert codex_sessions._item_to_block({"type": "commandExecution", "command": "cmd", "aggregatedOutput": "out"}) == {"role": "tool", "content": "cmd\n→ out"}
+    assert codex_sessions._item_to_block({"type": "mcpToolCall", "tool": "pan_probe", "arguments": {"x": 1}, "result": "ok"}) == {"role": "tool", "content": 'pan_probe({"x": 1})\n→ ok'}
     structured_result = {"content": [{"type": "text", "text": "ok"}], "structuredContent": None, "_meta": None}
     assert codex_sessions._item_to_block({"type": "mcpToolCall", "tool": "pan_probe", "result": structured_result}) == {
         "role": "tool",
-        "content": 'pan_probe({"result":' + json.dumps(structured_result, ensure_ascii=True, separators=(",", ":")) + '})',
+        "content": 'pan_probe({})\n→ ' + json.dumps(structured_result, ensure_ascii=False),
     }
     structured_error = {"message": "resources/list failed"}
     assert codex_sessions._item_to_block({"type": "mcpToolCall", "tool": "pan_probe", "error": structured_error}) == {
         "role": "tool",
-        "content": 'pan_probe({"result":' + json.dumps(structured_error, ensure_ascii=True, separators=(",", ":")) + '})',
+        "content": 'pan_probe({})\n→ ' + json.dumps(structured_error, ensure_ascii=False),
     }
     file_change = codex_sessions._item_to_block({"type": "fileChange", "changes": [{"path": "a.txt"}]})
     assert file_change and file_change["role"] == "tool" and file_change["content"].startswith("FileChange(")

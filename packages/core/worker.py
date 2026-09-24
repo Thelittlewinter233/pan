@@ -15,7 +15,6 @@ All persistent data lives in Session (session.py) — 即 Agent 的持久身份�
 from __future__ import annotations
 
 import asyncio
-import copy
 import hashlib
 import inspect
 import json
@@ -250,15 +249,10 @@ class Worker:
     # 入队时从 session 读、自增后随 item.seq 一起落盘。
     _current_seq: int | None = None  # 正在处理的 item 序号（_consumer 取出时记录）
     _current_task_id: str | None = None  # 正在处理的 item 的 taskId（幂等用）
-    _current_task_idempotent: bool = False  # formal assign vs inherited send context
     _current_source_session_id: str | None = None  # 当前 item 的来源 Session（审计元数据）
     # 当前正在执行的持久 queue item。直到 provider hand-off 成功前，item
     # 仍保留在 Session.queue_pending；这里仅保留运行期引用用于结果配对。
     _current_queue_item: dict | None = None
-    # A provider can repeat a terminal event during reconnect/replay.  This
-    # runtime guard prevents a second result/report for the same active turn;
-    # the durable usage job below provides the restart-side idempotency cursor.
-    _terminal_handled: bool = False
     # 已完成的协议序列化快照（仅兼容旧测试/嵌入方，队列真源仍在 Session）。
     _current_serialized: bytes | None = None
     # 兼容旧 consumer 的运行期位置字段；新 consumer 不依赖它决定持久语义。
@@ -334,83 +328,11 @@ _recovery_required: set[str] = set()
 # emits a generic wake-up and never stores queue payload.
 _queue_retry_tasks: dict[str, asyncio.Task] = {}
 _queue_locks: dict[str, asyncio.Lock] = {}
-_usage_enrichment_locks: dict[str, asyncio.Lock] = {}
-_usage_enrichment_tasks: dict[str, asyncio.Task] = {}
-_usage_enrichment_adapters: dict[str, CliAdapter] = {}
-_QUEUE_EDIT_LOCK_TTL_SECONDS = 5 * 60
-
-# Usage lookup is provider-specific synchronous I/O (and cbc/kimi include a
-# deliberate post-result wait).  Keep it off the asyncio loop, retry forever
-# with bounded backoff, and persist the retry metadata so a service restart can
-# resume it without inventing another queue/event protocol.
-_ENRICH_RETRY_BASE_SEC = 1.0
-_ENRICH_RETRY_MAX_SEC = 30.0
 
 
 def queue_lock(session_id: str) -> asyncio.Lock:
     """Serialize queue API mutations and Worker reservation decisions per Session."""
     return _queue_locks.setdefault(session_id, asyncio.Lock())
-
-
-def _queue_edit_token_digest(token: str) -> str:
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()
-
-
-def _active_queue_edit_lock(s, item_id: str, now: float | None = None) -> dict | None:
-    """Return an unexpired edit lease, discarding an expired one in memory."""
-    locks = getattr(s, "queue_edit_locks", None)
-    if not isinstance(locks, dict):
-        s.queue_edit_locks = locks = {}
-    lease = locks.get(item_id)
-    if not isinstance(lease, dict):
-        return None
-    expires_at = lease.get("expiresAt")
-    if (not isinstance(expires_at, (int, float))
-            or expires_at <= (time.time() if now is None else now)):
-        locks.pop(item_id, None)
-        return None
-    token_hash = lease.get("tokenHash")
-    if not isinstance(token_hash, str) or len(token_hash) != 64:
-        locks.pop(item_id, None)
-        return None
-    return lease
-
-
-def acquire_queue_edit_lock(s, item_id: str, token: str,
-                            now: float | None = None) -> tuple[dict | None, bool]:
-    """Acquire or renew an item edit lease; return (lease, conflict)."""
-    locks = getattr(s, "queue_edit_locks", None)
-    if not isinstance(locks, dict):
-        s.queue_edit_locks = locks = {}
-    current = _active_queue_edit_lock(s, item_id, now)
-    token_hash = _queue_edit_token_digest(token)
-    if current is not None and current.get("tokenHash") != token_hash:
-        return None, True
-    expires_at = (time.time() if now is None else now) + _QUEUE_EDIT_LOCK_TTL_SECONDS
-    lease = {"tokenHash": token_hash, "expiresAt": expires_at}
-    locks[item_id] = lease
-    return lease, False
-
-
-def release_queue_edit_lock(s, item_id: str, token: str) -> bool:
-    """Release only the matching lease; late clients cannot release a newer edit."""
-    lease = _active_queue_edit_lock(s, item_id)
-    locks = getattr(s, "queue_edit_locks", {})
-    if lease is None:
-        return False
-    if lease.get("tokenHash") != _queue_edit_token_digest(token):
-        return False
-    locks.pop(item_id, None)
-    return True
-
-
-def queue_item_edit_locked(s, item_id: str) -> bool:
-    return _active_queue_edit_lock(s, item_id) is not None
-
-
-def _usage_enrichment_lock(session_id: str) -> asyncio.Lock:
-    """Serialize usage post-processing for one Session, across Workers."""
-    return _usage_enrichment_locks.setdefault(session_id, asyncio.Lock())
 
 _broadcast: callable = None
 
@@ -465,7 +387,7 @@ def _mark_worker_tasks_error(worker_id: str, reason: str) -> int:
             pending_task_ids = {
                 item.get("taskId")
                 for item in session.queue_pending
-                if _is_formal_task_item(item)
+                if isinstance(item, dict) and item.get("type") == "task"
                 and item.get("taskId")
             }
     marked = 0
@@ -579,565 +501,6 @@ async def _record_legal_worker_state(
         w.worker_id, state, source, w.session_id,
     )
     return True
-
-
-def _terminal_enrichment_key(
-    task_id: str | None, task_seq: int | None, worker_id: str,
-    generation: int, *, task_idempotent: bool = True,
-) -> str:
-    """Build the durable idempotency key for one terminal turn."""
-    # An inherited agent_send/agent_send_force row deliberately carries the
-    # current formal task id for report pairing.  It is not the formal assign
-    # idempotency key: each queue row has its own sequence and must get its own
-    # terminal identity, otherwise a follow-up can be swallowed as a durable
-    # duplicate of the preceding assign.
-    if task_id and task_idempotent:
-        return f"task:{task_id}"
-    if task_seq is not None:
-        return f"seq:{task_seq}"
-    # Report batches and compatibility callers can lack both fields.  Their
-    # runtime _terminal_handled guard still suppresses duplicate events while
-    # this key makes a crash after the base save recoverable.
-    return f"worker:{worker_id}:generation:{generation}:{uuid.uuid4().hex}"
-
-
-def _queue_usage_enrichment(
-    s, adapter: CliAdapter, *, task_id: str | None, task_seq: int | None,
-    worker_id: str, generation: int, task_idempotent: bool = True,
-) -> str | None:
-    """Append one durable post-terminal usage job, without changing queues."""
-    if not callable(getattr(adapter, "enrich_after_result", None)):
-        return None
-    # Every built-in provider lookup is keyed by its native Session id.  A
-    # compatibility/direct stream caller without that id has no recoverable
-    # usage source, so do not create a no-op durable job (or an extra save).
-    if not s.cli_session_id:
-        return None
-    key = _terminal_enrichment_key(
-        task_id, task_seq, worker_id, generation,
-        task_idempotent=task_idempotent,
-    )
-    pending = getattr(s, "usage_enrichment_pending", None)
-    if not isinstance(pending, list):
-        pending = s.usage_enrichment_pending = []
-    if any(isinstance(job, dict) and job.get("key") == key for job in pending):
-        _usage_enrichment_adapters.setdefault(key, adapter)
-        return key
-    pending.append({
-        "key": key,
-        "adapter": getattr(adapter, "name", None) or s.adapter,
-        "taskId": task_id,
-        "taskSeq": task_seq,
-        "workerId": worker_id,
-        "generation": generation,
-        "state": "pending",
-        "attempts": 0,
-        "nextAttemptAt": 0.0,
-        "createdAt": time.time(),
-    })
-    # Keep the exact Worker adapter available for the current process (useful
-    # for registered extensions and tests); a restart falls back to the
-    # persisted adapter name below.
-    _usage_enrichment_adapters[key] = adapter
-    return key
-
-
-def _has_pending_usage_enrichment(s) -> bool:
-    return bool(
-        s is not None
-        and isinstance(getattr(s, "usage_enrichment_pending", None), list)
-        and s.usage_enrichment_pending
-    )
-
-
-def _enrichment_job(s, key: str) -> dict | None:
-    for job in getattr(s, "usage_enrichment_pending", []) or []:
-        if isinstance(job, dict) and job.get("key") == key:
-            return job
-    return None
-
-
-@dataclass
-class _UsageEnrichmentSnapshot:
-    """Minimal provider input/output state for background usage lookup.
-
-    Adapter enrichment only needs the provider session id, workdir, model,
-    accumulated usage, and adapter cursor/config.  Keeping this as a small
-    object is intentional: ``copy.deepcopy(Session)`` would also copy the
-    complete history, queue, and attachment-related state while the provider
-    is running in a background thread.
-    """
-
-    session_id: str
-    cli_session_id: str | None
-    workdir: str
-    model: str | None
-    model_before: str | None
-    raw_usage: dict | None
-    adapter_config: dict
-    adapter_config_before: dict
-
-    def set_adapter_field(self, key: str, value):
-        """Match ``Session.set_adapter_field`` for provider cursors."""
-        if value is not None and value != "" and value is not False:
-            self.adapter_config[key] = value
-        else:
-            self.adapter_config.pop(key, None)
-
-
-def _make_usage_enrichment_snapshot(s) -> _UsageEnrichmentSnapshot:
-    """Copy only fields that provider usage readers can inspect or advance."""
-    adapter_config = copy.deepcopy(s.adapter_config)
-    return _UsageEnrichmentSnapshot(
-        session_id=s.id,
-        cli_session_id=s.cli_session_id,
-        workdir=s.workdir,
-        model=s.model,
-        model_before=s.model,
-        raw_usage=copy.deepcopy(s.raw_usage),
-        adapter_config=adapter_config,
-        adapter_config_before=copy.deepcopy(adapter_config),
-    )
-
-
-def _merge_usage_enrichment_snapshot(s, snapshot: _UsageEnrichmentSnapshot) -> None:
-    """Merge provider-side model/cursor changes without clobbering live edits."""
-    if snapshot.model != snapshot.model_before:
-        # A live terminal/config path may have selected a model while the
-        # provider lookup was in flight.  Only fill the value if it still has
-        # the snapshot's original value.
-        if s.model == snapshot.model_before:
-            s.model = snapshot.model
-
-    missing = object()
-    before_config = snapshot.adapter_config_before
-    current_config = s.adapter_config
-    for key in set(before_config) | set(snapshot.adapter_config):
-        before = before_config.get(key, missing)
-        after = snapshot.adapter_config.get(key, missing)
-        if before == after:
-            continue
-        current = current_config.get(key, missing)
-        # Compare-and-merge: a concurrent live update owns the field and must
-        # win over the detached provider snapshot.
-        if current != before:
-            continue
-        if after is missing:
-            current_config.pop(key, None)
-        else:
-            current_config[key] = copy.deepcopy(after)
-
-
-async def _run_usage_enrichment(session_id: str) -> None:
-    """Run durable usage jobs serially for one Session.
-
-    Adapter lookup and the whole synchronous enrich call run in a worker
-    thread.  The Session lock serializes post-processing jobs; the provider
-    receives a minimal snapshot so a later terminal path can still
-    persist/broadcast without waiting for provider I/O or racing a provider
-    cursor write.
-    """
-    lock = _usage_enrichment_lock(session_id)
-    async with lock:
-        async def retry_job(s, job, exc) -> bool:
-            current = _enrichment_job(s, job.get("key"))
-            if current is None:
-                # Another recovery path completed this exact durable job.
-                return False
-            try:
-                attempts = max(0, int(current.get("attempts", 0))) + 1
-            except (TypeError, ValueError):
-                attempts = 1
-            delay = min(
-                _ENRICH_RETRY_MAX_SEC,
-                _ENRICH_RETRY_BASE_SEC * (2 ** min(attempts - 1, 5)),
-            )
-            current.update({
-                "state": "retrying",
-                "attempts": attempts,
-                "lastError": f"{type(exc).__name__}: {exc}",
-                "nextAttemptAt": time.time() + delay,
-            })
-            try:
-                await _sess.save_async(s)
-            except Exception:
-                _log.exception(
-                    "[Session %s] failed to persist usage retry state key=%s",
-                    session_id, current.get("key"),
-                )
-            _log.warning(
-                "[Session %s] usage enrichment failed key=%s attempt=%d; "
-                "retrying in %.1fs: %s",
-                session_id, current.get("key"), attempts, delay, exc,
-            )
-            await asyncio.sleep(delay)
-            return True
-
-        while True:
-            s = _get_session_shallow(session_id)
-            if s is None:
-                return
-            pending = getattr(s, "usage_enrichment_pending", None)
-            if not isinstance(pending, list) or not pending:
-                return
-            job = pending[0]
-            if not isinstance(job, dict) or not job.get("key"):
-                pending.pop(0)
-                try:
-                    await _sess.save_async(s)
-                except Exception:
-                    _log.exception(
-                        "[Session %s] failed to discard malformed usage enrichment job",
-                        session_id,
-                    )
-                    return
-                continue
-
-            next_attempt = job.get("nextAttemptAt", 0.0)
-            if isinstance(next_attempt, (int, float)) and next_attempt > time.time():
-                await asyncio.sleep(min(next_attempt - time.time(), _ENRICH_RETRY_MAX_SEC))
-                continue
-
-            # Run provider I/O against a detached, minimal snapshot.  The
-            # live Session can receive the next terminal result while this
-            # thread is blocked, without copying or exposing large state.
-            enrichment_session = _make_usage_enrichment_snapshot(s)
-            try:
-                adapter = _usage_enrichment_adapters.get(job.get("key"))
-                if adapter is None:
-                    adapter = get_adapter(job.get("adapter") or s.adapter)
-                enrichment = await asyncio.to_thread(
-                    adapter.enrich_after_result, enrichment_session,
-                )
-                if inspect.isawaitable(enrichment):
-                    enrichment = await enrichment
-            except asyncio.CancelledError:
-                # The live Session was not touched by provider execution, so
-                # the durable pending job remains for the next generation.
-                raise
-            except Exception as exc:
-                if await retry_job(s, job, exc):
-                    continue
-                return
-
-            # Provider success: merge only its usage delta and snapshot cursor
-            # changes.  Live usage/config updates win when the same field was
-            # changed after the snapshot was taken.
-            removed = False
-            try:
-                if enrichment:
-                    prev_total = s.total_usage
-                    s.raw_usage = _sess.accumulate_raw_usage(
-                        s.raw_usage, enrichment)
-                    s.total_usage = _sess.compute_total_usage(s.raw_usage)
-                    prev_credit = prev_total.get("credit", 0) if prev_total else 0
-                    new_credit = s.total_usage.get("credit", 0) if s.total_usage else 0
-                    _log.info(
-                        "[Session %s] usage enrichment credit: %.2f -> %.2f (+%.2f)",
-                        session_id, prev_credit, new_credit,
-                        new_credit - prev_credit,
-                    )
-                _merge_usage_enrichment_snapshot(s, enrichment_session)
-                # Remove by key rather than list position: another terminal
-                # may have appended a later job while this one was in a thread.
-                s.usage_enrichment_pending = [
-                    candidate for candidate in (s.usage_enrichment_pending or [])
-                    if candidate is not job and (
-                        not isinstance(candidate, dict)
-                        or candidate.get("key") != job.get("key")
-                    )
-                ]
-                removed = True
-                await _sess.save_async(s)
-            except asyncio.CancelledError:
-                if removed and _enrichment_job(s, job.get("key")) is None:
-                    s.usage_enrichment_pending.insert(0, job)
-                raise
-            except Exception as exc:
-                # A failed save must not turn a successful provider lookup into
-                # a lost durable job.  Keep merged live usage/config, restore
-                # the job, and retry; compare-and-merge makes the retry safe.
-                if removed and _enrichment_job(s, job.get("key")) is None:
-                    s.usage_enrichment_pending.insert(0, job)
-                if await retry_job(s, job, exc):
-                    continue
-                return
-
-            _usage_enrichment_adapters.pop(job.get("key"), None)
-            _log.info(
-                "[Session %s] usage enrichment complete key=%s attempts=%s",
-                session_id, job.get("key"), job.get("attempts", 0),
-            )
-
-
-def _schedule_usage_enrichment(session_id: str) -> asyncio.Task | None:
-    """Start at most one Session-scoped usage worker."""
-    if _shutdown_started:
-        return None
-    existing = _usage_enrichment_tasks.get(session_id)
-    if existing is not None and not existing.done():
-        return existing
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        return None
-    task = loop.create_task(
-        _run_usage_enrichment(session_id),
-        name=f"pan-usage-enrich-{session_id}",
-    )
-    _usage_enrichment_tasks[session_id] = task
-
-    def _finish(done: asyncio.Task) -> None:
-        if _usage_enrichment_tasks.get(session_id) is done:
-            _usage_enrichment_tasks.pop(session_id, None)
-        if done.cancelled():
-            return
-        try:
-            done.result()
-        except Exception:
-            _log.exception(
-                "[Pan] usage enrichment worker crashed for session=%s",
-                session_id,
-            )
-
-    task.add_done_callback(_finish)
-    return task
-
-
-def recover_pending_usage_enrichment() -> int:
-    """Schedule persisted usage jobs after startup/recovery scans."""
-    scheduled = 0
-    for s in _list_sessions_shallow():
-        if _has_pending_usage_enrichment(s):
-            if _schedule_usage_enrichment(s.id) is not None:
-                scheduled += 1
-    return scheduled
-
-
-async def _persist_terminal_state(
-    w: Worker, s, status: str, result_text: str | None,
-) -> dict | None:
-    """Persist the minimum terminal fact set before any completion broadcast."""
-    if w._terminal_handled:
-        _log.warning(
-            "[Worker %s] duplicate terminal event ignored generation=%s",
-            w.worker_id, w.generation,
-        )
-        return None
-
-    task_seq = w._current_seq
-    task_id = w._current_task_id
-    task_idempotent = w._current_task_idempotent
-    source_session_id = w._current_source_session_id
-    terminal_key = _terminal_enrichment_key(
-        task_id, task_seq, w.worker_id, w.generation,
-        task_idempotent=task_idempotent,
-    )
-    result_text = result_text if result_text is not None else ""
-    w.status = status
-    if s is None:
-        # There is no durable Session to protect.  Callers must not publish a
-        # terminal result that cannot be reconciled through session_get.
-        raise RuntimeError(
-            f"Session {w.session_id} disappeared before terminal persistence"
-        )
-    prior_result = s.last_result if isinstance(s.last_result, dict) else None
-    if (prior_result and prior_result.get("terminalKey") == terminal_key
-            and prior_result.get("status") == status):
-        # A replacement Worker can observe the provider's already-completed
-        # turn again.  The durable terminal key suppresses a second result
-        # broadcast when the in-memory guard was lost with the old Worker.
-        _log.warning(
-            "[Worker %s] durable duplicate terminal ignored key=%s",
-            w.worker_id, terminal_key,
-        )
-        w.status = "idle"
-        w._terminal_handled = True
-        # A duplicate terminal is still a terminal for the current consumer
-        # generation.  Without waking _consumer_stream, a durable duplicate
-        # can strand the serial queue until the watchdog removes the worker.
-        _signal_task_done(w)
-        w.last_activity = time.monotonic()
-        return None
-
-    # ``last_result`` is deliberately only the latest compatibility view.  A
-    # reconnect may cross several terminal turns, so keep a small durable
-    # ordered window as the source for cursor replay.  Check the window before
-    # allocating a new cursor as well; a replacement Worker may lose the
-    # in-memory terminal guard after a crash.
-    prior_terminals = [
-        item for item in (getattr(s, "terminal_results", None) or [])
-        if isinstance(item, dict)
-    ]
-    if any(
-        item.get("terminalKey") == terminal_key
-        and item.get("status") == status
-        for item in prior_terminals
-    ):
-        _log.warning(
-            "[Worker %s] durable terminal replay duplicate ignored key=%s",
-            w.worker_id, terminal_key,
-        )
-        w.status = "idle"
-        w._terminal_handled = True
-        _signal_task_done(w)
-        w.last_activity = time.monotonic()
-        return None
-
-    try:
-        result_cursor = max(
-            int(getattr(s, "result_cursor", 0) or 0),
-            max((int(item.get("resultCursor", 0) or 0)
-                 for item in prior_terminals), default=0),
-        ) + 1
-    except (TypeError, ValueError):
-        result_cursor = max(0, int(getattr(s, "result_cursor", 0) or 0)) + 1
-    s.result_cursor = result_cursor
-    terminal_record = {
-        "resultCursor": result_cursor,
-        "terminalKey": terminal_key,
-        "status": status,
-        "result": result_text,
-        "taskSeq": task_seq,
-        "taskId": task_id,
-        "taskIdempotent": task_idempotent,
-        "workerId": w.worker_id,
-        "generation": w.generation,
-        "sourceSessionId": source_session_id,
-        "timestamp": datetime.now().isoformat(),
-        "historyEpoch": getattr(s, "history_epoch", None),
-        "historyRevision": getattr(s, "history_revision", 0),
-    }
-    s.terminal_results = (
-        prior_terminals + [terminal_record]
-    )[-_sess.RESULT_REPLAY_MAX_ENTRIES:]
-
-    s.last_result = {
-        "status": status,
-        "result": result_text,
-        "cli_session_id": s.cli_session_id,
-        "timestamp": datetime.now().isoformat(),
-        "taskSeq": task_seq,
-        "taskId": task_id,
-        "taskIdempotent": task_idempotent,
-        "workerId": w.worker_id,
-        "generation": w.generation,
-        "resultCursor": result_cursor,
-        "sourceSessionId": source_session_id,
-        "terminalKey": terminal_key,
-    }
-    if isinstance(result_text, str) and result_text.strip():
-        last = s.history[-1] if s.history else None
-        if not (last and last.get("role") == "assistant"
-                and last.get("content") == result_text):
-            _sess.append_history(s, {"role": "assistant", "content": result_text})
-
-    # The result must cover the canonical history revision after the final
-    # append, not the revision that happened to exist when the replay record
-    # was allocated above. Persist this coverage in the same base commit as
-    # last_result/terminal_results before publishing result or idle.
-    history_epoch = getattr(s, "history_epoch", None)
-    history_revision = getattr(s, "history_revision", 0)
-    terminal_record["historyEpoch"] = history_epoch
-    terminal_record["historyRevision"] = history_revision
-    s.last_result["historyEpoch"] = history_epoch
-    s.last_result["historyRevision"] = history_revision
-
-    # Queue rows crossed the existing provider hand-off boundary earlier; this
-    # only clears runtime routing references and never changes FIFO state.
-    _ack_current_task(w, s)
-    _ack_current_reports(w, s)
-    _clear_active_task_if_current(s, task_id)
-    enrichment_key = _queue_usage_enrichment(
-        s, w.adapter, task_id=task_id, task_seq=task_seq,
-        worker_id=w.worker_id, generation=w.generation,
-        task_idempotent=task_idempotent,
-    )
-    if enrichment_key:
-        s.last_result["usageEnrichmentKey"] = enrichment_key
-
-    # Keep the persisted legal state aligned with the existing lifecycle
-    # ledger, but save only after history/result/job preparation is complete.
-    await _record_legal_worker_state(w, status, "task/complete", persist=False)
-    w.status = "idle"
-    await _record_legal_worker_state(w, "idle", "task/complete-idle", persist=False)
-    # This is the base commit.  If it fails, the exception prevents both
-    # worker.result and idle broadcasts, as required by the terminal contract.
-    await _flush_history_now(w)
-    w.status = status
-    w._terminal_handled = True
-    return {
-        "taskSeq": task_seq,
-        "taskId": task_id,
-        "taskIdempotent": task_idempotent,
-        "resultCursor": result_cursor,
-        "terminalKey": terminal_key,
-        "sourceSessionId": source_session_id,
-        "result": result_text,
-        "status": status,
-        "enrichmentKey": enrichment_key,
-        "historyEpoch": getattr(s, "history_epoch", None),
-        "historyRevision": getattr(s, "history_revision", 0),
-    }
-
-
-async def _publish_terminal_events(w: Worker, terminal: dict, s) -> None:
-    """Publish result then idle, without waiting for usage enrichment."""
-    completion_notification = _notifications.dispatch_completion_nonblocking(
-        s, terminal["status"], terminal["result"],
-    )
-    await _bcast({
-        "type": "worker.result",
-        "workerId": w.worker_id,
-        "sessionId": w.session_id,
-        "generation": w.generation,
-        "status": terminal["status"],
-        "result": terminal["result"],
-        "taskSeq": terminal["taskSeq"],
-        "taskId": terminal["taskId"],
-        "resultCursor": terminal["resultCursor"],
-        "terminalKey": terminal["terminalKey"],
-        "sourceSessionId": terminal["sourceSessionId"],
-        "historyEpoch": terminal.get("historyEpoch"),
-        "historyRevision": terminal.get("historyRevision", 0),
-        "terminalCoverage": {
-            "historyEpoch": terminal.get("historyEpoch"),
-            "historyRevision": terminal.get("historyRevision", 0),
-        },
-        **({"notification": completion_notification}
-           if completion_notification else {}),
-    })
-    w.status = "idle"
-    await _bcast({
-        "type": "worker.status",
-        "workerId": w.worker_id,
-        "sessionId": w.session_id,
-        "generation": w.generation,
-        "status": "idle",
-        "taskSeq": terminal["taskSeq"],
-        "sourceSessionId": terminal["sourceSessionId"],
-    })
-
-
-def _finish_terminal_bookkeeping(w: Worker, terminal: dict) -> None:
-    """Complete in-memory idempotency bookkeeping after terminal publication."""
-    task_id = terminal["taskId"]
-    if terminal["taskIdempotent"] and task_id and task_id in _task_status:
-        _task_status[task_id] = {
-            "status": terminal["status"],
-            "result": terminal["result"],
-            "workerId": w.worker_id,
-            "taskId": task_id,
-            "ts": time.monotonic(),
-        }
-    w._current_task_id = None
-    w._current_task_idempotent = False
-    w._current_source_session_id = None
-    w.last_activity = time.monotonic()
-    _signal_task_done(w)
-    _maybe_restart_pending(w)
-    if terminal.get("enrichmentKey"):
-        _schedule_usage_enrichment(w.session_id)
 
 
 def _runtime_stopped(w: Worker) -> bool:
@@ -1383,31 +746,6 @@ def _ack_current_task(w: Worker, s) -> None:
     w._current_queue_item = None
 
 
-def _clear_active_task_if_current(s, task_id: str | None) -> bool:
-    """Clear the persisted routing context only for the completed task.
-
-    A newer assign may already have replaced ``active_task_id`` while an older
-    FIFO item was still running.  Comparing the ids prevents that completion
-    from clearing the newer task's context.
-    """
-    if s is None or not task_id or getattr(s, "active_task_id", None) != task_id:
-        return False
-    s.active_task_id = None
-    return True
-
-
-def _clear_active_task_if_not_pending(s) -> bool:
-    """Drop a completed/aborted context, while retaining a queued retry."""
-    active = getattr(s, "active_task_id", None) if s is not None else None
-    if not active:
-        return False
-    if any(_is_formal_task_item(item) and item.get("taskId") == active
-           for item in (getattr(s, "queue_pending", None) or [])):
-        return False
-    s.active_task_id = None
-    return True
-
-
 def _ack_current_reports(w: Worker, s) -> None:
     """收到最终 result 后清理当前报告批次运行上下文。
 
@@ -1420,19 +758,47 @@ def _ack_current_reports(w: Worker, s) -> None:
 
 async def _finish_task_error(w: Worker, s, result: str) -> None:
     """把执行前失败也收敛成可见的 terminal result。"""
+    task_id = w._current_task_id
+    w.status = "error"
+    if s is not None:
+        s.last_result = {
+            "status": "error",
+            "result": result,
+            "cli_session_id": s.cli_session_id,
+            "timestamp": datetime.now().isoformat(),
+            "taskSeq": w._current_seq,
+        }
+        _ack_current_task(w, s)
+        _ack_current_reports(w, s)
+        # The existing terminal-result save should also persist the final
+        # legal state, avoiding extra full-session writes on this hot path.
+        await _record_legal_worker_state(w, "error", "task/error", persist=False)
+        w.status = "idle"
+        await _record_legal_worker_state(w, "idle", "task/error-complete", persist=False)
+        await _sess.save_async(s)
+    await _bcast({
+        "type": "worker.result",
+        "workerId": w.worker_id,
+        "sessionId": w.session_id,
+        "generation": w.generation,
+        "status": "error",
+        "result": result,
+        "taskSeq": w._current_seq,
+        "sourceSessionId": w._current_source_session_id,
+    })
+    await _enqueue_report(w.session_id, "error", result, task_id, w.worker_id)
+    if task_id and task_id in _task_status:
+        _task_status[task_id] = {
+            "status": "error", "result": result,
+            "workerId": w.worker_id, "taskId": task_id, "ts": time.monotonic(),
+        }
+    w._current_task_id = None
+    w._current_source_session_id = None
+    w.status = "idle"
     if s is None:
-        raise RuntimeError(
-            f"Session {w.session_id} disappeared before terminal persistence"
-        )
-    terminal = await _persist_terminal_state(w, s, "error", result)
-    if terminal is None:
-        return
-    await _publish_terminal_events(w, terminal, s)
-    await _enqueue_report(
-        w.session_id, terminal["status"], terminal["result"],
-        terminal["taskId"], w.worker_id,
-    )
-    _finish_terminal_bookkeeping(w, terminal)
+        await _record_legal_worker_state(w, "error", "task/error", persist=False)
+        await _record_legal_worker_state(w, "idle", "task/error-complete", persist=False)
+    _signal_task_done(w)
 
 
 # ── 流式块防抖落盘（A1）──
@@ -1585,19 +951,12 @@ async def _read_stdout(w: Worker):
             s = _session(w)
             if s:
                 for b in adapter.extract_assistant_blocks(event):
-                    _sess.append_history(s, b)
+                    s.history.append(b)
                 # A1 防抖：append 只标记 dirty，由防抖任务批量落盘（不逐块全量 save）
                 _mark_history_dirty(w)
 
         # 任务完成 → 保存 Session + last_result
         if adapter.is_result_event(event):
-            if w._terminal_handled:
-                _log.warning(
-                    "[Worker %s] duplicate result event ignored generation=%s",
-                    w.worker_id, w.generation,
-                )
-                w.status = "idle"
-                continue
             s = _session(w)
             is_error = adapter.is_result_error(event)
             is_cancelled = bool(event.get("cancelled") or event.get("is_cancelled"))
@@ -1616,20 +975,91 @@ async def _read_stdout(w: Worker):
             # 由 send_task 分配并随 item 落盘）。序号计数器在 session.task_seq
             # 上，跨 worker respawn 保持单调递增。
             task_seq = w._current_seq
+
+            if s:
+                result_text = adapter.extract_result_text(event)
+                s.last_result = {
+                    "status": w.status,
+                    "result": result_text,
+                    "cli_session_id": s.cli_session_id,
+                    "timestamp": datetime.now().isoformat(),
+                    "taskSeq": task_seq,
+                    "sourceSessionId": w._current_source_session_id,
+                }
+                if isinstance(result_text, str) and result_text.strip():
+                    last = s.history[-1] if s.history else None
+                    if not (last and last.get("role") == "assistant"
+                            and last.get("content") == result_text):
+                        s.history.append({"role": "assistant", "content": result_text})
+                # result 只记录终态；queue item 已在 provider hand-off 回调中
+                # 处理，这里不得再次按结果修改 queue_pending。
+                _ack_current_task(w, s)
+                _ack_current_reports(w, s)
+                # enrich: 从 CLI 原生存储获取消耗数据（如 raw_usage）
+                enrichment = None
+                try:
+                    enrichment = adapter.enrich_after_result(s)
+                except Exception:
+                    pass
+                if enrichment:
+                    prev_total = s.total_usage
+                    s.raw_usage = _sess.accumulate_raw_usage(s.raw_usage, enrichment)
+                    s.total_usage = _sess.compute_total_usage(s.raw_usage)
+                    prev_credit = prev_total.get("credit", 0) if prev_total else 0
+                    new_credit = s.total_usage.get("credit", 0) if s.total_usage else 0
+                    _log.info("credit: %.2f -> %.2f (+%.2f)", prev_credit, new_credit, new_credit - prev_credit)
+                # A1 result 立即落盘：同时 flush 防抖缓冲的流式块 + last_result，
+                # 由单写者防抖任务（若在跑）完成，避免双写竞态。
+                result_status = w.status
+                await _record_legal_worker_state(w, result_status, "task/complete", persist=False)
+                w.status = "idle"
+                await _record_legal_worker_state(w, "idle", "task/complete-idle", persist=False)
+                await _flush_history_now(w)
+                # Keep the live status semantics unchanged until the result
+                # event and task ledger have been published below.
+                w.status = result_status
+
+            # taskSeq 已在上方（last_result 补存处）统一用 _current_seq。
+            task_seq = w._current_seq
+            task_source_session_id = w._current_source_session_id
             result_text = adapter.extract_result_text(event)
-            terminal = await _persist_terminal_state(w, s, w.status, result_text)
-            if terminal is None:
-                continue
-            # Base state is durable before this point.  Usage enrichment is only
-            # scheduled after the result/idle pair and never delays either.
-            await _publish_terminal_events(w, terminal, s)
-            # Snapshot the input metadata before any cleanup.  Reports must be
-            # paired with this turn's queue item, never with a global/previous
-            # task id.
+            completion_notification = _notifications.dispatch_completion(s, w.status, result_text) if s else None
+            await _bcast({
+                "type": "worker.result",
+                "workerId": w.worker_id,
+                "sessionId": w.session_id,
+                "generation": w.generation,
+                "status": w.status,
+                "result": result_text,
+                "taskSeq": task_seq,
+                "sourceSessionId": task_source_session_id,
+                **({"notification": completion_notification} if completion_notification else {}),
+            })
             # 订阅制报告：完成 → 若被订阅则 append 到 manager 的落盘队列（立项 4.3）
-            await _enqueue_report(w.session_id, terminal["status"], terminal["result"],
-                                  terminal["taskId"], w.worker_id)
-            _finish_terminal_bookkeeping(w, terminal)
+            await _enqueue_report(w.session_id, w.status, result_text, w._current_task_id, w.worker_id)
+            # 幂等：完成对应 taskId（若有）
+            if w._current_task_id and w._current_task_id in _task_status:
+                _task_status[w._current_task_id] = {
+                    "status": w.status,
+                    "result": result_text,
+                    "workerId": w.worker_id,
+                    "taskId": w._current_task_id,
+                    "ts": time.monotonic(),
+                }
+            w._current_task_id = None
+            w.status = "idle"
+            # A3：idle 过渡即时广播（前端此前靠 result 推断，存在延迟）
+            await _bcast({
+                "type": "worker.status",
+                "workerId": w.worker_id,
+                "sessionId": w.session_id,
+                "generation": w.generation,
+                "status": "idle",
+                "sourceSessionId": task_source_session_id,
+            })
+            w._current_source_session_id = None
+            _signal_task_done(w)
+            _maybe_restart_pending(w)
             continue
 
         # replay 期间不广播 stream 事件
@@ -1639,8 +1069,6 @@ async def _read_stdout(w: Worker):
                 "workerId": w.worker_id,
                 "sessionId": w.session_id,
                 "generation": w.generation,
-                "taskSeq": w._current_seq,
-                "taskId": w._current_task_id,
                 "event": event,
             })
 
@@ -1783,7 +1211,6 @@ async def _legacy_consumer_reference(w: Worker):
                 text = await _maybe_inject_memory(_session(w), claimed["text"])
             w._current_seq = claimed.get("seq")
             w._current_task_id = claimed.get("taskId")
-            w._current_task_idempotent = _is_formal_task_item(claimed)
             w._current_source_session_id = claimed.get("sourceSessionId")
             w._current_queue_item = claimed
         else:
@@ -1832,7 +1259,7 @@ async def _legacy_consumer_reference(w: Worker):
                         hist_entry["clientMessageId"] = claimed["clientMessageId"]
                 old_history_len = len(s.history)
                 if not already_delivered:
-                    _sess.append_history(s, hist_entry)
+                    s.history.append(hist_entry)
                 try:
                     # Queue consumption is committed together with the history
                     # receipt before writing stdin/spawning oneshot.  Once this
@@ -1841,7 +1268,6 @@ async def _legacy_consumer_reference(w: Worker):
                 except Exception as e:
                     if not already_delivered:
                         del s.history[old_history_len:]
-                        _sess.replace_history(s, s.history)
                     if claimed is not None:
                         # _claim_pending_task removed the item synchronously to
                         # reserve it against API delete/order and duplicate signals.
@@ -1907,10 +1333,6 @@ def _select_queue_unit(s) -> list[dict] | None:
             # reserved/writing/sent rows belong to the current/recovering
             # hand-off.  They must not let a later item overtake them.
             return None
-        if queue_item_edit_locked(s, _queue_item_id(item)):
-            # Keep FIFO ordering while the browser owns this item's edit
-            # lease.  Releasing or saving the lease sends a fresh wakeup.
-            return None
         if kind == "task":
             return [item]
         unit = [item]
@@ -1948,76 +1370,71 @@ async def _reserve_queue_unit(w: Worker, s, items: list[dict], text: str) -> boo
     """Persist reservation/writing states and the user history before hand-off."""
     if not _process_alive(w):
         return False
-    async with queue_lock(s.id):
-        for item in items:
-            if (not any(existing is item for existing in s.queue_pending)
-                    or not _is_dispatchable(item)
-                    or queue_item_edit_locked(s, _queue_item_id(item))):
-                return False
-
-        history_items = [item for item in items if not _delivery_mark_in_history(s, item)]
-        history_added = bool(history_items)
-        if history_items:
-            if _queue_item_kind(items[0]) == "task":
-                item = items[0]
-                entry = {
-                    "role": "user",
-                    "content": text,
-                    "delivered_keys": [_delivery_key(item) for item in history_items],
-                    "source": _task_source(item) or "user",
-                }
-                if item.get("sourceSessionId") is not None:
-                    entry["sourceSessionId"] = item.get("sourceSessionId")
-                if item.get("taskId") is not None:
-                    entry["taskId"] = item.get("taskId")
-                    if item.get("taskIdSource") is not None:
-                        entry["taskIdSource"] = item.get("taskIdSource")
-                if item.get("clientMessageId"):
-                    entry["clientMessageId"] = item["clientMessageId"]
-                if isinstance(item.get("parts"), list):
-                    entry["parts"] = [dict(part) for part in item["parts"] if isinstance(part, dict)]
-            else:
-                entry = {
-                    "role": "user",
-                    "content": text,
-                    "delivered_keys": [_delivery_key(item) for item in history_items],
-                    "source": "report",
-                }
-                source_ids = sorted({
-                    item.get("sourceSessionId") for item in items
-                    if isinstance(item.get("sourceSessionId"), str)
-                    and item.get("sourceSessionId")
-                })
-                if source_ids:
-                    entry["sourceSessionIds"] = source_ids
-            _sess.append_history(s, entry)
-            history_added = True
-
-        for item in items:
-            item["deliveryState"] = _DELIVERY_RESERVED
-            item["reservedBy"] = w.worker_id
-            item["reservedGeneration"] = w.generation
-            item["reservedAt"] = time.time()
-            _remember_queue_item(s, item, _DELIVERY_RESERVED)
-        try:
-            await _save_receipt(s)
-        except Exception:
-            if history_added and s.history and set(s.history[-1].get("delivered_keys") or ()) == {
-                _delivery_key(item) for item in history_items
-            }:
-                s.history.pop()
-                _sess.replace_history(s, s.history)
-            for item in items:
-                _queue_item_backoff(item, "queue reservation save failed")
-                _remember_queue_item(s, item, _DELIVERY_QUEUED)
+    for item in items:
+        if (not any(existing is item for existing in s.queue_pending)
+                or not _is_dispatchable(item)):
             return False
 
-        # Keep the more precise writing state in memory for API/runtime observers,
-        # but the durable RESERVED marker is sufficient for restart recovery: any
-        # row left reserved is treated as an unfinished hand-off and requeued.
+    history_items = [item for item in items if not _delivery_mark_in_history(s, item)]
+    history_added = bool(history_items)
+    if history_items:
+        if _queue_item_kind(items[0]) == "task":
+            item = items[0]
+            entry = {
+                "role": "user",
+                "content": text,
+                "delivered_keys": [_delivery_key(item) for item in history_items],
+                "source": _task_source(item) or "user",
+            }
+            if item.get("sourceSessionId") is not None:
+                entry["sourceSessionId"] = item.get("sourceSessionId")
+            if item.get("taskId") is not None:
+                entry["taskId"] = item.get("taskId")
+            if item.get("clientMessageId"):
+                entry["clientMessageId"] = item["clientMessageId"]
+            if isinstance(item.get("parts"), list):
+                entry["parts"] = [dict(part) for part in item["parts"] if isinstance(part, dict)]
+        else:
+            entry = {
+                "role": "user",
+                "content": text,
+                "delivered_keys": [_delivery_key(item) for item in history_items],
+                "source": "report",
+            }
+            source_ids = sorted({
+                item.get("sourceSessionId") for item in items
+                if isinstance(item.get("sourceSessionId"), str)
+                and item.get("sourceSessionId")
+            })
+            if source_ids:
+                entry["sourceSessionIds"] = source_ids
+        s.history.append(entry)
+        history_added = True
+
+    for item in items:
+        item["deliveryState"] = _DELIVERY_RESERVED
+        item["reservedBy"] = w.worker_id
+        item["reservedGeneration"] = w.generation
+        item["reservedAt"] = time.time()
+        _remember_queue_item(s, item, _DELIVERY_RESERVED)
+    try:
+        await _save_receipt(s)
+    except Exception:
+        if history_added and s.history and set(s.history[-1].get("delivered_keys") or ()) == {
+            _delivery_key(item) for item in history_items
+        }:
+            s.history.pop()
         for item in items:
-            item["deliveryState"] = _DELIVERY_WRITING
-        return history_added
+            _queue_item_backoff(item, "queue reservation save failed")
+            _remember_queue_item(s, item, _DELIVERY_QUEUED)
+        return False
+
+    # Keep the more precise writing state in memory for API/runtime observers,
+    # but the durable RESERVED marker is sufficient for restart recovery: any
+    # row left reserved is treated as an unfinished hand-off and requeued.
+    for item in items:
+        item["deliveryState"] = _DELIVERY_WRITING
+    return history_added
 
 
 async def _requeue_queue_unit(w: Worker, s, items: list[dict], reason: str,
@@ -2031,13 +1448,11 @@ async def _requeue_queue_unit(w: Worker, s, items: list[dict], reason: str,
         if item.get("type") == "task":
             _task_status_queued(w, item)
     if history_added:
+        keys = {_delivery_key(item) for item in items}
         for index in range(len(s.history) - 1, -1, -1):
             entry = s.history[index]
-            if any(_delivery_key_matches(key, item)
-                   for key in (entry.get("delivered_keys") or ())
-                   for item in items):
+            if keys.intersection(entry.get("delivered_keys") or ()):
                 s.history.pop(index)
-                _sess.replace_history(s, s.history)
                 break
     try:
         await _save_receipt(s)
@@ -2137,14 +1552,12 @@ async def _deliver_queue_unit(w: Worker, s, items: list[dict]) -> None:
         source = _task_source(items[0])
         w._current_seq = items[0].get("seq")
         w._current_task_id = items[0].get("taskId")
-        w._current_task_idempotent = _is_formal_task_item(items[0])
         w._current_source_session_id = items[0].get("sourceSessionId")
         history_text = items[0]["text"]
     else:
         source = "report"
         w._current_seq = None
         w._current_task_id = None
-        w._current_task_idempotent = False
         w._current_source_session_id = None
         history_text = _format_report_batch(items)
     w._current_queue_item = items[0] if kind == "task" else None
@@ -2210,7 +1623,6 @@ async def _deliver_queue_unit(w: Worker, s, items: list[dict]) -> None:
             w._current_report_items = []
         if w._current_task_id == items[0].get("taskId") if kind == "task" else False:
             w._current_task_id = None
-            w._current_task_idempotent = False
         _wake_after_queue_unit(w, s)
 
 
@@ -2256,11 +1668,9 @@ _CHANNEL_HEADERS = {"qq": "@@@@by qq", "wechat": "@@@@by wechat"}
 
 
 def _format_report_batch(reports: list[dict]) -> str:
-    """积压报告拼接为可读文本。
+    """积压报告拼接为可读文本：`@@@@by agent : {sessionId} | {title}` 抬头 + 每字段一行。
 
-    Agent 报告/通知使用 ``@@@@by agent : {sessionId} | {title}``；
-    ``noticeKind=background_job_terminal`` 使用固定的 ``////by pan system``
-    抬头。报告形状：{"status","result","sessionId","taskId","workerId"}。
+    报告形状：{"status","result","sessionId","taskId","workerId"}。
     title 取被管 session 的 name（`_sess.get(session_id).name`），session 不存在则回退 unknown。
     result 值单独成行、去引号、保留多行原文；None → null。
     """
@@ -2301,60 +1711,6 @@ def _format_report_batch(reports: list[dict]) -> str:
             ]
             parts.append("\n".join(lines))
             continue
-        if r.get("noticeKind") == "background_job_terminal":
-            target_ids = r.get("targetSessionIds")
-            if not isinstance(target_ids, list):
-                target_ids = [r.get("targetSessionId") or r.get("sessionId")]
-            target_ids = [value for value in target_ids if value is not None]
-            lines = [
-                "////by pan system",
-                f"status: {_field_value(r.get('status'))}",
-                f"noticeKind: {_field_value(r.get('noticeKind'))}",
-                f"jobId: {_field_value(r.get('jobId'))}",
-                f"targetSessionId: {_field_value(r.get('targetSessionId') or r.get('sessionId'))}",
-                f"targetSessionIds: {_field_value(target_ids)}",
-            ]
-            if r.get("creatorSessionId") is not None:
-                lines.append(f"creatorSessionId: {_field_value(r.get('creatorSessionId'))}")
-            if r.get("eventId") is not None:
-                lines.append(f"eventId: {_field_value(r.get('eventId'))}")
-            lines += [
-                "result:",
-                _field_value(r.get("result")),
-            ]
-            parts.append("\n".join(lines))
-            continue
-        # Compatibility for terminal notices persisted by the pre-T-046
-        # scheduler: those rows have source=automation and an envelope, but
-        # do not yet have the explicit noticeKind/top-level projections.
-        # Keep them as Pan system messages instead of reviving the old
-        # `@@@@by agent : automation | automation` rendering.
-        if r.get("source") == "automation":
-            envelope = r.get("envelope") if isinstance(r.get("envelope"), dict) else {}
-            event_id = r.get("eventId")
-            job_id = r.get("jobId") or envelope.get("jobId")
-            if job_id is None and isinstance(event_id, str):
-                job_id = event_id.removesuffix(":terminal")
-            target_id = r.get("targetSessionId") or envelope.get("targetSessionId")
-            target_ids = r.get("targetSessionIds") or envelope.get("targetSessionIds")
-            if not isinstance(target_ids, list):
-                target_ids = [target_id] if target_id is not None else []
-            lines = [
-                "////by pan system",
-                f"status: {_field_value(envelope.get('status', r.get('status')))}",
-                f"jobId: {_field_value(job_id)}",
-                f"targetSessionId: {_field_value(target_id)}",
-                f"targetSessionIds: {_field_value(target_ids)}",
-            ]
-            creator_id = r.get("creatorSessionId") or envelope.get("creatorSessionId")
-            if creator_id is not None:
-                lines.append(f"creatorSessionId: {_field_value(creator_id)}")
-            lines += [
-                "result:",
-                _field_value(r.get("result")),
-            ]
-            parts.append("\n".join(lines))
-            continue
         # Reports identify the producing session in sourceSessionId. The
         # legacy sessionId field remains the report subject/fallback.
         if r.get("type") == "notice":
@@ -2367,12 +1723,10 @@ def _format_report_batch(reports: list[dict]) -> str:
         sid = candidate_sid if isinstance(candidate_sid, str) else ""
         title = "unknown"
         if sid:
-            sess = _get_session_shallow(sid)
+            sess = _sess.get(sid)
             if sess and sess.name:
                 title = sess.name
-        elif r.get("source") == "automation":
-            title = "automation"
-        src = sid or r.get("workerId") or r.get("source") or "unknown"
+        src = sid or r.get("workerId") or "unknown"
         lines = [
             f"@@@@by agent : {src} | {title}",
             f"status: {_field_value(r.get('status'))}",
@@ -2468,8 +1822,6 @@ async def request_claude_permission(
             "workerId": worker_id,
             "sessionId": w.session_id,
             "generation": w.generation,
-            "taskSeq": w._current_seq,
-            "taskId": w._current_task_id,
             "event": event,
         })
         try:
@@ -2518,8 +1870,6 @@ async def _resolve_claude_permission(worker_id: str, control: dict) -> bool:
             "workerId": worker_id,
             "sessionId": w.session_id,
             "generation": w.generation,
-            "taskSeq": w._current_seq,
-            "taskId": w._current_task_id,
             "event": {
                 "type": "claude.permission_resolved",
                 "request_id": key,
@@ -2530,19 +1880,6 @@ async def _resolve_claude_permission(worker_id: str, control: dict) -> bool:
 
 def _is_task_item(item) -> bool:
     return isinstance(item, dict) and item.get("type") == "task"
-
-
-def _is_formal_task_item(item) -> bool:
-    """Return whether a task row owns the assign idempotency key.
-
-    An inherited ``taskId`` links an agent_send message to the active formal
-    task for reporting, but must not make repeated follow-up messages look like
-    duplicate assign calls.  Older task rows have no origin marker and are
-    therefore treated as formal for backward compatibility.
-    """
-    return (_is_task_item(item)
-            and bool(item.get("taskId"))
-            and item.get("taskIdSource", "assign") != "active")
 
 
 def _is_valid_task_item(item) -> bool:
@@ -2654,253 +1991,6 @@ def _queue_source(item: dict) -> str | None:
     return _task_source(item)
 
 
-_IDEMPOTENCY_INDEX_VERSION = 1
-_IDEMPOTENCY_BUCKETS = ("taskId", "clientMessageId")
-# A freshly completed receipt must survive at least this small crash/retry
-# window even if a test or deployment overrides the normal seven-day TTL.
-# Count eviction uses the same floor, so an in-flight retry cannot lose its
-# only durable proof merely because the ledger is temporarily over capacity.
-_RECEIPT_MIN_RETRY_SEC = getattr(_sess, "QUEUE_RECEIPT_MIN_RETRY_SEC", 60.0)
-_RECEIPT_COMPACT_KEYS = frozenset({
-    "id", "queueItemId", "type", "kind", "source", "sourceSessionId",
-    "sessionId", "taskId", "taskIdSource", "clientMessageId", "eventId",
-    "jobId", "creatorSessionId", "targetSessionId", "targetSessionIds",
-    "status", "workerId", "seq", "revision", "createdAt", "updatedAt",
-    "receiptAt", "deliveredAt", "deletedAt", "deliveryState",
-    "dispatchState", "receiptVersion", "receiptOnly",
-})
-
-
-def _list_sessions_shallow():
-    """Use the shallow loader while tolerating legacy test/embedder shims."""
-    try:
-        return _sess.list_all(load_history=False)
-    except TypeError:
-        return _sess.list_all()
-
-
-def _get_session_shallow(session_id: str):
-    """Read queue/metadata state without hydrating a cold history JSONL."""
-    try:
-        return _sess.get(session_id, load_history=False)
-    except TypeError:
-        return _sess.get(session_id)
-
-
-def _empty_idempotency_index() -> dict:
-    return {
-        "version": _IDEMPOTENCY_INDEX_VERSION,
-        "taskId": {},
-        "clientMessageId": {},
-    }
-
-
-def _idempotency_index(s, *, normalize: bool = True) -> tuple[dict, bool]:
-    """Return the index and whether its top-level shape needed repair.
-
-    Full entry normalization is only needed once per loaded Session.  Hot
-    idempotency lookups pass ``normalize=False`` so a 4k-entry index does not
-    turn every retry into another linear scan.
-    """
-    raw = getattr(s, "queue_idempotency_index", None)
-    changed = False
-    if not isinstance(raw, dict) or raw.get("version") != _IDEMPOTENCY_INDEX_VERSION:
-        index = _empty_idempotency_index()
-        changed = raw is not None
-    else:
-        index = raw
-        for bucket in _IDEMPOTENCY_BUCKETS:
-            values = index.get(bucket)
-            if not isinstance(values, dict):
-                index[bucket] = {}
-                changed = True
-                continue
-            if normalize:
-                for key, entry in list(values.items()):
-                    if not isinstance(key, str) or not key:
-                        values.pop(key, None)
-                        changed = True
-                    elif isinstance(entry, str):
-                        values[key] = {"queueItemId": entry, "seenAt": 0.0}
-                        changed = True
-                    elif not isinstance(entry, dict):
-                        values.pop(key, None)
-                        changed = True
-    if index is not raw:
-        s.queue_idempotency_index = index
-    return index, changed
-
-
-def _idempotency_seen_at(item: dict | None, fallback: float | None = None) -> float:
-    if isinstance(item, dict):
-        for key in (
-            "receiptAt", "deliveredAt", "deletedAt", "createdAt", "updatedAt",
-            "seenAt",
-        ):
-            value = item.get(key)
-            if isinstance(value, (int, float)):
-                return float(value)
-    return float(fallback if fallback is not None else time.time())
-
-
-def _index_idempotency_key(
-    s, bucket: str, key: object, *, queue_item_id: str | None,
-    seen_at: float | None = None, prefer_existing: bool = False,
-) -> bool:
-    if bucket not in _IDEMPOTENCY_BUCKETS or not isinstance(key, str) or not key:
-        return False
-    index, changed = _idempotency_index(s, normalize=False)
-    values = index[bucket]
-    existing = values.get(key)
-    if isinstance(existing, str):
-        existing = {"queueItemId": existing, "seenAt": 0.0}
-        values[key] = existing
-        changed = True
-    if not isinstance(existing, dict):
-        values[key] = {
-            "queueItemId": queue_item_id,
-            "seenAt": _idempotency_seen_at(None, seen_at),
-        }
-        return True
-    old_id = existing.get("queueItemId")
-    # A current queue/ledger record is more useful than a history-only
-    # tombstone.  Otherwise preserve the first durable receipt for idempotency.
-    if queue_item_id and not old_id:
-        if old_id != queue_item_id:
-            existing["queueItemId"] = queue_item_id
-            changed = True
-    if not isinstance(existing.get("seenAt"), (int, float)):
-        existing["seenAt"] = _idempotency_seen_at(None, seen_at)
-        changed = True
-    elif seen_at is not None and queue_item_id and not old_id:
-        existing["seenAt"] = float(seen_at)
-        changed = True
-    return changed
-
-
-def _index_queue_item(s, item: dict, *, state: str | None = None) -> bool:
-    """Index formal task/client receipt keys without scanning history."""
-    if not isinstance(item, dict):
-        return False
-    item_id = _queue_item_id(item)
-    seen_at = _idempotency_seen_at(item)
-    changed = False
-    if _is_formal_task_item(item) and item.get("taskId"):
-        changed = _index_idempotency_key(
-            s, "taskId", item.get("taskId"), queue_item_id=item_id,
-            seen_at=seen_at, prefer_existing=True,
-        ) or changed
-    if item.get("clientMessageId"):
-        changed = _index_idempotency_key(
-            s, "clientMessageId", item.get("clientMessageId"),
-            queue_item_id=item_id, seen_at=seen_at, prefer_existing=True,
-        ) or changed
-    return changed
-
-
-def _synthetic_receipt(s, bucket: str, key: str, entry: dict) -> dict:
-    """Represent an indexed-but-compacted receipt without restoring its body."""
-    queue_item_id = entry.get("queueItemId")
-    receipt = {
-        "type": "task" if bucket in {"taskId", "clientMessageId"} else "receipt",
-        "kind": "task",
-        "deliveryState": _DELIVERY_SENT,
-        "dispatchState": _DELIVERY_SENT,
-        "receiptOnly": True,
-        "receiptVersion": 1,
-    }
-    if isinstance(queue_item_id, str) and queue_item_id:
-        receipt.update({"id": queue_item_id, "queueItemId": queue_item_id})
-    if bucket == "taskId":
-        receipt["taskId"] = key
-    else:
-        receipt["clientMessageId"] = key
-    return receipt
-
-
-def _history_idempotency_rows(s) -> list[dict]:
-    """Load only a bounded tail when rebuilding an old Session's index."""
-    limit = max(
-        getattr(_sess, "ACCEPTED_INPUT_ID_MAX", 256),
-        getattr(_sess, "QUEUE_IDEMPOTENCY_INDEX_MAX_ENTRIES", 4096),
-    )
-    if getattr(s, "_history_loaded", True):
-        return [row for row in (s.history or [])[-limit:]
-                if isinstance(row, dict)]
-    history_path = _sess._history_path(s.id)
-    if history_path.exists():
-        rows, _ = _sess._history_page_from_jsonl(
-            history_path, before=0, limit=limit,
-        )
-        return [row for row in rows if isinstance(row, dict)]
-    page = _sess.history_page(s.id, limit=limit)
-    if not page:
-        return []
-    return [row for row in page.get("history", []) if isinstance(row, dict)]
-
-
-def _ensure_idempotency_index(s) -> bool:
-    """Build/repair the durable task/client receipt index once per Session.
-
-    Old data has no index.  The compatibility rebuild scans at most the
-    bounded history tail once; subsequent assign/browser retries use the
-    persisted O(1) maps and the ledger's queueItemId lookup.
-    """
-    if s is None:
-        return False
-    had_index = bool(getattr(s, "_idempotency_index_present", False))
-    index, changed = _idempotency_index(
-        s, normalize=not getattr(s, "_idempotency_index_built", False),
-    )
-    if getattr(s, "_idempotency_index_built", False):
-        return changed
-    if not getattr(s, "_idempotency_index_built", False):
-        rows = _history_idempotency_rows(s)
-        for entry in rows:
-            # A legacy history row often has no timestamp.  Treat the first
-            # index build as the receipt's observation time rather than as a
-            # 1970 epoch value, otherwise the compatibility index would be
-            # expired immediately on its first compaction pass.
-            seen_at = _idempotency_seen_at(entry)
-            task_id = entry.get("taskId")
-            if task_id and entry.get("taskIdSource", "assign") != "active":
-                changed = _index_idempotency_key(
-                    s, "taskId", task_id, queue_item_id=(
-                        entry.get("queueItemId") or entry.get("queueItemID")
-                    ), seen_at=seen_at,
-                ) or changed
-            client_id = entry.get("clientMessageId")
-            if client_id:
-                changed = _index_idempotency_key(
-                    s, "clientMessageId", client_id, queue_item_id=(
-                        entry.get("queueItemId") or entry.get("queueItemID")
-                    ), seen_at=seen_at,
-                ) or changed
-        s._idempotency_index_built = True
-        changed = (not had_index) or changed
-
-    # Queue/ledger rows are bounded independently from history and may have
-    # been edited by the HTTP queue API since the last index persistence.  A
-    # legacy pending row without a ledger mirror is copied once here so a
-    # subsequent lookup can resolve its queueItemId directly, without a
-    # fallback scan through the ever-growing pending list.
-    for item in (s.queue_pending or []):
-        item_id = _queue_item_id(item) if isinstance(item, dict) else None
-        if (item_id and item_id not in s.queue_delivery_ledger
-                and isinstance(item, dict)):
-            s.queue_delivery_ledger[item_id] = dict(item)
-            changed = True
-        changed = _index_queue_item(s, item) or changed
-    for item in (getattr(s, "queue_delivery_ledger", {}) or {}).values():
-        changed = _index_queue_item(s, item) or changed
-    for client_id in getattr(s, "accepted_input_ids", []) or []:
-        changed = _index_idempotency_key(
-            s, "clientMessageId", client_id, queue_item_id=None,
-        ) or changed
-    s._idempotency_index_present = True
-    return changed
-
-
 def _ledger_record(s, queue_item_id: str | None) -> dict | None:
     if not queue_item_id:
         return None
@@ -2910,17 +2000,10 @@ def _ledger_record(s, queue_item_id: str | None) -> dict | None:
 
 def _remember_queue_item(s, item: dict, state: str | None = None) -> dict:
     item_id = _queue_item_id(item)
-    if state in {_DELIVERY_SENT, _DELIVERY_DELETED}:
-        item.setdefault("receiptAt", time.time())
-        if state == _DELIVERY_SENT:
-            item.setdefault("deliveredAt", item.get("receiptAt"))
-        elif state == _DELIVERY_DELETED:
-            item.setdefault("deletedAt", item.get("receiptAt"))
     record = dict(item)
     if state is not None:
         record["deliveryState"] = state
     s.queue_delivery_ledger[item_id] = record
-    _index_queue_item(s, record, state=state)
     return record
 
 
@@ -2936,20 +2019,12 @@ def _sync_queued_ledger(s) -> bool:
             if previous != record:
                 s.queue_delivery_ledger[item_id] = record
                 changed = True
-            changed = _index_queue_item(s, record) or changed
     return changed
 
 
 def _set_delivery_state(s, item: dict, state: str) -> None:
     item["deliveryState"] = state
     item["dispatchState"] = state
-    if state in {_DELIVERY_SENT, _DELIVERY_DELETED}:
-        now = time.time()
-        item.setdefault("receiptAt", now)
-        if state == _DELIVERY_SENT:
-            item.setdefault("deliveredAt", item.get("receiptAt"))
-        else:
-            item.setdefault("deletedAt", item.get("receiptAt"))
     _remember_queue_item(s, item, state)
 
 
@@ -2958,37 +2033,20 @@ def _recover_delivery_states(s) -> bool:
 
 
 def _find_queue_item_by_idempotency(s, client_message_id=None, task_id=None):
-    if s is None:
-        return None
-    _ensure_idempotency_index(s)
-    for bucket, key in (("clientMessageId", client_message_id),
-                        ("taskId", task_id)):
-        if not key:
+    for item in (s.queue_pending or []):
+        if not isinstance(item, dict):
             continue
-        entry = (getattr(s, "queue_idempotency_index", {}) or {}).get(bucket, {}).get(key)
-        if not isinstance(entry, dict):
+        if client_message_id and item.get("clientMessageId") == client_message_id:
+            return item
+        if task_id and item.get("type") == "task" and item.get("taskId") == task_id:
+            return item
+    for item in (getattr(s, "queue_delivery_ledger", {}) or {}).values():
+        if not isinstance(item, dict):
             continue
-        queue_item_id = entry.get("queueItemId")
-        if isinstance(queue_item_id, str) and queue_item_id:
-            record = _ledger_record(s, queue_item_id)
-            if isinstance(record, dict):
-                return record
-            # The index is an acceleration layer, not an independent receipt
-            # store.  If its ledger target has been evicted (or an operator
-            # has compacted the ledger directly), discard the stale pointer
-            # and let the process-local terminal cache or the durable history
-            # index decide the retry outcome.  Returning a synthetic
-            # sent_to_cli receipt here would mask a valid local ``done``
-            # result and could keep an expired task id alive forever.
-            values = (getattr(s, "queue_idempotency_index", {}) or {}).get(
-                bucket, {})
-            if values.get(key) is entry:
-                values.pop(key, None)
-            return None
-        # History/accepted-input entries without a queue receipt still count
-        # for the boolean dedup path, but cannot provide a terminal receipt
-        # payload to callers such as assign().
-        return None
+        if client_message_id and item.get("clientMessageId") == client_message_id:
+            return item
+        if task_id and item.get("type") == "task" and item.get("taskId") == task_id:
+            return item
     return None
 
 
@@ -3014,184 +2072,6 @@ def _queue_item_backoff(item: dict, reason: str, *, immediate: bool = False) -> 
     if reason:
         item["lastDeliveryError"] = str(reason)[:1000]
     _clear_delivery_reservation(item)
-
-
-def _compact_receipt_record(record: dict, queue_item_id: str) -> dict:
-    """Drop message bodies from an old terminal receipt, keeping its proof."""
-    compact = {
-        key: value for key, value in record.items()
-        if key in _RECEIPT_COMPACT_KEYS
-    }
-    compact["id"] = queue_item_id
-    compact["queueItemId"] = queue_item_id
-    compact["receiptOnly"] = True
-    compact["receiptVersion"] = 1
-    compact.setdefault("receiptAt", _idempotency_seen_at(record))
-    return compact
-
-
-def _remove_idempotency_receipt(s, record: dict, queue_item_id: str) -> bool:
-    """Remove only index entries that still point at this evicted receipt."""
-    changed = False
-    index, normalized = _idempotency_index(s, normalize=False)
-    changed = normalized
-    for bucket in _IDEMPOTENCY_BUCKETS:
-        values = index[bucket]
-        for key, entry in list(values.items()):
-            if not isinstance(entry, dict):
-                values.pop(key, None)
-                changed = True
-                continue
-            if entry.get("queueItemId") == queue_item_id:
-                values.pop(key, None)
-                changed = True
-    return changed
-
-
-def _compact_delivery_receipts(s) -> bool:
-    """Bound terminal receipt count/age while preserving recovery rows.
-
-    ``queue_pending`` is never shortened here.  Every non-terminal ledger row
-    is retained, as is a terminal row that still has a matching pending copy.
-    Terminal rows are first reduced to metadata-only receipts after the
-    compaction age, then evicted by TTL/count; the idempotency index is swept
-    in the same operation so an expired key is the only way a retry can start
-    a new item.
-    """
-    if s is None:
-        return False
-    changed = _ensure_idempotency_index(s)
-    ledger = getattr(s, "queue_delivery_ledger", None)
-    if not isinstance(ledger, dict):
-        s.queue_delivery_ledger = ledger = {}
-        changed = True
-    pending_ids = {
-        _queue_item_id(item) for item in (s.queue_pending or [])
-        if isinstance(item, dict)
-    }
-    now = time.time()
-    ttl = max(
-        _RECEIPT_MIN_RETRY_SEC,
-        float(getattr(_sess, "QUEUE_RECEIPT_TTL_SEC", 7 * 24 * 60 * 60)),
-    )
-    # Compact reasonably old bodies even when the count bound has not fired.
-    # This keeps the common long-running case cheap without changing the
-    # receipt key/state visible to duplicate callers.
-    compact_after = min(ttl, 15 * 60)
-    terminal: list[tuple[str, dict, float]] = []
-    for queue_item_id, record in list(ledger.items()):
-        if not isinstance(record, dict):
-            ledger.pop(queue_item_id, None)
-            changed = True
-            continue
-        state = _delivery_state(record)
-        if state not in {_DELIVERY_SENT, _DELIVERY_DELETED}:
-            changed = _index_queue_item(s, record, state=state) or changed
-            continue
-        receipt_at = _idempotency_seen_at(record, now)
-        if not record.get("receiptAt"):
-            record["receiptAt"] = receipt_at
-            changed = True
-        if queue_item_id not in pending_ids:
-            terminal.append((str(queue_item_id), record, receipt_at))
-        if (now - receipt_at) >= compact_after and not record.get("receiptOnly"):
-            ledger[queue_item_id] = _compact_receipt_record(record, str(queue_item_id))
-            changed = True
-
-    terminal.sort(key=lambda value: value[2])
-    evict = {
-        queue_item_id for queue_item_id, _, receipt_at in terminal
-        if (now - receipt_at) >= ttl
-    }
-    overflow = len(terminal) - max(
-        0, int(getattr(_sess, "QUEUE_RECEIPT_MAX_ENTRIES", 2048)),
-    )
-    if overflow > 0:
-        evict.update(queue_item_id for queue_item_id, _, _ in terminal[:overflow])
-        # Never use count pressure to evict a receipt still inside the
-        # minimum crash/retry window.  A short-lived overflow is safer than
-        # opening a duplicate-provider-turn window for a fresh receipt.
-        evict.difference_update(
-            queue_item_id for queue_item_id, _, _ in terminal
-            if (now - _idempotency_seen_at(
-                ledger.get(queue_item_id), now)) < _RECEIPT_MIN_RETRY_SEC
-        )
-    for queue_item_id in evict:
-        if queue_item_id in pending_ids:
-            continue
-        removed = ledger.pop(queue_item_id, None)
-        if isinstance(removed, dict):
-            changed = _remove_idempotency_receipt(
-                s, removed, str(queue_item_id),
-            ) or changed
-
-    # Bound the compact index independently.  Active/pending entries are
-    # never dropped; detached tombstones expire with the same retention window.
-    index, normalized = _idempotency_index(s, normalize=False)
-    changed = normalized or changed
-    active_ids = set(pending_ids)
-    active_ids.update(
-        str(queue_item_id) for queue_item_id, record in ledger.items()
-        if isinstance(record, dict)
-        and _delivery_state(record) not in {_DELIVERY_SENT, _DELIVERY_DELETED}
-    )
-    index_entries: list[tuple[float, str, str, dict]] = []
-    for bucket in _IDEMPOTENCY_BUCKETS:
-        for key, entry in list(index[bucket].items()):
-            if not isinstance(entry, dict):
-                index[bucket].pop(key, None)
-                changed = True
-                continue
-            qid = entry.get("queueItemId")
-            seen_at = _idempotency_seen_at(entry, now)
-            if qid in active_ids:
-                continue
-            if (isinstance(qid, str) and qid in ledger
-                    and _delivery_state(ledger[qid]) not in {
-                        _DELIVERY_SENT, _DELIVERY_DELETED}):
-                continue
-            index_entries.append((seen_at, bucket, key, entry))
-    index_entries.sort(key=lambda value: value[0])
-    index_limit = max(
-        0, int(getattr(_sess, "QUEUE_IDEMPOTENCY_INDEX_MAX_ENTRIES", 4096)),
-    )
-    index_evict = {
-        (bucket, key) for seen_at, bucket, key, _ in index_entries
-        if (now - seen_at) >= ttl
-    }
-    if len(index_entries) > index_limit:
-        eligible_entries = [
-            value for value in index_entries
-            if (now - value[0]) >= _RECEIPT_MIN_RETRY_SEC
-        ]
-        overflow = len(index_entries) - index_limit
-        index_evict.update(
-            (bucket, key)
-            for _, bucket, key, _ in eligible_entries[:overflow]
-        )
-    for bucket, key in index_evict:
-        if index[bucket].pop(key, None) is not None:
-            changed = True
-
-    client_index = index["clientMessageId"]
-    bounded_ids = [
-        value for value in (getattr(s, "accepted_input_ids", []) or [])
-        if value in client_index
-    ]
-    accepted_limit = int(getattr(_sess, "ACCEPTED_INPUT_ID_MAX", 256))
-    bounded_ids = list(dict.fromkeys(bounded_ids))[-accepted_limit:]
-    if bounded_ids != getattr(s, "accepted_input_ids", []):
-        s.accepted_input_ids = bounded_ids
-        changed = True
-    return changed
-
-
-def _prepare_receipt_persistence(s) -> bool:
-    """Normalize/index/compact receipt metadata before a durable save."""
-    changed = _sync_queued_ledger(s)
-    changed = _ensure_idempotency_index(s) or changed
-    changed = _compact_delivery_receipts(s) or changed
-    return changed
 
 
 def _has_dispatchable_items(s) -> bool:
@@ -3251,7 +2131,7 @@ def _normalize_source_session_id(source_session_id) -> tuple[str | None, str | N
         return None, None
     if not isinstance(source_session_id, str):
         return None, "sourceSessionId must be a string"
-    if _get_session_shallow(source_session_id) is None:
+    if _sess.get(source_session_id) is None:
         return None, f"Source session {source_session_id} not found"
     return source_session_id, None
 
@@ -3365,30 +2245,6 @@ def _migrate_queue_delivery_state(s, *, restore_ledger: bool = False) -> bool:
             changed = True
         pending_ids.add(_queue_item_id(item))
         state = _delivery_state(item)
-        ledger_record = _ledger_record(s, _queue_item_id(item))
-        ledger_state = _delivery_state(ledger_record) if ledger_record else None
-        # A sent ledger receipt is durable proof that the provider hand-off
-        # crossed the at-most-once boundary.  If a crash left the old row in
-        # queue_pending, remove only that stale row; never replay it.
-        if ledger_state == _DELIVERY_SENT:
-            _remember_queue_item(s, item, _DELIVERY_SENT)
-            changed = True
-            continue
-        # The pending row is the retryable source of truth, but a stale ledger
-        # reservation must not remain visible after recovery.  Treat the
-        # provider boundary as uncertain and normalize both copies to queued;
-        # the existing bounded backoff preserves the documented duplicate
-        # window when the hand-off outcome cannot be known.
-        if (state == _DELIVERY_QUEUED and ledger_state in {
-                _DELIVERY_RESERVED, _DELIVERY_WRITING, _DELIVERY_IN_FLIGHT,
-                _DELIVERY_WRITE_FAILED, _DELIVERY_UNKNOWN,
-        }):
-            item["lastDeliveryState"] = ledger_state
-            _queue_item_backoff(item, "reconciled stale queue delivery ledger")
-            _remember_queue_item(s, item, _DELIVERY_QUEUED)
-            keep.append(item)
-            changed = True
-            continue
         if state == _DELIVERY_SENT:
             _remember_queue_item(s, item, _DELIVERY_SENT)
             changed = True
@@ -3417,13 +2273,6 @@ def _migrate_queue_delivery_state(s, *, restore_ledger: bool = False) -> bool:
     if not restore_ledger:
         changed = changed or len(keep) != len(s.queue_pending or [])
         s.queue_pending = keep
-        # Building the in-memory acceleration index is deliberately not a
-        # queue-contract migration.  A clean legacy row must keep the
-        # historical ``changed=False`` result (callers use it to decide
-        # whether recovery needs a write); the next receipt save persists the
-        # index, while a restart can safely rebuild it from the durable queue
-        # and bounded history tail.
-        _ensure_idempotency_index(s)
         return changed
 
     for queue_item_id, record in list((getattr(s, "queue_delivery_ledger", {}) or {}).items()):
@@ -3456,10 +2305,6 @@ def _migrate_queue_delivery_state(s, *, restore_ledger: bool = False) -> bool:
     if len(keep) != len(s.queue_pending or []):
         changed = True
     s.queue_pending = keep
-    # See the non-restoring branch above: index construction is an
-    # acceleration/migration detail, not a reason to report a queue-state
-    # change for an otherwise canonical row.
-    _ensure_idempotency_index(s)
     return changed
 
 
@@ -3485,60 +2330,31 @@ _DELIVERY_SCAN_DEPTH: int = 50
 def _delivery_key(item: dict) -> str:
     """队列项的投递标记 key。
 
-    Task 用 queue item id 作为稳定身份。Report/QQ 保留 taskId + 消息指纹，
-    区分同一 taskId 下的不同报告。投递状态和恢复元数据不参与身份，恢复时从
-    reserved/writing 归一到 queued 不能改变历史收据键。
+    task 用 item.id；report/qq 用 taskId（保留可读性）+ 内容指纹（同 taskId
+    不同内容不误判，taskId 缺失回退纯指纹）。指纹取排序 JSON 的 sha1 前 12 位，
+    json 往返（磁盘重载）后内容一致 → 指纹一致。
     """
+    # Delivery bookkeeping is mutable, not message identity.  Excluding it
+    # keeps a history mark stable across retries and restart recovery.
     bookkeeping = {
-        "deliveryState", "dispatchState", "lastDeliveryState",
-        "reservedBy", "reservedGeneration", "reservedAt",
-        "deliveryAttempts", "nextAttemptAt", "lastDeliveryError",
-        "queueItemId", "receiptAt", "deliveredAt", "deletedAt",
-        "position", "revision",
+        "deliveryState", "reservedBy", "reservedGeneration", "reservedAt",
+        "deliveryAttempts", "nextAttemptAt", "lastDeliveryError", "queueItemId",
     }
-    if item.get("type") == "task":
-        return f"task:{_queue_item_id(item)}"
     identity = {k: v for k, v in item.items() if k not in bookkeeping}
     digest = hashlib.sha1(
         json.dumps(identity, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
     ).hexdigest()[:12]
+    if item.get("type") == "task":
+        return f"task:{item.get('id')}:{digest}"
     tid = item.get("taskId")
     return f"report:{tid if tid else 'anon'}:{digest}"
 
 
-def _delivery_key_matches(key: str, item: dict) -> bool:
-    """Match stable keys and receipts written by previous versions."""
-    current = _delivery_key(item)
-    if key == current:
-        return True
-    if item.get("type") == "task":
-        # Older task receipts appended a mutable-metadata digest after this
-        # unique queue item id. Preserve those marks during rolling upgrades.
-        return key.startswith(f"{current}:")
-
-    # The legacy report/QQ hash included delivery phase fields. Its initial
-    # pre-handoff shape was queued, with no recovery/terminal timestamps.
-    legacy_bookkeeping = {
-        "deliveryState", "reservedBy", "reservedGeneration", "reservedAt",
-        "deliveryAttempts", "nextAttemptAt", "lastDeliveryError", "queueItemId",
-    }
-    identity = {k: v for k, v in item.items() if k not in legacy_bookkeeping}
-    if "dispatchState" in identity:
-        identity["dispatchState"] = _DELIVERY_QUEUED
-    for field in ("lastDeliveryState", "receiptAt", "deliveredAt", "deletedAt"):
-        identity.pop(field, None)
-    digest = hashlib.sha1(
-        json.dumps(identity, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
-    ).hexdigest()[:12]
-    tid = item.get("taskId")
-    return key == f"report:{tid if tid else 'anon'}:{digest}"
-
-
 def _delivery_mark_in_history(s, item: dict) -> bool:
     """history 尾部是否已有该队列项的投递标记（消费前对账，查条目元数据）。"""
+    key = _delivery_key(item)
     for h in s.history[-_DELIVERY_SCAN_DEPTH:]:
-        if any(_delivery_key_matches(key, item)
-               for key in (h.get("delivered_keys") or ())):
+        if key in (h.get("delivered_keys") or ()):
             return True
     return False
 
@@ -3553,10 +2369,6 @@ async def _save_receipt(s) -> None:
     cancellation only after a successful commit.  Callers can safely rollback
     on ordinary save errors; a successful cancelled save remains consumed.
     """
-    # Keep the receipt/index state bounded at the same persistence boundary as
-    # queue hand-off.  This does not alter queue_pending or terminal event
-    # ordering; it only removes/compresses old terminal metadata.
-    _prepare_receipt_persistence(s)
     save_task = asyncio.create_task(_sess.save_async(s))
     try:
         await asyncio.shield(save_task)
@@ -3612,7 +2424,6 @@ async def _legacy_consume_pending_reports(w: Worker, s):
         except Exception as exc:
             s.queue_pending = old_queue_snapshot
             del s.history[old_history_len:]
-            _sess.replace_history(s, s.history)
             _log.warning(
                 "[Worker %s] legacy queue cleanup save failed; leaving rows "
                 "untouched: %s", w.worker_id, exc)
@@ -3638,7 +2449,6 @@ async def _legacy_consume_pending_reports(w: Worker, s):
     # 报告不是 assign 任务：无 seq 配对，清空当前配对上下文避免 last_result 错位
     w._current_seq = None
     w._current_task_id = None
-    w._current_task_idempotent = False
     w._replaying = False
 
     injected_text = await _maybe_inject_memory(s, text)
@@ -3675,12 +2485,11 @@ async def _legacy_consume_pending_reports(w: Worker, s):
                              and it.get("sourceSessionId")})
         if source_ids:
             report_entry["sourceSessionIds"] = source_ids
-        _sess.append_history(s, report_entry)
+        s.history.append(report_entry)
         try:
             await _save_receipt(s)
         except Exception as e:
             del s.history[old_history_len:]
-            _sess.replace_history(s, s.history)
             for index, it in reversed(report_positions):
                 s.queue_pending.insert(min(index, len(s.queue_pending)), it)
             for it in reports:
@@ -3885,10 +2694,10 @@ async def _enqueue_report(session_id: str, status: str, result: str,
     """
     if _shutdown_started:
         return
-    s = _get_session_shallow(session_id)
+    s = _sess.get(session_id)
     if not s or not s.managed_by:
         return
-    manager = _get_session_shallow(s.managed_by)
+    manager = _sess.get(s.managed_by)
     if not manager:
         return
     if session_id not in (manager.report_subscriptions or set()):
@@ -3918,7 +2727,7 @@ async def _enqueue_report(session_id: str, status: str, result: str,
     manager.queue_pending.append(item)
     _remember_queue_item(manager, item, _DELIVERY_QUEUED)
     manager.queue_revision = getattr(manager, "queue_revision", 0) + 1
-    await _save_receipt(manager)
+    await _sess.save_async(manager)
     await _bcast({"type": "queue.item_added", "sessionId": manager.id,
                   "queueItemId": item["id"],
                   "queueRevision": manager.queue_revision,
@@ -3946,7 +2755,7 @@ async def _wake_worker(session_id: str, auto_spawn: bool = False) -> None:
         mw.last_activity = time.monotonic()
         await mw.pending_signal.put({"type": "queue_signal"})
     elif not mw or mw.status not in {"held", "restarting"}:
-        session = _get_session_shallow(session_id)
+        session = _sess.get(session_id)
         if auto_spawn and (session is None or not session.queue_pending):
             # Legacy callers use auto_spawn to materialize an idle worker even
             # before the first item exists; retain that contract synchronously.
@@ -4017,7 +2826,7 @@ async def enqueue_channel_reminder(
     if bot_uin:
         item["botUin"] = str(bot_uin)
     delivered = 0
-    for s in _list_sessions_shallow():
+    for s in _sess.list_all():
         # 未知 channel → getattr 取不到 → 空集合，安全返回 0。
         subs = getattr(s, f"{channel}_subscriptions", set()) or set()
         if target_key not in subs and not (bot_key and bot_key in subs):
@@ -4030,7 +2839,7 @@ async def enqueue_channel_reminder(
         s.queue_pending.append(subscriber_item)
         _remember_queue_item(s, subscriber_item, _DELIVERY_QUEUED)
         s.queue_revision = getattr(s, "queue_revision", 0) + 1
-        await _save_receipt(s)
+        await _sess.save_async(s)
         await _bcast({"type": "queue.item_added", "sessionId": s.id,
                       "queueItemId": subscriber_item["id"],
                       "queueRevision": s.queue_revision,
@@ -4057,13 +2866,7 @@ async def enqueue_qq_reminder(target_type: str, target_id: str,
 async def enqueue_notice(target_session_id: str, text: str,
                          source: str = "agent",
                          source_session_id: str | None = None,
-                         event_id: str | None = None,
-                         *, notice_kind: str | None = None,
-                         job_id: str | None = None,
-                         notice_status: str | None = None,
-                         creator_session_id: str | None = None,
-                         target_session_ids: list[str] | None = None,
-                         envelope: dict | None = None) -> dict:
+                         event_id: str | None = None) -> dict:
     """向显式指定的 session 投递一条提醒（MCP agent_notify 的后端实现）。
 
     复刻 _enqueue_report 的持久化投递三步（append 落盘队列 + save_async +
@@ -4075,15 +2878,12 @@ async def enqueue_notice(target_session_id: str, text: str,
        **立即** create_worker 恢复（事件驱动，不等 watchdog tick；spawn
        失败打 warning，消息已落盘、由全局 watchdog 兜底）。
 
-    普通 agent 通知保持 report 兼容形状；后台 Job 终态通知可额外携带
-    ``noticeKind``, ``jobId``, ``status``, ``creatorSessionId``,
-    ``targetSessionId`` 和 ``targetSessionIds``。这些字段是结构化 envelope
-    元数据，不改变
-    ``agent_notify`` 的调用语义。
+    提醒项形状与 report 一致（{source,sourceSessionId,status,result,sessionId,
+    taskId,workerId}），
     加 type="notice" 区分语义：消费端按
     ``type != "task"`` 取报告、前端 normalize 非 task/qq 按 report 分支
     渲染，均天然兼容。渲染时抬头取 sourceSessionId（``@@@@by agent``），
-    sourceSessionId 缺省（无调用方身份）由 source 标签标识；自动化为 automation。
+    sourceSessionId 缺省（无调用方身份）记 unknown。
 
     返回 {"ok": True, "sessionId": ..., "pending": <队列长度>}；session
     不存在返回 {"ok": False, "error": {...}}。
@@ -4092,7 +2892,7 @@ async def enqueue_notice(target_session_id: str, text: str,
         return {"ok": False, "error": {
             "code": "pan_shutting_down",
             "message": "Pan main service is shutting down"}}
-    target = _get_session_shallow(target_session_id)
+    target = _sess.get(target_session_id)
     if not target:
         return {"ok": False, "error": {
             "code": "session_not_found",
@@ -4137,32 +2937,14 @@ async def enqueue_notice(target_session_id: str, text: str,
     }
     if event_id:
         item["eventId"] = event_id
-    if envelope is not None:
-        item["envelope"] = dict(envelope)
-        item["envelope"].setdefault(
-            "jobId", event_id.removesuffix(":terminal")
-            if isinstance(event_id, str) else None)
     item["queueItemId"] = item["id"]
     if source_sid is not None:
         item["sourceSessionId"] = source_sid
-    if notice_kind is not None:
-        item["noticeKind"] = notice_kind
-    if notice_kind == "background_job_terminal" and notice_status is not None:
-        item["status"] = notice_status
-    if job_id is not None:
-        item["jobId"] = job_id
-    if creator_session_id is not None:
-        item["creatorSessionId"] = creator_session_id
-    item["targetSessionId"] = target_session_id
-    item["targetSessionIds"] = (
-        list(target_session_ids) if target_session_ids is not None
-        else [target_session_id]
-    )
     item["position"] = len(target.queue_pending)
     target.queue_pending.append(item)
     _remember_queue_item(target, item, _DELIVERY_QUEUED)
     target.queue_revision = getattr(target, "queue_revision", 0) + 1
-    await _save_receipt(target)
+    await _sess.save_async(target)
     await _bcast({"type": "queue.item_added", "sessionId": target.id,
                   "queueItemId": item["id"],
                   "queueRevision": target.queue_revision,
@@ -4192,19 +2974,8 @@ async def _enqueue_zombie_report(w: Worker, reason: str) -> None:
     if w._zombie_reported:
         return
     w._zombie_reported = True
-    task_id = w._current_task_id
     await _enqueue_report(w.session_id, "error", f"worker died: {reason}",
-                          task_id, w.worker_id, report_type="zombie")
-    # A hand-off-complete task has no queue row to recover.  Clear its
-    # persisted context after emitting the exact zombie report; an unfinished
-    # queue row remains the active retry context for the replacement Worker.
-    s = _session(w)
-    if s and _clear_active_task_if_not_pending(s):
-        try:
-            await _sess.save_async(s)
-        except Exception as exc:
-            _log.warning("[Worker %s] failed to persist zombie task context clear: %s",
-                         w.worker_id, exc)
+                          w._current_task_id, w.worker_id, report_type="zombie")
 
 
 # ── watchdog：超时 / 空闲回收 ──
@@ -4336,7 +3107,7 @@ _global_watchdog_task: asyncio.Task | None = None
 
 async def _recover_session(session_id: str, *, force: bool = False) -> None:
     """Best-effort recovery for durable work or an abnormally dead worker."""
-    s = _get_session_shallow(session_id)
+    s = _sess.get(session_id)
     if not s:
         _recovery_required.discard(session_id)
         return
@@ -4434,7 +3205,7 @@ async def drain_recoveries(timeout: float = 10.0) -> int:
 
 def _schedule_queue_retry(session_id: str) -> asyncio.Task | None:
     """Wake a session once its earliest persisted retry becomes due."""
-    session = _get_session_shallow(session_id)
+    session = _sess.get(session_id)
     if session is None or not any(
         isinstance(item, dict)
         and _queue_item_kind(item) is not None
@@ -4457,7 +3228,7 @@ def _schedule_queue_retry(session_id: str) -> asyncio.Task | None:
 
     async def _wait_and_wake() -> None:
         while True:
-            s = _get_session_shallow(session_id)
+            s = _sess.get(session_id)
             if s is None:
                 return
             future_times = [
@@ -4514,14 +3285,6 @@ def stop_global_watchdog():
 
 async def _global_watchdog():
     """服务级常驻循环：周期扫描并自动恢复（见模块注释）。"""
-    # Usage jobs do not require a provider Worker and are safe to resume at
-    # startup.  Keep durable queue recovery on its historical first-tick
-    # timing; an immediate queue scan can race callers that are still setting
-    # up a Session after service startup.
-    try:
-        recover_pending_usage_enrichment()
-    except Exception:
-        _log.exception("[Pan] startup usage enrichment recovery failed")
     while True:
         await asyncio.sleep(_GLOBAL_WATCHDOG_TICK_SEC)
         try:
@@ -4536,12 +3299,7 @@ async def _global_watchdog_tick():
     整个 tick 由 _global_watchdog 的 try/except 兜底，单个 session 的异常不会
     中断后续轮次。
     """
-    for s in list(_list_sessions_shallow()):
-        # Usage post-processing is independent from Worker liveness.  A
-        # crashed/restarted Worker must not strand a terminal's eventual usage
-        # job, and this scan must not spawn a provider merely for enrichment.
-        if _has_pending_usage_enrichment(s):
-            _schedule_usage_enrichment(s.id)
+    for s in list(_sess.list_all()):
         if not _has_dispatchable_items(s) and s.id not in _recovery_required:
             continue
         current = find_worker_by_session(s.id)
@@ -4570,7 +3328,6 @@ async def _global_watchdog_tick():
 
 async def _consumer_stream(w: Worker, text: str, source: str, s, *, on_handoff=None):
     """Stream mode: write to the adapter's long-running stdin."""
-    w._terminal_handled = False
     standalone_items = []
     if on_handoff is None:
         if w._current_queue_item is not None:
@@ -4582,11 +3339,25 @@ async def _consumer_stream(w: Worker, text: str, source: str, s, *, on_handoff=N
     if w.process is None or w.process.returncode is not None:
         # No provider hand-off happened.  The queue coordinator will requeue
         # the still-pending item after this helper returns.
-        await _finish_task_error(
-            w,
-            s,
-            f"Worker process dead (returncode={w.process.returncode if w.process else 'none'})",
-        )
+        if s:
+            s.last_result = {
+                "status": "error",
+                "result": f"Worker process dead (returncode={w.process.returncode if w.process else 'none'})",
+                "cli_session_id": s.cli_session_id,
+                "timestamp": datetime.now().isoformat(),
+                "sourceSessionId": w._current_source_session_id,
+            }
+            await _sess.save_async(s)
+        await _bcast({
+            "type": "worker.result",
+            "workerId": w.worker_id,
+            "sessionId": w.session_id,
+            "generation": w.generation,
+            "status": "error",
+            "result": "Worker process dead",
+            "taskSeq": w._current_seq,
+            "sourceSessionId": w._current_source_session_id,
+        })
         return
 
     # Clear the completion latch before handing the prompt to the provider.
@@ -4637,7 +3408,6 @@ async def _consumer_stream(w: Worker, text: str, source: str, s, *, on_handoff=N
         "sessionId": w.session_id,
         "generation": w.generation,
         "status": "running",
-        "taskSeq": w._current_seq,
         "source": source,
         "sourceSessionId": w._current_source_session_id,
     })
@@ -4738,7 +3508,6 @@ async def _consumer_oneshot(w: Worker, text: str, source: str, s, *, on_handoff=
 
     详见 docs/design/adapter-p1-oneshot.md §4。
     """
-    w._terminal_handled = False
     standalone_items = []
     if on_handoff is None:
         if w._current_queue_item is not None:
@@ -4756,7 +3525,6 @@ async def _consumer_oneshot(w: Worker, text: str, source: str, s, *, on_handoff=
         "sessionId": w.session_id,
         "generation": w.generation,
         "status": "running",
-        "taskSeq": w._current_seq,
         "source": source,
         "sourceSessionId": w._current_source_session_id,
     })
@@ -4963,7 +3731,7 @@ async def _consumer_oneshot(w: Worker, text: str, source: str, s, *, on_handoff=
         s.model = captured_model
     # Append extracted blocks (assistant/thinking/tool) — same as stream mode.
     for block in assistant_blocks:
-        _sess.append_history(s, block)
+        s.history.append(block)
 
     # Surface failures the user can actually see (#8 timeout, #9 non-zero exit).
     if result_event is not None and adapter.is_result_error(result_event):
@@ -4990,11 +3758,37 @@ async def _consumer_oneshot(w: Worker, text: str, source: str, s, *, on_handoff=
             result_text or "(no output)",
         )
 
-    # Persist last_result/history/task association first.  In particular, do
-    # not let usage lookup (which may wait on provider files) sit on this path.
-    terminal = await _persist_terminal_state(w, s, status, result)
-    if terminal is None:
-        return
+    s.last_result = {
+        "status": status,
+        "result": result,
+        "cli_session_id": s.cli_session_id,
+        "timestamp": datetime.now().isoformat(),
+        "taskSeq": w._current_seq,
+    }
+    # One-shot 没有独立的 stdout result reader；在解析完本轮输出后同样以
+    # result/error 为完成确认点，从持久队列移除当前 task。
+    _ack_current_task(w, s)
+    _ack_current_reports(w, s)
+    # 用量/credit 落账：与 stream 路径（_read_stdout）同构——调用
+    # adapter.enrich_after_result 读取 CLI 原生存储/缓存的本轮消耗并累加进 session。
+    # 这也让 cbc/Claude 的 one-shot fallback 不丢 usage/cost（Claude result 事件
+    # 的 usage 已在上方由 extract_result_text 暂存）。
+    enrichment = None
+    try:
+        enrichment = adapter.enrich_after_result(s)
+    except Exception:
+        pass
+    if enrichment:
+        prev_total = s.total_usage
+        s.raw_usage = _sess.accumulate_raw_usage(s.raw_usage, enrichment)
+        s.total_usage = _sess.compute_total_usage(s.raw_usage)
+        prev_credit = prev_total.get("credit", 0) if prev_total else 0
+        new_credit = s.total_usage.get("credit", 0) if s.total_usage else 0
+        _log.info("credit: %.2f -> %.2f (+%.2f)", prev_credit, new_credit, new_credit - prev_credit)
+    await _record_legal_worker_state(w, status, "task/complete", persist=False)
+    w.status = "idle"
+    await _record_legal_worker_state(w, "idle", "task/complete-idle", persist=False)
+    await _sess.save_async(s)
 
     # Broadcast assistant events as worker.stream so the frontend displays the
     # reply in real-time — MCP mode otherwise only emits worker.result, which
@@ -5005,18 +3799,38 @@ async def _consumer_oneshot(w: Worker, text: str, source: str, s, *, on_handoff=
             "workerId": w.worker_id,
             "sessionId": w.session_id,
             "generation": w.generation,
-            "taskSeq": w._current_seq,
-            "taskId": w._current_task_id,
             "event": event,
         })
 
-    # Base persistence has succeeded.  Publish terminal state without waiting
-    # for usage enrichment, then preserve the existing report delivery path.
-    await _publish_terminal_events(w, terminal, s)
+    # M3: 置 idle 同步刷新活性时间——MCP 任务全程不刷新 last_activity，若不在此
+    # 重置，任务耗时会被算进 idle 时长，刚忙完就可能被 watchdog 立即回收。
+    w.last_activity = time.monotonic()
+    w.status = "idle"
+    _maybe_restart_pending(w)
+    task_seq = w._current_seq
+    completion_notification = _notifications.dispatch_completion(s, status, result)
+    await _bcast({
+        "type": "worker.result",
+        "workerId": w.worker_id,
+        "sessionId": w.session_id,
+        "generation": w.generation,
+        "status": status,
+        "result": result,
+        "taskSeq": task_seq,
+        **({"notification": completion_notification} if completion_notification else {}),
+    })
     # 订阅制报告：完成 → 若被订阅则 append 到 manager 的落盘队列（立项 4.3）
-    await _enqueue_report(w.session_id, terminal["status"], terminal["result"],
-                          terminal["taskId"], w.worker_id)
-    _finish_terminal_bookkeeping(w, terminal)
+    await _enqueue_report(w.session_id, status, result, w._current_task_id, w.worker_id)
+    # 幂等：完成对应 taskId（若有）
+    if w._current_task_id and w._current_task_id in _task_status:
+        _task_status[w._current_task_id] = {
+            "status": status,
+            "result": result,
+            "workerId": w.worker_id,
+            "taskId": w._current_task_id,
+            "ts": time.monotonic(),
+        }
+    w._current_task_id = None
 
 
 # ── lifecycle ──
@@ -5089,7 +3903,7 @@ async def restart_or_start_worker(session_id: str) -> Worker | str:
     """
     if _shutdown_started:
         return "Pan main service is shutting down"
-    if _get_session_shallow(session_id) is None:
+    if _sess.get(session_id) is None:
         return f"Session {session_id} not found"
     recovery_pending = session_id in _recovery_required
     lock = await _session_spawn_lock(session_id)
@@ -5287,7 +4101,7 @@ async def _create_worker(session_id: str) -> Worker | str:
         # Persist the compatibility migration before the consumer can execute
         # it.  Otherwise another crash would classify the same user message as
         # a report again on the following start.
-        await _save_receipt(s)
+        await _sess.save_async(s)
     # Queue signals are intentionally buffered while the consumer is being
     # created.  Starting it after the migration save closes the old-data race:
     # a legacy row is never consumed from memory before its new envelope is
@@ -5501,13 +4315,6 @@ async def _kill_worker_unlocked(
 
     # H2: worker 被杀 → 名下 pending 的 taskId 标 error（防止幂等重试永久卡 pending）
     _mark_worker_tasks_error(worker_id, "worker killed")
-    s = _session(w)
-    if s and _clear_active_task_if_not_pending(s):
-        try:
-            await _sess.save_async(s)
-        except Exception as exc:
-            _log.warning("[Worker %s] failed to persist kill task context clear: %s",
-                         worker_id, exc)
     # A1 崩溃安全：kill 前 flush 防抖缓冲的流式块
     if w._hist_dirty:
         await _flush_history_now(w)
@@ -5549,7 +4356,7 @@ async def kill_worker(worker_id: str, *, recover: bool = False,
 async def kill_session_worker(session_id: str, *,
                               report_abnormal: bool = False) -> Worker | str | None:
     """Kill the live worker for a session, if present."""
-    if _get_session_shallow(session_id) is None:
+    if _sess.get(session_id) is None:
         return f"Session {session_id} not found"
     lock = await _session_spawn_lock(session_id)
     async with lock:
@@ -5578,7 +4385,7 @@ async def takeover_worker(worker_id: str) -> str | None:
 
 async def takeover_session_worker(session_id: str) -> Worker | str | None:
     """Put the live worker for a session into takeover mode, if present."""
-    if _get_session_shallow(session_id) is None:
+    if _sess.get(session_id) is None:
         return f"Session {session_id} not found"
     lock = await _session_spawn_lock(session_id)
     async with lock:
@@ -5623,13 +4430,6 @@ async def cleanup_worker_background(worker_id: str, session_id: str):
         _unregister_worker(w)
         # H2: worker 回收 → 名下 pending 的 taskId 标 error（与 kill_worker 一致）
         _mark_worker_tasks_error(worker_id, "worker cleanup")
-        s = _session(w)
-        if s and _clear_active_task_if_not_pending(s):
-            try:
-                await _sess.save_async(s)
-            except Exception as exc:
-                _log.warning("[Worker %s] failed to persist cleanup task context clear: %s",
-                             worker_id, exc)
         try:
             await _bcast({
                 "type": "worker.destroyed",
@@ -5706,7 +4506,6 @@ async def _restart_tasks(w: Worker):
     w._task_done = asyncio.Event()
     w._current_seq = None
     w._current_task_id = None
-    w._current_task_idempotent = False
     w._current_queue_item = None
     w._claimed_queue_index = None
     w._current_report_items = []
@@ -5721,10 +4520,8 @@ async def _restart_tasks(w: Worker):
     # L4 落盘恢复：新 consumer 的信号队列是新建的，旧信号已随旧队列丢弃——
     # 重新为尚未接管的 queue_pending 积压发信号；已消费 item 不会重现。
     s = _session(w)
-    if s and _has_pending_usage_enrichment(s):
-        _schedule_usage_enrichment(s.id)
     if s and _recover_pending_signals(w, s):
-        await _save_receipt(s)
+        await _sess.save_async(s)
     # Start only after recovery has migrated unfinished rows and queued the
     # generic wake-up signal.  The signal queue safely buffers that wake-up.
     w._consume_task = asyncio.create_task(_consumer(w))
@@ -5987,10 +4784,9 @@ async def branch_worker(worker_id: str, new_session_id: str) -> Worker | str:
                 s.workdir or None,
             )
             s.cli_session_id = new_cli_id
-            parsed_history = await asyncio.to_thread(
+            s.history = await asyncio.to_thread(
                 provider.parse_history, new_cli_id, s.workdir or None
             )
-            _sess.replace_history(s, parsed_history)
             raw_usage_entries = await asyncio.to_thread(
                 provider.get_raw_usage, new_cli_id, s.workdir or None
             )
@@ -6040,7 +4836,13 @@ async def branch_worker(worker_id: str, new_session_id: str) -> Worker | str:
     return new_w
 
 
-async def _send_control_message_unlocked(worker_id: str, control: dict) -> str | None:
+async def send_control_message(worker_id: str, control: dict) -> str | None:
+    """Send a narrowly-scoped out-of-band control message to a live worker.
+
+    Native adapters may use this for controls that are not user turns, such
+    as Codex app-server approval and user-input responses.  The adapter owns wire encoding;
+    workers without that optional capability keep the existing behavior.
+    """
     w = workers.get(worker_id)
     if not w:
         return "Worker not found"
@@ -6072,32 +4874,7 @@ async def _send_control_message_unlocked(worker_id: str, control: dict) -> str |
     return None
 
 
-async def send_control_message(worker_id: str, control: dict) -> str | None:
-    """Send an out-of-band control, serializing Steer against queue edits.
-
-    Native adapters may use this for controls that are not user turns, such
-    as Codex app-server approval and user-input responses. The adapter owns
-    wire encoding; workers without that optional capability keep existing
-    behavior.
-    """
-    w = workers.get(worker_id)
-    if not w:
-        return "Worker not found"
-    if isinstance(control, dict) and control.get("type") == "steer":
-        s = _session(w)
-        if s is not None:
-            async with queue_lock(s.id):
-                if any(queue_item_edit_locked(s, item_id)
-                       for item_id in list(getattr(s, "queue_edit_locks", {}))):
-                    return "Cannot Steer while a queued message is being edited"
-                # Keep the lease check and stdin write in one critical section
-                # so direct API/programmatic Steer cannot race edit acquisition.
-                return await _send_control_message_unlocked(worker_id, control)
-    return await _send_control_message_unlocked(worker_id, control)
-
-
-async def steer_worker(worker_id: str, text: str,
-                       message_id: str | None = None) -> str | None:
+async def steer_worker(worker_id: str, text: str) -> str | None:
     """Inject a follow-up instruction into a native running turn.
 
     Codex app-server's ``turn/steer`` changes the native thread, but it does
@@ -6108,35 +4885,14 @@ async def steer_worker(worker_id: str, text: str,
     text = str(text or "").strip()
     if not text:
         return "Steer text is required"
-    if message_id is not None and (
-        not isinstance(message_id, str)
-        or not message_id.startswith("steer:")
-        or len(message_id) > 128
-    ):
-        return "Invalid Steer message id"
     err = await send_control_message(worker_id, {"type": "steer", "text": text})
     if err:
         return err
     w = workers.get(worker_id)
     s = _session(w) if w else None
     if s is not None:
-        history_row = {"role": "user", "content": text}
-        if message_id:
-            history_row["messageId"] = message_id
-        _sess.append_history(s, history_row)
-        # The native control has already been written successfully.  A
-        # transient history-file failure must not make the caller retry Steer
-        # (which would send the provider control a second time), so retry only
-        # the failed persistence operation once.  This stays off the normal
-        # delta/done path and remains bounded if the second write also fails.
-        for attempt in range(2):
-            try:
-                await _sess.save_async(s)
-                break
-            except Exception:
-                if attempt == 1:
-                    raise
-                await asyncio.sleep(0)
+        s.history.append({"role": "user", "content": text})
+        await _sess.save_async(s)
     return None
 
 
@@ -6188,7 +4944,7 @@ async def interrupt_worker(worker_id: str) -> str | None:
 
 async def interrupt_session_worker(session_id: str) -> Worker | str | None:
     """Interrupt the live worker for a session, if present."""
-    if _get_session_shallow(session_id) is None:
+    if _sess.get(session_id) is None:
         return f"Session {session_id} not found"
     lock = await _session_spawn_lock(session_id)
     async with lock:
@@ -6199,27 +4955,36 @@ async def interrupt_session_worker(session_id: str) -> Worker | str | None:
         return error or w
 
 
-_ACCEPTED_INPUT_ID_LIMIT = getattr(_sess, "ACCEPTED_INPUT_ID_MAX", 256)
+_ACCEPTED_INPUT_ID_LIMIT = 256
 
 
 def _has_accepted_input_id(s, client_message_id: str | None) -> bool:
     if not client_message_id:
         return False
-    _ensure_idempotency_index(s)
-    if client_message_id in (
-            (getattr(s, "queue_idempotency_index", {}) or {})
-            .get("clientMessageId", {})):
+    if client_message_id in s.accepted_input_ids:
         return True
-    return client_message_id in (getattr(s, "accepted_input_ids", []) or [])
+    # accepted_input_ids is intentionally bounded for hot-path metadata.  The
+    # receipt history is the durable long-term ledger and survives its eviction.
+    return any(
+        isinstance(entry, dict) and entry.get("clientMessageId") == client_message_id
+        for entry in (s.history or [])
+    )
 
 
 def _durable_task_id_seen(s, task_id: str | None) -> bool:
     """Whether a task id already crossed or is waiting at the receipt boundary."""
     if not task_id or s is None:
         return False
-    _ensure_idempotency_index(s)
-    return task_id in (
-        (getattr(s, "queue_idempotency_index", {}) or {}).get("taskId", {})
+    if any(
+        isinstance(item, dict)
+        and item.get("type") == "task"
+        and item.get("taskId") == task_id
+        for item in (s.queue_pending or [])
+    ):
+        return True
+    return any(
+        isinstance(entry, dict) and entry.get("taskId") == task_id
+        for entry in (s.history or [])
     )
 
 
@@ -6227,9 +4992,7 @@ async def _persist_task_item(s, text: str, source: str, seq: int | None,
                              task_id: str | None,
                              client_message_id: str | None,
                              source_session_id: str | None = None,
-                             parts: list[dict] | None = None,
-                             *, idempotent_task_id: bool = True,
-                             activate_task: bool = False) -> tuple[dict | None, str | None]:
+                             parts: list[dict] | None = None) -> tuple[dict | None, str | None]:
     """Durably append one task, atomically with the browser receipt ledger."""
     if _shutdown_started:
         return None, "Pan main service is shutting down"
@@ -6237,11 +5000,10 @@ async def _persist_task_item(s, text: str, source: str, seq: int | None,
         s, source, source_session_id)
     if source_error:
         return None, source_error
-    _ensure_idempotency_index(s)
     if client_message_id:
         existing = _find_queue_item_by_idempotency(
             s, client_message_id=client_message_id)
-        if existing is not None and not existing.get("receiptOnly"):
+        if existing is not None:
             # A retry addresses the original durable receipt and may only
             # re-arm it; it must never create a second queue item.
             return existing, None
@@ -6251,16 +5013,15 @@ async def _persist_task_item(s, text: str, source: str, seq: int | None,
     # in-memory registry is only an acceleration layer; queue/history checks
     # keep a retry after process restart or registry TTL expiry from running a
     # second provider turn.
-    if idempotent_task_id and task_id:
+    if task_id:
         existing = _find_queue_item_by_idempotency(s, task_id=task_id)
-        if existing is not None and not existing.get("receiptOnly"):
+        if existing is not None:
             return existing, None
         if _durable_task_id_seen(s, task_id):
             return None, None
     old_seq = s.task_seq
     old_accepted_input_ids = list(s.accepted_input_ids)
     old_queue_revision = getattr(s, "queue_revision", 0)
-    old_active_task_id = getattr(s, "active_task_id", None)
     if seq is None:
         s.task_seq += 1
         seq = s.task_seq
@@ -6278,10 +5039,6 @@ async def _persist_task_item(s, text: str, source: str, seq: int | None,
         "revision": 1,
         "createdAt": time.time(),
     }
-    if task_id is not None:
-        # An inherited id is reporting context only; an assign id is also the
-        # durable idempotency key.
-        item["taskIdSource"] = "assign" if idempotent_task_id else "active"
     item["queueItemId"] = item["id"]
     if source_sid is not None:
         item["sourceSessionId"] = source_sid
@@ -6297,21 +5054,17 @@ async def _persist_task_item(s, text: str, source: str, seq: int | None,
             del s.accepted_input_ids[:-_ACCEPTED_INPUT_ID_LIMIT]
     item["position"] = len(s.queue_pending)
     s.queue_pending.append(item)
-    if activate_task:
-        s.active_task_id = task_id
     _remember_queue_item(s, item, _DELIVERY_QUEUED)
     s.queue_revision = old_queue_revision + 1
     try:
-        await _save_receipt(s)
+        await _sess.save_async(s)
     except Exception as exc:
         # Do not poison retry idempotency after a failed durable write.
         s.queue_pending = [queued for queued in s.queue_pending if queued is not item]
         s.task_seq = old_seq
         s.accepted_input_ids = old_accepted_input_ids
         s.queue_revision = old_queue_revision
-        s.active_task_id = old_active_task_id
         s.queue_delivery_ledger.pop(item["id"], None)
-        _remove_idempotency_receipt(s, item, item["id"])
         return None, f"Failed to persist queued task: {exc}"
     _log.info("[Session %s] queued task id=%s source=%s sourceSessionId=%s",
               s.id, item["id"], source_type, source_sid)
@@ -6335,14 +5088,13 @@ async def enqueue_user_message(session_id: str, text: str,
     Retrying the same clientMessageId resolves the original pending item or
     durable ledger receipt and never creates a second queue item.
     """
-    s = _get_session_shallow(session_id)
+    s = _sess.get(session_id)
     if s is None:
         return {"status": "error", "result": f"Session {session_id} not found"}
     async with queue_lock(session_id):
         migrated = _recover_delivery_states(s)
         migrated = _sync_queued_ledger(s) or migrated
-        prepared = _prepare_receipt_persistence(s)
-        if migrated or prepared:
+        if migrated:
             await _save_receipt(s)
         existing = _find_queue_item_by_idempotency(
             s, client_message_id=client_message_id)
@@ -6409,7 +5161,7 @@ def _worker_owns_queue_item(w: Worker | None, item: dict) -> bool:
 
 async def retry_pending_item(session_id: str, item_id: str) -> dict | str:
     """Retry the original queued receipt without creating a second item."""
-    s = _get_session_shallow(session_id)
+    s = _sess.get(session_id)
     if not s:
         return f"Session {session_id} not found"
     async with queue_lock(session_id):
@@ -6467,8 +5219,7 @@ async def _restart_if_native_interrupt_stalls(w: Worker, generation: int) -> Non
 async def send_task(worker_id: str, text: str, source: str = "agent",
                     seq: int | None = None, task_id: str | None = None,
                     client_message_id: str | None = None,
-                    source_session_id: str | None = None,
-                    idempotent_task_id: bool = True) -> str | None:
+                    source_session_id: str | None = None) -> str | None:
     w = workers.get(worker_id)
     if not w:
         return "Worker not found"
@@ -6495,9 +5246,7 @@ async def send_task(worker_id: str, text: str, source: str = "agent",
     # 只放无正文 queue_signal，consumer 每次只看 FIFO 队首。worker 死亡/回收
     # 后由 create_worker / 全局 watchdog 自动恢复消费。
     item, persist_error = await _persist_task_item(
-        s, text, source, seq, task_id, client_message_id, source_sid,
-        idempotent_task_id=idempotent_task_id,
-        activate_task=idempotent_task_id and task_id is not None)
+        s, text, source, seq, task_id, client_message_id, source_sid)
     if persist_error:
         return persist_error
     if item is None:
@@ -6517,7 +5266,6 @@ async def send_task(worker_id: str, text: str, source: str = "agent",
             "sessionId": w.session_id,
             "generation": w.generation,
             "status": "queued",
-            "taskSeq": seq,
             "source": source,
             "sourceSessionId": source_sid,
         })
@@ -6554,17 +5302,13 @@ async def assign(session_id: str, text: str, source: str = "agent",
     """
     if _shutdown_started:
         return {"status": "error", "result": "Pan main service is shutting down"}
-    target = _get_session_shallow(session_id)
+    target = _sess.get(session_id)
     if target is None:
         return {"status": "error", "result": f"Session {session_id} not found"}
     source_type, source_sid, source_error = _validate_source_metadata(
         target, source, source_session_id)
     if source_error:
         return {"status": "error", "result": source_error}
-    if task_id is None:
-        # An assign without a business id starts an unlabelled task and must
-        # not accidentally inherit the previous completed assignment.
-        target.active_task_id = None
     # 惰性清理过期条目（TTL），防止注册表长期运行无界增长（H2 泄漏）
     _prune_task_status()
     # Durable queue/history wins over the process-local registry.  A stale
@@ -6594,7 +5338,7 @@ async def assign(session_id: str, text: str, source: str = "agent",
     # durable queue/history before spawning a worker so a late retry cannot
     # create a second execution after a Pan restart or TTL expiry.
     if task_id is not None:
-        durable_session = _get_session_shallow(session_id)
+        durable_session = _sess.get(session_id)
         if _durable_task_id_seen(durable_session, task_id):
             return {"status": "pending", "taskId": task_id}
 
@@ -6652,14 +5396,8 @@ async def send(worker_id: str, text: str, source: str = "agent",
         return {"status": "error", "result": "Worker not found"}
     if not _process_alive(w):
         return {"status": "error", "result": "Worker process dead"}
-    s = _session(w)
-    inherited_task_id = (
-        getattr(s, "active_task_id", None)
-        if source == "agent" and s is not None else None
-    )
-    send_err = await send_task(
-        worker_id, text, source=source, task_id=inherited_task_id,
-        source_session_id=source_session_id, idempotent_task_id=False)
+    send_err = await send_task(worker_id, text, source=source,
+                               source_session_id=source_session_id)
     if send_err:
         return {"status": "error", "result": send_err}
     return {"status": "queued", "workerId": worker_id, "sessionId": w.session_id}
@@ -6679,37 +5417,24 @@ async def send_session(session_id: str, text: str, source: str = "agent",
       非空 && 无活 worker → create_worker）spawn 后经 _recover_pending_signals
       补发无正文 queue_signal 分发——「send = 写给 agent」。
     - held（takeover 模式）→ 透传错误，不吞错不入队。
-
-    Pan agent messages copy the Session's persisted active_task_id at enqueue
-    time.  The copied value is report context only; it is not an assign
-    idempotency key.  User-originated messages keep taskId=None.
     """
     if _shutdown_started:
         return {"status": "error", "result": "Pan main service is shutting down"}
-    target = _get_session_shallow(session_id)
+    target = _sess.get(session_id)
     if target is None:
         return {"status": "error", "result": f"Session {session_id} not found"}
     source_type, source_sid, source_error = _validate_source_metadata(
         target, source, source_session_id)
     if source_error:
         return {"status": "error", "result": source_error}
-    # Capture the routing context before a possible force restart.  The value
-    # is copied onto this message's durable queue row and is never recomputed
-    # from a later/previous result.
-    inherited_task_id = (
-        getattr(target, "active_task_id", None)
-        if source_type == "agent" else None
-    )
     w = find_alive_worker_by_session(session_id)
     alive = w is not None
     if not alive:
-        s = _get_session_shallow(session_id)
+        s = _sess.get(session_id)
         if not s:
             return {"status": "error", "result": f"Session {session_id} not found"}
         item, persist_error = await _persist_task_item(
-            s, text, source_type, None, inherited_task_id,
-            client_message_id, source_sid,
-            idempotent_task_id=False)
+            s, text, source_type, None, None, client_message_id, source_sid)
         if persist_error:
             return {"status": "error", "result": persist_error}
         # The queue write is the acknowledgement boundary.  Start recovery
@@ -6723,10 +5448,8 @@ async def send_session(session_id: str, text: str, source: str = "agent",
             return {"status": "error", "result": restarted}
         w = restarted
     send_err = await send_task(w.worker_id, text, source=source_type,
-                               task_id=inherited_task_id,
                                client_message_id=client_message_id,
-                               source_session_id=source_sid,
-                               idempotent_task_id=False)
+                               source_session_id=source_sid)
     if send_err:
         return {"status": "error", "result": send_err}
     return {"status": "queued", "workerId": w.worker_id, "sessionId": session_id}
@@ -6759,23 +5482,22 @@ def find_worker_by_session(session_id: str) -> Worker | None:
     return None
 
 
-async def steer_session_worker(session_id: str, text: str,
-                               message_id: str | None = None) -> Worker | str | None:
+async def steer_session_worker(session_id: str, text: str) -> Worker | str | None:
     """Steer the session's live worker without exposing its runtime id."""
-    if _get_session_shallow(session_id) is None:
+    if _sess.get(session_id) is None:
         return f"Session {session_id} not found"
     lock = await _session_spawn_lock(session_id)
     async with lock:
         w = find_alive_worker_by_session(session_id)
         if w is None:
             return None
-        error = await steer_worker(w.worker_id, text, message_id)
+        error = await steer_worker(w.worker_id, text)
         return error or w
 
 
 async def send_session_control(session_id: str, control: dict) -> Worker | str | None:
     """Send an out-of-band control to the session's current worker."""
-    if _get_session_shallow(session_id) is None:
+    if _sess.get(session_id) is None:
         return f"Session {session_id} not found"
     lock = await _session_spawn_lock(session_id)
     async with lock:

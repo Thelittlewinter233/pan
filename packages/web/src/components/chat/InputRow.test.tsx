@@ -8,13 +8,11 @@ import { useUIStore } from '@/stores/uiStore';
 import { useAdapterStore } from '@/stores/adapterStore';
 import {
   enqueueSessionMessage,
-  fetchSessionQueue,
   fetchDirectories,
   sendSession,
   spawnWorker,
   patchSession,
   steerSessionWorker,
-  updateSessionQueueItem,
   uploadSessionAttachment,
   registerServerFileAttachment,
 } from '@/services/api';
@@ -32,18 +30,10 @@ vi.mock('@/services/ws', () => ({
   },
 }));
 
-const queueApi = vi.hoisted(() => ({
-  acquireSessionQueueItemEdit: vi.fn(),
-  fetchSessionQueue: vi.fn(),
-  releaseSessionQueueItemEdit: vi.fn(),
-  updateSessionQueueItem: vi.fn(),
-}));
-
 vi.mock('@/services/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/services/api')>();
   return {
     ...actual,
-    ...queueApi,
     patchSession: vi.fn(async () => ({})),
     fetchSessions: vi.fn(async () => []),
     fetchDirectories: vi.fn(async () => ({
@@ -160,17 +150,6 @@ beforeEach(() => {
   vi.mocked(patchSession).mockClear();
   vi.mocked(sendSession).mockClear();
   vi.mocked(enqueueSessionMessage).mockClear();
-  queueApi.acquireSessionQueueItemEdit.mockReset().mockResolvedValue({ expiresAt: Date.now() + 300_000 });
-  queueApi.fetchSessionQueue.mockReset().mockRejectedValue(new Error('offline'));
-  queueApi.releaseSessionQueueItemEdit.mockReset().mockResolvedValue(undefined);
-  queueApi.updateSessionQueueItem.mockReset().mockResolvedValue({
-    item: {
-      id: 'q-edit-send', queueItemId: 'q-edit-send', text: 'queued original',
-      source: 'user' as const, kind: 'task' as const, createdAt: 1,
-      meta: { dispatchState: 'queued', revision: 2 },
-    },
-    queueRevision: 2,
-  });
   vi.mocked(uploadSessionAttachment).mockClear();
   vi.mocked(registerServerFileAttachment).mockClear();
   vi.mocked(spawnWorker).mockClear();
@@ -223,101 +202,8 @@ describe('InputRow send queue wiring', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Steer' }));
 
     await waitFor(() =>
-      expect(steerSessionWorker).toHaveBeenCalledWith(
-        's1', 'continue with the latest result', expect.stringMatching(/^steer:/),
-      ),
+      expect(steerSessionWorker).toHaveBeenCalledWith('s1', 'continue with the latest result'),
     );
-    await waitFor(() => expect(
-      useSessionStore.getState().currentMessages.map((message) => message.content),
-    ).toEqual(['continue with the latest result']));
-    expect(useSessionStore.getState().sessions[0]?.history.map((message) => message.content))
-      .toEqual(['continue with the latest result']);
-    expect(useSessionStore.getState().currentMessages[0]?.messageId)
-      .toBe(vi.mocked(steerSessionWorker).mock.calls[0]?.[2]);
-  });
-
-  it('does not put a delayed Steer response into a newly selected Session', async () => {
-    const pending = deferred<{ workerId: string; status: string }>();
-    vi.mocked(steerSessionWorker).mockReturnValueOnce(pending.promise);
-    useSessionStore.setState({
-      currentSessionId: 's1',
-      currentMessages: [],
-      sessions: [
-        {
-          id: 's1', name: 'A', adapter: 'codex', model: null, permissionMode: null,
-          alwaysThinkingEnabled: false, effort: '', workerStatus: 'running', workerId: 'w1',
-          history: [],
-        },
-        {
-          id: 's2', name: 'B', adapter: 'codex', model: null, permissionMode: null,
-          alwaysThinkingEnabled: false, effort: '', workerStatus: 'running', workerId: 'w2',
-          history: [],
-        },
-      ],
-    });
-    useWorkerStore.setState({
-      workers: { s1: { id: 'w1', sessionId: 's1', status: 'running' } },
-      currentWorkerId: 'w1',
-      currentWorker: { id: 'w1', sessionId: 's1', status: 'running' },
-    });
-
-    render(<InputRow />);
-    fireEvent.change(screen.getByPlaceholderText(/Type a message/), {
-      target: { value: 'steer A' },
-    });
-    fireEvent.click(screen.getByRole('button', { name: 'Steer' }));
-    await waitFor(() => expect(steerSessionWorker).toHaveBeenCalledWith(
-      's1', 'steer A', expect.stringMatching(/^steer:/),
-    ));
-
-    useSessionStore.setState({ currentSessionId: 's2', currentMessages: [] });
-    pending.resolve({ workerId: 'w1', status: 'steer sent' });
-    await waitFor(() => expect(
-      useSessionStore.getState().sessions.find((session) => session.id === 's1')?.history
-        .map((message) => message.content),
-    ).toEqual(['steer A']));
-
-    expect(useSessionStore.getState().currentSessionId).toBe('s2');
-    expect(useSessionStore.getState().currentMessages).toEqual([]);
-  });
-
-  it('does not let a delayed Steer success clear a newer draft in the same Session', async () => {
-    const pending = deferred<{ workerId: string; status: string }>();
-    vi.mocked(steerSessionWorker).mockReturnValueOnce(pending.promise);
-    setBusySession();
-    useSessionStore.setState({
-      sessions: [{
-        id: 's1', name: 'Test', adapter: 'codex', model: null, permissionMode: null,
-        alwaysThinkingEnabled: false, effort: '', workerStatus: 'running', workerId: 'w1',
-        history: [],
-      }],
-    });
-    useWorkerStore.setState({
-      workers: { s1: { id: 'w1', sessionId: 's1', status: 'running' } },
-      currentWorkerId: 'w1',
-      currentWorker: { id: 'w1', sessionId: 's1', status: 'running' },
-    });
-
-    render(<InputRow />);
-    fireEvent.change(screen.getByPlaceholderText(/Type a message/), {
-      target: { value: 'steer A' },
-    });
-    fireEvent.click(screen.getByRole('button', { name: 'Steer' }));
-    await waitFor(() => expect(steerSessionWorker).toHaveBeenCalledWith(
-      's1', 'steer A', expect.stringMatching(/^steer:/),
-    ));
-
-    fireEvent.change(screen.getByPlaceholderText(/Type a message/), {
-      target: { value: 'new draft after request' },
-    });
-    pending.resolve({ workerId: 'w1', status: 'steer sent' });
-
-    await waitFor(() => expect(
-      (screen.getByPlaceholderText(/Type a message/) as HTMLTextAreaElement).value,
-    ).toBe('new draft after request'));
-    expect(useSessionStore.getState().inputDrafts.s1).toBe('new draft after request');
-    expect(useSessionStore.getState().currentMessages.map((message) => message.content))
-      .toEqual(['steer A']);
   });
 
   it('selects server files, renders attachment chips, and enqueues standard Markdown links', async () => {
@@ -614,7 +500,7 @@ describe('InputRow send queue wiring', () => {
     expect(screen.queryByTestId('server-attachments')).toBeNull();
   });
 
-  it('restores each session draft and its inline attachment structure independently', async () => {
+  it('clears inline attachments and restores the draft belonging to the selected session', async () => {
     setBusySession();
     useSessionStore.setState((state) => ({
       inputDrafts: { s1: 'first draft', s2: 'second draft' },
@@ -655,60 +541,6 @@ describe('InputRow send queue wiring', () => {
     );
     expect(screen.queryByRole('group', { name: '附件 session.txt' })).toBeNull();
     expect(screen.getByTestId('rich-text-composer').textContent).toBe('second draft');
-
-    useSessionStore.setState({ currentSessionId: 's1', currentMessages: [] });
-    await waitFor(() => {
-      expect(screen.getByTestId('rich-text-composer').textContent).toContain('session.txt');
-      expect(screen.getByRole('group', { name: '附件 session.txt' })).toBeTruthy();
-    });
-    expect(screen.getByTestId('rich-text-composer').textContent).toContain('first draft');
-  });
-
-  it('does not let an old Session attachment registration update the newly selected Session', async () => {
-    setBusySession();
-    useSessionStore.setState((state) => ({
-      sessions: [
-        ...state.sessions,
-        {
-          id: 's2',
-          name: 'Second',
-          adapter: 'cbc',
-          model: null,
-          permissionMode: null,
-          alwaysThinkingEnabled: false,
-          effort: '',
-          workerStatus: 'idle',
-          workerId: null,
-          history: [],
-        },
-      ],
-    }));
-    const registration = deferred<Awaited<ReturnType<typeof registerServerFileAttachment>>>();
-    vi.mocked(registerServerFileAttachment).mockReturnValueOnce(registration.promise);
-    useUIStore.getState().requestChatAttachment('s1', 'D:\\attachments\\old-session.txt');
-    render(<InputRow />);
-    await waitFor(() =>
-      expect(registerServerFileAttachment).toHaveBeenCalledWith(
-        's1',
-        'D:\\attachments\\old-session.txt',
-      ),
-    );
-
-    useSessionStore.setState({ currentSessionId: 's2', currentMessages: [] });
-    await waitFor(() =>
-      expect(screen.queryByRole('group', { name: '附件 old-session.txt' })).toBeNull(),
-    );
-    registration.resolve({
-      ok: true,
-      attachmentId: `att_${'b'.repeat(32)}`,
-      displayName: 'old-session.txt',
-      mimeType: 'text/plain',
-      size: 1,
-      path: 'D:\\attachments\\old-session.txt',
-      href: '/api/fs/read?session_id=s1&path=old-session.txt&download=1',
-    });
-    await Promise.resolve();
-    expect(screen.queryByRole('group', { name: '附件 old-session.txt' })).toBeNull();
   });
 
   it('consumes an editor request through the existing server attachment and queue path', async () => {
@@ -762,43 +594,6 @@ describe('InputRow send queue wiring', () => {
     );
     expect(enqueueSessionMessage).not.toHaveBeenCalled();
     expect(screen.getByTestId('server-attachments')).toBeTruthy();
-  });
-
-  it('does not finish an attachment send after a queue edit starts during validation', async () => {
-    setBusySession();
-    const queued = {
-      id: 'q-edit-attachment', queueItemId: 'q-edit-attachment', text: 'queued',
-      source: 'user' as const, kind: 'task' as const, createdAt: 1,
-      meta: { dispatchState: 'queued' as const, revision: 1 },
-    };
-    useQueueStore.setState({ queues: { s1: [queued] } });
-    const validation = deferred<Awaited<ReturnType<typeof fetchDirectories>>>();
-    vi.mocked(fetchDirectories).mockReturnValueOnce(validation.promise);
-    useUIStore.getState().requestChatAttachment('s1', 'D:\\attachments\\report.txt');
-    render(<InputRow />);
-    await waitFor(() =>
-      expect(screen.getByTestId('server-attachments').textContent).toContain('report.txt'),
-    );
-    fireEvent.change(screen.getByPlaceholderText(/Type a message/), {
-      target: { value: 'review the attachment' },
-    });
-    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
-    useQueueStore.getState().startEdit(queued.id);
-    await vi.waitFor(() => expect(useQueueStore.getState().edits.s1?.acquiring).toBe(false));
-
-    validation.resolve({
-      current: 'D:\\attachments',
-      parent: 'D:\\',
-      entries: [{ name: 'report.txt', path: 'D:\\attachments\\report.txt', isDirectory: false }],
-    });
-    await waitFor(() =>
-      expect(screen.getByPlaceholderText(/Type a message/)).toHaveProperty(
-        'value', 'review the attachment',
-      ),
-    );
-    expect(enqueueSessionMessage).not.toHaveBeenCalled();
-    expect(useQueueStore.getState().queues.s1?.map((item) => item.id)).toEqual([queued.id]);
-    expect(useQueueStore.getState().edits.s1?.id).toBe(queued.id);
   });
 
   it('closes the server browser with its close button and backdrop', async () => {
@@ -953,11 +748,8 @@ describe('InputRow send queue wiring', () => {
       expect(useQueueStore.getState().queues['s1']?.[0]?.text).toBe('queued msg'),
     );
     expect((textarea as HTMLTextAreaElement).value).toBe('');
-    // Successful enqueue is visible immediately, correlated by the server
-    // queue id; a later delivery event must merge idempotently.
-    expect(useSessionStore.getState().currentMessages).toEqual([{
-      role: 'user', content: 'queued msg', queueItemIds: ['q-queued-msg'],
-    }]);
+    // 排队消息不上屏：它不在服务端 history 中，伪装进聊天会在刷新后凭空消失
+    expect(useSessionStore.getState().currentMessages).toEqual([]);
 
     // ^ 按钮角标显示 1（面板头部的计数也在 DOM 中，用 getAllByText）
     expect(screen.getAllByText('1').length).toBeGreaterThan(0);
@@ -965,159 +757,6 @@ describe('InputRow send queue wiring', () => {
     // 点击 ^ 展开面板 → 显示队列项（排队消息的唯一 UI 呈现处）
     fireEvent.click(screen.getByLabelText('发送队列'));
     expect(screen.getByText('queued msg')).toBeTruthy();
-  });
-
-  it('blocks button, Enter, and imperative send paths while a queue item is being edited', async () => {
-    setBusySession();
-    useQueueStore.setState({
-      queues: {
-        s1: [{
-          id: 'q-edit-send',
-          queueItemId: 'q-edit-send',
-          text: 'queued original',
-          source: 'user',
-          kind: 'task',
-          createdAt: '2026-09-01T00:00:00Z',
-          meta: { dispatchState: 'queued', revision: 1 },
-        }],
-      },
-    });
-    useQueueStore.getState().startEdit('q-edit-send');
-    render(<InputRow />);
-
-    const send = screen.getByRole('button', { name: 'Send' }) as HTMLButtonElement;
-    expect(send.disabled).toBe(true);
-    fireEvent.change(screen.getByPlaceholderText(/Type a message/), {
-      target: { value: 'must not send while editing' },
-    });
-    fireEvent.keyDown(screen.getByPlaceholderText(/Type a message/), { key: 'Enter' });
-    fireEvent.keyDown(screen.getByTestId('rich-text-composer'), { key: 'Enter' });
-    expect(enqueueSessionMessage).not.toHaveBeenCalled();
-    expect(useSessionStore.getState().currentMessages).toEqual([]);
-
-    // Cancel releases the server lease and reopens the ordinary send path
-    // without changing the queue item's projection or adding an edit row.
-    useQueueStore.getState().cancelEdit();
-    await waitFor(() => expect(send.disabled).toBe(false));
-    fireEvent.click(send);
-    await waitFor(() => expect(enqueueSessionMessage).toHaveBeenCalledTimes(1));
-  });
-
-  it('keeps the queue badge at the real item count through one edit and repeated save', async () => {
-    setBusySession();
-    const first = {
-      id: 'q-count-edit', queueItemId: 'q-count-edit', text: 'before', source: 'user' as const,
-      kind: 'task' as const, createdAt: 1, meta: { dispatchState: 'queued' as const, revision: 1 },
-    };
-    const edited = {
-      ...first, text: 'after', meta: { dispatchState: 'queued' as const, revision: 2 },
-    };
-    useQueueStore.setState({ queues: { s1: [first] }, queueRevisions: { s1: 1 } });
-    const finalSnapshot = [edited];
-    Object.defineProperty(finalSnapshot, 'queueRevision', { value: 2, enumerable: false });
-    queueApi.fetchSessionQueue.mockRejectedValueOnce(new Error('offline'))
-      .mockResolvedValueOnce(finalSnapshot);
-    queueApi.updateSessionQueueItem.mockResolvedValueOnce({ item: edited, queueRevision: 2 });
-    render(<InputRow />);
-
-    expect(screen.getByTestId('queue-count-badge').textContent).toBe('1');
-    fireEvent.click(screen.getByRole('button', { name: /发送队列/ }));
-    const row = screen.getByText('before').closest('.queue-row-in');
-    expect(row).toBeTruthy();
-    fireEvent.click(row!.querySelector('[title="编辑"]')!);
-    const editBox = await screen.findByDisplayValue('before') as HTMLTextAreaElement;
-    await waitFor(() => expect(editBox.disabled).toBe(false));
-    expect(screen.getByTestId('queue-count-badge').textContent).toBe('1');
-    expect(useQueueStore.getState().queues.s1?.map((entry) => entry.id)).toEqual(['q-count-edit']);
-
-    fireEvent.change(editBox, { target: { value: 'after' } });
-    useQueueStore.getState().saveEdit();
-    useQueueStore.getState().saveEdit();
-    await waitFor(() => expect(useQueueStore.getState().edits.s1).toBeNull());
-
-    expect(queueApi.updateSessionQueueItem).toHaveBeenCalledTimes(1);
-    expect(useQueueStore.getState().queues.s1).toHaveLength(1);
-    expect(useQueueStore.getState().queues.s1?.[0]).toMatchObject({ id: 'q-count-edit', text: 'after' });
-    expect(screen.getByTestId('queue-count-badge').textContent).toBe('1');
-    expect(fetchSessionQueue).toHaveBeenCalledWith('s1');
-    expect(updateSessionQueueItem).toHaveBeenCalledWith(
-      's1', 'q-count-edit', 'after', 1, expect.any(String),
-    );
-  });
-
-  it('uses the current Session runtime worker, not the stale summary, to suppress optimistic history', async () => {
-    useSessionStore.setState({
-      currentSessionId: 's1',
-      currentMessages: [],
-      sessions: [
-        {
-          id: 's1',
-          name: 'Test',
-          adapter: 'cbc',
-          model: null,
-          permissionMode: null,
-          alwaysThinkingEnabled: false,
-          effort: '',
-          workerStatus: 'offline',
-          workerId: null,
-          history: [],
-        },
-      ],
-    });
-    useWorkerStore.setState({
-      workers: { s1: { id: 'w-runtime', sessionId: 's1', status: 'running' } },
-      currentWorkerId: 'w-runtime',
-      currentWorker: { id: 'w-runtime', sessionId: 's1', status: 'running' },
-    });
-    render(<InputRow />);
-
-    fireEvent.change(screen.getByPlaceholderText(/Type a message/), {
-      target: { value: 'live path msg' },
-    });
-    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
-
-    await waitFor(() =>
-      expect(useQueueStore.getState().queues.s1?.[0]?.text).toBe('live path msg'),
-    );
-    expect(enqueueSessionMessage).toHaveBeenCalledWith(
-      's1',
-      'live path msg',
-      expect.any(String),
-      expect.any(Array),
-    );
-    expect(useSessionStore.getState().currentMessages).toEqual([]);
-  });
-
-  it.each([
-    ['idle runtime', { s1: { id: 'w-idle', sessionId: 's1', status: 'idle' as const } }],
-    ['offline runtime', { s1: { id: 'w-offline', sessionId: 's1', status: 'offline' as const } }],
-    ['no runtime entry', {}],
-    [
-      'another Session runtime',
-      { s2: { id: 'w-other', sessionId: 's2', status: 'running' as const } },
-    ],
-    [
-      'mismatched runtime entry',
-      { s1: { id: 'w-other', sessionId: 's2', status: 'running' as const } },
-    ],
-  ])('keeps one optimistic row for %s', async (_name, workers) => {
-    // The summary deliberately says running in every case; only the
-    // current-session runtime registry is authoritative for this decision.
-    setBusySession();
-    useWorkerStore.setState({ workers });
-    render(<InputRow />);
-
-    fireEvent.change(screen.getByPlaceholderText(/Type a message/), {
-      target: { value: 'fallback path msg' },
-    });
-    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
-
-    await waitFor(() =>
-      expect(useQueueStore.getState().queues.s1?.[0]?.text).toBe('fallback path msg'),
-    );
-    expect(useSessionStore.getState().currentMessages).toEqual([{
-      role: 'user', content: 'fallback path msg', queueItemIds: ['q-fallback-path-msg'],
-    }]);
   });
 
   it('does not render a stale localStorage queue after a page reload', async () => {
@@ -1164,9 +803,7 @@ describe('InputRow send queue wiring', () => {
     await waitFor(() =>
       expect(useQueueStore.getState().queues['s1']?.[0]?.text).toBe('direct msg'),
     );
-    expect(useSessionStore.getState().currentMessages).toEqual([{
-      role: 'user', content: 'direct msg', queueItemIds: ['q-direct-msg'],
-    }]);
+    expect(useSessionStore.getState().currentMessages).toEqual([]);
   });
 
   it('uses the durable HTTP enqueue path when WS is unavailable', async () => {
@@ -1204,9 +841,7 @@ describe('InputRow send queue wiring', () => {
         expect.any(Array),
       ),
     );
-    expect(useSessionStore.getState().currentMessages).toEqual([{
-      role: 'user', content: 'survive reconnect', queueItemIds: ['q-survive-reconnect'],
-    }]);
+    expect(useSessionStore.getState().currentMessages).toEqual([]);
   });
 
   it('clears optimistically and restores the complete draft when enqueue fails', async () => {
@@ -1250,76 +885,6 @@ describe('InputRow send queue wiring', () => {
 
     await waitFor(() => expect(enqueueSessionMessage).toHaveBeenCalledTimes(1));
     expect(textarea.value).toBe('new input while waiting');
-  });
-
-  it('suppresses the optimistic row if the runtime becomes running before enqueue acknowledgement', async () => {
-    setBusySession();
-    useWorkerStore.setState({
-      workers: { s1: { id: 'w-idle', sessionId: 's1', status: 'idle' } },
-      currentWorkerId: 'w-idle',
-      currentWorker: { id: 'w-idle', sessionId: 's1', status: 'idle' },
-    });
-    const request = deferred<Awaited<ReturnType<typeof enqueueSessionMessage>>>();
-    vi.mocked(enqueueSessionMessage).mockReturnValueOnce(request.promise);
-    render(<InputRow />);
-
-    fireEvent.change(screen.getByPlaceholderText(/Type a message/), {
-      target: { value: 'transition to live' },
-    });
-    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
-    useWorkerStore.getState().updateWorker('s1', 'w-running', 'running');
-    request.resolve({
-      item: {
-        id: 'q-transition-to-live',
-        queueItemId: 'q-transition-to-live',
-        text: 'transition to live',
-        source: 'user',
-        kind: 'task',
-        createdAt: 1,
-        meta: { dispatchState: 'queued', revision: 1 },
-      },
-      queueRevision: 1,
-    });
-
-    await waitFor(() =>
-      expect(useQueueStore.getState().queues.s1?.[0]?.text).toBe('transition to live'),
-    );
-    expect(useSessionStore.getState().currentMessages).toEqual([]);
-  });
-
-  it('keeps a send that started in the live path suppressed if the runtime becomes idle before acknowledgement', async () => {
-    setBusySession();
-    useWorkerStore.setState({
-      workers: { s1: { id: 'w-running', sessionId: 's1', status: 'running' } },
-      currentWorkerId: 'w-running',
-      currentWorker: { id: 'w-running', sessionId: 's1', status: 'running' },
-    });
-    const request = deferred<Awaited<ReturnType<typeof enqueueSessionMessage>>>();
-    vi.mocked(enqueueSessionMessage).mockReturnValueOnce(request.promise);
-    render(<InputRow />);
-
-    fireEvent.change(screen.getByPlaceholderText(/Type a message/), {
-      target: { value: 'started while live' },
-    });
-    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
-    useWorkerStore.getState().updateWorker('s1', 'w-running', 'idle');
-    request.resolve({
-      item: {
-        id: 'q-started-while-live',
-        queueItemId: 'q-started-while-live',
-        text: 'started while live',
-        source: 'user',
-        kind: 'task',
-        createdAt: 1,
-        meta: { dispatchState: 'queued', revision: 1 },
-      },
-      queueRevision: 1,
-    });
-
-    await waitFor(() =>
-      expect(useQueueStore.getState().queues.s1?.[0]?.text).toBe('started while live'),
-    );
-    expect(useSessionStore.getState().currentMessages).toEqual([]);
   });
 
   it('keeps a new Session draft isolated while the old Session send completes', async () => {
@@ -1373,7 +938,6 @@ describe('InputRow send queue wiring', () => {
       ),
     );
     expect(textarea.value).toBe('belongs to s2');
-    expect(useSessionStore.getState().currentMessages).toEqual([]);
     expect(useQueueStore.getState().queues.s2).toBeUndefined();
     expect(useQueueStore.getState().queues.s1?.[0]?.text).toBe('belongs to s1');
   });
@@ -1649,31 +1213,6 @@ describe('InputRow pill visibility', () => {
 });
 
 describe('InputRow control row layout contract', () => {
-  it('anchors the queue count badge to the Queue button, including the desktop busy hint', () => {
-    mockMatchMedia(false);
-    setBusySession();
-    useQueueStore.setState({
-      queues: {
-        s1: [{
-          id: 'q-1',
-          queueItemId: 'q-1',
-          kind: 'task',
-          text: 'queued',
-          createdAt: 1,
-          meta: { dispatchState: 'queued', revision: 1 },
-        }],
-      },
-    });
-    render(<InputRow />);
-
-    const queueButton = screen.getByRole('button', { name: /发送队列（1 条待发）/ });
-    const badge = screen.getByTestId('queue-count-badge');
-    expect(queueButton.className).toContain('relative');
-    expect(badge.parentElement).toBe(queueButton);
-    expect(badge.className).toContain('absolute');
-    expect(badge.className).toContain('pointer-events-none');
-  });
-
   it('uses a wider Queue control and right-aligns desktop attachment', () => {
     mockMatchMedia(false);
     setModelAndPermissionSession();

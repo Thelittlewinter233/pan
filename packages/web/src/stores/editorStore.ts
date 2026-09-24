@@ -124,7 +124,6 @@ interface EditorStore {
   activePath: string | null;
   dirty: Set<string>;
   contents: Record<string, string>;
-  imagePreviews: Record<string, EditorImagePreviewSource>;
   mdViewMode: Record<string, 'edit' | 'preview' | 'split'>;
   /** A one-shot location request produced by a Markdown file link. */
   pendingLocation: EditorLocation | null;
@@ -135,7 +134,6 @@ interface EditorStore {
   refreshTree: (dirPath?: string) => Promise<void>;
   toggleDir: (path: string) => Promise<void>;
   openFile: (path: string, location?: EditorLocation) => Promise<boolean>;
-  openImage: (path: string, preview: EditorImagePreviewSource) => boolean;
   consumePendingLocation: (location: EditorLocation) => void;
   closeFile: (path: string) => void;
   setActive: (path: string) => void;
@@ -169,19 +167,6 @@ export interface EditorLocation {
   path: string;
   line: number;
   endLine?: number;
-}
-
-export interface EditorImagePreviewSource {
-  src: string;
-  displayName: string;
-  /** Server-authorized same-origin opaque attachment URL; absent for workdir files. */
-  downloadHref?: string;
-}
-
-const EDITOR_IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'avif']);
-
-function isEditorImagePath(path: string): boolean {
-  return EDITOR_IMAGE_EXTENSIONS.has(path.split('.').pop()?.toLowerCase() ?? '');
 }
 
 interface TreeRequestSnapshot extends RootSnapshot {
@@ -289,7 +274,6 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   activePath: null,
   dirty: new Set(),
   contents: {},
-  imagePreviews: {},
   mdViewMode: {},
   pendingLocation: null,
   pendingConfirmation: null,
@@ -324,7 +308,6 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
             activePath: null,
             dirty: new Set<string>(),
             contents: {},
-            imagePreviews: {},
             mdViewMode: {},
             pendingLocation: null,
             pendingConfirmation: null,
@@ -442,18 +425,6 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
 
     set({ selectedPath: path, openRequestGeneration: snapshot.requestGeneration });
 
-    if (isEditorImagePath(path)) {
-      const imageUrl = `/api/fs/read?${new URLSearchParams({
-        session_id: snapshot.sessionId,
-        path,
-        download: '1',
-      }).toString()}`;
-      return get().openImage(path, {
-        src: imageUrl,
-        displayName: path.split(/[\\/]/).pop() || path,
-      });
-    }
-
     // Already open — just switch active
     if (get().openPaths.includes(path)) {
       set({ activePath: path, pendingLocation: location ?? null });
@@ -484,20 +455,6 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     }
   },
 
-  openImage: (path, preview) => {
-    const state = get();
-    const root = captureRoot(state);
-    if (!root || !preview.src) return false;
-    set((s) => ({
-      selectedPath: path,
-      openPaths: s.openPaths.includes(path) ? s.openPaths : [...s.openPaths, path],
-      activePath: path,
-      imagePreviews: { ...s.imagePreviews, [path]: preview },
-      pendingLocation: null,
-    }));
-    return true;
-  },
-
   consumePendingLocation: (location: EditorLocation) => {
     set((s) => {
       const pending = s.pendingLocation;
@@ -520,8 +477,6 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       newDirty.delete(path);
       const newContents = { ...s.contents };
       delete newContents[path];
-      const newImagePreviews = { ...s.imagePreviews };
-      delete newImagePreviews[path];
       let newActive = s.activePath;
       if (s.activePath === path) {
         // Activate nearest tab
@@ -538,7 +493,6 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
         openPaths: newOpen,
         dirty: newDirty,
         contents: newContents,
-        imagePreviews: newImagePreviews,
         activePath: newActive,
         selectedPath: s.selectedPath === path ? newActive : s.selectedPath,
         pendingLocation: s.pendingLocation?.path === path ? null : s.pendingLocation,

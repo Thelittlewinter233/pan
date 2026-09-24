@@ -1,10 +1,6 @@
 import { createPortal } from 'react-dom';
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type RefObject } from 'react';
-import {
-  useCurrentSession,
-  useSessionStore,
-  type SessionSettingPatch,
-} from '@/stores/sessionStore';
+import { useCallback, useEffect, useLayoutEffect, useState, type RefObject } from 'react';
+import { useCurrentSession, useSessionStore } from '@/stores/sessionStore';
 import { useWorkerStore } from '@/stores/workerStore';
 import { useUIStore } from '@/stores/uiStore';
 import { useAdapterStore } from '@/stores/adapterStore';
@@ -12,7 +8,6 @@ import { Button } from '@/components/ui/Button';
 import { ModelSelect } from '@/components/ui/ModelSelect';
 import { fetchSession } from '@/services/api';
 import type { AdapterConfig, PermissionMode, Session } from '@/types';
-import { FreshnessStatus } from '@/components/session/FreshnessStatus';
 
 interface SettingsPopoverProps {
   open: boolean;
@@ -20,31 +15,12 @@ interface SettingsPopoverProps {
   anchorRef?: RefObject<HTMLElement | null>;
 }
 
-function supportsSetting(config: AdapterConfig | null, name: string): boolean {
+function supportsSetting(
+  config: AdapterConfig | null,
+  name: string,
+): boolean {
   if (!config?.supportedSettings) return false;
   return config.supportedSettings.includes(name);
-}
-
-function pickSettings(session: Session): SessionSettingPatch {
-  return {
-    ...(Object.prototype.hasOwnProperty.call(session, 'model') ? { model: session.model } : {}),
-    ...(Object.prototype.hasOwnProperty.call(session, 'permissionMode')
-      ? { permissionMode: session.permissionMode }
-      : {}),
-    ...(Object.prototype.hasOwnProperty.call(session, 'alwaysThinkingEnabled')
-      ? { alwaysThinkingEnabled: session.alwaysThinkingEnabled }
-      : {}),
-    ...(Object.prototype.hasOwnProperty.call(session, 'effort') ? { effort: session.effort } : {}),
-    ...(Object.prototype.hasOwnProperty.call(session, 'outputMode')
-      ? { outputMode: session.outputMode }
-      : {}),
-    ...(Object.prototype.hasOwnProperty.call(session, 'modelContextWindow')
-      ? { modelContextWindow: session.modelContextWindow }
-      : {}),
-    ...(Object.prototype.hasOwnProperty.call(session, 'modelAutoCompactTokenLimit')
-      ? { modelAutoCompactTokenLimit: session.modelAutoCompactTokenLimit }
-      : {}),
-  };
 }
 
 /**
@@ -57,14 +33,11 @@ export function SettingsPopover({ open, onClose, anchorRef }: SettingsPopoverPro
   const session = useCurrentSession();
   const currentWorker = useWorkerStore((s) => s.currentWorker);
   const showToast = useUIStore((s) => s.showToast);
-  const { restart, killCurrent, interrupt, takeover } = useWorkerStore();
+  const { restart, killCurrent, interrupt, takeover } =
+    useWorkerStore();
   const config = useAdapterStore((s) => s.getConfig());
   const applySettings = useAdapterStore((s) => s.applySettings);
-  const loadSessions = useSessionStore((s) => s.loadSessions);
-  const patchSessionSettings = useSessionStore((s) => s.patchSessionSettings);
-  const settingMutation = useSessionStore((s) =>
-    session?.id ? s.sessionSettingMutations[session.id] : undefined,
-  );
+  const { loadSessions } = useSessionStore();
 
   // The sidebar list is summary=1 driven and does NOT carry model /
   // permissionMode / alwaysThinkingEnabled / effort — fetch the full session
@@ -78,14 +51,7 @@ export function SettingsPopover({ open, onClose, anchorRef }: SettingsPopoverPro
   const [contextWindowError, setContextWindowError] = useState('');
   const [autoCompactError, setAutoCompactError] = useState('');
   const [restoringCodexDefaults, setRestoringCodexDefaults] = useState(false);
-  const [popoverPosition, setPopoverPosition] = useState<{ left: number; bottom: number } | null>(
-    null,
-  );
-  const detailRequestSeq = useRef(0);
-  const [detailLoading, setDetailLoading] = useState(false);
-  const [detailRefreshing, setDetailRefreshing] = useState(false);
-  const [detailError, setDetailError] = useState<string | null>(null);
-  const [detailRetrySeq, setDetailRetrySeq] = useState(0);
+  const [popoverPosition, setPopoverPosition] = useState<{ left: number; bottom: number } | null>(null);
   const updatePopoverPosition = () => {
     const rect = anchorRef?.current?.getBoundingClientRect();
     if (!rect) return;
@@ -112,12 +78,7 @@ export function SettingsPopover({ open, onClose, anchorRef }: SettingsPopoverPro
   }, [open, anchorRef]);
   useEffect(() => {
     if (!open || !session?.id) return;
-    const requestSeq = (detailRequestSeq.current += 1);
-    const sessionId = session.id;
     setDetailSession(null);
-    setDetailLoading(true);
-    setDetailRefreshing(false);
-    setDetailError(null);
     setMoreOpen(false);
     setContextWindowInput(session.modelContextWindow?.toString() ?? '');
     setAutoCompactInput(session.modelAutoCompactTokenLimit?.toString() ?? '');
@@ -125,13 +86,7 @@ export function SettingsPopover({ open, onClose, anchorRef }: SettingsPopoverPro
     setAutoCompactError('');
     fetchSession(session.id)
       .then((full) => {
-        if (
-          detailRequestSeq.current !== requestSeq ||
-          useSessionStore.getState().currentSessionId !== sessionId
-        ) return;
         setDetailSession(full);
-        setDetailLoading(false);
-        setDetailRefreshing(false);
         setContextWindowInput(full.modelContextWindow?.toString() ?? '');
         setAutoCompactInput(full.modelAutoCompactTokenLimit?.toString() ?? '');
         useSessionStore.getState().updateSession(full.id, {
@@ -144,25 +99,21 @@ export function SettingsPopover({ open, onClose, anchorRef }: SettingsPopoverPro
           workdir: full.workdir,
         });
       })
-      .catch((error) => {
-        if (detailRequestSeq.current !== requestSeq) return;
-        setDetailLoading(false);
-        setDetailRefreshing(false);
-        setDetailError(error instanceof Error ? error.message : 'Session metadata unavailable');
-        setDetailSession(null);
-      });
-  }, [open, session?.id, detailRetrySeq]);
+      .catch(() => setDetailSession(null));
+  }, [open, session?.id]);
 
   // Same per-session effective-worker logic as TopBar/SettingsPanel.
   const effectiveWorkerId =
     (session?.workerId && session.workerStatus ? session.workerId : null) ||
-    (currentWorker && currentWorker.sessionId === session?.id ? currentWorker.id : null) ||
+    (currentWorker && currentWorker.sessionId === session?.id
+      ? currentWorker.id
+      : null) ||
     null;
 
   const applySetting = useCallback(
     async (key: string, value: unknown): Promise<boolean> => {
       if (!session) return false;
-      const patch: SessionSettingPatch = { [key]: value } as SessionSettingPatch;
+      const patch: Record<string, unknown> = { [key]: value };
       // Codex exposes model-specific reasoning levels. Clear an effort that
       // the newly selected model cannot accept; empty means native default.
       if (key === 'model' && config?.modelEfforts) {
@@ -173,23 +124,22 @@ export function SettingsPopover({ open, onClose, anchorRef }: SettingsPopoverPro
         }
       }
       try {
-        // Reflect the change locally before awaiting PATCH so every control
-        // and the sidebar can show the selection without network latency.
+        const res = await applySettings(
+          session.id,
+          patch,
+        );
+        // Reflect the change locally so the select/checkbox stays in sync.
         setDetailSession((d) => (d ? { ...d, ...patch } : d));
-        const result = await patchSessionSettings(session.id, patch, applySettings);
-        const latest = useSessionStore.getState().sessions.find((item) => item.id === session.id);
-        if (latest) {
-          setDetailSession((d) => (d ? { ...d, ...pickSettings(latest) } : d));
-        }
-        // Snapshot reconciliation is background work and must not delay the
-        // optimistic render or make a closed popover observable.
-        void loadSessions();
+        await loadSessions();
         // Process-affecting settings (output_mode / model / mcp …) require a
         // worker restart to take effect. When a worker is NOT running the
         // backend flags `requireRestart`; surface it so the user knows the
         // change applies on next spawn / when the worker goes idle.
-        if (result.applied && (result.response as { requireRestart?: boolean }).requireRestart) {
-          showToast('配置已保存，Worker 将自动 respawn 后生效；当前 turn 结束后切换', 'info');
+        if ((res as { requireRestart?: boolean }).requireRestart) {
+          showToast(
+            '配置已保存，Worker 将自动 respawn 后生效；当前 turn 结束后切换',
+            'info',
+          );
         }
         return true;
       } catch (e) {
@@ -197,7 +147,7 @@ export function SettingsPopover({ open, onClose, anchorRef }: SettingsPopoverPro
         return false;
       }
     },
-    [session, detailSession, config, effectiveWorkerId, applySettings, patchSessionSettings, loadSessions, showToast],
+    [session, detailSession, config, effectiveWorkerId, applySettings, loadSessions, showToast],
   );
 
   const updateCodexNumber = async (
@@ -222,23 +172,17 @@ export function SettingsPopover({ open, onClose, anchorRef }: SettingsPopoverPro
     if (!session || restoringCodexDefaults) return;
     setRestoringCodexDefaults(true);
     try {
-      const result = await patchSessionSettings(session.id, {
+      const ok = await applySettings(session.id, {
         modelContextWindow: null,
         modelAutoCompactTokenLimit: null,
-      }, applySettings);
-      if (result.applied) {
-        setDetailSession((d) =>
-          d
-            ? {
-                ...d,
-                modelContextWindow: null,
-                modelAutoCompactTokenLimit: null,
-              }
-            : d,
-        );
-      }
-      void loadSessions();
-      if (result.applied && !(result.response as { error?: string }).error) {
+      });
+      setDetailSession((d) => (d ? {
+        ...d,
+        modelContextWindow: null,
+        modelAutoCompactTokenLimit: null,
+      } : d));
+      await loadSessions();
+      if (!(ok as { error?: string }).error) {
         setContextWindowInput('');
         setAutoCompactInput('');
         setContextWindowError('');
@@ -252,55 +196,34 @@ export function SettingsPopover({ open, onClose, anchorRef }: SettingsPopoverPro
     }
   };
 
-  // Close on any outside pointer. The gear wrapper and the popover itself both
-  // carry data-settings-popover; ModelSelect's menu is a separate body portal,
-  // so its existing data-model-select-menu boundary must also be kept inside.
-  // Capture phase makes this reliable for controls elsewhere in the app that
-  // stop propagation, and pointerdown covers touch as well as mouse input.
+  // Close on outside click (the gear button lives under [data-settings-popover]).
   useEffect(() => {
     if (!open) return;
-    const isInsideSettings = (e: Event) =>
-      e
-        .composedPath()
-        .some(
-          (node) =>
-            node instanceof Element &&
-            (node.matches('[data-settings-popover]') || node.matches('[data-model-select-menu]')),
-        );
-    const handlePointerDown = (e: PointerEvent) => {
-      if (!isInsideSettings(e)) onClose();
+    const handler = (e: MouseEvent) => {
+      const target = e.target as HTMLElement;
+      if (!target.closest('[data-settings-popover]')) onClose();
     };
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    document.addEventListener('pointerdown', handlePointerDown, true);
-    document.addEventListener('keydown', handleKeyDown);
-    return () => {
-      document.removeEventListener('pointerdown', handlePointerDown, true);
-      document.removeEventListener('keydown', handleKeyDown);
-    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
   }, [open, onClose]);
 
   if (!open || !session || !config) return null;
 
   // Prefer the on-demand full session when loaded; fall back to the store's
   // (summary) session for id / workerStatus etc.
-  // The on-demand detail object is intentionally retained for fields omitted
-  // by summary=1, but the store is the live source for optimistic settings.
-  // Overlay only fields that are actually present so a summary cannot erase
-  // detail values while a PATCH is pending.
-  const s = detailSession?.id === session.id
-    ? { ...detailSession, ...pickSettings(session) }
-    : session;
+  const s = detailSession ?? session;
 
   const models = config.models || [];
   const currentModel = s.model || config.defaultModel;
-  const modelOptions = models.includes(currentModel) ? models : [currentModel, ...models];
+  const modelOptions = models.includes(currentModel)
+    ? models
+    : [currentModel, ...models];
   const modes = config.permissionModes || [];
   const showMode = supportsSetting(config, 'permissionMode');
   const showThinking = supportsSetting(config, 'thinking');
   const showEffort =
-    supportsSetting(config, 'effort') && (!showThinking || !!s.alwaysThinkingEnabled);
+    supportsSetting(config, 'effort') &&
+    (!showThinking || !!s.alwaysThinkingEnabled);
   const modelEfforts = config.modelEfforts?.[currentModel];
   const effortValues = modelEfforts ? ['', ...modelEfforts] : config.effortValues || [];
   // opencode's effort list starts with "" (unset sentinel); filter it out so
@@ -313,7 +236,7 @@ export function SettingsPopover({ open, onClose, anchorRef }: SettingsPopoverPro
       ? s.effort
       : hadEmpty
         ? ''
-        : (validEffortValues[0] ?? '');
+        : validEffortValues[0] ?? '';
   // Output Mode selector is shown only when the adapter exposes more than one
   // execution mode (e.g. cbc: ["stream","oneshot"]). Single-mode adapters
   // (kimi/opencode: ["stream"]) never render it — they cannot switch.
@@ -325,7 +248,8 @@ export function SettingsPopover({ open, onClose, anchorRef }: SettingsPopoverPro
     s.adapter === 'codex' &&
     supportsSetting(config, 'modelContextWindow') &&
     supportsSetting(config, 'modelAutoCompactTokenLimit');
-  const hasCodexOverrides = s.modelContextWindow != null || s.modelAutoCompactTokenLimit != null;
+  const hasCodexOverrides =
+    s.modelContextWindow != null || s.modelAutoCompactTokenLimit != null;
 
   if (!popoverPosition) return null;
 
@@ -335,23 +259,6 @@ export function SettingsPopover({ open, onClose, anchorRef }: SettingsPopoverPro
       style={{ position: 'fixed', left: popoverPosition.left, bottom: popoverPosition.bottom }}
       className="z-[60] mb-1 w-72 max-w-[calc(100vw-1rem)] max-h-[60vh] overflow-y-auto rounded-md border border-border-default bg-bg-primary shadow-xl p-3 space-y-3"
     >
-      <FreshnessStatus
-        state={detailError ? 'error' : detailLoading ? (detailRefreshing ? 'refreshing' : 'loading') : detailSession ? 'updated' : 'cached'}
-        updatedAt={detailSession?.updatedAt ?? session.updatedAt}
-        source={detailSession ? 'session metadata' : 'session summary cache'}
-        error={detailError}
-        onRetry={detailError ? () => setDetailRetrySeq((value) => value + 1) : undefined}
-      />
-      {settingMutation?.pending && (
-        <div data-settings-pending className="text-[11px] text-text-muted" aria-live="polite">
-          保存中…
-        </div>
-      )}
-      {!settingMutation?.pending && settingMutation?.error && (
-        <div data-settings-error className="text-[11px] text-danger" role="status">
-          {settingMutation.error}
-        </div>
-      )}
       {/* Model — ModelSelect 支持关键字过滤（opencode 几十上百个模型时可快速检索） */}
       <div>
         <label className="block text-xs text-text-secondary mb-1">Model</label>
@@ -365,7 +272,9 @@ export function SettingsPopover({ open, onClose, anchorRef }: SettingsPopoverPro
       {/* Permission Mode */}
       {showMode && (
         <div>
-          <label className="block text-xs text-text-secondary mb-1">Permission Mode</label>
+          <label className="block text-xs text-text-secondary mb-1">
+            Permission Mode
+          </label>
           <select
             value={s.permissionMode || config.defaultPermissionMode}
             onChange={(e) => applySetting('permissionMode', e.target.value)}
@@ -390,9 +299,7 @@ export function SettingsPopover({ open, onClose, anchorRef }: SettingsPopoverPro
             onClick={() => setMoreOpen((value) => !value)}
           >
             <span>More</span>
-            <span aria-hidden="true" className="text-text-muted">
-              {moreOpen ? '▾' : '▸'}
-            </span>
+            <span aria-hidden="true" className="text-text-muted">{moreOpen ? '▾' : '▸'}</span>
           </button>
           {moreOpen && (
             <div className="mt-2 space-y-2">
@@ -416,18 +323,14 @@ export function SettingsPopover({ open, onClose, anchorRef }: SettingsPopoverPro
                       setContextWindowError('请输入正整数');
                     }
                   }}
-                  onBlur={() =>
-                    updateCodexNumber(
-                      'modelContextWindow',
-                      contextWindowInput,
-                      setContextWindowError,
-                    )
-                  }
+                  onBlur={() => updateCodexNumber(
+                    'modelContextWindow',
+                    contextWindowInput,
+                    setContextWindowError,
+                  )}
                   className="w-full rounded border border-border-default bg-bg-tertiary px-2 py-1 text-xs text-text-primary"
                 />
-                {contextWindowError && (
-                  <span className="mt-1 block text-[11px] text-danger">{contextWindowError}</span>
-                )}
+                {contextWindowError && <span className="mt-1 block text-[11px] text-danger">{contextWindowError}</span>}
               </label>
               <label className="block text-xs text-text-secondary">
                 <span className="mb-1 block">Auto-compact token limit</span>
@@ -446,18 +349,14 @@ export function SettingsPopover({ open, onClose, anchorRef }: SettingsPopoverPro
                       setAutoCompactError('请输入正整数');
                     }
                   }}
-                  onBlur={() =>
-                    updateCodexNumber(
-                      'modelAutoCompactTokenLimit',
-                      autoCompactInput,
-                      setAutoCompactError,
-                    )
-                  }
+                  onBlur={() => updateCodexNumber(
+                    'modelAutoCompactTokenLimit',
+                    autoCompactInput,
+                    setAutoCompactError,
+                  )}
                   className="w-full rounded border border-border-default bg-bg-tertiary px-2 py-1 text-xs text-text-primary"
                 />
-                {autoCompactError && (
-                  <span className="mt-1 block text-[11px] text-danger">{autoCompactError}</span>
-                )}
+                {autoCompactError && <span className="mt-1 block text-[11px] text-danger">{autoCompactError}</span>}
               </label>
               <Button
                 variant="secondary"
@@ -479,7 +378,9 @@ export function SettingsPopover({ open, onClose, anchorRef }: SettingsPopoverPro
             <input
               type="checkbox"
               checked={!!s.alwaysThinkingEnabled}
-              onChange={(e) => applySetting('alwaysThinkingEnabled', e.target.checked)}
+              onChange={(e) =>
+                applySetting('alwaysThinkingEnabled', e.target.checked)
+              }
               className="rounded border-border-default bg-bg-tertiary"
             />
             Always Thinking
@@ -507,7 +408,9 @@ export function SettingsPopover({ open, onClose, anchorRef }: SettingsPopoverPro
       {/* Output Mode (execution mode): only adapters with >1 mode offer it */}
       {showOutputMode && (
         <div>
-          <label className="block text-xs text-text-secondary mb-1">Output Mode</label>
+          <label className="block text-xs text-text-secondary mb-1">
+            Output Mode
+          </label>
           <select
             value={currentOutputMode}
             onChange={(e) => applySetting('outputMode', e.target.value)}
@@ -526,7 +429,9 @@ export function SettingsPopover({ open, onClose, anchorRef }: SettingsPopoverPro
 
       {/* Worker actions */}
       <div>
-        <h4 className="text-xs font-semibold text-text-secondary mb-2">Worker</h4>
+        <h4 className="text-xs font-semibold text-text-secondary mb-2">
+          Worker
+        </h4>
         <div className="flex flex-col gap-1.5">
           <Button
             variant="secondary"
@@ -561,7 +466,9 @@ export function SettingsPopover({ open, onClose, anchorRef }: SettingsPopoverPro
                 size="sm"
                 onClick={() =>
                   takeover(session.id)
-                    .then(() => showToast('PowerShell opened for takeover'))
+                    .then(() =>
+                      showToast('PowerShell opened for takeover'),
+                    )
                     .catch((e) => showToast(e.message, 'error'))
                 }
               >

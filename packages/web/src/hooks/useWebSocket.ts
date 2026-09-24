@@ -1,12 +1,12 @@
 import { useEffect } from 'react';
 import { wsClient } from '@/services/ws';
+import { fetchSessionHistory } from '@/services/api';
 import { isMockMode } from '@/demo/mockBackend';
 import { useSessionStore } from '@/stores/sessionStore';
 import { useWorkerStore } from '@/stores/workerStore';
 import { useUIStore } from '@/stores/uiStore';
 import { useQueueStore } from '@/stores/queueStore';
 import { useAppSettingsStore } from '@/stores/appSettingsStore';
-import { useWorkspaceStore } from '@/stores/workspaceStore';
 import {
   useAdapterStore,
 } from '@/stores/adapterStore';
@@ -42,15 +42,8 @@ function showCodexWarningToast(): boolean {
   return useAppSettingsStore.getState().notifications.codexWarningToast;
 }
 
-const queueRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
 function refreshAgentQueue(sessionId?: string): void {
-  if (!sessionId || queueRefreshTimers.has(sessionId)) return;
-  // Coalesce queue.item_* + worker.status bursts into one authoritative GET;
-  // the queue store also suppresses overlapping requests across callers.
-  queueRefreshTimers.set(sessionId, setTimeout(() => {
-    queueRefreshTimers.delete(sessionId);
-    void useQueueStore.getState().loadAgentQueue(sessionId);
-  }, 0));
+  if (sessionId) void useQueueStore.getState().loadAgentQueue(sessionId);
 }
 
 /**
@@ -134,41 +127,14 @@ export function useWebSocket() {
       streamPreviewLastFlush.delete(sessionId);
     };
 
-    let lastInteractiveSyncGeneration: number | null = null;
     const syncInteractiveRequests = (): void => {
       // The backend keeps a worker-local snapshot of native prompts while the
       // JSON-RPC request is still open. Ask for it after every connection so a
       // browser refresh/reconnect does not strand the user at a hidden prompt.
-      const generation = wsClient.getConnectionGeneration();
-      if (generation > 0 && generation === lastInteractiveSyncGeneration) return;
-      if (wsClient.sendInteractiveSync() && generation > 0) {
-        lastInteractiveSyncGeneration = generation;
-      }
-    };
-
-    const syncAuthoritativeSnapshot = (recovery = false): void => {
-      const state = useSessionStore.getState();
-      const sessionIds = [...new Set([
-        ...(state.currentSessionId ? [state.currentSessionId] : []),
-        ...Object.keys(state.liveStreamBuffers),
-      ])];
-      const cursor = typeof wsClient.getEventCursor === 'function'
-        ? wsClient.getEventCursor()
-        : { eventEpoch: null, eventSeq: 0 };
-      wsClient.sendAuthoritativeResync({
-        type: 'resync',
-        ...(sessionIds.length ? { sessionIds } : {}),
-        includeAllSessions: true,
-        includeIdentity: true,
-        ...(cursor.eventEpoch ? { eventEpoch: cursor.eventEpoch } : {}),
-        eventSeq: cursor.eventSeq,
-      }, recovery ? 'recovery' : 'initial');
+      wsClient.send({ type: 'sync_interactive' });
     };
 
     const refreshAuthoritativeState = (): void => {
-      // HTTP convergence is deliberately separate from the native-interaction
-      // handshake.  resync_required may need a new snapshot on this socket,
-      // but must not turn every refresh/snapshot callback into another replay.
       const sessionId = useSessionStore.getState().currentSessionId;
       void useSessionStore.getState().loadSessions();
       void useWorkerStore.getState().refresh();
@@ -176,6 +142,7 @@ export function useWebSocket() {
         void useSessionStore.getState().refreshCurrentSessionHistory();
         void useQueueStore.getState().loadAgentQueue(sessionId);
       }
+      syncInteractiveRequests();
     };
 
     // Open handler — refresh sessions and restore live native prompts on connect
@@ -185,173 +152,51 @@ export function useWebSocket() {
       useAdapterStore.getState().loadAdapterList();
       useAdapterStore.getState().loadConfig('cbc');
       // An open event is the completion point for a focus-triggered stale
-      // reconnect. The snapshot callback finalizes buffered tasks before
-      // refreshing history, so a missed terminal cannot leave a partial echo.
+      // reconnect. Refresh the selected session and queue here so recovery
+      // does not race a new socket with HTTP snapshots.
       const sessionId = useSessionStore.getState().currentSessionId;
       if (sessionId) {
+        void useSessionStore.getState().refreshCurrentSessionHistory();
         void useQueueStore.getState().loadAgentQueue(sessionId);
       }
-      syncAuthoritativeSnapshot();
       syncInteractiveRequests();
     }));
     // If the singleton was already open before this hook mounted (HMR/route
     // remount), no new `open` event will arrive; sync explicitly as well.
-    if (wsClient.isOpen) {
-      syncAuthoritativeSnapshot();
-      syncInteractiveRequests();
-    }
+    if (wsClient.isOpen) syncInteractiveRequests();
 
-    // A bounded sender can explicitly evict this dashboard when it cannot
-    // preserve the live stream.  The event is not replay: converge from the
-    // authoritative HTTP snapshots, then let the socket reconnect normally.
-    unsubscribers.push(wsClient.on('resync_required', () => {
-      // If the server did not close the socket (for example, the client
-      // detected a live event cursor gap), request a fresh boundary on the
-      // same connection.  A close-triggered resync simply returns false and
-      // the normal open/reconnect path repeats this handshake.
-      syncAuthoritativeSnapshot(true);
-    }));
-    unsubscribers.push(wsClient.on('server_epoch_changed', (e: StreamEvent) => {
-      useSessionStore.getState().acceptServerEpoch(e.serverEpoch || e.eventEpoch);
-      useWorkerStore.getState().acceptServerEpoch(e.serverEpoch || e.eventEpoch);
-    }));
-    unsubscribers.push(wsClient.on('resync.snapshot', (e: StreamEvent) => {
-      useSessionStore.getState().acceptServerEpoch(e.serverEpoch || e.eventEpoch);
-      useWorkerStore.getState().acceptServerEpoch(e.serverEpoch || e.eventEpoch);
-      // A task may have completed while the physical socket was absent. The
-      // snapshot's lastResult is the durable terminal boundary, even when no
-      // worker.result frame can be replayed. Finalize its buffered partial
-      // answer before any history merge, otherwise the id-less canonical final
-      // and the old partial are rendered as two separate assistant messages.
-      for (const [sessionId, detail] of Object.entries(e.details ?? {})) {
-        const last = detail.lastResult as Record<string, unknown> | null | undefined;
-        const buffer = useSessionStore.getState().liveStreamBuffers[sessionId];
-        if (!buffer || !last || typeof last.taskSeq !== 'number') continue;
-        if (last.taskSeq !== buffer.taskSeq) continue;
-        useSessionStore.getState().reconcileWorkerResult(sessionId, {
-          result: typeof last.result === 'string' ? last.result : '',
-          status: typeof last.status === 'string' ? last.status : 'done',
-          historyEpoch: typeof last.historyEpoch === 'string' ? last.historyEpoch : undefined,
-          historyRevision: typeof last.historyRevision === 'number' ? last.historyRevision : undefined,
-        }, {
-          serverEpoch: e.serverEpoch || e.eventEpoch,
-          workerId: typeof last.workerId === 'string' ? last.workerId : buffer.workerId,
-          generation: typeof last.generation === 'number' ? last.generation : buffer.generation,
-          taskSeq: last.taskSeq,
-          taskId: typeof last.taskId === 'string' ? last.taskId : undefined,
-        });
-      }
-      const knownSessionIds = [
-        ...useSessionStore.getState().sessions.map((session) => session.id),
-        ...(e.sessions ?? []).map((session) => session.id),
-        ...(e.workers ?? [])
-          .map((worker) => typeof worker.sessionId === 'string' ? worker.sessionId : null)
-          .filter((id): id is string => Boolean(id)),
-      ];
-      useSessionStore.getState().beginUnscopedReplay(knownSessionIds);
-      refreshAuthoritativeState();
-      syncInteractiveRequests();
-    }));
-
-    // Browser lifecycle events (visibilitychange / pageshow / focus) are only
-    // signals. The singleton connection layer remains the single owner of
-    // reconnect/open synchronization. All three funnel through one debounced
-    // recovery so a window switch cannot fan out into duplicate request bursts:
-    //   - signals within RECOVERY_DEBOUNCE_MS collapse into a single run;
-    //   - if the socket is still fresh and authoritative state was refreshed
-    //     within RECOVERY_COALESCE_MS, the duplicate signal is absorbed — the
-    //     live connection already keeps the UI current, so there is nothing new
-    //     to fetch.
-    // The stale-socket path is always preserved: the freshness check runs for
-    // every recovery, a stale socket is always reconnected (whose open handler
-    // performs the authoritative refresh), and absorption only happens on a
-    // fresh socket — so a duplicate signal never loses disconnect recovery.
-    // A hidden page is a special case: Chromium may freeze the JS event loop
-    // while the TCP/WebSocket object still reports OPEN. On resume, its last
-    // activity timestamp can therefore look fresh even though a resync sent
-    // through that half-open transport will never produce a response. A real
-    // hidden→visible transition forces one new physical socket; focus-only
-    // signals still use the cheaper freshness path.
-    const RECOVERY_DEBOUNCE_MS = 100;
-    const RECOVERY_COALESCE_MS = 500;
+    // Browser lifecycle events are only signals. The singleton connection
+    // layer remains the single owner of reconnect/open synchronization.
     let recoveryTimer: ReturnType<typeof setTimeout> | null = null;
-    let lastRecoveryAt = 0;
-    let lastRecoveryReplacedTransport = false;
-    // Track transitions observed by this mounted dashboard. If the app is
-    // first mounted in a background tab, its initial open/replay path is the
-    // appropriate owner; the next observed hidden→visible transition still
-    // receives the forced transport recovery.
-    let hiddenSince: number | null = null;
-    let forceTransportRecovery = false;
-
-    const isConnectionFresh = (): boolean =>
-      typeof wsClient.isConnectionFresh === 'function'
-        ? wsClient.isConnectionFresh()
-        : wsClient.isOpen;
-
-    const drainRecovery = (): void => {
-      const forceReconnect = forceTransportRecovery;
-      forceTransportRecovery = false;
-      const fresh = isConnectionFresh();
-      const elapsed = Date.now() - lastRecoveryAt;
-      if (
-        fresh
-        && lastRecoveryAt > 0
-        && elapsed < RECOVERY_COALESCE_MS
-        && (!forceReconnect || lastRecoveryReplacedTransport)
-      ) {
-        // Same resume already refreshed authoritative state on a live socket —
-        // absorb the duplicate instead of issuing a second request burst.
-        return;
-      }
-      lastRecoveryAt = Date.now();
-      if (forceReconnect || !fresh) {
-        lastRecoveryReplacedTransport = true;
-        // reconnect() preserves all subscribers and its open handler above
-        // performs the authoritative refresh once the new socket is live.
-        if (typeof wsClient.reconnect === 'function') wsClient.reconnect();
-        else wsClient.connect();
-        return;
-      }
-      lastRecoveryReplacedTransport = false;
-      // A buffered task needs its durable terminal boundary before history
-      // can converge. Without a partial stream, HTTP alone is sufficient.
-      if (Object.keys(useSessionStore.getState().liveStreamBuffers).length > 0) {
-        syncAuthoritativeSnapshot(true);
-      } else {
-        refreshAuthoritativeState();
-      }
-    };
-
-    const recover = (forceReconnect = false): void => {
-      if (forceReconnect) forceTransportRecovery = true;
+    let recoveryInFlight: Promise<void> | null = null;
+    const recover = (): void => {
       if (recoveryTimer) clearTimeout(recoveryTimer);
       recoveryTimer = setTimeout(() => {
         recoveryTimer = null;
-        drainRecovery();
-      }, RECOVERY_DEBOUNCE_MS);
+        if (recoveryInFlight) return;
+        recoveryInFlight = (async () => {
+          const fresh = typeof wsClient.isConnectionFresh === 'function'
+            ? wsClient.isConnectionFresh()
+            : wsClient.isOpen;
+          if (!fresh) {
+            // reconnect() preserves all subscribers and its open handler above
+            // performs the authoritative refresh once the new socket is live.
+            if (typeof wsClient.reconnect === 'function') wsClient.reconnect();
+            else wsClient.connect();
+            return;
+          }
+          refreshAuthoritativeState();
+        })().finally(() => {
+          recoveryInFlight = null;
+        });
+      }, 100);
     };
     const onVisibilityChange = (): void => {
-      if (document.visibilityState === 'hidden') {
-        hiddenSince ??= Date.now();
-        return;
-      }
-      if (document.visibilityState === 'visible') {
-        const resumedFromBackground = hiddenSince !== null;
-        hiddenSince = null;
-        recover(resumedFromBackground);
-      }
+      if (document.visibilityState === 'visible') recover();
     };
-    const onPageShow = (event: PageTransitionEvent): void => {
-      // `persisted` covers a bfcache restore where visibilitychange may not
-      // arrive while the document is frozen. An ordinary initial pageshow is
-      // intentionally cheap and remains covered by the normal open path.
-      recover(event.persisted || hiddenSince !== null);
-    };
-    const onFocus = (): void => recover();
     document.addEventListener('visibilitychange', onVisibilityChange);
-    window.addEventListener('pageshow', onPageShow);
-    window.addEventListener('focus', onFocus);
+    window.addEventListener('pageshow', recover);
+    window.addEventListener('focus', recover);
 
     // Queue events are convergence hints. The server snapshot remains the
     // business source of truth, so a stale or duplicated event cannot create
@@ -363,6 +208,7 @@ export function useWebSocket() {
       }));
     }
     unsubscribers.push(wsClient.on('queue.item_delivered', (e: StreamEvent) => {
+      refreshAgentQueue(e.sessionId);
       if (!e.sessionId || !Array.isArray(e.messages)) return;
       useSessionStore.getState().appendDeliveredMessages(e.sessionId, e.messages);
     }));
@@ -370,30 +216,21 @@ export function useWebSocket() {
     // Worker spawned / restarted / reconfigured
     unsubscribers.push(wsClient.on('worker.spawned', (e: StreamEvent) => {
       if (!isCurrentWorkerEvent(e)) return;
-      if (e.sessionId) {
-        clearNativeTurnAliases(e.sessionId);
-        useSessionStore.getState().clearLiveStream(e.sessionId);
-      }
+      if (e.sessionId) clearNativeTurnAliases(e.sessionId);
       clearInteractiveRequests(e.sessionId);
       if (!handleWorkerUpdate(e, 'idle')) return;
       refreshAgentQueue(e.sessionId);
     }));
     unsubscribers.push(wsClient.on('worker.restarted', (e: StreamEvent) => {
       if (!isCurrentWorkerEvent(e)) return;
-      if (e.sessionId) {
-        clearNativeTurnAliases(e.sessionId);
-        useSessionStore.getState().clearLiveStream(e.sessionId);
-      }
+      if (e.sessionId) clearNativeTurnAliases(e.sessionId);
       clearInteractiveRequests(e.sessionId);
       if (!handleWorkerUpdate(e, 'idle')) return;
       refreshAgentQueue(e.sessionId);
     }));
     unsubscribers.push(wsClient.on('worker.reconfigured', (e: StreamEvent) => {
       if (!isCurrentWorkerEvent(e)) return;
-      if (e.sessionId) {
-        clearNativeTurnAliases(e.sessionId);
-        useSessionStore.getState().clearLiveStream(e.sessionId);
-      }
+      if (e.sessionId) clearNativeTurnAliases(e.sessionId);
       clearInteractiveRequests(e.sessionId);
       if (!handleWorkerUpdate(e, 'idle')) return;
       refreshAgentQueue(e.sessionId);
@@ -573,10 +410,9 @@ export function useWebSocket() {
         ui.removeUserInputRequest(e.sessionId, requestId);
         ui.removeElicitationRequest(e.sessionId, requestId);
       }
-      // Persist a transient live suffix for every session. The store projects
-      // it into currentMessages only when that session is selected, so A→B→A
-      // does not lose deltas while the selected-session viewport changes.
-      appendEvent(e.sessionId, e.event, e);
+      const store = useSessionStore.getState();
+      // 消息区：仅当前 session 追加（原有逻辑，保留）
+      if (e.sessionId === store.currentSessionId) appendEvent(e.sessionId, e.event);
       // 卡片预览：所有 session 就地 throttle 更新 lastMessage（无文本事件跳过）
       const text = extractStreamText(e.event);
       if (text) throttledLastMessageUpdate(e.sessionId, text);
@@ -592,8 +428,6 @@ export function useWebSocket() {
         scheduleRefreshSessions();
         return;
       }
-      if (!e.sessionId) return;
-      const sessionId = e.sessionId;
       const notification = e.notification as { title?: string; body?: string; browser?: boolean } | undefined;
       // Permission is explicitly requested from msgBridge; completion events
       // never prompt in the background.
@@ -602,48 +436,28 @@ export function useWebSocket() {
         new Notification(notification.title || 'Pan:', { body: notification.body || '' });
       }
       const sessionStore = useSessionStore.getState();
-      clearInteractiveRequests(sessionId);
-      const reconciled = sessionStore.reconcileWorkerResult(sessionId, e, {
-        serverEpoch: e.serverEpoch || e.eventEpoch,
-        workerId: e.workerId,
-        generation: e.generation,
-        taskSeq: e.taskSeq,
-        taskId: typeof e.taskId === 'string' ? e.taskId : undefined,
-      });
-      if (!reconciled) {
-        scheduleRefreshSessions();
-        return;
-      }
-      const afterReconcile = useSessionStore.getState();
-      if (sessionId === afterReconcile.currentSessionId) {
+      clearInteractiveRequests(e.sessionId);
+      if (e.sessionId === sessionStore.currentSessionId) {
         const status = e.status === 'error'
           ? 'error'
           : e.status === 'cancelled' || e.cancelled
             ? 'cancelled'
             : 'done';
-        const resultKey = e.taskSeq === undefined
-          ? undefined
-          : `worker.result:${e.sessionId}:${e.taskSeq}`;
-        const alreadyShown = resultKey
-          ? afterReconcile.currentMessages.some((message) => message.nativeItemId === resultKey)
-          : false;
-        if (!alreadyShown) {
-          afterReconcile.addMessage({
-            role: 'system',
-            content: `[${status.toUpperCase()}] Task completed`,
-            ...(resultKey ? { nativeItemId: resultKey } : {}),
-          });
-        }
+        sessionStore.addMessage({
+          role: 'system',
+          content: `[${status.toUpperCase()}] Task completed`,
+        });
       }
       // 流式预览节流：result 为最终 lastMessage，先清掉该 session 未 flush 的
       // pending 文本与尾随 timer，防止其迟到覆盖 result（applyResultToSession
       // 紧接着以 result 写入 lastMessage）。
-      cancelStreamPreview(sessionId);
-      clearNativeTurnAliases(sessionId);
+      if (e.sessionId) cancelStreamPreview(e.sessionId);
+      if (e.sessionId) clearNativeTurnAliases(e.sessionId);
       handleWorkerUpdate(e, 'idle');
       refreshAgentQueue(e.sessionId);
       // 就地更新该 session 卡片（lastResult + 结果文本追加 + historyTotal），
       // 不等 300ms 防抖全量兜底即可让「最后消息 summary」立即最新。
+      if (e.sessionId) sessionStore.applyResultToSession(e.sessionId, e);
       // 实时刷新侧边栏列表（lastResult / historyTotal / workerStatus 等卡片
       // 数据）。防抖合并为单次全量抓取：既避免每个任务完成都触发整列表重渲染
       // 造成的滞涩，也避开了后端「done→idle」的瞬态窗口（否则快照可能把已置为
@@ -653,25 +467,10 @@ export function useWebSocket() {
 
     // Session events — created/deleted 也需刷新列表（否则新 session 不出现、
     // 删除的残留，需手动刷新才更新）。同样防抖合并。
-    const applySessionEvent = (e: StreamEvent): void => {
-      if (!e.sessionId) return;
-      const patch: Partial<import('@/types').Session> = e.session
-        ? { ...e.session }
-        : {};
-      if (e.type === 'session.renamed') {
-        const nextName = e.name ?? e.newName;
-        if (nextName) patch.name = nextName;
-      }
-      if (Object.keys(patch).length > 0) {
-        useSessionStore.getState().updateSession(e.sessionId, patch, true);
-      }
-    };
-    unsubscribers.push(wsClient.on('session.renamed', (e: StreamEvent) => {
-      applySessionEvent(e);
+    unsubscribers.push(wsClient.on('session.renamed', () => {
       scheduleRefreshSessions();
     }));
-    unsubscribers.push(wsClient.on('session.updated', (e: StreamEvent) => {
-      applySessionEvent(e);
+    unsubscribers.push(wsClient.on('session.updated', () => {
       scheduleRefreshSessions();
     }));
     unsubscribers.push(wsClient.on('session.created', () => {
@@ -682,38 +481,6 @@ export function useWebSocket() {
     }));
     unsubscribers.push(wsClient.on('sessions.deleted', () => {
       scheduleRefreshSessions();
-    }));
-    // Cold-start projection repair is an eventual metadata-only operation.
-    // Its completion event is the explicit refresh trigger for cards that
-    // initially rendered an unknown count/preview.
-    unsubscribers.push(wsClient.on('session.summaryBackfillCompleted', () => {
-      scheduleRefreshSessions();
-    }));
-    // Workspaces: metadata is durable server state — refetch on any change
-    // (the payload is tiny). Membership snapshots are applied verbatim so the
-    // rail counts, the card badges and the active scope converge without a
-    // full session refetch.
-    unsubscribers.push(wsClient.on('workspace.created', () => {
-      void useWorkspaceStore.getState().loadWorkspaces();
-    }));
-    unsubscribers.push(wsClient.on('workspace.updated', () => {
-      void useWorkspaceStore.getState().loadWorkspaces();
-    }));
-    unsubscribers.push(wsClient.on('workspace.orderUpdated', () => {
-      void useWorkspaceStore.getState().loadWorkspaces();
-    }));
-    unsubscribers.push(wsClient.on('workspace.deleted', () => {
-      void useWorkspaceStore.getState().loadWorkspaces();
-    }));
-    unsubscribers.push(wsClient.on('workspace.membershipUpdated', (e: StreamEvent) => {
-      if (e.workspaceId && Array.isArray(e.sessionIds)) {
-        useWorkspaceStore.getState().applyMembership(e.workspaceId, e.sessionIds);
-      }
-    }));
-    unsubscribers.push(wsClient.on('session.workspaceUpdated', (e: StreamEvent) => {
-      if (e.sessionId && Array.isArray(e.workspaceIds)) {
-        useWorkspaceStore.getState().applySessionMembership(e.sessionId, e.workspaceIds);
-      }
     }));
     // Custom session order persisted (POST /api/sessions/order broadcast). A
     // debounced full-list refresh re-reads the server snapshot; in custom sort
@@ -737,12 +504,10 @@ export function useWebSocket() {
       streamPreviewTimers.clear();
       streamPreviewPending.clear();
       streamPreviewLastFlush.clear();
-      for (const timer of queueRefreshTimers.values()) clearTimeout(timer);
-      queueRefreshTimers.clear();
       if (recoveryTimer) clearTimeout(recoveryTimer);
       document.removeEventListener('visibilitychange', onVisibilityChange);
-      window.removeEventListener('pageshow', onPageShow);
-      window.removeEventListener('focus', onFocus);
+      window.removeEventListener('pageshow', recover);
+      window.removeEventListener('focus', recover);
     };
   }, []);
 }
@@ -769,19 +534,12 @@ function handleWorkerUpdate(
   if (!e.sessionId) return false;
   if (!isCurrentWorkerEvent(e, terminal)) return false;
   const sessStore = useSessionStore.getState();
-  const accepted = sessStore.applyWorkerStatus(
-    e.sessionId,
-    status,
-    {
-      serverEpoch: e.serverEpoch || e.eventEpoch,
-      workerId: e.workerId,
-      generation: e.generation,
-      taskSeq: e.taskSeq,
-      taskId: typeof e.taskId === 'string' ? e.taskId : undefined,
-    },
-    terminal,
-  );
-  if (!accepted) return false;
+  sessStore.updateSession(e.sessionId, {
+    // A destroy/crash event is authoritative even though older event payloads
+    // may omit workerId.  Do not turn its explicit null into "leave unchanged".
+    workerId: status === null ? null : e.workerId ?? undefined,
+    workerStatus: status,
+  });
   const workerStore = useWorkerStore.getState();
   workerStore.updateWorker(e.sessionId, e.workerId ?? null, status, e.generation, terminal);
 
@@ -817,15 +575,10 @@ function pyJsonDumps(value: unknown): string {
  *          {type:'content.part', role:'assistant', part:{type,text}}、
  *          以及 tool_calls —— kimi 事件以 role 标识、可无 type 字段，
  *          此前前端只认 type==='assistant' 导致 kimi 流式/完成后均不渲染。 */
-interface ExtractedBlock {
-  role: string;
-  content: string;
-  /** Provider-supplied block identity when one exists. */
-  blockId?: string;
-}
-
-function extractBlocks(event: WorkerEvent): ExtractedBlock[] {
-  const blocks: ExtractedBlock[] = [];
+function extractBlocks(
+  event: WorkerEvent,
+): Array<{ role: string; content: string }> {
+  const blocks: Array<{ role: string; content: string }> = [];
   if (event.type === 'codex.plan' && Array.isArray(event.plan)) {
     const statusMark: Record<string, string> = {
       completed: '[x]',
@@ -903,14 +656,6 @@ function extractBlocks(event: WorkerEvent): ExtractedBlock[] {
     }
   }
 
-  // Codex can expose a tool delta only as the cumulative stream_text while
-  // the final envelope carries the structured tool_use block.  Keep the
-  // delta visible and let the final item identity replace this placeholder.
-  if (blocks.length === 0 && event.delta && typeof event.stream_text === 'string'
-      && (event.type === 'assistant' || event.role === 'assistant')) {
-    blocks.push({ role: 'assistant', content: event.stream_text });
-  }
-
   // kimi tool_calls：{tool_calls:[{function:{name, arguments}}]}
   for (const tc of event.tool_calls ?? []) {
     const fn = tc?.function ?? {};
@@ -939,256 +684,111 @@ function extractStreamText(event: WorkerEvent): string | null {
 // notifications. Keep that transient alias outside Message so it does not
 // become persisted history, while retaining the first item's position.
 const nativeTurnItemAliases = new Map<string, string>();
-/** Whether the first assistant item in a turn arrived as a delta or completed. */
-const nativeTurnAliasOrigins = new Map<string, 'delta' | 'completed'>();
 // An alias is safe for a late delta only after this turn has completed an
 // assistant item. Before that point, a new item id must remain a new message:
 // multiple native items can legitimately interleave within one turn.
 const nativeTurnCompleted = new Set<string>();
 
-function appendEventToMessages(
-  sessionId: string,
-  event: StreamEvent['event'],
-  initialMessages: Message[],
-  scope?: Pick<StreamEvent, 'workerId' | 'generation' | 'taskSeq' | 'taskId'>,
-): Message[] {
-  if (!event) return initialMessages;
+function appendEvent(sessionId: string, event: StreamEvent['event']): void {
+  if (!event) return;
   const t = event.type;
-  if (t === 'system' && event.subtype === 'init') return initialMessages;
-  if (t === 'result') return initialMessages;
-  let messages = initialMessages;
-  const blocks = extractBlocks(event);
-  // A single native event may contain thinking, text, and tool blocks for the
-  // same item. Each block must consume a different existing row; otherwise a
-  // repeated findIndex() updates the first row and later blocks drift into it.
-  // The ordinary one-block path avoids allocating this Set.
-  const usedIndexes = blocks.length > 1 ? new Set<number>() : undefined;
-  const cumulativeStreamText = event.delta
-    && blocks.length === 1
-    && typeof event.stream_text === 'string'
-    ? event.stream_text
-    : undefined;
-
-  // 最终 assistant 消息由服务端一次性携带的完成时刻（delta chunk 不带）。
-  const eventTs = typeof event.ts === 'string' ? event.ts : undefined;
+  if (t === 'system' && event.subtype === 'init') return;
+  if (t === 'result') return;
 
   // Stream arrival order is the display order: the first event for a native
   // item reserves its position, and later deltas/completion replace that item
   // in place. Thinking/tool blocks therefore stay before or after content
   // according to the adapter's event semantics, never according to the
   // render timing or the current viewport position.
-  for (const [blockIndex, b] of blocks.entries()) {
+  // 最终 assistant 消息由服务端一次性携带的完成时刻（delta chunk 不带）。
+  const eventTs = typeof event.ts === 'string' ? event.ts : undefined;
+  for (const b of extractBlocks(event)) {
+    const store = useSessionStore.getState();
+    const messages = store.currentMessages;
     // A Codex assistant reply is one logical message for the whole turn. The
     // native bridge can expose different item ids for its delta and completed
     // notifications (and an interleaved tool can become the last message), so
     // use the native item id as the canonical identity. The turn id is only a
     // transient alias for bridges that change ids between delta and completed.
     const itemId = event.item_id !== undefined ? String(event.item_id) : undefined;
-    const eventTurnId = event.turn_id !== undefined
+    const turnId = b.role === 'assistant' && event.turn_id !== undefined
       ? String(event.turn_id)
       : undefined;
-    const turnId = b.role === 'assistant' ? eventTurnId : undefined;
-    const scopeSuffix = eventTurnId && scope?.taskSeq !== undefined
-      ? `:seq:${scope.taskSeq}`
-      : eventTurnId && scope?.taskId
-        ? `:task:${scope.taskId}`
-        : '';
-    const turnKey = eventTurnId ? `${sessionId}${scopeSuffix}:${eventTurnId}` : undefined;
-    const aliasKey = turnId ? turnKey : undefined;
+    const aliasKey = turnId ? `${sessionId}:${turnId}` : undefined;
     const aliasedItemId = aliasKey ? nativeTurnItemAliases.get(aliasKey) : undefined;
-    const aliasOrigin = aliasKey ? nativeTurnAliasOrigins.get(aliasKey) : undefined;
-    const completedBeforeEvent = Boolean(aliasKey && nativeTurnCompleted.has(aliasKey));
     const nativeItemId = itemId ?? (aliasedItemId ?? (turnId ? `turn:${turnId}` : undefined));
-    const blockId = b.blockId
-      ?? (itemId && blocks.length > 1 ? `${itemId}:block:${blockIndex}` : undefined);
-    if (aliasKey && itemId && !aliasedItemId) {
-      nativeTurnItemAliases.set(aliasKey, itemId);
-      nativeTurnAliasOrigins.set(aliasKey, event.delta ? 'delta' : 'completed');
-    }
-
-    // App-server may start the final assistant text before the command item
-    // completes.  The command completion is the durable ordering boundary:
-    // history will contain [tool, assistant], while the live buffer has so far
-    // reserved [assistant, tool].  Move only that still-open native assistant
-    // item behind the tool.  A completed assistant is protected by
-    // nativeTurnCompleted, and a tool-first turn has an alias pointing at its
-    // tool row rather than an assistant, so neither case is reordered.
-    if (b.role === 'tool' && turnKey && !usedIndexes
-        && !nativeTurnCompleted.has(turnKey)) {
-      const openItemId = nativeTurnItemAliases.get(turnKey);
-      const openIndex = openItemId === undefined ? -1 : messages.findIndex((message) =>
-        message.role === 'assistant' && message.nativeItemId === openItemId);
-      if (openIndex >= 0) {
-        const openMessage = messages[openIndex]!;
-        messages = [
-          ...messages.slice(0, openIndex),
-          ...messages.slice(openIndex + 1),
-          openMessage,
-        ];
-      }
-    }
-
-    if (event.delta && cumulativeStreamText !== undefined && completedBeforeEvent
-        && itemId && aliasedItemId && itemId !== aliasedItemId
-        && messages.some((message) => message.role === b.role
-          && message.nativeItemId === aliasedItemId
-          && message.content.startsWith(cumulativeStreamText))) {
-      // A late cumulative prefix of a completed item is an echo. Ignore the
-      // echo without claiming its new item id: if that id later diverges, it
-      // can still become a distinct assistant item in its proper position.
-      continue;
-    }
-
-    // A turn can contain several completed assistant items separated by tools.
-    // Cumulative stream_text belongs to its explicit item_id, so it must not
-    // update the first completed item just because both share a turn_id. Keep
-    // the narrow bridges for delta(A) → completed(B) and completed(B) → a
-    // late non-cumulative delta(A) from older adapters.
-    const allowTurnAlias = Boolean(aliasedItemId && itemId !== aliasedItemId
-      && ((event.final && aliasOrigin === 'delta' && !completedBeforeEvent)
-        || (event.delta && aliasOrigin === 'completed' && completedBeforeEvent
-          && cumulativeStreamText === undefined)));
+    if (aliasKey && itemId && !aliasedItemId) nativeTurnItemAliases.set(aliasKey, itemId);
     const nativeIds = [
       nativeItemId,
-      ...(allowTurnAlias ? [aliasedItemId!] : []),
+      ...((!event.delta || (aliasKey && nativeTurnCompleted.has(aliasKey))) && aliasedItemId
+        ? [aliasedItemId]
+        : []),
       ...(turnId && nativeItemId !== `turn:${turnId}` ? [`turn:${turnId}`] : []),
     ].filter((id): id is string => Boolean(id));
-    let nativeIndex = -1;
-    if (blockId) {
-      nativeIndex = usedIndexes
-        ? messages.findIndex((message, index) =>
-            !usedIndexes.has(index)
-            && (message.role === b.role || event.final || event.replace)
-            && message.blockId === blockId)
-        : messages.findIndex((message) =>
-            (message.role === b.role || event.final || event.replace)
-            && message.blockId === blockId);
-    }
-    if (nativeIndex < 0 && nativeIds.length > 0) {
-      // Exact item identity takes precedence over the turn's compatibility
-      // aliases, regardless of row order. A tool delta can have claimed the
-      // first assistant alias before the real answer item began streaming.
-      for (const id of nativeIds) {
-        nativeIndex = messages.findIndex((message, index) =>
-          !usedIndexes?.has(index)
-          && (message.role === b.role || event.final || event.replace)
-          && message.nativeItemId === id);
-        if (nativeIndex >= 0) break;
-      }
-    }
-    if (nativeIndex < 0 && usedIndexes && event.final && !nativeItemId && !blockId) {
-      // Claude stream-json deltas do not carry an item id, while its final
-      // assistant envelope can add thinking/tool blocks before repeating the
-      // complete text. Rebind that final text only to one same-role live row
-      // in this task buffer whose body is a prefix of the final body (or the
-      // reverse for providers that corrected a suffix). This stays local to
-      // the current event/task and never dedupes equal text across turns.
-      const untaggedFinalMatches = messages.flatMap((candidate, index) =>
-        !usedIndexes.has(index)
-          && candidate.role === b.role
-          && (candidate.content.startsWith(b.content) || b.content.startsWith(candidate.content))
-          ? [index]
-          : [],
-      );
-      if (untaggedFinalMatches.length === 1) nativeIndex = untaggedFinalMatches[0]!;
-    }
+    const nativeIndex = nativeIds.length > 0
+      ? messages.findIndex((message) => message.nativeItemId && nativeIds.includes(message.nativeItemId))
+      : -1;
     const lastIndex = messages.length - 1;
     // A native id is an explicit target. Falling back to the last message here
     // lets an interleaved later item be replaced by an earlier item's update.
     // Untagged adapter events retain the legacy last-message behavior.
-    const targetIndex = nativeIndex >= 0 || nativeItemId
-      ? nativeIndex
-      : usedIndexes?.has(lastIndex) ? -1 : lastIndex;
+    const targetIndex = nativeIndex >= 0 || nativeItemId ? nativeIndex : lastIndex;
     const target = targetIndex >= 0 ? messages[targetIndex] : undefined;
     const aliasOnlyMatch = Boolean(
       itemId && aliasedItemId && target?.nativeItemId === aliasedItemId && itemId !== aliasedItemId,
     );
-    if (event.replace && target && (target.role === b.role || nativeIndex >= 0)) {
-      const updated = { ...target, role: b.role, content: b.content, ...(eventTs ? { ts: eventTs } : {}) };
-      if (blockId && !updated.blockId) updated.blockId = blockId;
+    if (event.replace && target?.role === b.role) {
+      const updated = { ...target, content: b.content, ...(eventTs ? { ts: eventTs } : {}) };
       inheritMessageIdentity(updated, target);
-      messages = messages.map((message, index) => index === targetIndex ? updated : message);
-      if (usedIndexes) usedIndexes.add(targetIndex);
+      useSessionStore.setState({
+        currentMessages: messages.map((message, index) => index === targetIndex ? updated : message),
+      });
       continue;
     }
     if (event.delta) {
       if (target?.role === b.role && (nativeIndex >= 0 || !nativeItemId)) {
-        const cumulativeContent = cumulativeStreamText !== undefined
-          && (b.role === 'assistant' || b.role === 'thinking')
-          ? cumulativeStreamText
-          : undefined;
-        const content = event.replace
-          ? b.content
-          : cumulativeContent !== undefined
-            ? cumulativeContent
-            : target.content + b.content;
+        const content = event.replace ? b.content : target.content + b.content;
         const updated = {
           ...target,
           content,
           ...(nativeItemId && !target?.nativeItemId ? { nativeItemId } : {}),
-          ...(blockId && !target?.blockId ? { blockId } : {}),
         };
         inheritMessageIdentity(updated, target);
-        messages = messages.map((message, index) => index === targetIndex ? updated : message);
-        if (usedIndexes) usedIndexes.add(targetIndex);
+        useSessionStore.setState({
+          currentMessages: messages.map((message, index) => index === targetIndex ? updated : message),
+        });
       } else {
         const message = {
           role: b.role,
-          // The first frame this browser sees may be a coalesced/reconnected
-          // delta from the middle of an item. Its cumulative body includes
-          // the prefix that never arrived on this socket.
-          content: cumulativeStreamText !== undefined
-            && (b.role === 'assistant' || b.role === 'thinking')
-            ? cumulativeStreamText : b.content,
-          ...(nativeItemId ? { nativeItemId } : {}),
-          ...(blockId ? { blockId } : {}),
+          content: b.content,
+          ...(nativeItemId && !target?.nativeItemId ? { nativeItemId } : {}),
         };
         rememberMessageIdentity(message);
-        messages = [...messages, message];
-        if (usedIndexes) usedIndexes.add(messages.length - 1);
+        useSessionStore.getState().addMessage(message);
       }
       continue;
     }
     if (aliasKey && event.final && b.role === 'assistant') {
       nativeTurnCompleted.add(aliasKey);
     }
-    if (event.final && target && (target.role === b.role || nativeIndex >= 0)
-        && target.content !== b.content) {
+    if (event.final && target?.role === b.role && target.content !== b.content) {
       // Replace the prefix accumulated from app-server deltas with the
       // authoritative completed item.  If it is unrelated, retain both.
       if ((!aliasOnlyMatch && nativeIndex >= 0) || b.content.startsWith(target.content)) {
         const updated = {
           ...target,
-          role: b.role,
           content: b.content,
           ...(nativeItemId && !target.nativeItemId ? { nativeItemId } : {}),
           ...(eventTs ? { ts: eventTs } : {}),
         };
         inheritMessageIdentity(updated, target);
-        messages = messages.map((message, index) => index === targetIndex ? updated : message);
-        if (usedIndexes) usedIndexes.add(targetIndex);
+        useSessionStore.setState({
+          currentMessages: messages.map((message, index) => index === targetIndex ? updated : message),
+        });
         continue;
       }
     }
-    if (event.final && target && (target.role === b.role || nativeIndex >= 0)
-        && target.content === b.content) {
-      if (target.role !== b.role) {
-        const updated = { ...target, role: b.role };
-        inheritMessageIdentity(updated, target);
-        messages = messages.map((message, index) => index === targetIndex ? updated : message);
-      }
-      if (usedIndexes) usedIndexes.add(targetIndex);
-      continue;
-    }
-    // Some adapters repeat a complete item envelope without setting either
-    // delta or final.  Native identity makes this an idempotent replay, not a
-    // second message.  Do not use body text globally: this check is scoped to
-    // the explicit item/block target above.
-    if (!event.delta && !event.final && !event.replace
-        && nativeIds.length > 0
-        && targetIndex >= 0 && target?.role === b.role
-        && target.content === b.content) {
-      if (usedIndexes) usedIndexes.add(targetIndex);
+    if (event.final && target?.role === b.role && target.content === b.content) {
       continue;
     }
     if (b.role === 'assistant') {
@@ -1196,101 +796,36 @@ function appendEventToMessages(
         role: 'assistant',
         content: b.content,
         ...(nativeItemId ? { nativeItemId } : {}),
-        ...(blockId ? { blockId } : {}),
         ...(eventTs ? { ts: eventTs } : {}),
       };
       rememberMessageIdentity(message);
-      messages = [...messages, message];
-      if (usedIndexes) usedIndexes.add(messages.length - 1);
+      useSessionStore.getState().addMessage(message);
     } else if (b.role === 'thinking') {
+      store.markUnread(b.content);
       const message = {
         role: 'thinking',
         content: b.content,
         ...(nativeItemId ? { nativeItemId } : {}),
-        ...(blockId ? { blockId } : {}),
       };
       rememberMessageIdentity(message);
-      messages = [...messages, message];
-      if (usedIndexes) usedIndexes.add(messages.length - 1);
+      useSessionStore.getState().addMessage(message);
     } else if (b.role === 'tool') {
+      store.markUnread(b.content);
       const message = {
         role: 'tool',
         content: b.content,
         ...(nativeItemId ? { nativeItemId } : {}),
-        ...(blockId ? { blockId } : {}),
       };
       rememberMessageIdentity(message);
-      messages = [...messages, message];
-      if (usedIndexes) usedIndexes.add(messages.length - 1);
+      useSessionStore.getState().addMessage(message);
     }
   }
-  if (event.final && usedIndexes && usedIndexes.size === blocks.length) {
-    // A multi-block final envelope defines the canonical order of those
-    // blocks. Reconcile first so an already-streamed id-less assistant row
-    // keeps its React identity, then move the matched block run into envelope
-    // order (for Claude: thinking → tool → assistant).
-    const targetIndexes = [...usedIndexes];
-    const orderedTargets = [...new Set(targetIndexes)].sort((a, b) => a - b);
-    const canReorder = orderedTargets.length === targetIndexes.length
-      && orderedTargets.length > 1
-      && orderedTargets.at(-1)! - orderedTargets[0]! + 1 === orderedTargets.length
-      && targetIndexes.some((index, slot) => index !== orderedTargets[0]! + slot);
-    if (canReorder) {
-      const first = orderedTargets[0]!;
-      const targetSet = new Set(orderedTargets);
-      const blockRows = targetIndexes.map((index) => messages[index]!);
-      const withoutBlocks = messages.filter((_message, index) => !targetSet.has(index));
-      const beforeCount = messages
-        .slice(0, first)
-        .filter((_message, index) => !targetSet.has(index))
-        .length;
-      messages = [
-        ...withoutBlocks.slice(0, beforeCount),
-        ...blockRows,
-        ...withoutBlocks.slice(beforeCount),
-      ];
-    }
-  }
-  return messages;
-}
-
-function appendEvent(sessionId: string, event: StreamEvent['event'], meta: StreamEvent): boolean {
-  if (!event) return false;
-  const store = useSessionStore.getState();
-  const scope = {
-    serverEpoch: meta.serverEpoch || meta.eventEpoch,
-    workerId: meta.workerId,
-    generation: meta.generation,
-    taskSeq: typeof meta.taskSeq === 'number' ? meta.taskSeq : undefined,
-    taskId: typeof meta.taskId === 'string' && meta.taskId ? meta.taskId : undefined,
-    replayed: meta.replayed === true,
-    turnId: event.turn_id,
-    itemId: event.item_id !== undefined ? String(event.item_id) : undefined,
-    streamText: event.delta && typeof event.stream_text === 'string'
-      ? event.stream_text
-      : undefined,
-  };
-  // Do this check before resolving native ids/aliases.  A stale frame must
-  // not mutate the transient alias table and then make a later native item
-  // look like a current task, even when applyLiveStream would reject it.
-  if (!store.canApplyLiveStream(sessionId, scope)) return false;
-  const before = store.getLiveStreamMessages(sessionId);
-  // The native alias table is only a transient accelerator. If the durable
-  // live buffer is gone (result/restart or a fresh client state), an alias
-  // from an earlier turn must not attach a new event to that old turn.
-  if (before.length === 0) clearNativeTurnAliases(sessionId);
-  const messages = appendEventToMessages(sessionId, event, before, meta);
-  const accepted = store.applyLiveStream(sessionId, messages, scope);
-  return accepted;
 }
 
 function clearNativeTurnAliases(sessionId: string): void {
   const prefix = `${sessionId}:`;
   for (const key of nativeTurnItemAliases.keys()) {
     if (key.startsWith(prefix)) nativeTurnItemAliases.delete(key);
-  }
-  for (const key of nativeTurnAliasOrigins.keys()) {
-    if (key.startsWith(prefix)) nativeTurnAliasOrigins.delete(key);
   }
   for (const key of nativeTurnCompleted) {
     if (key.startsWith(prefix)) nativeTurnCompleted.delete(key);
@@ -1321,14 +856,12 @@ function syncAgentInjectedMessage(): void {
       if (store.currentSessionId !== sid) return; // 用户已切走，丢弃过期结果
 
       try {
-        const before = store.currentMessages;
-        // Use the store's guarded history reconciliation rather than writing
-        // the HTTP response directly.  This keeps agent/report injection on
-        // the same identity-aware path as Steer, queue delivery, and replay.
-        await useSessionStore.getState().refreshCurrentSessionHistory();
+        const data = await fetchSessionHistory(sid, 0, 50);
         const latest = useSessionStore.getState();
         if (latest.currentSessionId !== sid) return;
-        if (latest.currentMessages !== before) {
+        const merged = mergeServerMessages(latest.currentMessages, data.history || []);
+        if (merged !== latest.currentMessages) {
+          useSessionStore.setState({ currentMessages: merged });
           return;
         }
         // 当前快照没有带来新消息：注入可能仍在异步落盘，继续下一轮。
@@ -1341,4 +874,49 @@ function syncAgentInjectedMessage(): void {
   void sync().finally(() => {
     agentSyncInFlight = false;
   });
+}
+
+/** 把服务端历史里本地缺失的消息并入本地（幂等），同时保留本地已在流式的
+ *  assistant 块（服务端落盘滞后）。无变化时返回原引用，避免多余重渲染。 */
+function mergeServerMessages(
+  local: Message[],
+  server: Message[],
+): Message[] {
+  if (server.length === 0) return local;
+  // 最长公共前缀：服务端在分叉点之前与本地一致
+  let k = 0;
+  while (
+    k < local.length &&
+    k < server.length &&
+    local[k]!.role === server[k]!.role &&
+    local[k]!.content === server[k]!.content &&
+    JSON.stringify(local[k]!.parts ?? null) === JSON.stringify(server[k]!.parts ?? null)
+  ) {
+    k++;
+  }
+  // 服务端历史是本地前缀 → 服务端没有本地没有的消息（流式中）→ 不动
+  if (k === server.length) return local;
+  const serverTail = server.slice(k);
+  const localTail = local.slice(k);
+  // 本地尾部中已被服务端新段覆盖的部分（流式块已落盘 + 新 user 消息），按
+  // 「本地前缀 == 服务端后缀」判定，插入后不重复。
+  let overlap = 0;
+  for (let n = 1; n <= Math.min(localTail.length, serverTail.length); n++) {
+    let match = true;
+    for (let i = 0; i < n; i++) {
+      const a = localTail[i]!;
+      const b = serverTail[serverTail.length - n + i]!;
+      if (a.role !== b.role || a.content !== b.content
+          || JSON.stringify(a.parts ?? null) !== JSON.stringify(b.parts ?? null)) {
+        match = false;
+        break;
+      }
+    }
+    if (match) overlap = n;
+  }
+  return [
+    ...local.slice(0, k),
+    ...serverTail,
+    ...localTail.slice(overlap),
+  ];
 }

@@ -8,12 +8,9 @@ into queue_pending after the job fact has been committed.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
 import hashlib
 import json
-import math
 import os
-import re
 import secrets
 import subprocess
 import threading
@@ -35,8 +32,6 @@ _stop_recovery = asyncio.Event()
 # number of service lifecycle Jobs.  Keep the latter deliberately data-only:
 # they do not have a target Session and never participate in queue_pending.
 BACKGROUND_PROCESS_KIND = "background-process"
-SESSION_MESSAGE_KIND = "session-message"
-SESSION_BROADCAST_KIND = "session-broadcast"
 SERVICE_LIFECYCLE_KIND = "main-lifecycle"
 SERVICE_ACTIVE_PHASES = frozenset({
     "requested", "stopping", "stopping_workers", "stopping_service",
@@ -180,12 +175,6 @@ def _normalize_job(job: dict | None) -> dict | None:
     result = dict(job)
     result.setdefault("kind", BACKGROUND_PROCESS_KIND)
     result.setdefault("operation", "run")
-    # T-046: creator and target are independent identities.  Old records did
-    # not persist creatorSessionId, so keep them readable with a null creator.
-    if result.get("kind") in {SESSION_MESSAGE_KIND, SESSION_BROADCAST_KIND}:
-        result.setdefault("creatorSessionId", result.get("sourceSessionId"))
-    else:
-        result.setdefault("creatorSessionId", None)
     if result.get("kind") == SERVICE_LIFECYCLE_KIND:
         result.setdefault("options", {})
         # ``errors`` was added after the first lifecycle Job schema.  Keep
@@ -262,14 +251,9 @@ def _runner_command(job_id: str) -> list[str]:
     return [*resolve_pan_python_argv(), "-m", "packages.core.background_runner", "--job-id", job_id]
 
 
-def start(target_session_id: str, argv: list[str], cwd: str, *,
-          label: str | None = None,
-          creator_session_id: str | None = None) -> dict:
+def start(target_session_id: str, argv: list[str], cwd: str, *, label: str | None = None) -> dict:
     if not _sessions.get(target_session_id):
         raise ValueError("target session does not exist")
-    creator_sid, creator_error = _worker._normalize_source_session_id(creator_session_id)
-    if creator_error:
-        raise ValueError(creator_error)
     argv, cwd_path = _validate_command(argv, cwd)
     job_id = "job_" + secrets.token_hex(12)
     now = time.time()
@@ -277,7 +261,6 @@ def start(target_session_id: str, argv: list[str], cwd: str, *,
     job = {
         "jobId": job_id, "targetSessionId": target_session_id, "argv": argv,
         "kind": BACKGROUND_PROCESS_KIND, "operation": "run",
-        "creatorSessionId": creator_sid,
         "commandSummary": " ".join(argv[:3]) + (" …" if len(argv) > 3 else ""),
         "cwd": str(cwd_path), "label": label, "status": "starting",
         "createdAt": now, "updatedAt": now, "pid": None, "processCreatedAt": None,
@@ -305,407 +288,6 @@ def start(target_session_id: str, argv: list[str], cwd: str, *,
     return _update(job_id, {"status": "running", "runnerPid": proc.pid,
                              "runnerProcessCreatedAt": _process_create_time(proc.pid),
                              "updatedAt": time.time()})
-
-
-# ---------------------------------------------------------------------------
-# Durable Session-message Jobs
-# ---------------------------------------------------------------------------
-
-_CLOCK_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?$")
-MESSAGE_JOB_TERMINAL = frozenset({"completed", "failed", "cancelled"})
-MESSAGE_JOB_ACTIVE = frozenset({"pending", "scheduled", "running"})
-MESSAGE_JOB_REQUEUE_AFTER_SEC = 5.0
-
-
-def _iso_utc(epoch: float | None) -> str | None:
-    if epoch is None:
-        return None
-    return datetime.fromtimestamp(float(epoch), timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def _parse_at(value: Any) -> float:
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        result = float(value)
-    elif isinstance(value, str) and value.strip():
-        raw = value.strip()
-        if raw.endswith("Z"):
-            raw = raw[:-1] + "+00:00"
-        try:
-            parsed = datetime.fromisoformat(raw)
-        except ValueError as exc:
-            raise ValueError("schedule.at must be an ISO-8601 timestamp") from exc
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        result = parsed.timestamp()
-    else:
-        raise ValueError("schedule.at must be an ISO-8601 timestamp")
-    if not math.isfinite(result):
-        raise ValueError("schedule.at must be finite")
-    return result
-
-
-def _positive_seconds(value: Any, field: str) -> float:
-    if isinstance(value, bool):
-        raise ValueError(f"{field} must be a positive number")
-    try:
-        result = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{field} must be a positive number") from exc
-    if not math.isfinite(result) or result <= 0:
-        raise ValueError(f"{field} must be a positive number")
-    return result
-
-
-def _weekly_timezone(name: Any):
-    if name in (None, "", "local"):
-        return datetime.now().astimezone().tzinfo
-    if name in ("UTC", "Z", "+00:00"):
-        return timezone.utc
-    try:
-        from zoneinfo import ZoneInfo
-        return ZoneInfo(str(name))
-    except Exception as exc:
-        raise ValueError("schedule.timezone must be local, UTC, or a valid IANA zone") from exc
-
-
-def _next_weekly(schedule: dict, after: float) -> float:
-    weekday = schedule["weekday"]
-    clock = schedule["time"]
-    parts = [int(part) for part in clock.split(":")]
-    hour, minute = parts[:2]
-    second = parts[2] if len(parts) == 3 else 0
-    tz = _weekly_timezone(schedule.get("timezone"))
-    current = datetime.fromtimestamp(after, tz)
-    delta = (weekday - current.weekday()) % 7
-    candidate = current.replace(hour=hour, minute=minute, second=second, microsecond=0)
-    candidate += timedelta(days=delta)
-    if candidate.timestamp() <= after:
-        candidate += timedelta(days=7)
-    return candidate.timestamp()
-
-
-def _normalize_message_schedule(schedule: Any, now: float) -> tuple[dict, float]:
-    if not isinstance(schedule, dict):
-        raise ValueError("schedule must be an object")
-    kind = schedule.get("type")
-    if kind == "once":
-        has_at = schedule.get("at") is not None
-        has_delay = schedule.get("delaySeconds") is not None
-        if has_at == has_delay:
-            raise ValueError("once schedule requires exactly one of at or delaySeconds")
-        if has_at:
-            at = _parse_at(schedule.get("at"))
-            if at <= now:
-                raise ValueError("schedule.at must be in the future")
-            normalized = {"type": "once", "at": _iso_utc(at)}
-            return normalized, at
-        delay = _positive_seconds(schedule.get("delaySeconds"), "schedule.delaySeconds")
-        return {"type": "once", "delaySeconds": delay}, now + delay
-    if kind == "interval":
-        interval = _positive_seconds(schedule.get("intervalSeconds"), "schedule.intervalSeconds")
-        return {"type": "interval", "intervalSeconds": interval}, now + interval
-    if kind == "weekly":
-        try:
-            weekday = int(schedule.get("weekday"))
-        except (TypeError, ValueError) as exc:
-            raise ValueError("schedule.weekday must be an integer from 0 (Monday) to 6 (Sunday)") from exc
-        if weekday not in range(7):
-            raise ValueError("schedule.weekday must be an integer from 0 (Monday) to 6 (Sunday)")
-        clock = schedule.get("time")
-        if not isinstance(clock, str) or not _CLOCK_RE.match(clock):
-            raise ValueError("schedule.time must be HH:MM or HH:MM:SS")
-        # Validate the timezone now, so a typo cannot create a permanently
-        # un-runnable persisted Job.
-        _weekly_timezone(schedule.get("timezone"))
-        normalized = {"type": "weekly", "weekday": weekday, "time": clock}
-        if schedule.get("timezone") not in (None, ""):
-            normalized["timezone"] = schedule.get("timezone")
-        return normalized, _next_weekly(normalized, now)
-    raise ValueError("schedule.type must be once, interval, or weekly")
-
-
-def _message_next_run(schedule: dict, after: float) -> float | None:
-    if schedule.get("type") == "interval":
-        return after + float(schedule["intervalSeconds"])
-    if schedule.get("type") == "weekly":
-        return _next_weekly(schedule, after)
-    return None
-
-
-def _normalize_target_session_ids(target_session_ids: Any) -> list[str]:
-    if not isinstance(target_session_ids, list) or not target_session_ids:
-        raise ValueError("targetSessionIds must be a non-empty array")
-    result: list[str] = []
-    seen: set[str] = set()
-    for value in target_session_ids:
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError("targetSessionIds must contain non-empty strings")
-        if value not in seen:
-            seen.add(value)
-            result.append(value)
-    return result
-
-
-def _message_job_common(text: str, schedule: dict, *,
-                        source: str, source_session_id: str | None,
-                        creator_session_id: str | None) -> tuple[str, str | None, str | None, dict, float, float]:
-    if not isinstance(text, str) or not text.strip():
-        raise ValueError("text is required")
-    source_type, source_error = _worker._normalize_source_type(source)
-    if source_error:
-        raise ValueError(source_error)
-    source_sid, source_error = _worker._normalize_source_session_id(source_session_id)
-    if source_error:
-        raise ValueError(source_error)
-    creator_sid, creator_error = _worker._normalize_source_session_id(creator_session_id)
-    if creator_error:
-        raise ValueError(creator_error)
-    now = time.time()
-    normalized, next_run = _normalize_message_schedule(schedule, now)
-    return source_type, source_sid, creator_sid, normalized, next_run, now
-
-
-def start_message(target_session_id: str, text: str, schedule: dict, *,
-                  description: str | None = None, source: str = "agent",
-                  source_session_id: str | None = None,
-                  creator_session_id: str | None = None,
-                  registry_root: str | Path | None = None) -> dict:
-    """Create a durable one-target Session message schedule.
-
-    ``text`` is always message text delivered through ``worker.send_session``;
-    it is never parsed as or executed through an operating-system shell.
-    """
-    if not isinstance(target_session_id, str) or not target_session_id:
-        raise ValueError("target session does not exist")
-    if not _sessions.get(target_session_id):
-        raise ValueError("target session does not exist")
-    source_type, source_sid, creator_sid, normalized, next_run, now = _message_job_common(
-        text, schedule, source=source, source_session_id=source_session_id,
-        creator_session_id=creator_session_id)
-    job_id = "job_" + secrets.token_hex(12)
-    job = {
-        "jobId": job_id, "kind": SESSION_MESSAGE_KIND, "operation": "send",
-        "targetSessionId": target_session_id, "text": text,
-        "description": description if description is not None else "",
-        "source": source_type, "sourceSessionId": source_sid,
-        "creatorSessionId": creator_sid,
-        "schedule": normalized, "nextRunAt": _iso_utc(next_run),
-        "status": "pending", "runCount": 0, "lastRunAt": None,
-        "lastDelivery": None, "lastError": None,
-        "createdAt": now, "updatedAt": now,
-    }
-    return _create(job, registry_root)
-
-
-def start_broadcast(target_session_ids: list[str], text: str, schedule: dict, *,
-                    description: str | None = None, source: str = "agent",
-                    source_session_id: str | None = None,
-                    creator_session_id: str | None = None,
-                    registry_root: str | Path | None = None) -> dict:
-    """Create one durable scheduled fan-out Job for an ordered target list."""
-    target_ids = _normalize_target_session_ids(target_session_ids)
-    if any(not _sessions.get(session_id) for session_id in target_ids):
-        raise ValueError("target session does not exist")
-    source_type, source_sid, creator_sid, normalized, next_run, now = _message_job_common(
-        text, schedule, source=source, source_session_id=source_session_id,
-        creator_session_id=creator_session_id)
-    job_id = "job_" + secrets.token_hex(12)
-    job = {
-        "jobId": job_id, "kind": SESSION_BROADCAST_KIND, "operation": "broadcast",
-        "targetSessionIds": target_ids, "text": text,
-        "description": description if description is not None else "",
-        "source": source_type, "sourceSessionId": source_sid,
-        "creatorSessionId": creator_sid,
-        "schedule": normalized, "nextRunAt": _iso_utc(next_run),
-        "status": "pending", "runCount": 0, "lastRunAt": None,
-        "lastDelivery": None, "lastError": None,
-        "createdAt": now, "updatedAt": now,
-    }
-    return _create(job, registry_root)
-
-
-def update_message(job_id: str, *, text: str | None = None,
-                   schedule: dict | None = None, description: str | None = None,
-                   target_session_ids: list[str] | None = None,
-                   registry_root: str | Path | None = None) -> dict:
-    """Edit a non-terminal message or broadcast Job."""
-    changes: dict[str, Any] = {}
-    if text is not None:
-        if not isinstance(text, str) or not text.strip():
-            raise ValueError("text is required")
-        changes["text"] = text
-    if description is not None:
-        if not isinstance(description, str):
-            raise ValueError("description must be a string")
-        changes["description"] = description
-    normalized_targets = None
-    if target_session_ids is not None:
-        normalized_targets = _normalize_target_session_ids(target_session_ids)
-        if any(not _sessions.get(session_id) for session_id in normalized_targets):
-            raise ValueError("target session does not exist")
-        changes["targetSessionIds"] = normalized_targets
-    if schedule is not None:
-        normalized, next_run = _normalize_message_schedule(schedule, time.time())
-        changes.update(schedule=normalized, nextRunAt=_iso_utc(next_run),
-                       status="pending", lastError=None)
-    if not changes:
-        raise ValueError("one of text, description, or schedule is required")
-    changes["updatedAt"] = time.time()
-    with _lock, _job_lock(job_id, registry_root):
-        path = _job_path(job_id, registry_root)
-        current = _load_path(path)
-        if not current or current.get("kind") not in {
-            SESSION_MESSAGE_KIND, SESSION_BROADCAST_KIND}:
-            raise ValueError("message Job not found")
-        if normalized_targets is not None and current.get("kind") != SESSION_BROADCAST_KIND:
-            raise ValueError("targetSessionIds are only valid for broadcast Jobs")
-        if current.get("status") in MESSAGE_JOB_TERMINAL:
-            raise ValueError("terminal message Jobs cannot be edited")
-        current.update(changes)
-        _atomic_write(path, current)
-        return current
-
-
-def cancel_message(job_id: str, registry_root: str | Path | None = None) -> dict:
-    current = get(job_id, registry_root)
-    if not current or current.get("kind") not in {
-        SESSION_MESSAGE_KIND, SESSION_BROADCAST_KIND}:
-        raise ValueError("message Job not found")
-    if current.get("status") in MESSAGE_JOB_TERMINAL:
-        return current
-    return _update(job_id, {"status": "cancelled", "nextRunAt": None,
-                            "cancelRequestedAt": time.time(),
-                            "updatedAt": time.time()}, registry_root=registry_root)
-
-
-async def run_due_message_jobs(now: float | None = None) -> int:
-    """Claim and deliver due message Jobs once; safe across Pan processes."""
-    current_time = time.time() if now is None else float(now)
-    # A service crash can leave a message Job between claim and the normal
-    # post-send update.  Requeue only stale claims, allowing a fresh service
-    # to recover them without treating an active in-process send as orphaned.
-    for candidate in list_jobs():
-        if (candidate.get("kind") in {SESSION_MESSAGE_KIND, SESSION_BROADCAST_KIND}
-                and candidate.get("status") == "running"):
-            started = candidate.get("runStartedAt")
-            if isinstance(started, (int, float)) and current_time - started < MESSAGE_JOB_REQUEUE_AFTER_SEC:
-                continue
-            with _lock, _job_lock(candidate["jobId"]):
-                path = _job_path(candidate["jobId"])
-                current = _load_path(path)
-                if current and current.get("status") == "running":
-                    current.update(status=("scheduled" if current.get("schedule", {}).get("type")
-                                   in {"interval", "weekly"} else "pending"),
-                                   # Keep the recovered occurrence due even
-                                   # after ISO serialization rounds the float.
-                                   nextRunAt=_iso_utc(current_time - 0.001),
-                                   lastError="recovered after scheduler restart",
-                                   updatedAt=current_time)
-                    _atomic_write(path, current)
-    claimed: list[dict] = []
-    for candidate in list_jobs():
-        if candidate.get("kind") not in {SESSION_MESSAGE_KIND, SESSION_BROADCAST_KIND}:
-            continue
-        if candidate.get("status") not in {"pending", "scheduled"}:
-            continue
-        try:
-            due = _parse_at(candidate.get("nextRunAt")) <= current_time
-        except (TypeError, ValueError):
-            due = False
-        if not due:
-            continue
-        with _lock, _job_lock(candidate["jobId"]):
-            path = _job_path(candidate["jobId"])
-            job = _load_path(path)
-            if (not job or job.get("kind") not in {SESSION_MESSAGE_KIND, SESSION_BROADCAST_KIND}
-                    or job.get("status") not in {"pending", "scheduled"}):
-                continue
-            try:
-                if _parse_at(job.get("nextRunAt")) > current_time:
-                    continue
-            except (TypeError, ValueError):
-                continue
-            job.update(status="running", runStartedAt=current_time,
-                       updatedAt=current_time)
-            _atomic_write(path, job)
-            claimed.append(job)
-    delivered = 0
-    for job in claimed:
-        # A cancel racing the claim wins before the actual send whenever
-        # possible; an already in-flight send cannot be retracted.
-        latest = get(job["jobId"])
-        if not latest or latest.get("status") != "running":
-            continue
-        target_ids = ([job["targetSessionId"]]
-                      if job.get("kind") == SESSION_MESSAGE_KIND
-                      else list(job.get("targetSessionIds") or []))
-        target_results: list[dict] = []
-        for target_id in target_ids:
-            try:
-                result = await _worker.send_session(
-                    target_id, job["text"], source=job.get("source", "agent"),
-                    source_session_id=job.get("sourceSessionId"))
-                if not isinstance(result, dict):
-                    result = {"status": "error", "result": "send returned an invalid result"}
-            except Exception as exc:  # isolate one target and keep the fan-out alive
-                result = {"status": "error", "result": str(exc)}
-            item = dict(result)
-            item["sessionId"] = target_id
-            target_results.append(item)
-        if job.get("kind") == SESSION_MESSAGE_KIND:
-            result = target_results[0] if target_results else {
-                "status": "error", "result": "no target session"
-            }
-        else:
-            failures = [item for item in target_results if item.get("status") == "error"]
-            successes = len(target_results) - len(failures)
-            result = {
-                "status": ("error" if not successes else ("partial" if failures else "queued")),
-                "results": target_results,
-            }
-            if failures:
-                result["errors"] = [
-                    f"{item['sessionId']}: {item.get('result') or item.get('error') or 'send failed'}"
-                    for item in failures
-                ]
-        finished = time.time()
-        recurring = job.get("schedule", {}).get("type") in {"interval", "weekly"}
-        ok = isinstance(result, dict) and result.get("status") != "error"
-        changes: dict[str, Any] = {
-            "lastRunAt": _iso_utc(finished), "runCount": int(job.get("runCount", 0)) + 1,
-            "lastDelivery": result if isinstance(result, dict) else {"status": "error"},
-            "updatedAt": finished,
-        }
-        if ok:
-            if recurring:
-                changes.update(status="scheduled",
-                               nextRunAt=_iso_utc(_message_next_run(job["schedule"], finished)),
-                               lastError=("; ".join(result.get("errors", []))
-                                          if result.get("status") == "partial" else None))
-            else:
-                changes.update(
-                    status="completed", nextRunAt=None,
-                    lastError=("; ".join(result.get("errors", []))
-                               if result.get("status") == "partial" else None))
-            delivered += 1
-        elif recurring:
-            changes.update(status="scheduled",
-                           nextRunAt=_iso_utc(_message_next_run(job["schedule"], finished)),
-                           lastError=("; ".join(result.get("errors", []))
-                                      if isinstance(result, dict) and result.get("status") == "partial"
-                                      else (result.get("result") if isinstance(result, dict) else "send failed")))
-        else:
-            changes.update(status="failed", nextRunAt=None,
-                           lastError=("; ".join(result.get("errors", []))
-                                      if isinstance(result, dict) and result.get("status") == "partial"
-                                      else (result.get("result") if isinstance(result, dict) else "send failed")))
-        with _lock, _job_lock(job["jobId"]):
-            path = _job_path(job["jobId"])
-            latest = _load_path(path)
-            if latest and latest.get("status") == "running":
-                latest.update(changes)
-                _atomic_write(path, latest)
-    return delivered
 
 
 def _process_create_time(pid: int | None) -> float | None:
@@ -736,8 +318,6 @@ def cancel(job_id: str) -> dict:
     job = get(job_id)
     if not job:
         raise ValueError("job not found")
-    if job.get("kind") in {SESSION_MESSAGE_KIND, SESSION_BROADCAST_KIND}:
-        return cancel_message(job_id)
     if job.get("status") in {"completed", "failed", "cancelled"}:
         return job
     proc = _owns_process(job)
@@ -778,16 +358,11 @@ def retry(job_id: str) -> dict:
     old = get(job_id)
     if not old:
         raise ValueError("job not found")
-    if old.get("kind") in {SESSION_MESSAGE_KIND, SESSION_BROADCAST_KIND}:
-        raise ValueError("message Jobs are edited or recreated, not retried")
     if old.get("status") in {"starting", "running"}:
         raise ValueError("running jobs cannot be retried; cancel them first")
     if old.get("status") not in {"completed", "failed", "cancelled"}:
         raise ValueError("job is not retryable")
-    new_job = start(
-        old["targetSessionId"], old["argv"], old["cwd"], label=old.get("label"),
-        creator_session_id=old.get("creatorSessionId"),
-    )
+    new_job = start(old["targetSessionId"], old["argv"], old["cwd"], label=old.get("label"))
     new_job["retryOf"] = job_id
     return _update(new_job["jobId"], {"retryOf": job_id})
 
@@ -953,8 +528,7 @@ def reconcile_running() -> int:
     """
     changed = 0
     for job in list_jobs():
-        if job.get("kind") in {
-            SERVICE_LIFECYCLE_KIND, SESSION_MESSAGE_KIND, SESSION_BROADCAST_KIND}:
+        if job.get("kind") == SERVICE_LIFECYCLE_KIND:
             continue
         if job.get("status") not in {"starting", "running"}:
             continue
@@ -972,15 +546,10 @@ def reconcile_running() -> int:
 
 
 async def recover_notifications() -> int:
-    # Message Jobs are delivered through the normal Session send queue and do
-    # not create a second terminal notice.  Running them here makes service
-    # restart recovery share the existing one-second lifecycle loop.
-    await run_due_message_jobs()
     reconcile_running()
     delivered = 0
     for job in list_jobs():
-        if job.get("kind") in {SERVICE_LIFECYCLE_KIND, SESSION_MESSAGE_KIND,
-                                SESSION_BROADCAST_KIND}:
+        if job.get("kind") == SERVICE_LIFECYCLE_KIND:
             continue
         if job.get("status") not in {"completed", "failed", "cancelled"} or job.get("notificationState") == "delivered":
             continue
@@ -994,20 +563,8 @@ async def recover_notifications() -> int:
                 continue
             target = current.get("targetSessionId")
             event_id = current.get("terminalEventId") or f"{current['jobId']}:terminal"
-            text = json.dumps({
-                "jobId": current["jobId"],
-                "status": current["status"],
-                "exitCode": current.get("exitCode"),
-                "logPath": current.get("logPath"),
-            }, ensure_ascii=False)
-            result = await _worker.enqueue_notice(
-                target, text, source="automation", event_id=event_id,
-                notice_kind="background_job_terminal",
-                job_id=current["jobId"],
-                notice_status=current["status"],
-                creator_session_id=current.get("creatorSessionId"),
-                target_session_ids=[target] if target else [],
-            )
+            text = json.dumps({"jobId": current["jobId"], "status": current["status"], "exitCode": current.get("exitCode"), "logPath": current.get("logPath")}, ensure_ascii=False)
+            result = await _worker.enqueue_notice(target, text, source="automation", event_id=event_id)
             if result.get("ok"):
                 current["notificationState"] = "delivered"
                 current["terminalEventId"] = event_id

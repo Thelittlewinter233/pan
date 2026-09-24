@@ -1,21 +1,16 @@
 import type { Message } from '@/types';
-import { memo, useMemo } from 'react';
 import { MarkdownRenderer } from './MarkdownRenderer';
 import { ThinkingBlock } from './ThinkingBlock';
-import { ThinkingGroup } from './ThinkingGroup';
 import { ToolGroup } from './ToolGroup';
-import { NonBodyGroup } from './NonBodyGroup';
-import type { GroupDisplayItem } from '@/utils/messageIdentity';
+import type { ToolGroupDisplayItem } from '@/utils/messageIdentity';
+import { getQuickJumpKind } from './messageFilter';
 
-export type GroupedItem = Message | GroupDisplayItem;
+export type GroupedItem = Message | ToolGroupDisplayItem;
 type PrevRole = Message['role'] | 'tool' | null;
 
-/** Role used for spacing decisions. Groups use the role of their member blocks. */
+/** Role used for spacing decisions. Tool groups behave like 'tool'. */
 export function getItemRole(item: GroupedItem): PrevRole {
-  if ('type' in item) {
-    if (item.type === 'non_body_group') return item.items[item.items.length - 1]?.role ?? 'tool';
-    return item.type === 'tool_group' ? 'tool' : 'thinking';
-  }
+  if ('type' in item && item.type === 'tool_group') return 'tool';
   return (item as Message).role;
 }
 
@@ -71,13 +66,13 @@ function MessageTimestamp({ ts }: { ts?: string }) {
   );
 }
 
-export const MessageBubble = memo(function MessageBubble({ message, prevRole = null }: MessageBubbleProps) {
+export function MessageBubble({ message, prevRole = null }: MessageBubbleProps) {
   const role = message.role;
   const mt = marginTopClass(role, prevRole);
-  const attachmentIds = useMemo(
-    () => message.parts?.flatMap((part) => part.type === 'attachment' ? [part.attachmentId] : []),
-    [message.parts],
-  );
+  const isWorkerReport = getQuickJumpKind(message) === 'worker';
+  const workerReportLabel = isWorkerReport ? (
+    <span className="worker-report-label" aria-label="Worker report">Worker report</span>
+  ) : null;
 
   // Thinking blocks get their own component
   if (role === 'thinking') {
@@ -104,15 +99,16 @@ export const MessageBubble = memo(function MessageBubble({ message, prevRole = n
     );
   }
 
-  // Retained TUI-style view: full-width green user box (3px green left bar +
-  // green top/bottom separator + ">" prefix), styled via .msg.user CSS.
+  // TUI-style message rows use flex alignment so the virtualized row can keep
+  // its full width without changing the measured wrapper's layout.
   if (role === 'user') {
     return (
-      <div className={`${mt} px-3 sm:px-6 lg:px-8`}>
-        <div className="msg user w-full text-sm">
+      <div className={`message-row message-row-user ${isWorkerReport ? 'message-row-worker-report' : ''} ${mt} px-3 sm:px-6 lg:px-8`}>
+        {workerReportLabel}
+        <div className="msg user text-sm">
           <MarkdownRenderer
             content={message.content}
-            attachmentIds={attachmentIds}
+            attachmentIds={message.parts?.flatMap((part) => part.type === 'attachment' ? [part.attachmentId] : [])}
             className="text-sm"
           />
         </div>
@@ -123,68 +119,41 @@ export const MessageBubble = memo(function MessageBubble({ message, prevRole = n
 
   // Assistant messages — no bubble, left-aligned, full-width markdown flow
   return (
-    <div className={`${mt} px-3 sm:px-6 lg:px-8`}>
+    <div className={`message-row message-row-assistant ${isWorkerReport ? 'message-row-worker-report' : ''} ${mt} px-3 sm:px-6 lg:px-8`}>
+      {workerReportLabel}
       <div className="msg assistant text-sm leading-relaxed">
         <MarkdownRenderer
           content={message.content}
-          attachmentIds={attachmentIds}
+          attachmentIds={message.parts?.flatMap((part) => part.type === 'attachment' ? [part.attachmentId] : [])}
         />
       </div>
       <MessageTimestamp ts={message.ts} />
     </div>
   );
-});
+}
 
 /**
- * Group consecutive tool and thinking messages into semantic display rows.
- * Other roles end the current group so blocks never cross a message boundary.
+ * Group consecutive messages into display items.
+ * Consecutive tool messages are grouped into a single ToolGroup.
  */
 export function groupMessages(
   messages: Message[],
-  mergeConsecutiveNonBodyBlocks = false,
-): GroupedItem[] {
-  const grouped: GroupedItem[] = [];
-
-  if (mergeConsecutiveNonBodyBlocks) {
-    let currentNonBodyGroup: Message[] | null = null;
-
-    for (const msg of messages) {
-      if (msg.role === 'tool' || msg.role === 'thinking') {
-        if (!currentNonBodyGroup) {
-          currentNonBodyGroup = [];
-          grouped.push({ type: 'non_body_group', items: currentNonBodyGroup });
-        }
-        currentNonBodyGroup.push(msg);
-      } else {
-        currentNonBodyGroup = null;
-        grouped.push(msg);
-      }
-    }
-
-    return grouped;
-  }
-
+): Array<Message | { type: 'tool_group'; items: Message[] }> {
+  const grouped: Array<Message | { type: 'tool_group'; items: Message[] }> = [];
   let currentToolGroup: Message[] | null = null;
-  let currentThinkingGroup: Message[] | null = null;
 
   for (const msg of messages) {
     if (msg.role === 'tool') {
-      currentThinkingGroup = null;
       if (!currentToolGroup) {
         currentToolGroup = [];
-        grouped.push({ type: 'tool_group', items: currentToolGroup });
+        grouped.push({
+          type: 'tool_group',
+          items: currentToolGroup,
+        });
       }
       currentToolGroup.push(msg);
-    } else if (msg.role === 'thinking') {
-      currentToolGroup = null;
-      if (!currentThinkingGroup) {
-        currentThinkingGroup = [];
-        grouped.push({ type: 'thinking_group', items: currentThinkingGroup });
-      }
-      currentThinkingGroup.push(msg);
     } else {
       currentToolGroup = null;
-      currentThinkingGroup = null;
       grouped.push(msg);
     }
   }
@@ -197,28 +166,13 @@ interface MessageDisplayItemProps {
   prevRole?: PrevRole;
 }
 
-export const MessageDisplayItem = memo(function MessageDisplayItem({ item, prevRole = null }: MessageDisplayItemProps) {
-  if ('type' in item) {
-    if (item.type === 'non_body_group') {
-      const firstRole = item.items[0]?.role === 'thinking' ? 'thinking' : 'tool';
-      return (
-        <div className={`${marginTopClass(firstRole, prevRole)} pb-3 px-3 sm:px-6 lg:px-8`}>
-          <NonBodyGroup items={item.items} />
-        </div>
-      );
-    }
-    if (item.type === 'tool_group') {
-      return (
-        <div className={`${marginTopClass('tool', prevRole)} pb-3 px-3 sm:px-6 lg:px-8`}>
-          <ToolGroup items={item.items} />
-        </div>
-      );
-    }
+export function MessageDisplayItem({ item, prevRole = null }: MessageDisplayItemProps) {
+  if ('type' in item && item.type === 'tool_group') {
     return (
-      <div className={`${marginTopClass('thinking', prevRole)} px-3 sm:px-6 lg:px-8`}>
-        <ThinkingGroup items={item.items} />
+      <div className={`${marginTopClass('tool', prevRole)} pb-3 px-3 sm:px-6 lg:px-8`}>
+        <ToolGroup items={item.items} />
       </div>
     );
   }
   return <MessageBubble message={item as Message} prevRole={prevRole} />;
-});
+}

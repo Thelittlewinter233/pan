@@ -33,9 +33,6 @@ function findWorker(
 interface WorkerStore {
   workers: Record<string, WorkerInfo>;
   currentWorkerId: string | null;
-  refreshSeq: number;
-  workerTouchedSeq: Record<string, number>;
-  runtimeEpoch: string | null;
 
   // Derived
   currentWorker: WorkerInfo | null;
@@ -44,7 +41,7 @@ interface WorkerStore {
   startWorker: (sessionId: string, settings?: SettingsBody) => Promise<void>;
   killCurrent: (sessionId: string) => Promise<void>;
   interrupt: (sessionId: string) => Promise<void>;
-  steer: (sessionId: string, text: string, messageId?: string) => Promise<void>;
+  steer: (sessionId: string, text: string) => Promise<void>;
   restart: (sessionId: string, settings?: SettingsBody) => Promise<void>;
   takeover: (sessionId: string) => Promise<ApiGenericResponse>;
   updateWorker: (
@@ -71,18 +68,12 @@ interface WorkerStore {
   ) => void;
   syncToSession: (sessionId: string | null) => void;
   refresh: () => Promise<void>;
-  acceptServerEpoch: (epoch: string | null | undefined) => void;
 }
 
-let workerTouchSeq = 0;
-
-export const useWorkerStore = create<WorkerStore>((set, get) => ({
+export const useWorkerStore = create<WorkerStore>((set) => ({
   workers: {},
   currentWorkerId: null,
   currentWorker: null,
-  refreshSeq: 0,
-  workerTouchedSeq: {},
-  runtimeEpoch: null,
 
   startWorker: async (sessionId, settings) => {
     if (settings) await patchSession(sessionId, settings);
@@ -119,8 +110,8 @@ export const useWorkerStore = create<WorkerStore>((set, get) => ({
     await interruptSessionWorker(sessionId);
   },
 
-  steer: async (sessionId, text, messageId) => {
-    await steerSessionWorker(sessionId, text, messageId);
+  steer: async (sessionId, text) => {
+    await steerSessionWorker(sessionId, text);
   },
 
   restart: async (sessionId, settings) => {
@@ -193,7 +184,6 @@ export const useWorkerStore = create<WorkerStore>((set, get) => ({
         workers,
         currentWorkerId,
         currentWorker: findWorker(workers, currentWorkerId),
-        workerTouchedSeq: { ...s.workerTouchedSeq, [sessionId]: ++workerTouchSeq },
       };
     });
   },
@@ -289,12 +279,8 @@ export const useWorkerStore = create<WorkerStore>((set, get) => ({
   },
 
   refresh: async () => {
-    const refreshSeq = get().refreshSeq + 1;
-    const touchedAtStart = { ...get().workerTouchedSeq };
-    set({ refreshSeq });
     try {
       const workers = await listWorkers();
-      if (get().refreshSeq !== refreshSeq) return;
       const map: Record<string, WorkerInfo> = {};
       for (const w of workers) {
         const previous = useWorkerStore.getState().workers[w.sessionId];
@@ -317,51 +303,18 @@ export const useWorkerStore = create<WorkerStore>((set, get) => ({
       }
       // Pre-existing workers (spawned before this page loaded) never fire a
       // worker.spawned event — pick up the current session's worker here.
-      set((s) => {
-        const merged = { ...map };
-        // A list response can have been captured before a WS spawn/status
-        // event. Preserve only sessions touched during this request; later
-        // refreshes remain authoritative and can correct missed events.
-        for (const [sid, touched] of Object.entries(s.workerTouchedSeq)) {
-          if ((touched ?? 0) > (touchedAtStart[sid] ?? 0) && s.workers[sid]) {
-            merged[sid] = s.workers[sid]!;
-          }
-        }
-        const selected = useSessionStore.getState().currentSessionId;
-        const selectedWorkerId = selected ? merged[selected]?.id ?? null : null;
-        return {
-          workers: merged,
-          currentWorkerId: selectedWorkerId,
-          currentWorker: findWorker(merged, selectedWorkerId),
-        };
+      const sid = useSessionStore.getState().currentSessionId;
+      const currentWorkerId = sid ? map[sid]?.id ?? null : null;
+      set({
+        workers: map,
+        currentWorkerId,
+        currentWorker: findWorker(map, currentWorkerId),
       });
     } catch {
       // ignore
     }
   },
-
-  acceptServerEpoch: (epoch) => {
-    if (!epoch) return;
-    set((state) => state.runtimeEpoch === epoch
-      ? state
-      : {
-          runtimeEpoch: epoch,
-          workers: {},
-          currentWorkerId: null,
-          currentWorker: null,
-        });
-  },
 }));
-
-/**
- * Read the cached runtime worker for one durable Session without touching the
- * network. A map entry with a mismatched (or missing) sessionId is unknown,
- * rather than allowing another Session's worker to suppress UI.
- */
-export function isRuntimeWorkerRunning(sessionId: string): boolean {
-  const worker = useWorkerStore.getState().workers[sessionId];
-  return worker?.sessionId === sessionId && worker.status === 'running';
-}
 
 // Keep currentWorkerId in lockstep with the selected session. Worker events
 // and refresh() also sync, but the initial session selection (or switching)

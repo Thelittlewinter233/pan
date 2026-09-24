@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { render, renderHook, act, cleanup } from '@testing-library/react';
+import { render, renderHook, act } from '@testing-library/react';
 import { useWebSocket } from '@/hooks/useWebSocket';
 import { useSessionStore } from '@/stores/sessionStore';
 import { useUIStore } from '@/stores/uiStore';
@@ -10,28 +10,14 @@ import { useAppSettingsStore, DEFAULT_SETTINGS } from '@/stores/appSettingsStore
 import type { Session, Message } from '@/types';
 import { MessageBubble } from '@/components/chat/MessageBubble';
 import { SessionItem } from '@/components/session/SessionItem';
-import { getMessageIdentity } from '@/utils/messageIdentity';
 
 // Capture WS handlers registered by useWebSocket so tests can dispatch events.
 const wsMock = vi.hoisted(() => {
   const handlers: Record<string, Array<(e: unknown) => void>> = {};
-  const send = vi.fn((_payload: Record<string, unknown>) => true);
-  let syncSent = false;
-  const sendInteractiveSync = vi.fn(() => {
-    if (syncSent) return true;
-    syncSent = true;
-    return send({ type: 'sync_interactive' });
-  });
   return {
     handlers,
     connect: vi.fn(),
-    send,
-    sendInteractiveSync,
-    sendAuthoritativeResync: vi.fn(
-      (payload: Record<string, unknown>, _mode?: 'initial' | 'recovery') => send(payload),
-    ),
-    getConnectionGeneration: vi.fn(() => 1),
-    resetInteractiveSync: () => { syncSent = false; },
+    send: vi.fn(() => true),
     reconnect: vi.fn(),
     isConnectionFresh: vi.fn(() => true),
     on: vi.fn((type: string, h: (e: unknown) => void) => {
@@ -51,11 +37,8 @@ vi.mock('@/services/ws', () => ({
     connect: wsMock.connect,
     reconnect: wsMock.reconnect,
     on: wsMock.on,
-      send: wsMock.send,
-      sendInteractiveSync: wsMock.sendInteractiveSync,
-      sendAuthoritativeResync: wsMock.sendAuthoritativeResync,
-      getConnectionGeneration: wsMock.getConnectionGeneration,
-      isOpen: true,
+    send: wsMock.send,
+    isOpen: true,
     isConnectionFresh: wsMock.isConnectionFresh,
   },
 }));
@@ -99,10 +82,6 @@ describe('useWebSocket worker.result wiring', () => {
   beforeEach(() => {
     for (const k of Object.keys(wsMock.handlers)) delete wsMock.handlers[k];
     wsMock.send.mockClear();
-    wsMock.sendInteractiveSync.mockClear();
-    wsMock.sendAuthoritativeResync.mockClear();
-    wsMock.getConnectionGeneration.mockReturnValue(1);
-    wsMock.resetInteractiveSync();
     wsMock.connect.mockClear();
     wsMock.reconnect.mockClear();
     wsMock.isConnectionFresh.mockReturnValue(true);
@@ -121,13 +100,9 @@ describe('useWebSocket worker.result wiring', () => {
       initialLoading: false,
       sessionsLoading: false,
       historyLoadEnd: 0,
-      sessionTranscripts: {},
       _loadSeq: 0,
       _sessionWsTouchedSeq: {},
       _historyRefreshSeq: {},
-      liveStreamBuffers: {},
-      terminalWatermarks: {},
-      unscopedReplayPending: {},
     });
     useUIStore.setState({ terminalInteractions: [], toastQueue: [] });
     useAppSettingsStore.setState({ ...DEFAULT_SETTINGS, loaded: true });
@@ -138,11 +113,8 @@ describe('useWebSocket worker.result wiring', () => {
     apiMock.updateUiSettings.mockResolvedValue({});
   });
 
-  // Never let a failing test leak fake timers (or a still-mounted hook's
-  // window listeners) into the rest of the file. RTL auto-cleanup is not
-  // enabled in this repo's vitest config, so unmount explicitly.
+  // Never let a failing test leak fake timers into the rest of the file.
   afterEach(() => {
-    cleanup();
     vi.useRealTimers();
   });
 
@@ -197,123 +169,6 @@ describe('useWebSocket worker.result wiring', () => {
     vi.useRealTimers();
   });
 
-  it('forces a new transport after a hidden-to-visible resume even when the socket looks fresh', () => {
-    vi.useFakeTimers();
-    renderHook(() => useWebSocket());
-    wsMock.reconnect.mockClear();
-    Object.defineProperty(document, 'visibilityState', { value: 'hidden', configurable: true });
-    act(() => {
-      document.dispatchEvent(new Event('visibilitychange'));
-    });
-    Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true });
-    act(() => {
-      document.dispatchEvent(new Event('visibilitychange'));
-      vi.advanceTimersByTime(100);
-    });
-    act(() => {
-      window.dispatchEvent(new Event('focus'));
-      window.dispatchEvent(new PageTransitionEvent('pageshow'));
-      vi.advanceTimersByTime(100);
-    });
-
-    // `isConnectionFresh()` is deliberately true: a background page can have
-    // an OPEN but half-open socket, so visibility recovery must replace it.
-    expect(wsMock.isConnectionFresh).toHaveBeenCalled();
-    expect(wsMock.reconnect).toHaveBeenCalledTimes(1);
-    vi.useRealTimers();
-  });
-
-  // ── Browser-lifecycle recovery coalescing (FE-4) ──
-  // Focus/visibilitychange/pageshow are the same "the window came back" event;
-  // they must not fan out into duplicate authoritative request bursts, while a
-  // stale socket must still reconnect.
-
-  it('absorbs a duplicate focus/visibility recovery inside the coalescing window', async () => {
-    vi.useFakeTimers();
-    apiMock.fetchSessions.mockResolvedValue([
-      mk('B', 'B', { history: [msg('user', 'u1')], historyTotal: 1 }),
-      mk('A', 'A', { history: [msg('user', 'u0')] }),
-    ]);
-    apiMock.fetchSessionHistory.mockResolvedValue({
-      history: [msg('user', 'u0')], total: 1, hasMore: false, start: 0,
-    });
-    renderHook(() => useWebSocket());
-    Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true });
-    const flush = async () => {
-      for (let i = 0; i < 8; i += 1) await Promise.resolve();
-    };
-
-    await act(async () => {
-      window.dispatchEvent(new Event('focus'));
-      vi.advanceTimersByTime(100);
-      await flush();
-    });
-    expect(apiMock.fetchSessions).toHaveBeenCalledTimes(2); // initial load + recovery
-
-    await act(async () => {
-      // Same resume, a little later than the debounce but inside the window.
-      document.dispatchEvent(new Event('visibilitychange'));
-      vi.advanceTimersByTime(100);
-      await flush();
-    });
-    // Duplicate signal folded into the recovery that already ran — no second burst.
-    expect(apiMock.fetchSessions).toHaveBeenCalledTimes(2);
-    vi.useRealTimers();
-  });
-
-  it('runs a later recovery once the coalescing window has elapsed', async () => {
-    vi.useFakeTimers();
-    apiMock.fetchSessions.mockResolvedValue([mk('A', 'A')]);
-    apiMock.fetchSessionHistory.mockResolvedValue({
-      history: [], total: 0, hasMore: false, start: 0,
-    });
-    renderHook(() => useWebSocket());
-    const flush = async () => {
-      for (let i = 0; i < 8; i += 1) await Promise.resolve();
-    };
-
-    await act(async () => {
-      window.dispatchEvent(new Event('focus'));
-      vi.advanceTimersByTime(100);
-      await flush();
-    });
-    expect(apiMock.fetchSessions).toHaveBeenCalledTimes(2);
-
-    await act(async () => {
-      vi.advanceTimersByTime(600); // outside RECOVERY_COALESCE_MS
-      window.dispatchEvent(new Event('focus'));
-      vi.advanceTimersByTime(100);
-      await flush();
-    });
-    // A genuinely new resume is not permanently suppressed.
-    expect(apiMock.fetchSessions).toHaveBeenCalledTimes(3);
-    vi.useRealTimers();
-  });
-
-  it('never absorbs duplicate signals while the socket is stale (disconnect recovery preserved)', () => {
-    vi.useFakeTimers();
-    wsMock.isConnectionFresh.mockReturnValue(false);
-    apiMock.fetchSessions.mockResolvedValue([mk('A', 'A')]);
-    renderHook(() => useWebSocket());
-    wsMock.reconnect.mockClear();
-    Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true });
-
-    act(() => {
-      window.dispatchEvent(new Event('focus'));
-      vi.advanceTimersByTime(100);
-    });
-    act(() => {
-      document.dispatchEvent(new Event('visibilitychange'));
-      vi.advanceTimersByTime(100);
-    });
-
-    // Stale socket is never absorbed: each recovery still attempts reconnect,
-    // and the open handler (not the recovery) owns the HTTP refresh.
-    expect(wsMock.reconnect).toHaveBeenCalled();
-    expect(apiMock.fetchSessions).toHaveBeenCalledTimes(1); // initial load only
-    vi.useRealTimers();
-  });
-
   it('drops recovery history that completes after the selected session changes', async () => {
     let resolveHistory!: (value: unknown) => void;
     apiMock.fetchSessionHistory.mockReturnValueOnce(new Promise((resolve) => { resolveHistory = resolve; }));
@@ -331,329 +186,7 @@ describe('useWebSocket worker.result wiring', () => {
   it('requests pending native interactions when the singleton is already open', () => {
     renderHook(() => useWebSocket());
 
-    const syncCalls = wsMock.send.mock.calls.filter(
-      ([payload]) => (payload as { type?: string }).type === 'sync_interactive',
-    );
-    expect(syncCalls).toHaveLength(1);
-  });
-
-  it('sends sync_interactive at most once for one socket generation during open/mount race', () => {
-    renderHook(() => useWebSocket());
-
-    // The mock models the real singleton being OPEN before mount, followed by
-    // its already-registered open callback running in the same turn.
-    act(() => {
-      wsMock.trigger('open', { type: 'open' });
-    });
-
-    expect(wsMock.sendInteractiveSync).toHaveBeenCalledTimes(1);
-  });
-
-  it('keeps two hook mounts on one socket generation to one interactive replay frame', () => {
-    renderHook(() => useWebSocket());
-    renderHook(() => useWebSocket());
-
-    const syncCalls = wsMock.send.mock.calls.filter(
-      ([payload]) => (payload as { type?: string }).type === 'sync_interactive',
-    );
-    expect(syncCalls).toHaveLength(1);
-  });
-
-  it('does not resync native interactions after the authoritative snapshot callback', () => {
-    renderHook(() => useWebSocket());
-
-    act(() => {
-      wsMock.trigger('resync.snapshot', {
-        type: 'resync.snapshot', sessions: [], workers: [], eventSeq: 81512,
-      });
-    });
-
-    expect(wsMock.sendInteractiveSync).toHaveBeenCalledTimes(1);
-  });
-
-  it('lets resync_required send a snapshot without another interactive replay', () => {
-    renderHook(() => useWebSocket());
-
-    act(() => {
-      wsMock.trigger('resync_required', { type: 'resync_required', reason: 'source_cursor_gap' });
-    });
-
-    expect(wsMock.sendInteractiveSync).toHaveBeenCalledTimes(1);
-    const resyncCalls = wsMock.send.mock.calls.filter(
-      ([payload]) => (payload as { type?: string }).type === 'resync',
-    );
-    expect(resyncCalls).toHaveLength(2); // initial handshake + explicit gap recovery
-  });
-
-  it('applies session rename/update payloads before the debounced snapshot', () => {
-    renderHook(() => useWebSocket());
-
-    act(() => {
-      wsMock.trigger('session.renamed', {
-        type: 'session.renamed',
-        sessionId: 'A',
-        name: 'renamed immediately',
-        session: { id: 'A', name: 'renamed immediately', historyTotal: 4 },
-      });
-      wsMock.trigger('session.updated', {
-        type: 'session.updated',
-        sessionId: 'A',
-        session: { id: 'A', lastMessage: 'updated immediately', historyTotal: 5 },
-      });
-    });
-
-    expect(useSessionStore.getState().sessions.find((s) => s.id === 'A')).toMatchObject({
-      name: 'renamed immediately',
-      lastMessage: 'updated immediately',
-      historyTotal: 5,
-    });
-  });
-
-  it('keeps the selected transcript through summary backfill, live events, and delayed history', async () => {
-    vi.useFakeTimers();
-    const history = Array.from({ length: 12 }, (_, index) => msg(
-      index % 2 === 0 ? 'user' : 'assistant',
-      `old-${index}`,
-    ));
-    const selected = mk('A', 'A', {
-      history,
-      historyStart: 0,
-      historyTotal: history.length,
-      historyEpoch: 'new-epoch',
-      historyRevision: 10,
-      workerStatus: 'running',
-      workerId: 'w1',
-    });
-    const other = mk('B', 'B', { history: [msg('user', 'other')] });
-    useSessionStore.setState({
-      sessions: [selected, other],
-      currentSessionId: 'A',
-      currentMessages: history.slice(),
-      sessionTranscripts: {},
-      _historyRefreshSeq: {},
-      _selectionSeq: {},
-    });
-
-    // The hook's initial list load is a real summary shape: no history rows.
-    apiMock.fetchSessions.mockResolvedValueOnce([
-      mk('A', 'A', {
-        history: [],
-        historyTotal: history.length,
-        historyEpoch: 'new-epoch',
-        historyRevision: 10,
-      }),
-      other,
-    ]);
-    renderHook(() => useWebSocket());
-    await act(async () => {
-      for (let i = 0; i < 6; i += 1) await Promise.resolve();
-    });
-
-    let resolveSummary!: (sessions: Session[]) => void;
-    apiMock.fetchSessions.mockImplementationOnce(
-      () => new Promise<Session[]>((resolve) => { resolveSummary = resolve; }),
-    );
-    let resolveHistory!: (page: unknown) => void;
-    apiMock.fetchSessionHistory.mockImplementationOnce(
-      () => new Promise((resolve) => { resolveHistory = resolve; }),
-    );
-
-    act(() => {
-      // This is the optimistic user row created by the send transaction.
-      useSessionStore.getState().appendLocalMessage('A', {
-        role: 'user',
-        content: 'just sent',
-      });
-      wsMock.trigger('worker.stream', {
-        type: 'worker.stream',
-        sessionId: 'A',
-        workerId: 'w1',
-        generation: 1,
-        taskSeq: 1,
-        event: {
-          type: 'assistant',
-          message: { content: [{ type: 'thinking', thinking: 'thinking now' }] },
-        },
-      });
-      wsMock.trigger('worker.stream', {
-        type: 'worker.stream',
-        sessionId: 'A',
-        workerId: 'w1',
-        generation: 1,
-        taskSeq: 1,
-        event: {
-          type: 'assistant',
-          message: { content: [{ type: 'text', text: 'streamed answer' }] },
-        },
-      });
-    });
-
-    const delayedHistory = useSessionStore.getState().refreshCurrentSessionHistory();
-    act(() => {
-      wsMock.trigger('worker.result', {
-        type: 'worker.result',
-        sessionId: 'A',
-        workerId: 'w1',
-        generation: 1,
-        taskSeq: 1,
-        status: 'done',
-        result: 'final answer',
-      });
-      wsMock.trigger('worker.status', {
-        type: 'worker.status',
-        sessionId: 'A',
-        workerId: 'w1',
-        generation: 1,
-        taskSeq: 1,
-        status: 'idle',
-      });
-      wsMock.trigger('session.summaryBackfillCompleted', {
-        type: 'session.summaryBackfillCompleted',
-      });
-      wsMock.trigger('session.updated', {
-        type: 'session.updated',
-        sessionId: 'A',
-        session: { id: 'A', summaryRevision: 11 },
-      });
-    });
-
-    const beforeRefresh = useSessionStore.getState().currentMessages.map((message) => ({
-      role: message.role,
-      content: message.content,
-    }));
-    expect(beforeRefresh.some((message) => message.content === 'just sent')).toBe(true);
-    expect(beforeRefresh.some((message) => message.content === 'old-0')).toBe(true);
-
-    await act(async () => {
-      vi.advanceTimersByTime(300);
-      await Promise.resolve();
-    });
-    expect(resolveSummary).toBeTypeOf('function');
-
-    // This is the real summary shape: it carries metadata but no history.
-    // The delayed history response below is an older window from another
-    // epoch with an equal revision (the ambiguous legacy shape); it must not
-    // replace the selected transcript after the summary refresh.
-    resolveSummary([
-      mk('A', 'A', {
-        history: [],
-        historyTotal: history.length + 2,
-        historyEpoch: 'new-epoch',
-        historyRevision: 10,
-      }),
-      other,
-    ]);
-    await act(async () => {
-      for (let i = 0; i < 8; i += 1) await Promise.resolve();
-    });
-
-    // This is an older response from the refresh that was already in flight.
-    resolveHistory({
-      history: history.slice(-2),
-      start: history.length - 2,
-      total: history.length,
-      hasMore: true,
-      historyEpoch: 'old-epoch',
-      historyRevision: 10,
-    });
-    await act(async () => { await delayedHistory; });
-
-    expect(useSessionStore.getState().currentMessages.map((message) => ({
-      role: message.role,
-      content: message.content,
-    }))).toEqual(beforeRefresh);
-
-    // Switching away and back must not be the operation that restores the
-    // rows. A fresh authoritative page is supplied only to prove convergence.
-    apiMock.fetchSessionHistory.mockResolvedValueOnce({
-      history: [
-        ...history,
-        { role: 'user', content: 'just sent' },
-        { role: 'thinking', content: 'thinking now' },
-        { role: 'assistant', content: 'final answer' },
-      ],
-      start: 0,
-      total: history.length + 3,
-      hasMore: false,
-      historyEpoch: 'new-epoch',
-      historyRevision: 12,
-    });
-    act(() => {
-      useSessionStore.setState({ currentSessionId: 'B', currentMessages: other.history });
-    });
-    await act(async () => {
-      await useSessionStore.getState().selectSession('A');
-    });
-    expect(useSessionStore.getState().currentMessages.map((message) => ({
-      role: message.role,
-      content: message.content,
-    }))).toEqual(beforeRefresh);
-  });
-
-  it('does not feed a partial compatibility history carried by summary into the selected chat', async () => {
-    vi.useFakeTimers();
-    const history = Array.from({ length: 8 }, (_, index) => msg(
-      index % 2 === 0 ? 'user' : 'assistant',
-      `history-${index}`,
-    ));
-    const selected = mk('A', 'A', {
-      history,
-      historyStart: 0,
-      historyTotal: history.length,
-      historyEpoch: 'epoch-current',
-      historyRevision: 20,
-    });
-    const other = mk('B', 'B');
-    useSessionStore.setState({
-      sessions: [selected, other],
-      currentSessionId: 'A',
-      currentMessages: history.slice(),
-      sessionTranscripts: {},
-    });
-    apiMock.fetchSessions.mockResolvedValueOnce([
-      mk('A', 'A', {
-        history: [],
-        historyTotal: history.length,
-        historyEpoch: 'epoch-current',
-        historyRevision: 20,
-      }),
-      other,
-    ]);
-    renderHook(() => useWebSocket());
-    await act(async () => {
-      for (let i = 0; i < 6; i += 1) await Promise.resolve();
-    });
-
-    let resolveSummary!: (sessions: Session[]) => void;
-    apiMock.fetchSessions.mockImplementationOnce(
-      () => new Promise<Session[]>((resolve) => { resolveSummary = resolve; }),
-    );
-    act(() => {
-      wsMock.trigger('session.summaryBackfillCompleted', {
-        type: 'session.summaryBackfillCompleted',
-      });
-    });
-    await act(async () => {
-      vi.advanceTimersByTime(300);
-      await Promise.resolve();
-    });
-
-    resolveSummary([
-      mk('A', 'A', {
-        history: history.slice(-2),
-        historyStart: history.length - 2,
-        historyTotal: history.length,
-        historyEpoch: 'epoch-compat-tail',
-        historyRevision: 21,
-      }),
-      other,
-    ]);
-    await act(async () => {
-      for (let i = 0; i < 8; i += 1) await Promise.resolve();
-    });
-
-    expect(useSessionStore.getState().currentMessages.map((message) => message.content))
-      .toEqual(history.map((message) => message.content));
+    expect(wsMock.send).toHaveBeenCalledWith({ type: 'sync_interactive' });
   });
 
   it('routes Claude permission requests and removes them after resolution', () => {
@@ -1123,9 +656,7 @@ describe('useWebSocket worker.result wiring', () => {
       await Promise.resolve();
     });
 
-    // Queue refreshes are intentionally coalesced through a zero-delay timer;
-    // wait for that timer instead of relying on incidental event-loop timing.
-    await vi.waitFor(() => expect(apiMock.fetchSessionQueue).toHaveBeenCalledWith('B'));
+    expect(apiMock.fetchSessionQueue).toHaveBeenCalledWith('B');
     expect(useQueueStore.getState().agentQueues.B).toEqual([]);
   });
 
@@ -1316,7 +847,6 @@ describe('useWebSocket mock mode recovery', () => {
 describe('useWebSocket agent-injected message sync', () => {
   beforeEach(() => {
     for (const k of Object.keys(wsMock.handlers)) delete wsMock.handlers[k];
-    useWorkerStore.setState({ workers: {}, currentWorkerId: null, currentWorker: null });
     apiMock.fetchSessions.mockReset().mockRejectedValue(new Error('not mocked'));
     apiMock.fetchSessionHistory.mockReset();
     apiMock.fetchSessionHistory.mockResolvedValue({
@@ -1334,11 +864,8 @@ describe('useWebSocket agent-injected message sync', () => {
       initialLoading: false,
       sessionsLoading: false,
       historyLoadEnd: 0,
-      sessionTranscripts: {},
       _loadSeq: 0,
       _sessionWsTouchedSeq: {},
-      liveStreamBuffers: {},
-      terminalWatermarks: {},
     });
   });
 
@@ -1659,7 +1186,6 @@ describe('useWebSocket agent-injected message sync', () => {
 describe('useWebSocket worker.stream lastMessage preview', () => {
   beforeEach(() => {
     for (const k of Object.keys(wsMock.handlers)) delete wsMock.handlers[k];
-    useWorkerStore.setState({ workers: {}, currentWorkerId: null, currentWorker: null });
     apiMock.fetchSessions.mockReset().mockRejectedValue(new Error('not mocked'));
     useSessionStore.setState({
       sessions: [
@@ -1673,11 +1199,8 @@ describe('useWebSocket worker.stream lastMessage preview', () => {
       initialLoading: false,
       sessionsLoading: false,
       historyLoadEnd: 0,
-      sessionTranscripts: {},
       _loadSeq: 0,
       _sessionWsTouchedSeq: {},
-      liveStreamBuffers: {},
-      terminalWatermarks: {},
     });
     vi.useFakeTimers();
   });
@@ -1835,154 +1358,6 @@ describe('useWebSocket worker.stream lastMessage preview', () => {
     ]);
   });
 
-  it('keeps the same display identity across id-less streaming deltas', () => {
-    renderHook(() => useWebSocket());
-
-    act(() => {
-      wsMock.trigger('worker.stream', {
-        type: 'worker.stream', sessionId: 'A', workerId: 'w1',
-        event: {
-          type: 'content.part', role: 'assistant', delta: true,
-          part: { type: 'text', text: 'Hel' },
-        },
-      });
-    });
-    const first = useSessionStore.getState().currentMessages.at(-1)!;
-    const firstIdentity = getMessageIdentity(first);
-
-    act(() => {
-      wsMock.trigger('worker.stream', {
-        type: 'worker.stream', sessionId: 'A', workerId: 'w1',
-        event: {
-          type: 'content.part', role: 'assistant', delta: true,
-          part: { type: 'text', text: 'lo' },
-        },
-      });
-    });
-    const second = useSessionStore.getState().currentMessages.at(-1)!;
-    expect(second.content).toBe('Hello');
-    expect(getMessageIdentity(second)).toBe(firstIdentity);
-  });
-
-  it('gives separate display identities to blocks from one native item', () => {
-    renderHook(() => useWebSocket());
-
-    act(() => {
-      wsMock.trigger('worker.stream', {
-        type: 'worker.stream', sessionId: 'A', workerId: 'w1',
-        event: {
-          type: 'assistant', item_id: 'compound-item',
-          message: { content: [
-            { type: 'thinking', thinking: 'plan' },
-            { type: 'text', text: 'answer' },
-            { type: 'tool_use', name: 'Command', input: { command: 'true' } },
-          ] },
-        },
-      });
-    });
-
-    const messages = useSessionStore.getState().currentMessages;
-    expect(messages).toHaveLength(3);
-    expect(new Set(messages.map(getMessageIdentity)).size).toBe(3);
-  });
-
-  it('updates compound thinking/text/tool blocks by role without collapsing them', () => {
-    renderHook(() => useWebSocket());
-
-    const compound = (thinking: string, text: string, output: string) => ({
-      type: 'assistant',
-      delta: true,
-      replace: true,
-      item_id: 'compound-update',
-      message: { content: [
-        { type: 'thinking', thinking },
-        { type: 'text', text },
-        { type: 'tool_use', name: 'Command', input: { command: 'true', output } },
-      ] },
-    });
-    act(() => {
-      wsMock.trigger('worker.stream', {
-        type: 'worker.stream', sessionId: 'A', workerId: 'w1',
-        event: compound('plan-1', 'answer-1', 'one'),
-      });
-      wsMock.trigger('worker.stream', {
-        type: 'worker.stream', sessionId: 'A', workerId: 'w1',
-        event: compound('plan-2', 'answer-2', 'two'),
-      });
-    });
-
-    expect(useSessionStore.getState().currentMessages.map((message) => message.content)).toEqual([
-      'plan-2',
-      'answer-2',
-      'Command({"command":"true","output":"two"})',
-    ]);
-  });
-
-  it('keeps old task deltas out of the new task watermark window', () => {
-    renderHook(() => useWebSocket());
-
-    const stream = (taskSeq: number, text: string) => {
-      wsMock.trigger('worker.stream', {
-        type: 'worker.stream', sessionId: 'A', workerId: 'w1', taskSeq,
-        event: {
-          type: 'content.part', role: 'assistant', delta: true,
-          turn_id: `turn-${taskSeq}`, stream_text: text,
-          part: { type: 'text', text },
-        },
-      });
-    };
-    act(() => {
-      wsMock.trigger('worker.status', {
-        type: 'worker.status', sessionId: 'A', workerId: 'w1',
-        generation: 1, taskSeq: 1, status: 'running',
-      });
-      stream(1, 'old');
-      wsMock.trigger('worker.status', {
-        type: 'worker.status', sessionId: 'A', workerId: 'w1',
-        generation: 1, taskSeq: 2, status: 'running',
-      });
-      stream(1, 'old-late');
-      stream(2, 'new');
-    });
-
-    expect(useSessionStore.getState().getLiveStreamMessages('A')
-      .map((message) => message.content)).toEqual(['new']);
-    expect(useSessionStore.getState().currentMessages.filter((message) => message.role === 'assistant')
-      .map((message) => message.content)).toEqual(['old', 'new']);
-  });
-
-  it('rejects a foreign taskId at the same taskSeq before native alias lookup', () => {
-    renderHook(() => useWebSocket());
-
-    act(() => {
-      wsMock.trigger('worker.status', {
-        type: 'worker.status', sessionId: 'A', workerId: 'w1',
-        generation: 1, taskSeq: 7, taskId: 'task-a', status: 'running',
-      });
-      wsMock.trigger('worker.stream', {
-        type: 'worker.stream', sessionId: 'A', workerId: 'w1',
-        taskSeq: 7, taskId: 'task-a',
-        event: {
-          type: 'content.part', role: 'assistant', delta: true,
-          turn_id: 'shared-turn', item_id: 'native-a', stream_text: 'old',
-          part: { type: 'text', text: 'old' },
-        },
-      });
-      wsMock.trigger('worker.stream', {
-        type: 'worker.stream', sessionId: 'A', workerId: 'w1',
-        taskSeq: 7, taskId: 'task-b',
-        event: {
-          type: 'content.part', role: 'assistant', delta: true,
-          turn_id: 'shared-turn', item_id: 'native-b', stream_text: 'foreign',
-          part: { type: 'text', text: 'foreign' },
-        },
-      });
-    });
-
-    expect(useSessionStore.getState().getLiveStreamMessages('A')
-      .map((message) => message.content)).toEqual(['old']);
-  });
-
   it('converges a delta that arrives after its turn item completed under another native id', () => {
     renderHook(() => useWebSocket());
 
@@ -2011,52 +1386,7 @@ describe('useWebSocket worker.stream lastMessage preview', () => {
     expect(useSessionStore.getState().currentMessages.filter((m) => m.role === 'assistant'))
       .toEqual([{
         role: 'assistant', content: 'completed tail', nativeItemId: 'completed-item',
-    }]);
-  });
-
-  it('reconciles id-less Claude deltas with its multi-block final in canonical order', () => {
-    renderHook(() => useWebSocket());
-    const fullText = 'Claude streamed answer';
-
-    act(() => {
-      // Claude stream-json deltas have no item id. The final assistant event
-      // repeats the text after adding the thinking and tool blocks.
-      wsMock.trigger('worker.stream', {
-        type: 'worker.stream', sessionId: 'A', workerId: 'w1', taskSeq: 1,
-        event: {
-          type: 'assistant', delta: true,
-          message: { content: [{ type: 'text', text: 'Claude streamed ' }] },
-        },
-      });
-      wsMock.trigger('worker.stream', {
-        type: 'worker.stream', sessionId: 'A', workerId: 'w1', taskSeq: 1,
-        event: {
-          type: 'assistant', final: true,
-          message: { content: [
-            { type: 'thinking', thinking: 'considered the request' },
-            { type: 'tool_use', name: 'Bash', input: { command: 'pwd' } },
-            { type: 'text', text: fullText },
-          ] },
-        },
-      });
-    });
-
-    const rows = useSessionStore.getState().currentMessages;
-    expect(rows.map((row) => row.role)).toEqual(['thinking', 'tool', 'assistant']);
-    expect(rows.filter((row) => row.role === 'assistant')).toEqual([
-      { role: 'assistant', content: fullText },
-    ]);
-
-    act(() => {
-      wsMock.trigger('worker.result', {
-        type: 'worker.result', sessionId: 'A', workerId: 'w1', taskSeq: 1,
-        status: 'done', result: fullText,
-      });
-    });
-    expect(useSessionStore.getState().currentMessages.filter((row) => row.role !== 'system')
-      .map((row) => row.role).slice(-3)).toEqual(['thinking', 'tool', 'assistant']);
-    expect(useSessionStore.getState().currentMessages.filter((row) => row.role === 'assistant'))
-      .toHaveLength(1);
+      }]);
   });
 
   it('does not reuse a transient turn alias after the worker is restarted', () => {
@@ -2114,78 +1444,6 @@ describe('useWebSocket worker.stream lastMessage preview', () => {
         { role: 'assistant', content: 'first reply', nativeItemId: 'first-completed' },
         { role: 'assistant', content: 'second reply', nativeItemId: 'second-completed' },
       ]);
-  });
-
-  it('ignores a late cumulative echo without absorbing the next distinct item', () => {
-    renderHook(() => useWebSocket());
-    const stream = (event: Record<string, unknown>) => wsMock.trigger('worker.stream', {
-      type: 'worker.stream', sessionId: 'A', workerId: 'w1',
-      generation: 0, taskSeq: 1, event,
-    });
-    act(() => {
-      stream({ type: 'assistant', final: true, turn_id: 'turn-echo',
-        item_id: 'completed-item',
-        message: { content: [{ type: 'text', text: 'completed answer' }] } });
-      stream({ type: 'content.part', role: 'assistant', delta: true,
-        turn_id: 'turn-echo', item_id: 'late-item',
-        stream_text: 'completed', part: { type: 'text', text: 'completed' } });
-    });
-    expect(useSessionStore.getState().currentMessages.filter(m => m.role === 'assistant'))
-      .toEqual([{ role: 'assistant', content: 'completed answer', nativeItemId: 'completed-item' }]);
-    act(() => {
-      stream({ type: 'content.part', role: 'assistant', delta: true,
-        turn_id: 'turn-echo', item_id: 'late-item',
-        stream_text: 'a new answer', part: { type: 'text', text: 'a new answer' } });
-    });
-    expect(useSessionStore.getState().currentMessages.filter(m => m.role === 'assistant'))
-      .toEqual([
-        { role: 'assistant', content: 'completed answer', nativeItemId: 'completed-item' },
-        { role: 'assistant', content: 'a new answer', nativeItemId: 'late-item' },
-      ]);
-  });
-
-  it('streams a new cumulative Codex body after a completed body and intervening tool', () => {
-    renderHook(() => useWebSocket());
-    const stream = (event: Record<string, unknown>) => wsMock.trigger('worker.stream', {
-      type: 'worker.stream', sessionId: 'A', workerId: 'w1',
-      generation: 0, taskSeq: 11, event,
-    });
-    const turn = 'turn-five-stories';
-    act(() => {
-      stream({ type: 'content.part', role: 'assistant', delta: true,
-        turn_id: turn, item_id: 'story-1', stream_text: 'first story',
-        part: { type: 'text', text: 'first story' } });
-      stream({ type: 'assistant', final: true, turn_id: turn, item_id: 'story-1',
-        message: { content: [{ type: 'text', text: 'first story' }] } });
-    });
-    const expected: Array<[string, string, string]> = [
-      ['assistant', 'story-1', 'first story'],
-    ];
-    for (let story = 2; story <= 5; story += 1) {
-      const prefix = `story ${story}`;
-      const full = `${prefix} completed`;
-      act(() => {
-        stream({ type: 'assistant', final: true, turn_id: turn, item_id: `tool-${story}`,
-          message: { content: [{ type: 'tool_use', name: 'Command', input: { command: `date-${story}` } }] } });
-        stream({ type: 'content.part', role: 'assistant', delta: true,
-          turn_id: turn, item_id: `story-${story}`, stream_text: prefix,
-          part: { type: 'text', text: prefix } });
-        stream({ type: 'content.part', role: 'assistant', delta: true,
-          turn_id: turn, item_id: `story-${story}`, stream_text: full,
-          part: { type: 'text', text: ' completed' } });
-      });
-      expected.push(
-        ['tool', `tool-${story}`, `Command({"command":"date-${story}"})`],
-        ['assistant', `story-${story}`, full],
-      );
-      expect(useSessionStore.getState().currentMessages.map((row) => [
-        row.role, row.nativeItemId, row.content,
-      ])).toEqual(expected);
-      act(() => {
-        stream({ type: 'assistant', final: true, turn_id: turn, item_id: `story-${story}`,
-          message: { content: [{ type: 'text', text: full }] } });
-      });
-    }
   });
 
   it('keeps one selected-session assistant message across an interleaved turn, result, and history refresh', async () => {

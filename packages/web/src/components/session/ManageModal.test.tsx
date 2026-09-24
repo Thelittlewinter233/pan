@@ -10,7 +10,6 @@ import {
 } from '@testing-library/react';
 import { ManageModal } from './ManageModal';
 import { useSessionStore } from '@/stores/sessionStore';
-import { DEFAULT_SETTINGS, useAppSettingsStore } from '@/stores/appSettingsStore';
 import type { McpServerInfo, Session } from '@/types';
 
 const apiMock = vi.hoisted(() => ({
@@ -50,41 +49,11 @@ describe('ManageModal', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    useAppSettingsStore.setState({ ...DEFAULT_SETTINGS, loaded: true });
     useSessionStore.setState({
       sessions: [mk('s1', 'Child', { managedBy: 'mgr' }), mk('mgr', 'Boss')],
       currentSessionId: 's1',
       loadSessions: vi.fn(async () => {}),
     });
-  });
-
-  it('cancels cross-workspace management from ManageModal before calling claim', async () => {
-    useSessionStore.setState({
-      sessions: [
-        mk('mgr', 'Manager', { workspaceIds: ['workspace-b'], managed: [] }),
-        mk('target', 'Target', { workspaceIds: ['workspace-a'] }),
-      ],
-      currentSessionId: 'mgr',
-      loadSessions: vi.fn(async () => {}),
-    });
-    apiMock.fetchSession.mockResolvedValue(
-      mk('mgr', 'Manager', { workspaceIds: ['workspace-b'], managed: [], reportSubscriptions: [] }),
-    );
-    const confirmation = new Promise<void>((resolve) => {
-      window.addEventListener('pan:confirm-workspace-manager-change', ((event: Event) => {
-        const detail = (event as CustomEvent<{ changeType: string; resolve: (accepted: boolean) => void }>).detail;
-        expect(detail.changeType).toBe('attach');
-        detail.resolve(false);
-        resolve();
-      }) as EventListener, { once: true });
-    });
-
-    render(<ManageModal open onClose={() => {}} sessionId="mgr" />);
-    fireEvent.click(await section(1).findByRole('button', { name: 'Manage' }));
-
-    await confirmation;
-    expect(apiMock.claimSession).not.toHaveBeenCalled();
-    expect(apiMock.unclaimSession).not.toHaveBeenCalled();
   });
 
   it('shows the managing session and detaches it via unclaim', async () => {
@@ -443,42 +412,5 @@ describe('ManageModal', () => {
         forceMcp: true,
       }),
     );
-  });
-
-  it('does not let an older detail response replace the newly opened Session', async () => {
-    const first = mk('s1', 'First', { managed: [] });
-    const second = mk('s2', 'Second', { managed: [] });
-    let resolveFirst: (value: Session) => void = () => {};
-    let resolveSecond: (value: Session) => void = () => {};
-    apiMock.fetchSession.mockImplementation((id: string) => new Promise((resolve) => {
-      if (id === first.id) resolveFirst = resolve;
-      else resolveSecond = resolve;
-    }));
-    useSessionStore.setState({ sessions: [first, second], currentSessionId: first.id });
-
-    const { rerender } = render(<ManageModal open onClose={() => {}} sessionId={first.id} />);
-    rerender(<ManageModal open onClose={() => {}} sessionId={second.id} />);
-
-    resolveFirst({ ...first, name: 'Stale First' });
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(screen.queryByText(/Stale First manages/)).toBeNull();
-
-    resolveSecond({ ...second, name: 'Fresh Second' });
-    expect(await screen.findByText(/Fresh Second manages/)).toBeTruthy();
-    expect(screen.queryByText(/Stale First manages/)).toBeNull();
-  });
-
-  it('keeps cached metadata visible and offers retry after a detail failure', async () => {
-    apiMock.fetchSession
-      .mockRejectedValueOnce(new Error('metadata timeout'))
-      .mockResolvedValueOnce(mk('s1', 'Fresh after retry', { managed: [] }));
-    useSessionStore.setState({ sessions: [mk('s1', 'Child')] });
-
-    render(<ManageModal open onClose={() => {}} sessionId="s1" />);
-    expect(await screen.findByText('error')).toBeTruthy();
-    expect(screen.getByText(/metadata timeout/)).toBeTruthy();
-    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
-    expect(await screen.findByText('updated')).toBeTruthy();
-    expect(screen.getByText(/Fresh after retry manages/)).toBeTruthy();
   });
 });

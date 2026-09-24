@@ -9,25 +9,6 @@ description: Pan HTTP API 速查（技术细节引用文档，配合 docs/skills
 
 Pan 的 HTTP API 在 `packages/web/server.py`，基址 `http://127.0.0.1:<port>`（代码默认 **8768**；main/test 测试或隔离运行使用 8767 或 8765；由 `config.json` 的 `port` 字段或 `PAN_PORT` 环境变量覆盖）。全部返回 JSON；错误通常返回 `{"error": "..."}`。**API 无鉴权、绑 loopback（127.0.0.1）**——不要在非本机环境暴露端口。
 
-## Agent taskId / send 继承（T-040）
-
-`POST /api/assign` 的 `taskId` 是正式任务幂等键。成功入队后，它成为目标
-Session 的持久 `active_task_id`；同一 `taskId` 的 assign 重试仍按原有幂等语义
-返回 pending/receipt，不重复执行。
-
-`POST /api/send`（以及 `agent_send_force` 重启后使用的兼容 task 路径）不生成新的
-业务编号。对来源为 Pan agent 的消息，入队时复制目标 Session 当时的
-`active_task_id`；没有活动任务就是 `taskId: null`。普通消息的 inherited taskId
-只用于完成 report 配对，不参加 assign 去重，所以连续 send 不会互相去重。正式
-任务完成/终止后，新的普通 send 不继承旧 taskId；已入队消息仍使用自己入队时的
-快照。Session 重启/恢复只从持久 queue 中的未完成正式 task 恢复活动上下文，绝不
-从 `lastResult` 或 history 猜测。
-
-单 Session/单 Worker/FIFO 下，新的 assign 入队即切换活动上下文；旧任务及其已经
-入队的普通消息仍按 FIFO 处理。`queueItemId` 只是内部技术 ID，不是业务 taskId；
-本规则不引入 `sourceQueueItemId`、`deliveryUnitId` 或事件模型。既有进程内
-`_task_status` 仍保持全局 taskId 注册作用域，本次未修改其作用域。
-
 ## 端点清单
 
 ### 批量 / 更新 / 特殊操作（MCP 覆盖不到或直调排查用）
@@ -40,19 +21,16 @@ Session 的持久 `active_task_id`；同一 `taskId` 的 assign 重试仍按原�
 | `POST` | `/api/sessions/{id}/branch` | `{"name": "fork-name"}` | 复制 adapter transcript 新建 session（保留 workdir/character/MCP 绑定）。**无 MCP 工具，需 HTTP 直调** |
 | `POST` | `/api/sessions/{id}/handoff` | `{"handoffPrompt": "...", "copySettings": true, "adapter"?: "...", "model"?: "...", "permissionMode"?: "..."}` | **替身交接**：创建孪生 session B 接替 A（见 SKILL.md §2.7）。等价 MCP 工具 `session_handoff`；`handoffPrompt` 必填，`copySettings=false` 时 `adapter` 必填 |
 | `POST` | `/api/readonly` | `{"managerId": "...", "sessionId": "...", "readonlySession": true}` | 设置或清除已由 `managerId` 管理的 session 的持久只读状态；不能借此认领 session。只读目标拒绝其他 session 的任务/消息/通知，返回 `readonly_session` |
-| `POST` | `/api/notify` | `{"targetSessionId": "...", "text": "...", "source"?: "...", "sourceSessionId"?: "..."}` | 持久化 Agent 主动通知到目标 `queue_pending`；无活 worker 时自动唤醒/spawn。该路由供 MCP `agent_notify` 使用，权限隔离由 MCP 层执行，不是普通任务派发；调度器/后台 Job 终态通知另带结构化 `noticeKind=background_job_terminal`、`jobId`、`status`、`targetSessionId(s)` 和可选 `creatorSessionId`，并渲染为 `////by pan system` |
+| `POST` | `/api/notify` | `{"targetSessionId": "...", "text": "...", "source"?: "..."}` | 持久化后台任务完成/状态通知到目标 `queue_pending`；无活 worker 时自动唤醒/spawn。该路由供 MCP `agent_notify` 使用，权限隔离由 MCP 层执行，不是普通任务派发 |
 | `POST` | `/api/notifications/send` | `{"sessionId":"...", "title":"...", "body":"...", "sourceSessionId":"..."}` | 发送 best-effort Pan 系统通知；MCP `notification_send` 使用，调用者身份和 managed 隔离由 MCP 层执行 |
 | `POST` | `/api/sessions/{id}/reminders` | `{"dueAt":"<absolute ISO-8601>", "title":"...", "body":"..."}` | 注册一次性持久提醒；MCP `reminder_register` 使用 |
 | `GET` | `/api/sessions/{id}/reminders` | — | 列出该 session 的待处理提醒；MCP `reminder_list` 使用 |
 | `DELETE` | `/api/sessions/{id}/reminders/{reminderId}` | — | 取消该 session 的待处理提醒；MCP `reminder_cancel` 使用 |
-| `POST` | `/api/background-jobs` | `{"targetSessionId":"...", "argv":[...], "cwd":"...", "label"?:"...", "creatorSessionId"?:"..."}` | 创建脱离 Worker 生命周期的持久后台 Job；argv 不经 shell，MVP 的 cwd 仅允许 Pan 项目目录内；creator 与接收 target 分开持久化 |
+| `POST` | `/api/background-jobs` | `{"targetSessionId":"...", "argv":[...], "cwd":"...", "label"?:"..."}` | 创建脱离 Worker 生命周期的持久后台 Job；argv 不经 shell，MVP 的 cwd 仅允许 Pan 项目目录内 |
 | `GET` | `/api/background-jobs[?targetSessionId=...]` | — | 列出 Job Registry 记录 |
 | `GET` | `/api/background-jobs/{jobId}` | — | 查询 Job 事实、PID、日志和通知状态 |
-| `POST` | `/api/session-message-jobs` | `{"targetSessionId":"...", "creatorSessionId"?:"..."}` 或 `{"targetSessionIds":["..."], "text":"...", "schedule":{...}, "description"?:"...", "sourceSessionId"?:"...", "creatorSessionId"?:"..."}` | 创建单目标 Session 时间消息或定时群发 Job；creator 与接收 target 分开持久化，群发目标去重且保持输入顺序；单目标消息沿用 agent send 语义，保留 `sourceSessionId` 与 `////by agent : <creatorSessionId> | <title>`；`text` 只作为消息发送，不执行 shell |
-| `PATCH` | `/api/background-jobs/{jobId}` | `{"schedule"?:{...}, "text"?:"...", "description"?:"...", "targetSessionIds"?:[...]}` | 编辑未终态 Session 消息/定时群发 Job；重排或改目标后回到 `pending` |
 | `POST` | `/api/background-jobs/{jobId}/cancel` | — | 取消并杀完整进程树（PID 创建时间必须匹配；无法安全确认时返回 `cancel_unsafe`） |
 | `POST` | `/api/background-jobs/{jobId}/retry` | — | 用新 jobId 重试原命令 |
-| `POST` | `/api/sessions/broadcast` | `{"sessionIds":["..."], "text":"...", "source"?:"agent", "sourceSessionId"?:"..."}` | 对选定 Session 逐个复用普通 send 入队；返回每个目标结果 |
 | `GET` | `/api/main/restart/status` | — | 读取当前 checkout/port 的持久化 main-lifecycle Job；`pending` 只表示 requested/stopping/stopped/starting，终态含 `ready`/`failed`/`timed_out` 与 PID/错误字段 |
 | `POST` | `/api/main/restart` | — | 原子登记 service lifecycle Job 后返回 `status:"scheduled"`, `accepted:true`, `phase:"requested"`；重复请求返回 `busy` 与已有 `requestId`/`jobId`，不会绑定 Session 或进入 `queue_pending` |
 | `POST` | `/api/report-subscribe` | `{"managerId": "<MA session id>", "sessionId": "<managed session id>"}` | `{"subscribed": true, "reportSubscriptions": [...]}`。**等价 MCP 工具：`report_subscribe`（编排首选）** |

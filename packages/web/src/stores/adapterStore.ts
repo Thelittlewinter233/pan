@@ -16,9 +16,6 @@ import {
   patchSession,
 } from '@/services/api';
 
-const configLoadsInFlight = new Map<string, Promise<void>>();
-let cliStatusRequestSeq = 0;
-
 interface AdapterStore {
   // State
   adapters: AdapterInfo[];
@@ -72,14 +69,11 @@ export const useAdapterStore = create<AdapterStore>((set, get) => ({
   },
 
   loadCliStatus: async () => {
-    const requestSeq = ++cliStatusRequestSeq;
     set({ cliStatusLoading: true, cliStatusError: null });
     try {
       const cliStatus = await fetchCliStatus();
-      if (cliStatusRequestSeq !== requestSeq) return;
       set({ cliStatus, cliStatusLoading: false });
     } catch (error: unknown) {
-      if (cliStatusRequestSeq !== requestSeq) return;
       set({
         cliStatus: null,
         cliStatusLoading: false,
@@ -90,34 +84,15 @@ export const useAdapterStore = create<AdapterStore>((set, get) => ({
   },
 
   loadConfig: async (adapter) => {
-    // Make the requested adapter authoritative immediately. A slower request
-    // for the previously selected adapter may still resolve later, but it
-    // must not move the shared currentAdapter pointer back behind the user.
-    set({ currentAdapter: adapter, configReady: Boolean(get().adapterConfigs[adapter]) });
-    const loaded = get().adapterConfigs[adapter];
-    if (loaded) {
-      set({ currentAdapter: adapter, configReady: true });
-      return;
-    }
-    const existing = configLoadsInFlight.get(adapter);
-    if (existing) return existing;
-    const request = (async () => {
-      try {
-        const config = await fetchAdapterConfig(adapter);
-        set((s) => ({
-          adapterConfigs: { ...s.adapterConfigs, [adapter]: config },
-          currentAdapter: s.currentAdapter === adapter ? adapter : s.currentAdapter,
-          configReady: s.currentAdapter === adapter ? true : s.configReady,
-        }));
-      } catch {
-        // retry on next settings open
-      }
-    })();
-    configLoadsInFlight.set(adapter, request);
     try {
-      await request;
-    } finally {
-      if (configLoadsInFlight.get(adapter) === request) configLoadsInFlight.delete(adapter);
+      const config = await fetchAdapterConfig(adapter);
+      set((s) => ({
+        adapterConfigs: { ...s.adapterConfigs, [adapter]: config },
+        currentAdapter: adapter,
+        configReady: true,
+      }));
+    } catch {
+      // retry on next settings open
     }
   },
 

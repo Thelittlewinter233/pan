@@ -1,11 +1,7 @@
 import { useRef, useCallback, useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
-import {
-  useSessionStore,
-  useCurrentSession,
-  type SessionSettingPatch,
-} from '@/stores/sessionStore';
-import { isRuntimeWorkerRunning, useWorkerStore } from '@/stores/workerStore';
+import { useSessionStore, useCurrentSession } from '@/stores/sessionStore';
+import { useWorkerStore } from '@/stores/workerStore';
 import { useUIStore } from '@/stores/uiStore';
 import { useAdapterStore } from '@/stores/adapterStore';
 import { useQueueStore } from '@/stores/queueStore';
@@ -125,16 +121,7 @@ interface SendSnapshot {
   attachments: PendingAttachment[];
   message: string;
   parts?: MessagePart[];
-  appendOptimisticHistory: boolean;
 }
-
-interface SessionComposerDraft {
-  value: ComposerValue;
-  attachments: PendingAttachment[];
-}
-
-type AttachmentStateUpdate =
-  PendingAttachment[] | ((current: PendingAttachment[]) => PendingAttachment[]);
 
 function composerPartOccurrenceId(part: ComposerValue['parts'][number]): string | null {
   return part.type === 'attachment' ? part.occurrenceId || part.attachmentId : null;
@@ -336,7 +323,7 @@ export function InputRow() {
   const resizeStartRef = useRef<{ y: number; height: number } | null>(null);
   const currentSessionId = useSessionStore((s) => s.currentSessionId);
   const currentSession = useCurrentSession();
-  const appendLocalMessage = useSessionStore((s) => s.appendLocalMessage);
+  const addMessage = useSessionStore((s) => s.addMessage);
   const setInputDraft = useSessionStore((s) => s.setInputDraft);
   const steer = useWorkerStore((s) => s.steer);
   // The worker store is keyed by durable sessionId and is refreshed from the
@@ -359,72 +346,32 @@ export function InputRow() {
   const [attachmentBrowserPath, setAttachmentBrowserPath] = useState('');
   const [attachmentDirectoryError, setAttachmentDirectoryError] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
-  const attachmentsRef = useRef<PendingAttachment[]>([]);
   const [composerText, setComposerText] = useState(() =>
     currentSessionId ? useSessionStore.getState().inputDrafts[currentSessionId] || '' : '',
   );
-  const [composerOccurrenceIds, setComposerOccurrenceIds] = useState<string[]>([]);
   const clientAttachmentInputRef = useRef<HTMLInputElement>(null);
   const uploadControllersRef = useRef(new Map<string, AbortController>());
   const attachmentEpochRef = useRef(0);
   const activeAttachmentSessionRef = useRef<string | null>(currentSessionId);
-  const draftsBySessionRef = useRef(new Map<string, SessionComposerDraft>());
   const sendSnapshotsRef = useRef(new Map<string, SendSnapshot>());
   const recoveryBySessionRef = useRef(new Map<string, SendSnapshot>());
   const pendingRecoveryValueRef = useRef<ComposerValue | null>(null);
-
-  const rememberSessionDraft = useCallback(
-    (sessionId: string, value: ComposerValue, nextAttachments: PendingAttachment[]) => {
-      const clonedValue = cloneComposerValue(value);
-      const clonedAttachments = nextAttachments.map((attachment) => ({ ...attachment }));
-      if (
-        !clonedValue.text &&
-        clonedValue.occurrenceIds.length === 0 &&
-        clonedAttachments.length === 0
-      ) {
-        draftsBySessionRef.current.delete(sessionId);
-        return;
-      }
-      draftsBySessionRef.current.set(sessionId, {
-        value: clonedValue,
-        attachments: clonedAttachments,
-      });
-    },
-    [],
-  );
-
-  const updateAttachments = useCallback(
-    (update: AttachmentStateUpdate) => {
-      setAttachments((current) => {
-        const next = typeof update === 'function' ? update(current) : update;
-        attachmentsRef.current = next;
-        const sessionId = activeAttachmentSessionRef.current;
-        if (sessionId) rememberSessionDraft(sessionId, composerValueRef.current, next);
-        return next;
-      });
-    },
-    [rememberSessionDraft],
-  );
   const enqueue = useQueueStore((s) => s.enqueue);
   const panelOpen = useQueueStore((s) => s.panelOpen);
   const togglePanel = useQueueStore((s) => s.togglePanel);
-  // 计数只投影真正待发的队列项；编辑是同一项的状态，不是额外一条。
+  // 队列计数（含编辑中的一条）：原始值比较，selector 稳定
   const queueCount = useQueueStore((s) => {
     if (!currentSessionId) return 0;
     const q = s.queues[currentSessionId];
-    return q?.filter((item) => item.meta?.dispatchState === 'queued').length ?? 0;
+    const e = s.edits[currentSessionId];
+    return (q ? q.length : 0) + (e ? 1 : 0);
   });
-  const queueEditActive = useQueueStore((s) =>
-    currentSessionId ? Boolean(s.edits[currentSessionId]) : false,
-  );
-  const queuedWhileBusy = currentSession?.workerStatus === 'running' && queueCount > 0;
 
   // ── Adapter settings ──
   const config = useAdapterStore((s) => s.getConfig());
   const loadConfig = useAdapterStore((s) => s.loadConfig);
   const applySettings = useAdapterStore((s) => s.applySettings);
-  const loadSessions = useSessionStore((s) => s.loadSessions);
-  const patchSessionSettings = useSessionStore((s) => s.patchSessionSettings);
+  const { loadSessions } = useSessionStore();
 
   useEffect(() => {
     if (currentSession) {
@@ -434,17 +381,9 @@ export function InputRow() {
 
   const applySetting = async (key: string, value: unknown) => {
     if (!currentSession) return;
-    const patch: SessionSettingPatch = { [key]: value } as SessionSettingPatch;
-    if (key === 'model' && config?.modelEfforts) {
-      const nextEfforts = config.modelEfforts[String(value)];
-      const currentEffort = currentSession.effort || '';
-      if (nextEfforts && currentEffort && !nextEfforts.includes(currentEffort)) {
-        patch.effort = '';
-      }
-    }
     try {
-      await patchSessionSettings(currentSession.id, patch, applySettings);
-      void loadSessions();
+      await applySettings(currentSession.id, { [key]: value });
+      await loadSessions();
     } catch (e) {
       showToast((e as Error).message || 'Failed', 'error');
     }
@@ -456,48 +395,32 @@ export function InputRow() {
     setAttachmentDirectoryError(null);
   };
 
-  // Keep the complete composer draft (text + inline structure + attachment
-  // metadata) in the mounted InputRow, keyed by durable Session id. The
-  // session store still owns the plain-text projection for compatibility, but
-  // text alone cannot reconstruct inline occurrence ordering.
+  // Restore draft when session changes. Reads from getState() so it does not
+  // depend on `inputDrafts` (which would re-run — and reset the caret — on
+  // every keystroke now that onChange persists drafts).
   useEffect(() => {
-    const previousSessionId = activeAttachmentSessionRef.current;
-    if (previousSessionId && previousSessionId !== currentSessionId) {
-      rememberSessionDraft(previousSessionId, composerValueRef.current, attachmentsRef.current);
-    }
-
-    attachmentEpochRef.current += 1;
-    activeAttachmentSessionRef.current = currentSessionId;
-
     const draft = currentSessionId ? useSessionStore.getState().inputDrafts[currentSessionId] : '';
-    const stored = currentSessionId ? draftsBySessionRef.current.get(currentSessionId) : undefined;
     const recovery = currentSessionId
       ? recoveryBySessionRef.current.get(currentSessionId)
       : undefined;
-    const value = recovery?.value ||
-      stored?.value || {
-        parts: draft
-          ? [{ type: 'text' as const, value: draft }]
-          : [{ type: 'text' as const, value: '' }],
-        text: draft || '',
-        occurrenceIds: [],
-        attachmentIds: [],
-      };
-    const restoredAttachments = recovery?.attachments || stored?.attachments || [];
-    const clonedAttachments = restoredAttachments.map((attachment) => ({ ...attachment }));
-    composerValueRef.current = cloneComposerValue(value);
-    attachmentsRef.current = clonedAttachments;
-    setAttachments(clonedAttachments);
-    pendingRecoveryValueRef.current = value.occurrenceIds.length ? cloneComposerValue(value) : null;
-    if (!pendingRecoveryValueRef.current) composerRef.current?.replaceValue(value);
-    setComposerText(value.text);
-    setComposerOccurrenceIds([...value.occurrenceIds]);
-    return () => {
-      if (activeAttachmentSessionRef.current === currentSessionId && currentSessionId) {
-        rememberSessionDraft(currentSessionId, composerValueRef.current, attachmentsRef.current);
-      }
+    const value = recovery?.value || {
+      parts: draft
+        ? [{ type: 'text' as const, value: draft }]
+        : [{ type: 'text' as const, value: '' }],
+      text: draft || '',
+      occurrenceIds: [],
+      attachmentIds: [],
     };
-  }, [currentSessionId, rememberSessionDraft]);
+    if (recovery) {
+      pendingRecoveryValueRef.current = value;
+      setAttachments(recovery.attachments.map((attachment) => ({ ...attachment })));
+    } else {
+      pendingRecoveryValueRef.current = null;
+      setAttachments([]);
+      composerRef.current?.replaceValue(value);
+    }
+    setComposerText(value.text);
+  }, [currentSessionId]);
 
   useEffect(() => {
     const pending = pendingRecoveryValueRef.current;
@@ -513,7 +436,9 @@ export function InputRow() {
 
   useEffect(() => {
     const uploadControllers = uploadControllersRef.current;
-    if (!currentSessionId) updateAttachments([]);
+    attachmentEpochRef.current += 1;
+    activeAttachmentSessionRef.current = currentSessionId;
+    if (!currentSessionId) setAttachments([]);
     setAttachmentBrowserOpen(false);
     setAttachmentMenuOpen(false);
     return () => {
@@ -521,7 +446,7 @@ export function InputRow() {
       uploadControllers.clear();
       attachmentEpochRef.current += 1;
     };
-  }, [currentSessionId, updateAttachments]);
+  }, [currentSessionId]);
 
   // The editor can be a separate route, so it hands a server path to the
   // mounted composer through a one-shot UI request. The actual attachment
@@ -541,7 +466,7 @@ export function InputRow() {
           attachmentEpochRef.current !== sessionEpoch
         )
           return;
-        updateAttachments((current) => {
+        setAttachments((current) => {
           const additions = registered.map((item) => {
             const occurrenceId = attachmentId();
             return {
@@ -568,13 +493,7 @@ export function InputRow() {
         showToast(error instanceof Error ? error.message : '服务端附件注册失败', 'error');
       });
     consumeChatAttachmentRequests(currentSessionId, requested);
-  }, [
-    chatAttachmentRequests,
-    consumeChatAttachmentRequests,
-    currentSessionId,
-    showToast,
-    updateAttachments,
-  ]);
+  }, [chatAttachmentRequests, consumeChatAttachmentRequests, currentSessionId, showToast]);
 
   useEffect(() => {
     if (!isMobile) {
@@ -647,7 +566,7 @@ export function InputRow() {
           attachment.file,
           (loaded, total) => {
             if (!isLive()) return;
-            updateAttachments((current) =>
+            setAttachments((current) =>
               current.map((item) =>
                 attachmentOccurrenceId(item) === attachmentOccurrenceId(attachment)
                   ? { ...item, loadedBytes: loaded, totalBytes: total }
@@ -658,7 +577,7 @@ export function InputRow() {
           controller.signal,
         );
         if (!isLive()) return;
-        updateAttachments((current) =>
+        setAttachments((current) =>
           current.map((item) =>
             attachmentOccurrenceId(item) === attachmentOccurrenceId(attachment)
               ? {
@@ -679,7 +598,7 @@ export function InputRow() {
         );
       } catch (error) {
         if (!isLive()) return;
-        updateAttachments((current) =>
+        setAttachments((current) =>
           current.map((item) =>
             attachmentOccurrenceId(item) === attachmentOccurrenceId(attachment)
               ? {
@@ -696,7 +615,7 @@ export function InputRow() {
         }
       }
     },
-    [currentSessionId, updateAttachments],
+    [currentSessionId],
   );
 
   const queueClientFiles = useCallback(
@@ -727,11 +646,11 @@ export function InputRow() {
         }))
         .map((attachment) => ({ ...attachment, id: attachment.occurrenceId }));
       if (added.length === 0) return [];
-      updateAttachments((current) => [...current, ...added]);
+      setAttachments((current) => [...current, ...added]);
       void Promise.all(added.map((attachment) => uploadClientAttachment(attachment)));
       return added.map((attachment) => attachment.id);
     },
-    [attachments, currentSessionId, updateAttachments, uploadClientAttachment],
+    [attachments, currentSessionId, uploadClientAttachment],
   );
 
   const handleClientFiles = useCallback(
@@ -761,12 +680,6 @@ export function InputRow() {
     (value: ComposerValue) => {
       composerValueRef.current = value;
       setComposerText(value.text);
-      setComposerOccurrenceIds((current) =>
-        current.length === value.occurrenceIds.length
-          && current.every((occurrenceId, index) => occurrenceId === value.occurrenceIds[index])
-          ? current
-          : [...value.occurrenceIds],
-      );
       if (currentSessionId) {
         const recovery = recoveryBySessionRef.current.get(currentSessionId);
         if (
@@ -777,10 +690,9 @@ export function InputRow() {
           recoveryBySessionRef.current.delete(currentSessionId);
         }
         setInputDraft(currentSessionId, value.text);
-        rememberSessionDraft(currentSessionId, value, attachmentsRef.current);
       }
     },
-    [currentSessionId, rememberSessionDraft, setInputDraft],
+    [currentSessionId, setInputDraft],
   );
 
   const handleAttachmentDrop = useCallback(
@@ -802,7 +714,7 @@ export function InputRow() {
       const occurrenceId = attachmentId();
       const remoteId = payload.serverAttachmentId || uploadAttachmentIdFromHref(payload.href);
       const needsRegistration = !remoteId && !!payload.path;
-      updateAttachments((current) => [
+      setAttachments((current) => [
         ...current,
         {
           occurrenceId,
@@ -828,7 +740,7 @@ export function InputRow() {
               attachmentEpochRef.current !== sessionEpoch
             )
               return;
-            updateAttachments((current) =>
+            setAttachments((current) =>
               current.map((item) =>
                 attachmentOccurrenceId(item) === occurrenceId
                   ? {
@@ -851,7 +763,7 @@ export function InputRow() {
               attachmentEpochRef.current !== sessionEpoch
             )
               return;
-            updateAttachments((current) =>
+            setAttachments((current) =>
               current.map((item) =>
                 attachmentOccurrenceId(item) === occurrenceId
                   ? {
@@ -866,19 +778,16 @@ export function InputRow() {
       }
       return occurrenceId;
     },
-    [attachments, currentSessionId, showToast, updateAttachments],
+    [attachments, currentSessionId, showToast],
   );
 
-  const handleRemoveComposerAttachment = useCallback(
-    (attachmentIdToRemove: string) => {
-      uploadControllersRef.current.get(attachmentIdToRemove)?.abort();
-      uploadControllersRef.current.delete(attachmentIdToRemove);
-      updateAttachments((current) =>
-        current.filter((attachment) => attachmentOccurrenceId(attachment) !== attachmentIdToRemove),
-      );
-    },
-    [updateAttachments],
-  );
+  const handleRemoveComposerAttachment = useCallback((attachmentIdToRemove: string) => {
+    uploadControllersRef.current.get(attachmentIdToRemove)?.abort();
+    uploadControllersRef.current.delete(attachmentIdToRemove);
+    setAttachments((current) =>
+      current.filter((attachment) => attachmentOccurrenceId(attachment) !== attachmentIdToRemove),
+    );
+  }, []);
 
   const restoreSubmission = useCallback(
     (snapshot: SendSnapshot) => {
@@ -908,7 +817,7 @@ export function InputRow() {
       const value = hasCurrentInput
         ? appendComposerValues(current, snapshot.value)
         : cloneComposerValue(snapshot.value);
-      updateAttachments((currentAttachments) => {
+      setAttachments((currentAttachments) => {
         const existingIds = new Set(currentAttachments.map(attachmentOccurrenceId));
         const additions = snapshot.attachments
           .filter((attachment) => !existingIds.has(attachmentOccurrenceId(attachment)))
@@ -931,7 +840,7 @@ export function InputRow() {
       // both the merged text and every attachment occurrence.
       recoveryBySessionRef.current.set(snapshot.sessionId, { ...snapshot, value });
     },
-    [attachments, setInputDraft, updateAttachments],
+    [attachments, setInputDraft],
   );
 
   const handleSend = useCallback(
@@ -940,14 +849,6 @@ export function InputRow() {
         showToast('Select a session first');
         return;
       }
-      if (useQueueStore.getState().edits[currentSessionId]) {
-        showToast('请先保存或取消队列消息编辑', 'error');
-        return;
-      }
-      // Read the cached, Session-keyed runtime registry synchronously at the
-      // start of the send transaction.  Session summaries can lag worker
-      // events; this must not add a request or wait before enqueueing.
-      const appendOptimisticHistory = !isRuntimeWorkerRunning(currentSessionId);
       if (attachments.some((attachment) => attachment.status === 'uploading')) {
         showToast('附件仍在上传，请稍候', 'error');
         return;
@@ -1066,7 +967,6 @@ export function InputRow() {
         attachments: snapshotAttachments,
         message,
         parts: structuredParts.length > 0 ? structuredParts : undefined,
-        appendOptimisticHistory,
       };
       sendSnapshotsRef.current.set(snapshot.transactionId, snapshot);
 
@@ -1075,7 +975,7 @@ export function InputRow() {
       // cleared or restored by the old request.
       composerRef.current?.replaceValue(emptyComposerValue());
       setInputDraft(currentSessionId, '');
-      updateAttachments((current) =>
+      setAttachments((current) =>
         current.filter(
           (attachment) =>
             !snapshotAttachments.some(
@@ -1105,15 +1005,11 @@ export function InputRow() {
             }
             throw new Error('当前目录非法');
           }
-          if (useQueueStore.getState().edits[snapshot.sessionId]) {
-            throw new Error('队列消息正在编辑');
-          }
           const ok = await enqueue(
             snapshot.message,
             snapshot.parts,
             snapshot.sessionId,
             snapshot.clientMessageId,
-            { appendOptimisticHistory: snapshot.appendOptimisticHistory },
           );
           if (!ok) throw new Error('消息尚未入队');
           sendSnapshotsRef.current.delete(snapshot.transactionId);
@@ -1131,7 +1027,6 @@ export function InputRow() {
       setInputDraft,
       enqueue,
       attachments,
-      updateAttachments,
       restoreSubmission,
       setAttachmentDirectoryError,
       setAttachmentBrowserPath,
@@ -1142,43 +1037,19 @@ export function InputRow() {
 
   const handleSteer = useCallback(
     async (text: string) => {
-      const steerSessionId = currentSessionId;
-      if (!steerSessionId || !text.trim()) return;
-      if (useQueueStore.getState().edits[steerSessionId]) {
-        showToast('请先保存或取消队列消息编辑', 'error');
-        return;
-      }
-      const draftState = useSessionStore.getState();
-      const draftRevision = draftState.inputDraftRevisions[steerSessionId] ?? 0;
-      const draftText = draftState.inputDrafts[steerSessionId] ?? text;
-      const attachmentRevision = attachments.map(attachmentOccurrenceId).join('\u0000');
-      const messageId = `steer:${attachmentId()}`;
+      if (!currentSessionId || !text.trim()) return;
       try {
-        await steer(steerSessionId, text, messageId);
-        // The request may outlive a Session switch.  Only the original
-        // composer may be cleared; the message projection is always written
-        // to the captured target Session, never whichever Session is current
-        // when the provider control resolves.
-        const latest = useSessionStore.getState();
-        const draftStillOwnsTransaction =
-          latest.inputDraftRevisions[steerSessionId] === draftRevision
-          && (latest.inputDrafts[steerSessionId] ?? draftText) === draftText
-          && attachments.map(attachmentOccurrenceId).join('\u0000') === attachmentRevision;
-        const stillSelected = latest.currentSessionId === steerSessionId;
-        if (draftStillOwnsTransaction) {
-          if (stillSelected) composerRef.current?.replaceText('');
-          setInputDraft(steerSessionId, '');
-          if (stillSelected) updateAttachments(() => []);
-        }
-        // Optimistic append with a local ts; the server stamps the same
-        // moment into history (steer_worker appends + saves right after the
-        // control write).
-        appendLocalMessage(steerSessionId, { role: 'user', content: text, messageId, ts: new Date().toISOString() });
+        await steer(currentSessionId, text);
+        composerRef.current?.replaceText('');
+        setInputDraft(currentSessionId, '');
+        // Optimistic append; the server stamps the same moment into history
+        // (steer_worker appends + saves right after the control write).
+        addMessage({ role: 'user', content: text, ts: new Date().toISOString() });
       } catch (e) {
         showToast((e as Error).message || 'Steer failed', 'error');
       }
     },
-    [currentSessionId, steer, setInputDraft, appendLocalMessage, showToast, attachments, updateAttachments],
+    [currentSessionId, steer, setInputDraft, addMessage, showToast],
   );
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLElement>) => {
@@ -1211,22 +1082,7 @@ export function InputRow() {
     currentSession?.adapter === 'codex' &&
     currentWorker?.status === 'running' &&
     !!currentWorker.id;
-  // During the render between a Session id change and its restoration effect,
-  // the React state still contains the previous Session's value. Never expose
-  // that transient state in the new Session's composer or attachment chips.
-  const sessionDraft = currentSessionId
-    ? draftsBySessionRef.current.get(currentSessionId)
-    : undefined;
-  const sessionAttachments =
-    activeAttachmentSessionRef.current === currentSessionId
-      ? attachments
-      : (sessionDraft?.attachments ?? []);
-  const sessionComposerText =
-    activeAttachmentSessionRef.current === currentSessionId
-      ? composerText
-      : (sessionDraft?.value.text ??
-        (currentSessionId ? useSessionStore.getState().inputDrafts[currentSessionId] || '' : ''));
-  const clientAttachments = sessionAttachments.filter((attachment) => !!attachment.file);
+  const clientAttachments = attachments.filter((attachment) => !!attachment.file);
   const uploadTotalBytes = clientAttachments.reduce(
     (total, attachment) => total + (attachment.totalBytes ?? attachment.file?.size ?? 0),
     0,
@@ -1250,9 +1106,9 @@ export function InputRow() {
     : clientAttachments.some((attachment) => attachment.status === 'error')
       ? '失败'
       : '已完成';
-  const attachmentsBlocked = sessionAttachments.some((attachment) => attachment.status !== 'ready');
-  const embeddedAttachmentIds = new Set(composerOccurrenceIds);
-  const visibleAttachmentChips = sessionAttachments.filter(
+  const attachmentsBlocked = attachments.some((attachment) => attachment.status !== 'ready');
+  const embeddedAttachmentIds = new Set(composerValueRef.current.occurrenceIds);
+  const visibleAttachmentChips = attachments.filter(
     (attachment) => !embeddedAttachmentIds.has(attachmentOccurrenceId(attachment)),
   );
 
@@ -1315,37 +1171,23 @@ export function InputRow() {
                   />
                 </div>
                 <div className="relative">
-                  {queuedWhileBusy && (
-                    <span
-                      data-testid="queued-while-busy"
-                      className="mr-1 hidden text-xs text-accent md:inline"
-                      title="Worker 正在处理上一条任务，当前消息将在之后处理"
-                    >
-                      排队中
-                    </span>
-                  )}
                   <button
-                    id="send-queue-button"
                     onClick={togglePanel}
                     title={queueCount > 0 ? `发送队列（${queueCount} 条待发）` : '发送队列'}
-                    aria-label={queueCount > 0 ? `发送队列（${queueCount} 条待发）` : '发送队列'}
-                    className={`relative flex h-7 w-7 shrink-0 items-center justify-center rounded border transition-colors md:h-8 md:w-auto md:px-2 ${panelOpen || queueCount > 0 ? 'border-accent/50 bg-accent/10 text-accent' : 'border-border-default bg-bg-tertiary text-text-secondary hover:bg-bg-hover'}`}
+                    aria-label="发送队列"
+                    className={`flex h-7 w-7 shrink-0 items-center justify-center rounded border transition-colors md:h-8 md:w-auto md:px-2 ${panelOpen || queueCount > 0 ? 'border-accent/50 bg-accent/10 text-accent' : 'border-border-default bg-bg-tertiary text-text-secondary hover:bg-bg-hover'}`}
                   >
                     <ChevronUp
                       size={14}
                       className={`transition-transform duration-200 ${panelOpen ? 'rotate-180' : ''}`}
                     />
                     <span className="ml-1 hidden text-xs md:inline">Queue</span>
-                    {queueCount > 0 && (
-                      <span
-                        data-testid="queue-count-badge"
-                        className="pointer-events-none absolute -top-1.5 -right-1.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-accent px-1 text-[10px] font-medium leading-none text-white"
-                      >
-                        {queueCount > 99 ? '99+' : queueCount}
-                      </span>
-                    )}
                   </button>
-                  <label htmlFor="send-queue-button" className="sr-only">发送队列</label>
+                  {queueCount > 0 && (
+                    <span className="absolute -top-1.5 -right-1.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-accent px-1 text-[10px] font-medium leading-none text-white">
+                      {queueCount > 99 ? '99+' : queueCount}
+                    </span>
+                  )}
                 </div>
               </div>
               <ModelPill
@@ -1510,7 +1352,7 @@ export function InputRow() {
                       aria-label={`重试上传 ${attachment.displayName}`}
                       onClick={() => {
                         if (attachment.file) {
-                          updateAttachments((current) =>
+                          setAttachments((current) =>
                             current.map((item) =>
                               attachmentOccurrenceId(item) === attachmentOccurrenceId(attachment)
                                 ? { ...item, status: 'uploading', error: undefined }
@@ -1524,7 +1366,7 @@ export function InputRow() {
                           const retrySessionId = currentSessionId;
                           const retryEpoch = attachmentEpochRef.current;
                           if (!retrySessionId) return;
-                          updateAttachments((current) =>
+                          setAttachments((current) =>
                             current.map((item) =>
                               attachmentOccurrenceId(item) === attachmentOccurrenceId(attachment)
                                 ? { ...item, status: 'registering', error: undefined }
@@ -1541,7 +1383,7 @@ export function InputRow() {
                                 attachmentEpochRef.current !== retryEpoch
                               )
                                 return;
-                              updateAttachments((current) =>
+                              setAttachments((current) =>
                                 current.map((item) =>
                                   attachmentOccurrenceId(item) ===
                                   attachmentOccurrenceId(attachment)
@@ -1563,7 +1405,7 @@ export function InputRow() {
                                 attachmentEpochRef.current !== retryEpoch
                               )
                                 return;
-                              updateAttachments((current) =>
+                              setAttachments((current) =>
                                 current.map((item) =>
                                   attachmentOccurrenceId(item) ===
                                   attachmentOccurrenceId(attachment)
@@ -1595,7 +1437,7 @@ export function InputRow() {
                     onClick={() => {
                       uploadControllersRef.current.get(attachmentOccurrenceId(attachment))?.abort();
                       uploadControllersRef.current.delete(attachmentOccurrenceId(attachment));
-                      updateAttachments((current) =>
+                      setAttachments((current) =>
                         current.filter(
                           (item) =>
                             attachmentOccurrenceId(item) !== attachmentOccurrenceId(attachment),
@@ -1642,7 +1484,7 @@ export function InputRow() {
                       )
                         return;
                       const occurrenceId = attachmentId();
-                      updateAttachments((current) => [
+                      setAttachments((current) => [
                         ...current,
                         {
                           occurrenceId,
@@ -1706,7 +1548,6 @@ export function InputRow() {
                   attachmentIds: [],
                 };
                 setComposerText(text);
-                setComposerOccurrenceIds([]);
                 composerRef.current?.replaceText(text);
                 if (currentSessionId) setInputDraft(currentSessionId, text);
               }}
@@ -1715,8 +1556,8 @@ export function InputRow() {
             <RichTextComposer
               key={currentSessionId || 'no-session'}
               ref={composerRef}
-              initialText={sessionComposerText}
-              attachments={sessionAttachments.map(
+              initialText={composerText}
+              attachments={attachments.map(
                 ({
                   id,
                   occurrenceId,
@@ -1746,7 +1587,6 @@ export function InputRow() {
             <div className="flex flex-col gap-1 items-end">
               {canSteer && (
                 <button
-                  disabled={queueEditActive}
                   onClick={() => handleSteer(composerValueRef.current.text)}
                   className="inline-flex items-center gap-1 rounded border border-accent/50 bg-accent/10 px-2 py-1 text-xs font-medium text-accent hover:bg-accent/20 transition-colors"
                   title="Send an instruction to the running Codex turn"
@@ -1759,12 +1599,8 @@ export function InputRow() {
                 <button
                   type="button"
                   onClick={() => handleSend(composerValueRef.current.text)}
-                  disabled={attachmentsBlocked || queueEditActive}
-                  title={queueEditActive
-                    ? '请先保存或取消队列消息编辑'
-                    : attachmentsBlocked
-                      ? '请等待附件上传完成，或重试/取消失败附件'
-                      : 'Send'}
+                  disabled={attachmentsBlocked}
+                  title={attachmentsBlocked ? '请等待附件上传完成，或重试/取消失败附件' : 'Send'}
                   className="rounded bg-accent px-4 py-2 text-sm font-medium text-white hover:bg-accent-hover transition-colors self-end disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   Send

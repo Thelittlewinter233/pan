@@ -79,45 +79,6 @@ export function matchesSpecialFilters(
   return true;
 }
 
-/** Workspace scope key: 'all' / 'ungrouped' / a workspace id. */
-export const ALL_WORKSPACES = 'all';
-export const UNGROUPED_WORKSPACES = 'ungrouped';
-
-/** Resolve a session's workspace from its manager chain; corrupt chains fail closed. */
-export function effectiveWorkspaceIds(session: Session, sessions: Session[]): string[] {
-  const byId = new Map(sessions.map((item) => [item.id, item]));
-  const seen = new Set<string>();
-  let current: Session | undefined = session;
-  while (current) {
-    if (seen.has(current.id)) return [];
-    seen.add(current.id);
-    if (!current.managedBy) return (current.workspaceIds ?? []).slice(0, 1);
-    current = byId.get(current.managedBy);
-  }
-  return [];
-}
-
-/**
- * Sessions belonging to the active workspace scope.
- *   - 'all' / missing      → every session (the historical, unscoped list);
- *   - 'ungrouped'          → sessions without any membership;
- *   - a workspace id       → members of that workspace only.
- *
- * The workspace scope is the OUTERMOST filter: search, special filters and
- * select-all all run on top of it, so no list-level operation can ever reach
- * across workspaces.
- */
-export function scopeSessionsByWorkspace(
-  sessions: Session[],
-  activeWorkspaceId?: string | null,
-): Session[] {
-  if (!activeWorkspaceId || activeWorkspaceId === ALL_WORKSPACES) return sessions;
-  if (activeWorkspaceId === UNGROUPED_WORKSPACES) {
-    return sessions.filter((session) => effectiveWorkspaceIds(session, sessions).length === 0);
-  }
-  return sessions.filter((session) => effectiveWorkspaceIds(session, sessions).includes(activeWorkspaceId));
-}
-
 /**
  * Return the sessions that SessionList can operate on for the current view.
  * Select mode deliberately includes sessions hidden from the normal list,
@@ -132,14 +93,11 @@ export function getSessionListCandidates(
     hiddenSessionIds: Set<string>;
     searchQuery: string;
     specialFilters: Set<SpecialFilterId>;
-    /** Active workspace scope ('all' keeps the historical full list). */
-    activeWorkspaceId?: string | null;
   },
 ): Session[] {
-  const inScope = scopeSessionsByWorkspace(sessions, options.activeWorkspaceId);
   const base = options.multiSelectMode
-    ? inScope
-    : inScope.filter((session) => !options.hiddenSessionIds.has(session.id));
+    ? sessions
+    : sessions.filter((session) => !options.hiddenSessionIds.has(session.id));
 
   let candidates = base.filter((session) =>
     matchesSpecialFilters(session, sessions, options.specialFilters),

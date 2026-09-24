@@ -210,30 +210,6 @@ def test_unknown_cross_session_reference_is_rejected(monkeypatch, tmp_path):
     assert result["error"]["code"] == "attachment_not_found"
 
 
-def test_queue_edit_updates_plain_composer_parts_and_delivery(monkeypatch, tmp_path):
-    first, _second = _setup(tmp_path, monkeypatch)
-    monkeypatch.setattr(_sess, "save_async", _noop_save_async)
-    monkeypatch.setattr(srv.worker, "_schedule_session_recovery", lambda _sid: None)
-    result = asyncio.run(srv.api_session_queue_enqueue(first.id, {
-        "parts": [{"type": "text", "text": "original"}],
-    }))
-    item_id = result["item"]["id"]
-    edit_token = "attachment-edit-token"
-    locked = asyncio.run(srv.api_session_queue_edit_lock(first.id, item_id, {
-        "editToken": edit_token, "expectedRevision": 1,
-    }))
-    assert locked["ok"] is True
-    edited = asyncio.run(srv.api_session_queue_update(first.id, item_id, {
-        "text": "edited", "expectedRevision": 1, "editToken": edit_token,
-    }))
-    assert edited["ok"] is True
-    assert edited["item"]["text"] == "edited"
-    target = next(item for item in first.queue_pending if item["id"] == item_id)
-    assert target["parts"] == [{"type": "text", "text": "edited"}]
-    assert srv.worker.project_message_parts(target["parts"], target["text"]) == "edited"
-    assert first.queue_delivery_ledger[item_id]["parts"] == target["parts"]
-
-
 def test_queue_edit_cannot_make_text_disagree_with_parts(monkeypatch, tmp_path):
     first, _second = _setup(tmp_path, monkeypatch)
     monkeypatch.setattr(_sess, "save_async", _noop_save_async)
@@ -251,13 +227,8 @@ def test_queue_edit_cannot_make_text_disagree_with_parts(monkeypatch, tmp_path):
         "parts": [{"type": "attachment", "attachmentId": stored.name}],
     }))
     item_id = result["item"]["id"]
-    edit_token = "attachment-conflict-token"
-    locked = asyncio.run(srv.api_session_queue_edit_lock(first.id, item_id, {
-        "editToken": edit_token, "expectedRevision": 1,
-    }))
-    assert locked["ok"] is True
     conflict = asyncio.run(srv.api_session_queue_update(first.id, item_id, {
-        "text": "different", "expectedRevision": 1, "editToken": edit_token,
+        "text": "different", "expectedRevision": 1,
     }))
     assert conflict["ok"] is False
     assert conflict["error"]["code"] == "parts_text_conflict"
@@ -277,41 +248,6 @@ def test_history_projects_existing_local_link_to_opaque_editor_reference(monkeyp
     assert "#L2-L3" in content
     assert "docs/readme.md" not in content
     assert "https://example.test" in content
-
-
-def test_live_result_and_stream_projection_match_history_projection(monkeypatch, tmp_path):
-    first, _second = _setup(tmp_path, monkeypatch)
-    source = tmp_path / "docs" / "live.md"
-    source.parent.mkdir()
-    source.write_text("one\ntwo\nthree", encoding="utf-8")
-    content = "See [live](docs/live.md#L2-L3) and [web](https://example.test)"
-
-    stream = srv._project_worker_event({
-        "type": "worker.stream",
-        "sessionId": first.id,
-        "event": {"type": "assistant", "message": {"content": content}},
-    })
-    stream_content = stream["event"]["message"]["content"]
-    result = srv._project_worker_event({
-        "type": "worker.result",
-        "sessionId": first.id,
-        "result": content,
-    })
-
-    for projected in (stream_content, result["result"]):
-        assert "/api/attachments/editor/att_" in projected
-        assert "docs/live.md" not in projected
-        assert "https://example.test" in projected
-
-    first.history.append({"role": "assistant", "content": content})
-    first.last_result = {"status": "done", "result": content}
-    api = srv._session_to_api(first)
-    assert "/api/attachments/editor/att_" in api["lastResult"]["result"]
-    # Summary previews are deliberately raw/bounded. Attachment/editor
-    # projection remains limited to history/full-result views because summary
-    # GET must not touch the registry or stat local paths.
-    assert srv._session_summary(first)["lastMessage"] == content
-    assert "/api/attachments/editor/att_" not in srv._session_summary(first)["lastMessage"]
 
 
 def test_attachment_source_rejects_relative_workdir_escape(tmp_path):

@@ -1,7 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { Profiler } from 'react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { MarkdownRenderer } from './MarkdownRenderer';
 import { parseMarkdownFileLink } from '@/utils/markdownFileLinks';
@@ -46,20 +45,6 @@ beforeEach(() => {
 });
 
 describe('MarkdownRenderer', () => {
-  it('does not reparse historical Markdown when another message streams', () => {
-    const commits = vi.fn();
-    render(<Profiler id="historical-markdown" onRender={commits}>
-      <MarkdownRenderer content={'# Existing history\n```js\nconst x = 1;\n```'} />
-    </Profiler>);
-    commits.mockClear();
-    act(() => {
-      useSessionStore.setState(s => ({ sessions: s.sessions.map(session => ({
-        ...session, history: [...session.history, { role: 'assistant', content: 'new delta' }],
-      })) }));
-    });
-    expect(commits).not.toHaveBeenCalled();
-  });
-
   it('renders list bullets structure and hljs spans', () => {
     const md = [
       '- item one',
@@ -221,58 +206,6 @@ describe('MarkdownRenderer', () => {
     expect(useEditorStore.getState().pendingLocation).toEqual({
       path: 'D:\\project\\Pan\\docs\\readme.md', line: 4, endLine: 8,
     });
-  });
-
-  it('opens raster attachment links in the Editor preview using the server-owned opaque reference', async () => {
-    const attachmentId = `att_${'e'.repeat(32)}`;
-    const secondAttachmentId = `att_${'f'.repeat(32)}`;
-    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
-      ok: true,
-      path: 'D:\\private\\photo.png',
-      displayName: 'photo.png',
-      mimeType: 'image/png',
-    }), { status: 200, headers: { 'Content-Type': 'application/json' } })));
-    render(
-      <MemoryRouter initialEntries={['/']}>
-        <MarkdownRenderer content={[
-          `[photo.png](/api/attachments/ref/${attachmentId}?session_id=s1)`,
-          `[photo.png](/api/attachments/ref/${secondAttachmentId}?session_id=s1)`,
-        ].join(' ')} />
-      </MemoryRouter>,
-    );
-
-    const imageLinks = screen.getAllByRole('link', { name: 'photo.png' });
-    fireEvent.click(imageLinks[0]!);
-
-    await waitFor(() => expect(useEditorStore.getState().imagePreviews[`attachment:s1:${attachmentId}`]).toEqual({
-      src: `/api/attachments/ref/${attachmentId}?session_id=s1`,
-      downloadHref: `/api/attachments/ref/${attachmentId}?session_id=s1`,
-      displayName: 'photo.png',
-    }));
-    expect(fetch).toHaveBeenCalledWith(`/api/attachments/editor/${attachmentId}?session_id=s1`);
-    fireEvent.click(imageLinks[1]!);
-    await waitFor(() => expect(useEditorStore.getState().imagePreviews[`attachment:s1:${secondAttachmentId}`]).toEqual({
-      src: `/api/attachments/ref/${secondAttachmentId}?session_id=s1`,
-      downloadHref: `/api/attachments/ref/${secondAttachmentId}?session_id=s1`,
-      displayName: 'photo.png',
-    }));
-    expect(useEditorStore.getState().imagePreviews[`attachment:s1:${attachmentId}`]?.src)
-      .toBe(`/api/attachments/ref/${attachmentId}?session_id=s1`);
-    expect(useEditorStore.getState().activePath).toBe(`attachment:s1:${secondAttachmentId}`);
-    expect(readFile).not.toHaveBeenCalled();
-  });
-
-  it('keeps non-image attachment links on their original browser path', () => {
-    vi.stubGlobal('fetch', vi.fn());
-    const { container } = render(
-      <MemoryRouter>
-        <MarkdownRenderer content={'[archive.zip](/api/attachments/upload_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.zip?session_id=s1)'} />
-      </MemoryRouter>,
-    );
-    const link = container.querySelector('a')!;
-    expect(link.getAttribute('href')).toContain('/api/attachments/upload_');
-    expect(fetch).not.toHaveBeenCalled();
-    expect(readFile).not.toHaveBeenCalled();
   });
 
   it('recovers a legacy attachment without display metadata using a safe download href', () => {

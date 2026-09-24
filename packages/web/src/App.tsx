@@ -1,7 +1,6 @@
 import { useState, useEffect } from 'react';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { Sidebar } from './components/layout/Sidebar';
-import { WorkspaceRail } from './components/layout/WorkspaceRail';
 import { ToastContainer } from './components/ui/Toast';
 import { CommandPalette } from './components/CommandPalette';
 import { EditorConfirmationModal } from './components/editor/EditorConfirmationModal';
@@ -11,14 +10,9 @@ import { DemoBadge } from './demo/DemoBadge';
 import { isMockMode } from './demo/mockBackend';
 import { useMediaQuery } from './hooks/useMediaQuery';
 import { useUIStore } from './stores/uiStore';
-import { useWebSocket } from './hooks/useWebSocket';
 import { Outlet, useNavigate } from 'react-router-dom';
 
-export function Layout() {
-  // The dashboard connection is route-independent. Keeping this singleton
-  // consumer above <Outlet> lets editor/manage continue receiving Session,
-  // worker, queue and reconnect events while ChatView is unmounted.
-  useWebSocket();
+function Layout() {
   const { isMobile } = useMediaQuery();
   const mobileSidebarOpen = useUIStore((s) => s.mobileSidebarOpen);
   const setMobileSidebarOpen = useUIStore((s) => s.setMobileSidebarOpen);
@@ -122,26 +116,19 @@ export function Layout() {
         />
       )}
 
-      {/* Sidebar drawer on mobile, Sidebar plus WorkspaceRail in the desktop
-          layout. The desktop rail takes real width when expanded. */}
+      {/* Sidebar — full overlay on mobile — grid column 1 */}
       <div
         className={`${
           isMobile
             ? `fixed inset-y-0 left-0 z-40 transform transition-transform duration-200 ${
                 mobileSidebarOpen ? 'translate-x-0' : '-translate-x-full'
               }`
-            : 'relative z-30 flex'
+            : 'relative'
         }`}
         style={{ gridColumn: '1' }}
       >
         <Sidebar />
-        {!isMobile && <WorkspaceRail />}
       </div>
-
-      {/* Mobile workspace rail is independent from the Sidebar drawer. Its
-          collapsed handle stays on screen; expansion overlays both Sidebar
-          and chat at full viewport width. */}
-      {isMobile && <WorkspaceRail mobileOverlay />}
 
       {/* Resize handle gutter — grid column 2 (0-width) */}
 

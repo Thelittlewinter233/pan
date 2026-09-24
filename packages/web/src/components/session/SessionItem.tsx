@@ -1,8 +1,6 @@
-import { memo, useMemo } from 'react';
+import { memo } from 'react';
 import type { Session } from '@/types';
 import { WorkerDot } from '@/components/worker/WorkerDot';
-import { useUIStore } from '@/stores/uiStore';
-import { useWorkspaceStore } from '@/stores/workspaceStore';
 import type { DropZone } from './sessionDrag';
 import { MessageSquare, Folder, Monitor, Settings, ChevronDown, ChevronRight, Eye, EyeOff } from 'lucide-react';
 
@@ -93,32 +91,18 @@ export const SessionItem = memo(function SessionItem({
   // Preview comes from the summary endpoint's lastMessage (the list carries no
   // history now); fall back to the last local history message when present.
   const messages = session.history || [];
-  const lastContent = messages.length > 0 ? messages[messages.length - 1]?.content : undefined;
-  // stripMarkdown + 截断的成本不低，而卡片会因 isActive / isSelected / 拖拽反馈
-  // 等无关 props 变化重渲染。按来源文本缓存：内容不变则跳过重复计算。
-  const preview = useMemo(() => {
-    const source = session.lastMessage || lastContent;
-    if (!source) return null;
-    const text = stripMarkdown(source);
-    if (!text) return null;
-    return text.length > 50 ? `${text.slice(0, 50)}...` : text;
-  }, [session.lastMessage, lastContent]);
-  // A cold summary intentionally uses null/undefined for an unknown total.
-  // Only a loaded local message list can provide a conservative fallback;
-  // never turn an unloaded empty list into a misleading zero.
-  const messageCount = typeof session.historyTotal === 'number'
-    ? session.historyTotal
-    : messages.length > 0
-      ? messages.length
-      : '—';
+  const lastMsg = messages.length > 0 ? messages[messages.length - 1] : null;
+  const previewText = session.lastMessage
+    ? stripMarkdown(session.lastMessage)
+    : lastMsg
+      ? stripMarkdown(lastMsg.content)
+      : '';
+  const preview = previewText
+    ? previewText.length > 50
+      ? previewText.slice(0, 50) + '...'
+      : previewText
+    : null;
   const credit = session.totalUsage?.credit ?? null;
-  // Workspace membership badge: shown only in the unscoped "all" view (inside
-  // a workspace tab the scope is already known, and the chip just costs width).
-  const workspaceId = session.workspaceIds?.[0] ?? null;
-  const workspaceName = useWorkspaceStore((s) =>
-    workspaceId ? s.workspaces.find((w) => w.id === workspaceId)?.name ?? null : null,
-  );
-  const showWorkspaceBadge = useUIStore((s) => s.activeWorkspaceId === 'all') && !!workspaceName;
 
   const handleClick = () => {
     if (isPending) return;
@@ -232,15 +216,6 @@ export const SessionItem = memo(function SessionItem({
               {session.adapter}
             </span>
           )}
-          {showWorkspaceBadge && (
-            <span
-              className="flex items-center gap-0.5 text-[10px] text-accent bg-accent/10 border border-accent/25 rounded px-1 py-px shrink-0"
-              title={`工作区：${workspaceName}`}
-            >
-              <Folder size={9} />
-              <span className="max-w-[72px] truncate">{workspaceName}</span>
-            </span>
-          )}
         </div>
 
         {preview && (
@@ -252,7 +227,7 @@ export const SessionItem = memo(function SessionItem({
         <div className="flex items-center gap-2 mt-1 text-xs text-text-secondary">
           <span className="flex items-center gap-0.5">
             <MessageSquare size={10} />
-            {messageCount}
+            {session.historyTotal ?? messages.length}
           </span>
           {session.model && (
             <span className="flex items-center gap-0.5 truncate">

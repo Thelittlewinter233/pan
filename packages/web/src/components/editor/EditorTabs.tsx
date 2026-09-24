@@ -4,14 +4,12 @@ export function EditorTabs() {
   const openPaths = useEditorStore((s) => s.openPaths);
   const activePath = useEditorStore((s) => s.activePath);
   const dirty = useEditorStore((s) => s.dirty);
-  const imagePreviews = useEditorStore((s) => s.imagePreviews);
   const setActive = useEditorStore((s) => s.setActive);
   const closeFile = useEditorStore((s) => s.closeFile);
 
   if (openPaths.length === 0) return null;
 
   const getFileName = (p: string) => {
-    if (imagePreviews[p]) return imagePreviews[p].displayName;
     const idx = p.lastIndexOf('/');
     return idx === -1 ? p : p.substring(idx + 1);
   };
@@ -24,7 +22,6 @@ export function EditorTabs() {
         return (
           <div
             key={p}
-            data-testid="editor-tab"
             className={`flex items-center gap-1.5 px-3 text-xs cursor-pointer border-r border-border-default flex-shrink-0 select-none group ${
               isActive
                 ? 'bg-bg-primary text-text-primary border-b-2 border-b-accent -mb-px'
@@ -55,7 +52,6 @@ export function EditorTabs() {
                 e.stopPropagation();
                 closeFile(p);
               }}
-              aria-label={`关闭 ${getFileName(p)}`}
               title="Close"
             >
               ✕

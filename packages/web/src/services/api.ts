@@ -1,7 +1,6 @@
 import type {
   Session,
   SessionUsageView,
-  CodexQuotaProjection,
   ApiSessionsResponse,
   ApiSessionResponse,
   ApiSessionHistoryResponse,
@@ -33,10 +32,6 @@ import type {
   FsEntry,
   ApiClaimResponse,
   ApiSessionOrderResponse,
-  ApiWorkspacesResponse,
-  ApiWorkspaceResponse,
-  ApiWorkspaceOrderResponse,
-  Workspace,
   ApiReportSubscribeResponse,
   ApiReadonlyResponse,
   ApiQqContactsResponse,
@@ -117,16 +112,7 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
     ...options,
   });
   if (!res.ok) {
-    let detail = '';
-    try {
-      const body = (await res.json()) as { detail?: unknown; error?: unknown };
-      const candidate = body.detail ?? body.error;
-      if (typeof candidate === 'string' && candidate.trim()) detail = candidate.trim();
-    } catch {
-      // Some error responses are empty or not JSON; retain the HTTP status below.
-    }
-    const status = res.statusText ? `HTTP ${res.status}: ${res.statusText}` : `HTTP ${res.status}`;
-    throw new Error(detail ? `${status}: ${detail}` : status);
+    throw new Error(`HTTP ${res.status}: ${res.statusText}`);
   }
   return res.json() as Promise<T>;
 }
@@ -227,36 +213,15 @@ export async function fetchSessions(summary = false): Promise<Session[]> {
   return data.sessions || [];
 }
 
-export type SessionFetchView = 'metadata' | 'full';
-
-/**
- * Session metadata is the default UI read. The legacy full response remains
- * available explicitly for callers that need history/raw payloads.
- */
-export async function fetchSession(
-  id: string,
-  view: SessionFetchView = 'metadata',
-  signal?: AbortSignal,
-): Promise<Session> {
-  const query = view === 'metadata' ? '?view=metadata' : '';
-  const data = await request<ApiSessionResponse>(`${BASE}/sessions/${id}${query}`, { signal });
+export async function fetchSession(id: string): Promise<Session> {
+  const data = await request<ApiSessionResponse>(`${BASE}/sessions/${id}`);
   if (data.error) throw new Error(data.error);
   return data;
 }
 
-export async function fetchSessionUsage(id: string, signal?: AbortSignal): Promise<SessionUsageView> {
-  const data = await request<SessionUsageView>(`${BASE}/sessions/${encodeURIComponent(id)}/usage`, { signal });
+export async function fetchSessionUsage(id: string): Promise<SessionUsageView> {
+  const data = await request<SessionUsageView>(`${BASE}/sessions/${encodeURIComponent(id)}/usage`);
   if (data.ok === false) throw new Error(data.error?.message || 'Failed to load session usage');
-  return data;
-}
-
-/** Refresh account-scoped Codex quota separately from persisted Session usage. */
-export async function fetchCodexQuota(id: string, signal?: AbortSignal): Promise<CodexQuotaProjection> {
-  const data = await request<CodexQuotaProjection & { error?: { message?: string } }>(
-    `${BASE}/codex/quota?session_id=${encodeURIComponent(id)}`,
-    { signal },
-  );
-  if (data.ok === false) throw new Error(data.error?.message || 'Failed to refresh Codex quota');
   return data;
 }
 
@@ -264,9 +229,11 @@ export async function fetchSessionHistory(
   id: string,
   before: number = 0,
   limit: number = 50,
+  signal?: AbortSignal,
 ): Promise<ApiSessionHistoryResponse> {
   const data = await request<ApiSessionHistoryResponse>(
     `${BASE}/sessions/${id}/history?before=${before}&limit=${limit}`,
+    { signal },
   );
   if (data.error) throw new Error(data.error);
   return data;
@@ -318,8 +285,8 @@ export async function fetchSessionTemplates(): Promise<SessionTemplate[]> {
   return data.sessionTemplates || [];
 }
 
-export async function fetchMcpServers(signal?: AbortSignal): Promise<McpServerInfo[]> {
-  const data = await request<ApiMcpServersResponse>(`${BASE}/mcp/servers`, { signal });
+export async function fetchMcpServers(): Promise<McpServerInfo[]> {
+  const data = await request<ApiMcpServersResponse>(`${BASE}/mcp/servers`);
   // `loaded: false` means the manifest isn't loaded yet — return empty rather
   // than throwing, so the modal can show an explanatory empty state.
   if (!data.loaded) return [];
@@ -411,7 +378,6 @@ export async function updateSessionQueueItem(
   itemId: string,
   text: string,
   expectedRevision?: number,
-  editToken?: string,
 ): Promise<Omit<ApiSessionQueueResponse, 'error'> & {
   item?: AgentQueueItem;
   error?: { code?: string; message?: string } | string;
@@ -421,52 +387,13 @@ export async function updateSessionQueueItem(
     error?: { code?: string; message?: string } | string;
   }>(`${BASE}/sessions/${sessionId}/queue/${itemId}`, {
     method: 'PATCH',
-    body: JSON.stringify({ text, expectedRevision, editToken }),
+    body: JSON.stringify({ text, expectedRevision }),
   });
   if (data.ok === false || data.error) {
     const error = typeof data.error === 'string' ? data.error : data.error?.message;
     throw new Error(error || '队列项更新失败');
   }
   return data;
-}
-
-export async function acquireSessionQueueItemEdit(
-  sessionId: string,
-  itemId: string,
-  editToken: string,
-  expectedRevision?: number,
-): Promise<{ expiresAt: number }> {
-  const data = await request<{
-    ok?: boolean;
-    expiresAt?: number;
-    error?: { message?: string } | string;
-  }>(`${BASE}/sessions/${sessionId}/queue/${itemId}/edit`, {
-    method: 'POST',
-    body: JSON.stringify({ editToken, expectedRevision }),
-  });
-  if (!data.ok || typeof data.expiresAt !== 'number') {
-    const error = typeof data.error === 'string' ? data.error : data.error?.message;
-    throw new Error(error || '无法锁定正在编辑的队列消息');
-  }
-  return { expiresAt: data.expiresAt };
-}
-
-export async function releaseSessionQueueItemEdit(
-  sessionId: string,
-  itemId: string,
-  editToken: string,
-): Promise<void> {
-  const data = await request<{
-    ok?: boolean;
-    error?: { message?: string } | string;
-  }>(`${BASE}/sessions/${sessionId}/queue/${itemId}/edit/release`, {
-    method: 'POST',
-    body: JSON.stringify({ editToken }),
-  });
-  if (!data.ok) {
-    const error = typeof data.error === 'string' ? data.error : data.error?.message;
-    throw new Error(error || '无法释放队列消息编辑锁');
-  }
 }
 
 export async function deleteSessionQueueItem(
@@ -559,88 +486,6 @@ export async function reorderSessions(
     throw err;
   }
   return { ok: true, order: data.order || [] };
-}
-
-/* ── Workspaces: durable named session groups (sidebar rail) ── */
-
-export async function fetchWorkspaces(): Promise<Workspace[]> {
-  const data = await request<ApiWorkspacesResponse>(`${BASE}/workspaces`);
-  if (data.error) throw new Error(data.error);
-  return data.workspaces || [];
-}
-
-function workspaceFailure(data: ApiWorkspaceResponse, fallback: string): Error & { code?: string } {
-  const err = new Error(data.error?.message || fallback) as Error & { code?: string };
-  err.code = data.error?.code || 'workspace_request_failed';
-  return err;
-}
-
-export async function createWorkspace(name: string): Promise<Workspace> {
-  const data = await request<ApiWorkspaceResponse>(`${BASE}/workspaces`, {
-    method: 'POST',
-    body: JSON.stringify({ name }),
-  });
-  if (data.ok === false || !data.workspace) throw workspaceFailure(data, 'Create workspace failed');
-  return data.workspace;
-}
-
-export async function renameWorkspace(workspaceId: string, name: string): Promise<Workspace> {
-  const data = await request<ApiWorkspaceResponse>(`${BASE}/workspaces/${workspaceId}`, {
-    method: 'PATCH',
-    body: JSON.stringify({ name }),
-  });
-  if (data.ok === false || !data.workspace) throw workspaceFailure(data, 'Rename workspace failed');
-  return data.workspace;
-}
-
-export async function deleteWorkspace(workspaceId: string): Promise<void> {
-  const data = await request<{ ok?: boolean; error?: { code?: string; message?: string } }>(
-    `${BASE}/workspaces/${workspaceId}`,
-    { method: 'DELETE' },
-  );
-  if (data.ok === false) {
-    const err = new Error(data.error?.message || 'Delete workspace failed') as Error & { code?: string };
-    err.code = data.error?.code || 'delete_workspace_failed';
-    throw err;
-  }
-}
-
-/** Persist the full workspace display order (backend expands/validates ids). */
-export async function saveWorkspaceOrder(workspaceIds: string[]): Promise<string[]> {
-  const data = await request<ApiWorkspaceOrderResponse>(`${BASE}/workspaces/order`, {
-    method: 'POST',
-    body: JSON.stringify({ workspaceIds }),
-  });
-  if (data.ok === false) {
-    const err = new Error(data.error?.message || 'Reorder workspaces failed') as Error & { code?: string };
-    err.code = data.error?.code || 'reorder_workspaces_failed';
-    throw err;
-  }
-  return data.order || [];
-}
-
-/**
- * Replace one session's workspace membership. Single membership rule: callers
- * pass [] (ungrouped) or exactly one workspace id.
- */
-export async function setSessionWorkspaces(
-  sessionId: string,
-  workspaceIds: string[],
-): Promise<Session | undefined> {
-  const data = await request<{
-    ok?: boolean;
-    session?: Session;
-    error?: { code?: string; message?: string };
-  }>(`${BASE}/sessions/${sessionId}/workspaces`, {
-    method: 'PUT',
-    body: JSON.stringify({ workspaceIds }),
-  });
-  if (data.ok === false) {
-    const err = new Error(data.error?.message || 'Set session workspace failed') as Error & { code?: string };
-    err.code = data.error?.code || 'set_session_workspace_failed';
-    throw err;
-  }
-  return data.session;
 }
 
 export async function claimSession(
@@ -862,12 +707,10 @@ export async function steerWorker(workerId: string, text: string): Promise<ApiGe
   return data;
 }
 
-export async function steerSessionWorker(
-  sessionId: string, text: string, messageId?: string,
-): Promise<ApiGenericResponse> {
+export async function steerSessionWorker(sessionId: string, text: string): Promise<ApiGenericResponse> {
   const data = await request<ApiGenericResponse>(
     `${BASE}/sessions/${encodeURIComponent(sessionId)}/worker/steer`,
-    { method: 'POST', body: JSON.stringify({ text, ...(messageId ? { messageId } : {}) }) },
+    { method: 'POST', body: JSON.stringify({ text }) },
   );
   if (data.error) throw new Error(data.error);
   return data;

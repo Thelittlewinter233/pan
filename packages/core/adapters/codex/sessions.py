@@ -24,8 +24,6 @@ import uuid as _uuid
 from datetime import datetime
 from pathlib import Path
 
-from .tool_projection import canonical_tool_content
-
 
 # Match the Codex CLI's own home selection.  This matters for isolated
 # profiles, CI, and users who keep separate authenticated Codex environments.
@@ -253,33 +251,23 @@ def _item_to_block(item: dict) -> dict | None:
         # snake_case spelling.  Accept both so switching protocols does not
         # lose tool output after a refresh.
         out = _stringify_content(item.get("aggregated_output") or item.get("aggregatedOutput"))
-        args = {"command": cmd}
+        content = cmd
         if out:
-            args["output"] = out
-        block = {"role": "tool", "content": canonical_tool_content("Command", args)}
-        if item.get("id") is not None:
-            block["nativeItemId"] = str(item["id"])
-        return block
+            content += "\n→ " + out
+        return {"role": "tool", "content": content}
     if itype in ("functioncall", "mcptoolcall", "dynamictoolcall"):
         name = (item.get("name") or item.get("tool") or item.get("pluginId")
                 or item.get("server") or "tool")
         args = item.get("arguments") or item.get("parameters") or item.get("input") or {}
-        raw_out = item.get("output") or item.get("result") or item.get("error")
-        out = raw_out if isinstance(raw_out, (dict, list)) else _stringify_content(raw_out)
-        if out and isinstance(args, dict):
-            args = {**args, "result": out}
-        block = {
-            "role": "tool",
-            "content": canonical_tool_content(name, args),
-        }
-        if item.get("id") is not None:
-            block["nativeItemId"] = str(item["id"])
-        return block
+        inp = json.dumps(args, ensure_ascii=False) if isinstance(args, (dict, list)) else str(args or "")
+        out = _stringify_content(item.get("output") or item.get("result") or item.get("error"))
+        content = f"{name}({inp})"
+        if out:
+            content += "\n→ " + out
+        return {"role": "tool", "content": content}
     if itype in ("filechange", "patchapply"):
-        block = {"role": "tool", "content": canonical_tool_content("FileChange", item)}
-        if item.get("id") is not None:
-            block["nativeItemId"] = str(item["id"])
-        return block
+        inp = json.dumps(item, ensure_ascii=False)
+        return {"role": "tool", "content": f"FileChange({inp})"}
     native_tool_names = {
         "collabagenttoolcall": "Agent",
         "subagentactivity": "SubAgent",
@@ -296,10 +284,8 @@ def _item_to_block(item: dict) -> dict | None:
         name = native_tool_names[itype]
         if itype == "collabagenttoolcall" and item.get("tool"):
             name = f"{name}/{item['tool']}"
-        block = {"role": "tool", "content": canonical_tool_content(name, tool_input)}
-        if item.get("id") is not None:
-            block["nativeItemId"] = str(item["id"])
-        return block
+        inp = json.dumps(tool_input, ensure_ascii=False)
+        return {"role": "tool", "content": f"{name}({inp})"}
     return None
 
 

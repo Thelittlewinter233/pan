@@ -8,9 +8,8 @@ credit get back-filled. Stream mode (``_read_stdout``) does call it, so:
 - Claude's explicit one-shot fallback recorded no usage/cost at all.
 
 This suite verifies:
-- ``_consumer_oneshot`` schedules ``enrich_after_result`` after setting
-  last_result and accumulates raw_usage / total_usage exactly like
-  ``_read_stdout``;
+- ``_consumer_oneshot`` calls ``enrich_after_result`` after setting last_result
+  and accumulates raw_usage / total_usage exactly like ``_read_stdout``;
 - enrich returning None / raising must not break the oneshot flow;
 - claude's cost (authoritative only on stdout result events) bridges into
   raw_usage via ``_PENDING_RESULT_USAGE``, populated by ``extract_result_text``
@@ -36,9 +35,6 @@ from packages.core.adapters.claude.adapter import ClaudeAdapter
 def _cleanup():
     worker.workers.clear()
     worker._task_status.clear()
-    worker._usage_enrichment_tasks.clear()
-    worker._usage_enrichment_adapters.clear()
-    worker._usage_enrichment_locks.clear()
     _sess._cache.clear()
     worker.set_broadcaster(None)
 
@@ -137,9 +133,6 @@ def test_oneshot_calls_enrich_and_accumulates_usage(monkeypatch, tmp_path):
     _patch_spawn(monkeypatch, FakeMcpProc(_oneshot_output()))
 
     asyncio.run(worker._consumer_oneshot(w, "hello", "agent", s))
-    # T-041: usage is eventual; explicitly drain the Session-scoped worker for
-    # deterministic assertions instead of making terminal completion wait.
-    asyncio.run(worker._run_usage_enrichment(s.id))
 
     assert w.status == "idle", f"expected idle, got {w.status}"
     # last_result 语义不变（只补用量记账）
@@ -178,7 +171,6 @@ def test_oneshot_enrich_none_tolerated(monkeypatch, tmp_path):
     _patch_spawn(monkeypatch, FakeMcpProc(_oneshot_output()))
 
     asyncio.run(worker._consumer_oneshot(w, "hello", "agent", s))
-    asyncio.run(worker._run_usage_enrichment(s.id))
 
     assert w.status == "idle"
     assert s.last_result["result"] == "hi"
@@ -250,11 +242,7 @@ def test_oneshot_claude_bridges_result_usage_cache(monkeypatch, tmp_path):
     monkeypatch.setattr(_sess, "SESSION_DIR", tmp_path / "sessions")
     _patch_spawn(monkeypatch, FakeMcpProc(output))
 
-    async def scenario():
-        await worker._consumer_oneshot(w, "hello", "agent", s)
-        await worker._run_usage_enrichment(sid)
-
-    asyncio.run(scenario())
+    asyncio.run(worker._consumer_oneshot(w, "hello", "agent", s))
 
     assert w.status == "idle"
     assert s.cli_session_id == "clu-bridge-1"

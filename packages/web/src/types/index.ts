@@ -7,12 +7,6 @@ export type { AttachmentLocation } from './attachment';
 export interface Message {
   role: string;
   content: string;
-  /** Stable canonical history identity. Absent on legacy rows. */
-  messageId?: string;
-  /** Stable provider block identity for compound messages. */
-  blockId?: string;
-  /** Stable provider turn identity when the adapter exposes one. */
-  turnId?: string;
   /** Server-canonical parts; content remains the adapter/legacy fallback. */
   parts?: MessagePart[];
   /** 本地 ISO-8601 发送/回复时间（后端写入历史时刻打点）；旧数据缺失则不显示时间。 */
@@ -79,9 +73,6 @@ export interface Session {
   systemPrompt?: string | null;
   workerStatus?: string | null;
   workerId?: string | null;
-  workerGeneration?: number | null;
-  workerTaskId?: string | null;
-  workerTaskSeq?: number | null;
   /** Last Worker state confirmed through an explicit Pan lifecycle action. */
   lastLegalWorkerState?: string | null;
   /** Id of the managing (parent) session; absent/null means unmanaged. */
@@ -90,12 +81,6 @@ export interface Session {
   readonlySession?: boolean;
   /** Ids of sessions this session manages (claims as a meta-agent). */
   managed?: string[];
-  /**
-   * Durable workspace memberships. The backend permits multiple memberships;
-   * a missing or empty array means the session is ungrouped. Old sessions may
-   * omit the field entirely.
-   */
-  workspaceIds?: string[];
   /** Managed-session report subscriptions (ids this session gets reports from). */
   reportSubscriptions?: string[];
   /** QQ inbox subscriptions, each formatted "user:<uin>" or "group:<uin>". */
@@ -112,61 +97,16 @@ export interface Session {
   /** Names of MCP servers currently enabled for this session. */
   mcpServers?: string[];
   history: Message[];
-  /** Latest formal assign task context used by subsequent agent_send messages. */
-  activeTaskId?: string | null;
   historyTruncated?: boolean;
-  /** Null/undefined means the cold summary cannot know the total yet. */
-  historyTotal?: number | null;
-  /** Server history identity scope. Old sessions/clients may omit it. */
-  historyEpoch?: string | null;
-  /** Persisted Session-level canonical history revision across epoch changes. */
-  historyRevision?: number;
-  /** Absolute start offset of the currently loaded history window. */
-  historyStart?: number;
-  /** Raw bounded display preview (summary=1 endpoint, truncated ~200 chars). */
+  historyTotal?: number;
+  /** Last history message text (summary=1 endpoint, truncated ~200 chars). */
   lastMessage?: string;
-  /** Monotonic backend summary projection version. */
-  summaryRevision?: number;
-  lastUserPreview?: string;
-  lastAssistantPreview?: string;
-  lastDisplayPreview?: string;
   /** Explicit worker execution mode for this session: "stream" / "oneshot" / null(unset). */
   outputMode?: string | null;
   lastResult?: Record<string, unknown> | null;
   totalUsage?: Record<string, number> | null;
   createdAt?: string;
   updatedAt?: string;
-}
-
-/** Durable named container grouping Sessions (sidebar Workspace rail). */
-export interface Workspace {
-  id: string;
-  name: string;
-  /** Independent display order; null = never explicitly ordered (sorts last). */
-  order: number | null;
-  createdAt?: string;
-  updatedAt?: string;
-  /** Server-computed member count (present on workspace endpoints). */
-  sessionCount?: number;
-  /** Server-computed member session ids. */
-  sessionIds?: string[];
-}
-
-export interface ApiWorkspacesResponse {
-  workspaces: Workspace[];
-  error?: string;
-}
-
-export interface ApiWorkspaceResponse {
-  ok?: boolean;
-  workspace: Workspace;
-  error?: { code?: string; message?: string };
-}
-
-export interface ApiWorkspaceOrderResponse {
-  ok?: boolean;
-  order?: string[];
-  error?: { code?: string; message?: string };
 }
 
 export interface SessionUsageView {
@@ -179,8 +119,6 @@ export interface SessionUsageView {
   total: { tokens: number | null; credit: number | null };
   /** Account-scoped Codex quota projection; never part of raw/total usage. */
   codexQuota?: CodexQuotaProjection | null;
-  /** Stable projection provenance; raw payloads are intentionally excluded. */
-  source?: Record<string, unknown> | string | null;
   updatedAt?: string | null;
   error?: { code?: string | number; message?: string };
 }
@@ -331,43 +269,10 @@ export interface TerminalInteraction {
 
 export interface StreamEvent {
   type: string;
-  /** Legacy/source cursor; new clients prefer sourceCursorStart/End. */
-  eventEpoch?: string;
-  eventSeq?: number;
-  /** Per-connection contiguous transport cursor. */
-  deliveryEpoch?: string;
-  deliverySeq?: number;
-  /** Global source cursor range represented by this frame. */
-  sourceCursorStart?: number;
-  sourceCursorEnd?: number;
-  /** Server process epoch; aliases eventEpoch for old payloads. */
-  serverEpoch?: string;
-  historyEpoch?: string;
-  historyRevision?: number;
-  /** Durable result/history coverage boundary. */
-  terminalCoverage?: {
-    historyEpoch?: string;
-    historyRevision?: number;
-    messageIds?: string[];
-  };
-  snapshotId?: string;
-  boundary?: 'authoritative' | string;
-  reason?: string;
-  sessions?: Session[];
-  sessionsTruncated?: boolean;
-  workers?: Array<Record<string, unknown>>;
-  details?: Record<string, Record<string, unknown>>;
-  resultCursors?: Record<string, number>;
-  resultsAvailableFrom?: Record<string, number>;
   sessionId?: string;
   workerId?: string;
   /** Monotonic runtime generation, used to ignore late lifecycle events. */
   generation?: number;
-  /** Physical browser WebSocket generation for client handshake idempotency. */
-  connectionGeneration?: number;
-  /** Identity of a native-interaction replay handshake batch. */
-  replayGeneration?: number;
-  replayRequestId?: string;
   event?: WorkerEvent;
   message?: string;
   status?: string;
@@ -378,13 +283,7 @@ export interface StreamEvent {
     system?: Record<string, unknown> | null;
   };
   cancelled?: boolean;
-  taskSeq?: number;
-  /** Durable task identity carried by worker.stream for late-frame isolation. */
-  taskId?: string | null;
   name?: string;
-  newName?: string;
-  /** Safe session fields included by session lifecycle events when available. */
-  session?: Partial<Session>;
   cliSessionId?: string;
   /** 任务来源标记（worker.status 事件透传）：agent=meta-agent 编排注入、
    *  report=订阅报告、user=前端发送、system_prompt=系统提示词注入。 */
@@ -395,17 +294,8 @@ export interface StreamEvent {
   queueItemIds?: string[];
   /** Raw or normalized queue item carried by queue update notifications. */
   item?: Record<string, unknown>;
-  /** Stable canonical message/block identity when the event carries one. */
-  messageId?: string;
-  blockId?: string;
   /** True when the server replays a still-pending interactive prompt after WS reconnect. */
   replayed?: boolean;
-  /** Workspace events: the workspace whose membership/metadata changed. */
-  workspaceId?: string;
-  /** session.workspaceUpdated: the session's complete membership snapshot. */
-  workspaceIds?: string[];
-  /** workspace.membershipUpdated: the workspace's complete member id snapshot. */
-  sessionIds?: string[];
 }
 
 // ── API response types ──
@@ -526,8 +416,6 @@ export interface ApiSessionHistoryResponse {
   total: number;
   hasMore: boolean;
   start: number;
-  historyEpoch?: string;
-  historyRevision?: number;
   error?: string;
 }
 
@@ -665,7 +553,7 @@ export interface ApiWorkerSettingsUpdateResponse {
   after: Partial<ApiConfigReloadWorkerValues>;
 }
 
-// ── Remote tunnel (cloudflared via the internal Python launcher) ──
+// ── Remote tunnel (cloudflared via scripts/start_cf.ps1) ──
 
 export interface ApiRemoteStatusResponse {
   available: boolean;
@@ -867,26 +755,16 @@ export interface QueuedMessage {
   status: 'pending'; // 首版恒 pending，预留扩展
 }
 
-/** Edit overlay for one queued item; the server lease keeps Worker hand-off paused. */
+/** 编辑中的队列项（先从队列取出，避免被自动 flush 发出）。 */
 export interface QueuedEdit {
   id: string;
-  /** Draft shown over the same pending queue row while its server lease is held. */
+  /** 编辑框当前值（持久化，刷新恢复编辑态）。 */
   text: string;
   /** 编辑前的原文（Esc 取消 / 保存为空时恢复）。 */
   originalText: string;
   /** 原队列位置（Enter 保存后插回原位置）。 */
   index: number;
   createdAt: number;
-  /** Monotonic identity for one edit transaction; never sent to the server. */
-  editToken?: number;
-  /** Keep editing locked while its PATCH and authoritative refresh settle. */
-  saving?: boolean;
-  /** Opaque server lease identity that prevents Worker hand-off while editing. */
-  serverToken?: string;
-  acquiring?: boolean;
-  releasing?: boolean;
-  cancelRequested?: boolean;
-  leaseExpiresAt?: number;
 }
 
 // ── Agent queue (backend session.queue_pending, normalized) ──
