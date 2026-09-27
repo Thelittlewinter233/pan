@@ -3,16 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import ctypes
 import errno
+import functools
 import hashlib
 import inspect
 import json
+import logging
 import math
 import mimetypes
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -22,7 +27,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any, Callable
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException, Body
@@ -33,6 +38,14 @@ import httpx
 
 from packages.core import worker
 from packages.core import session as sess
+from packages.core import workspace as workspaces
+from packages.core.data_retention import (
+    DataRetentionService,
+    _history_activity as _retention_history_activity,
+    _timestamp as _retention_timestamp,
+    normalize_policies as normalize_data_retention_policies,
+    validate_policy_update as validate_data_retention_update,
+)
 from packages.core.adapters import get_adapter, list_adapters, get_sessions_provider
 from packages.core.adapters.validation import (
     AdapterCapabilityError,
@@ -41,6 +54,7 @@ from packages.core.adapters.validation import (
     validate_effort,
     validate_model,
     validate_permission_mode,
+    validate_output_mode,
     validate_session_settings,
     sanitize_adapter_config,
     supported_settings as _adapter_supported_settings,
@@ -61,6 +75,7 @@ from packages.core.cli_diagnostics import get_cli_diagnostics
 from packages.core.character import CharacterManager
 from packages.core.manifest_loader import SessionTemplate
 from packages.core import background_jobs
+from packages.core.data_catalog import get_data_catalog
 from packages.core.codex_quota import (
     format_codex_quota_record,
     validate_quota_window,
@@ -73,6 +88,7 @@ from packages.core.codex_quota_store import (
     resolve_profile_identity,
 )
 from packages.core import main_lifecycle
+from packages.core import launcher
 from packages.core import notifications, reminders
 from packages.scheduler import api as scheduler_api
 from packages.scheduler import engine as scheduler_engine
@@ -100,19 +116,95 @@ _LOG_SKIP = [
 
 # ── lifespan ──
 
+_SUMMARY_BACKFILL_SHUTDOWN_TIMEOUT_SEC = 5.0
+_DETACHED_SUMMARY_BACKFILL_TASKS: set[asyncio.Task] = set()
+
+
+def _consume_detached_summary_backfill(task: asyncio.Task) -> None:
+    """Keep a timed-out cooperative worker observable until it retires."""
+    try:
+        result = task.result()
+        _log(
+            "[Pan] Summary projection backfill retired after shutdown wait: "
+            f"{result.get('state') if isinstance(result, dict) else 'unknown'}"
+        )
+    except asyncio.CancelledError:
+        _log("[Pan] Summary projection backfill task was cancelled")
+    except Exception as exc:
+        _log(f"[Pan] Summary projection backfill task failed after shutdown: {exc}")
+    finally:
+        _DETACHED_SUMMARY_BACKFILL_TASKS.discard(task)
+
+
+async def _shutdown_summary_projection_backfill(
+    task: asyncio.Task,
+    cancel_event: threading.Event,
+    *,
+    timeout: float | None = None,
+) -> bool:
+    """Request cooperative cancellation and wait a bounded amount of time.
+
+    The task is shielded deliberately: cancelling an ``asyncio.to_thread``
+    wrapper cannot stop an in-flight filesystem replace and would leave an
+    unobserved thread mutating Session files after shutdown.  The scanner
+    checks ``cancel_event`` at Session boundaries; a timeout only detaches the
+    supervised task and its completion callback, leaving its state truthful.
+    """
+    cancel_event.set()
+    wait_seconds = (
+        _SUMMARY_BACKFILL_SHUTDOWN_TIMEOUT_SEC if timeout is None else timeout
+    )
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=wait_seconds)
+    except asyncio.TimeoutError:
+        _DETACHED_SUMMARY_BACKFILL_TASKS.add(task)
+        task.add_done_callback(_consume_detached_summary_backfill)
+        _log(
+            "[Pan] Summary projection backfill did not retire within shutdown "
+            f"deadline ({wait_seconds:.2f}s); cancellation remains supervised"
+        )
+        return False
+    except asyncio.CancelledError:
+        if task.cancelled():
+            _log("[Pan] Summary projection backfill task was cancelled")
+        else:
+            # Preserve cancellation of the lifespan caller; shield only
+            # protects the worker task from an accidental wrapper cancel.
+            raise
+    except Exception as exc:
+        _log(f"[Pan] Summary projection backfill stopped with error: {exc}")
+    return True
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup: load all saved sessions (don't auto-spawn Workers).
     Shutdown: kill all child processes."""
-    sessions = sess.list_all()
+    sessions = sess.list_all(load_history=False)
     if sessions:
         _log(f"[Pan] Loaded {len(sessions)} sessions from disk")
+    try:
+        await _initialize_startup_recovery(sessions)
+    except Exception as exc:
+        _log(f"[Pan] Startup legal-state recovery initialization failed: {exc}")
+
+    # Upgrade-shaped/incomplete summary projections are repaired in one
+    # bounded worker-thread scan.  The summary HTTP path remains projection
+    # only, while this task gives the frontend a deterministic convergence
+    # event once the durable metadata is authoritative.
+    summary_backfill_cancel = threading.Event()
+    summary_backfill_task = asyncio.create_task(
+        _run_summary_projection_backfill(summary_backfill_cancel),
+        name="pan-summary-projection-backfill",
+    )
 
     # 服务级 watchdog（立项 4.4）：生命周期=Pan 服务，周期扫描落盘队列
     # queue_pending 非空但没有活 worker 的 session，自动 spawn 恢复。
     worker.start_global_watchdog()
     background_jobs.start_recovery_loop()
+    global _DATA_RETENTION_LOOP
+    _DATA_RETENTION_LOOP = asyncio.get_running_loop()
+    _get_data_retention_service().start()
     reminder_task = asyncio.create_task(_reminder_loop())
     # 定时任务调度循环（同 background_jobs：拿不到 leader 锁的实例只服务读请求）
     try:
@@ -133,11 +225,19 @@ async def lifespan(app: FastAPI):
         _log(f"[Pan] Character manifest not loaded: {e}")
     
     yield
+    # Request cancellation at a Session boundary.  The bounded wait protects
+    # shutdown from a stuck/slow disk while the shield and done callback keep
+    # any late worker observable instead of leaving an untracked mutator.
+    await _shutdown_summary_projection_backfill(
+        summary_backfill_task, summary_backfill_cancel,
+    )
     reminder_task.cancel()
     try:
         await reminder_task
     except asyncio.CancelledError:
         pass
+    await asyncio.to_thread(_get_data_retention_service().stop)
+    _DATA_RETENTION_LOOP = None
     worker.stop_global_watchdog()
     await scheduler_engine.stop_loop()
     await background_jobs.stop_recovery_loop()
@@ -153,6 +253,22 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
     _log("[Pan] All workers shut down")
+
+
+async def _run_summary_projection_backfill(
+    cancel_event: threading.Event | None = None,
+) -> dict:
+    result = await sess.backfill_summary_projections(cancel_event=cancel_event)
+    # ``repaired`` is incremented only after the per-Session atomic replace
+    # succeeds.  A partial failed pass may still have durable repairs that
+    # the client must refresh; a cancelled shutdown pass must not broadcast.
+    if result.get("state") != "cancelled" and result.get("repaired", 0):
+        await broadcast({
+            "type": "session.summaryBackfillCompleted",
+            "repaired": result["repaired"],
+            "discovered": result["discovered"],
+        })
+    return result
 
 
 _character_manager: CharacterManager | None = None
@@ -187,6 +303,14 @@ agent_clients: set[WebSocket] = set()
 # agent 视角的默认订阅：只推结果摘要，不推原始 stream（防 context 爆炸）
 _AGENT_DEFAULT_SUBSCRIPTION = frozenset({"worker.result"})
 _AGENT_TERMINAL_RESULT_STATUSES = frozenset({"done", "error", "cancelled"})
+_RESYNC_HISTORY_LIMIT = 50
+_RESYNC_MAX_SESSIONS = 512
+
+# This is a live transport cursor, not durable business state.  A restart
+# changes the epoch and therefore makes an old cursor ineligible for delta
+# replay; the client must accept the authoritative snapshot boundary instead.
+_EVENT_EPOCH = uuid.uuid4().hex
+_EVENT_SEQ = 0
 
 
 @dataclass
@@ -201,6 +325,9 @@ class AgentSubscription:
     event_types: set[str] = field(default_factory=lambda: set(_AGENT_DEFAULT_SUBSCRIPTION))
     session_ids: set[str] = field(default_factory=set)
     consumed_seq: dict[str, int] = field(default_factory=dict)
+    # Durable result cursor acknowledged by the external agent.  ``consumed_seq``
+    # remains as the taskSeq compatibility view used by older clients.
+    consumed_cursor: dict[str, int] = field(default_factory=dict)
 
 
 # 每个 /ws/agent 连接的订阅状态；未订阅默认只推 worker.result
@@ -212,8 +339,91 @@ _PROJECT_DIR = _WEB_DIR.parent.parent  # packages/web/ → packages/ → project
 DATA_DIR = _PROJECT_DIR / "data"
 WORKDIRS_DIR = DATA_DIR / "workdirs"
 ATTACHMENTS_DIR = DATA_DIR / "attachments"
+_ATTACHMENT_REGISTRY_LOCK = threading.RLock()
+_DATA_RETENTION_SERVICE: DataRetentionService | None = None
+_DATA_RETENTION_LOOP: asyncio.AbstractEventLoop | None = None
 REACT_DIST_DIR = _WEB_DIR / "dist"
+
+# A new id is generated by each Pan process. The durable record is keyed by
+# this generation so a later start can never mistake an earlier prompt for its
+# own decision.
+_STARTUP_RECOVERY_GENERATION = uuid.uuid4().hex
+_STARTUP_RECOVERY_LOCK = threading.RLock()
+_STARTUP_RECOVERY_INFLIGHT: set[str] = set()
+_STARTUP_RECOVERY_CLAIM_SECONDS = 20
 REACT_DIST_EXISTS = REACT_DIST_DIR.is_dir()
+
+_SESSION_LIFECYCLE_DEFAULTS = {
+    "exitStrategy": "ask",
+    "startupPreference": "ask",
+}
+_SESSION_LIFECYCLE_EXIT_STRATEGIES = frozenset({
+    "ask", "offline", "preserve-running",
+})
+_SESSION_LIFECYCLE_STARTUP_PREFERENCES = frozenset({
+    "ask", "wake-running", "sync-actual", "preserve-running",
+})
+
+
+def _session_lifecycle_preferences(config: dict | None = None) -> dict[str, str]:
+    """Return valid persisted lifecycle preferences, defaulting old configs to ask."""
+    if config is None:
+        config = load_config()
+    raw = config.get("session_lifecycle", {}) if isinstance(config, dict) else {}
+    raw = raw if isinstance(raw, dict) else {}
+    return {
+        "exitStrategy": (
+            raw.get("exitStrategy")
+            if isinstance(raw.get("exitStrategy"), str)
+            and raw.get("exitStrategy") in _SESSION_LIFECYCLE_EXIT_STRATEGIES
+            else _SESSION_LIFECYCLE_DEFAULTS["exitStrategy"]
+        ),
+        "startupPreference": (
+            raw.get("startupPreference")
+            if isinstance(raw.get("startupPreference"), str)
+            and raw.get("startupPreference") in _SESSION_LIFECYCLE_STARTUP_PREFERENCES
+            else _SESSION_LIFECYCLE_DEFAULTS["startupPreference"]
+        ),
+    }
+
+
+def _get_data_retention_service() -> DataRetentionService:
+    global _DATA_RETENTION_SERVICE
+    if _DATA_RETENTION_SERVICE is None:
+        _DATA_RETENTION_SERVICE = DataRetentionService(
+            sessions_root=sess.SESSION_DIR,
+            attachments_root=ATTACHMENTS_DIR,
+            qq_history_root=DATA_DIR / "qq_history",
+            qq_media_root=DATA_DIR / "qq_media",
+            pan_logs_root=DATA_DIR / "logs",
+            active_log_path=_effective_pan_log_path,
+            status_path=DATA_DIR / "retention" / "status.json",
+            policy_loader=lambda: load_config().get("data_retention", {}),
+            session_delete=_retention_delete_session_from_thread,
+            attachment_registry_lock=_ATTACHMENT_REGISTRY_LOCK,
+        )
+    return _DATA_RETENTION_SERVICE
+
+
+def _effective_pan_log_path() -> Path:
+    for handler in logging.getLogger().handlers:
+        filename = getattr(handler, "baseFilename", None)
+        if filename:
+            return Path(filename)
+    return _PROJECT_DIR / "data" / "logs" / "pan.log"
+
+
+def _retention_delete_session_from_thread(session_id: str, expected: dict) -> dict:
+    loop = _DATA_RETENTION_LOOP
+    if loop is None or loop.is_closed():
+        return {"reason": "service_loop_unavailable"}
+    try:
+        future = asyncio.run_coroutine_threadsafe(
+            _retention_delete_session(session_id, expected), loop,
+        )
+        return future.result(timeout=60)
+    except Exception as exc:
+        return {"reason": f"session_delete_failed:{type(exc).__name__}"}
 
 # Main-service restart compatibility aliases.  Durable Registry records are
 # authoritative; these names remain for older in-process callers/tests only.
@@ -229,16 +439,14 @@ _main_exit_pending = False
 _main_exit_request_id: str | None = None
 _main_exit_stage = "idle"
 _main_exit_error: str | None = None
+_lifecycle_operation_lock = asyncio.Lock()
 
-# Phase-one main lifecycle options are intentionally empty.  Keep the
-# validation at the HTTP boundary so a future option cannot be accepted by
-# one operation and silently ignored by the other.
 _MAIN_LIFECYCLE_REQUEST_FIELDS = frozenset({"options"})
-_MAIN_LIFECYCLE_SUPPORTED_OPTIONS = frozenset()
+_MAIN_EXIT_SUPPORTED_OPTIONS = frozenset({"markRunningSessionsOffline"})
 
 
 def _parse_main_lifecycle_options(payload: dict | None, operation: str) -> dict:
-    """Validate and freeze the phase-one lifecycle request options once.
+    """Validate and freeze lifecycle request options once.
 
     The returned mapping is JSON-shaped and is persisted in the lifecycle Job
     before any worker gate or detached supervisor is touched.  ``None`` and
@@ -279,7 +487,8 @@ def _parse_main_lifecycle_options(payload: dict | None, operation: str) -> dict:
                 "message": "options must be an object",
             },
         )
-    unknown_options = sorted(set(options) - _MAIN_LIFECYCLE_SUPPORTED_OPTIONS)
+    supported_options = _MAIN_EXIT_SUPPORTED_OPTIONS if operation == "exit" else frozenset()
+    unknown_options = sorted(set(options) - supported_options)
     if unknown_options:
         raise HTTPException(
             status_code=400,
@@ -291,6 +500,18 @@ def _parse_main_lifecycle_options(payload: dict | None, operation: str) -> dict:
             },
         )
 
+    if operation == "exit" and "markRunningSessionsOffline" in options \
+            and not isinstance(options["markRunningSessionsOffline"], bool):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_lifecycle_options",
+                "operation": operation,
+                "fields": ["markRunningSessionsOffline"],
+                "message": "markRunningSessionsOffline must be a boolean",
+            },
+        )
+
     # JSON request data is already detached from the caller.  Rebuild the
     # mapping so later phases receive a canonical snapshot, not a live input
     # object; the Job write is the cross-process source of truth.
@@ -298,12 +519,7 @@ def _parse_main_lifecycle_options(payload: dict | None, operation: str) -> dict:
 
 
 def _main_restart_paths() -> dict[str, Path]:
-    scripts = _PROJECT_DIR / "scripts"
-    return {
-        "supervisor": scripts / "restart_pan.ps1",
-        "stop": scripts / "stop_pan.bat",
-        "start": scripts / "start_pan.bat",
-    }
+    return {"supervisor": _PROJECT_DIR / "packages" / "core" / "main_lifecycle.py"}
 
 
 def _main_restart_registry_root() -> Path:
@@ -342,7 +558,8 @@ def _main_restart_job_view(job: dict | None) -> dict:
 
 def _main_restart_status() -> dict:
     paths = _main_restart_paths()
-    available = os.name == "nt" and all(path.is_file() for path in paths.values())
+    launcher_module = Path(launcher.__file__).resolve()
+    available = os.name == "nt" and launcher_module.is_file()
     missing = [str(path) for path in paths.values() if not path.is_file()]
     registry_root = _main_restart_registry_root()
     port = _main_restart_port()
@@ -378,7 +595,7 @@ def _main_restart_status() -> dict:
         result["reason"] = (
             "main service restart is available only on Windows"
             if os.name != "nt"
-            else "restart scripts are missing: " + ", ".join(missing)
+            else "Pan lifecycle supervisor is missing: " + str(launcher_module)
         )
     return result
 
@@ -401,48 +618,24 @@ def _watch_main_restart(process: subprocess.Popen, request_id: str) -> None:
 
 
 def _launch_main_restart_supervisor(request_id: str) -> subprocess.Popen:
-    """Launch a hidden, detached PowerShell supervisor.
-
-    The supervisor is deliberately not awaited here.  It starts a second
-    PowerShell process before running stop_pan.bat, so taskkill /T against the
-    current Pan process cannot take the restart orchestration with it.
-    """
-    script = _main_restart_paths()["supervisor"]
+    """Launch the Python durable supervisor outside the current process tree."""
     registry_root = _main_restart_registry_root()
     job = background_jobs.find_service_job(request_id, registry_root)
     if not job:
         raise ValueError("durable restart Job not found")
-    powershell_args = [
-        "powershell.exe",
-        "-NoProfile",
-        "-NonInteractive",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        str(script),
-        "-Root",
-        str(_PROJECT_DIR),
-        "-RequestId",
-        request_id,
-        "-JobId",
-        job["jobId"],
-        "-RegistryRoot",
-        str(registry_root),
-        "-Port",
-        str(job["port"]),
-        # The shell launcher enters the real supervisor directly instead of
-        # relying on restart_pan.ps1's second Start-Process hop.
-        "-Supervisor",
+    python_argv, _source = launcher.resolve_python_argv(_PROJECT_DIR, probe=False)
+    supervisor_args = [
+        *python_argv, "-m", "packages.core.main_lifecycle", "--supervise",
+        "--job-id", job["jobId"], "--root", str(_PROJECT_DIR),
+        "--registry-root", str(registry_root), "--port", str(job["port"]),
     ]
     if job.get("oldPid"):
-        powershell_args += ["-OldPid", str(job["oldPid"])]
+        supervisor_args += ["--old-pid", str(job["oldPid"])]
     if job.get("oldPidCreatedAt") is not None:
-        powershell_args += ["-OldPidCreatedAt", str(job["oldPidCreatedAt"])]
-    # A new process group does not change the parent PID relationship.  The
-    # old Pan service's stop_pan.bat uses taskkill /T, so launch through the
-    # short-lived `start` shell and let it exit after CreateProcess succeeds;
-    # the PowerShell supervisor is then no longer below the old Pan tree.
-    command = ["cmd.exe", "/d", "/c", "start", "", "/b"] + powershell_args
+        supervisor_args += ["--old-pid-created-at", str(job["oldPidCreatedAt"])]
+    # The short-lived cmd start shell breaks the parent relationship before
+    # the Python supervisor asks the current service to shut itself down.
+    command = ["cmd.exe", "/d", "/c", "start", "", "/b"] + supervisor_args
     launcher_log = _PROJECT_DIR / "data" / "logs" / "pan-restart-launcher.log"
     launcher_log.parent.mkdir(parents=True, exist_ok=True)
     # Windows DETACHED_PROCESS can report a successful Popen while the
@@ -455,8 +648,6 @@ def _launch_main_restart_supervisor(request_id: str) -> subprocess.Popen:
     )
     # Keep the handle open only across Popen.  subprocess duplicates the
     # redirected standard handle for the detached child before this closes it.
-    # This captures PowerShell parameter/parser/startup failures that happen
-    # before restart_pan.ps1 can create its own pan-restart.log.
     with launcher_log.open("ab") as log:
         return subprocess.Popen(
             command,
@@ -470,13 +661,13 @@ def _launch_main_restart_supervisor(request_id: str) -> subprocess.Popen:
 
 
 def _main_exit_paths() -> dict[str, Path]:
-    scripts = _PROJECT_DIR / "scripts"
-    return {"supervisor": scripts / "exit_pan.ps1", "stop": scripts / "stop_pan.bat"}
+    return {"supervisor": _PROJECT_DIR / "packages" / "core" / "main_lifecycle.py"}
 
 
 def _main_exit_status() -> dict:
     paths = _main_exit_paths()
-    available = os.name == "nt" and all(path.is_file() for path in paths.values())
+    launcher_module = Path(launcher.__file__).resolve()
+    available = os.name == "nt" and launcher_module.is_file()
     missing = [str(path) for path in paths.values() if not path.is_file()]
     registry_root = _main_restart_registry_root()
     port = _main_restart_port()
@@ -524,33 +715,28 @@ def _main_exit_status() -> dict:
         result["reason"] = (
             "main service exit is available only on Windows"
             if os.name != "nt"
-            else "exit scripts are missing: " + ", ".join(missing)
+            else "Pan lifecycle supervisor is missing: " + str(launcher_module)
         )
     return result
 
 
 def _launch_main_exit_supervisor(request_id: str) -> subprocess.Popen:
-    """Launch the stop-only exit supervisor outside the old Pan process tree."""
-    script = _main_exit_paths()["supervisor"]
+    """Launch the stop-only Python supervisor outside the old Pan process tree."""
     registry_root = _main_restart_registry_root()
     job = background_jobs.find_service_job(request_id, registry_root)
     if not job or job.get("operation") != "exit":
         raise ValueError("durable exit Job not found")
-    powershell_args = [
-        "powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-        "-File", str(script), "-Root", str(_PROJECT_DIR),
-        "-RequestId", request_id, "-JobId", job["jobId"],
-        "-RegistryRoot", str(registry_root), "-Port", str(job["port"]),
-        "-Supervisor",
+    python_argv, _source = launcher.resolve_python_argv(_PROJECT_DIR, probe=False)
+    supervisor_args = [
+        *python_argv, "-m", "packages.core.main_lifecycle", "--supervise",
+        "--job-id", job["jobId"], "--root", str(_PROJECT_DIR),
+        "--registry-root", str(registry_root), "--port", str(job["port"]),
     ]
     if job.get("oldPid"):
-        powershell_args += ["-OldPid", str(job["oldPid"])]
+        supervisor_args += ["--old-pid", str(job["oldPid"])]
     if job.get("oldPidCreatedAt") is not None:
-        powershell_args += ["-OldPidCreatedAt", str(job["oldPidCreatedAt"])]
-    # CREATE_NEW_PROCESS_GROUP alone does not break the old Pan parent tree;
-    # stop_pan.bat uses taskkill /T.  The short-lived start shell creates the
-    # PowerShell child and exits before the stop-only supervisor runs.
-    command = ["cmd.exe", "/d", "/c", "start", "", "/b"] + powershell_args
+        supervisor_args += ["--old-pid-created-at", str(job["oldPidCreatedAt"])]
+    command = ["cmd.exe", "/d", "/c", "start", "", "/b"] + supervisor_args
     launcher_log = _PROJECT_DIR / "data" / "logs" / "pan-exit-launcher.log"
     launcher_log.parent.mkdir(parents=True, exist_ok=True)
     flags = (
@@ -568,13 +754,682 @@ def _launch_main_exit_supervisor(request_id: str) -> subprocess.Popen:
             creationflags=flags,
         )
 
-async def _send_ws(ws: WebSocket, data: dict):
-    """单个客户端发送（带 2s 超时）；超时/失败由 broadcast 统一剔除。
+_WS_OUTBOUND_QUEUE_MAX = 64
+_WS_SEND_TIMEOUT_SEC = 2.0
+_WS_RESYNC_CLOSE_CODE = 1013
 
-    慢客户端（TCP 缓冲满）2s 内不消费即断开，防止阻塞 broadcast → 卡死
-    所有 _read_stdout / worker（实测 Edge 后台标签页）。
+# A Worker stdout producer must never wait for a browser/agent socket.  The
+# queue is deliberately process-local: queue_pending/history remain the
+# durable truth for business/report delivery, while this is only a bounded
+# live-view transport buffer.
+_WS_DIAGNOSTICS = {
+    "enqueued": 0,
+    "coalescedDeltas": 0,
+    "droppedDeltas": 0,
+    "droppedControlEvents": 0,
+    "slowClients": 0,
+    "resyncRequired": 0,
+    "resyncFrames": 0,
+    "sendFailures": 0,
+    "maxQueueDepth": 0,
+}
+
+
+@dataclass
+class _OutboundMessage:
+    data: dict
+    control: bool
+    coalesce_key: tuple | None = None
+    on_delivered: Callable[[], None] | None = None
+
+
+# This map is intentionally bounded by live connections.  It is separate from
+# ws_clients/agent_clients because tests and legacy embedders may populate
+# those sets directly before the first broadcast.
+_ws_outbound: dict[WebSocket, "_OutboundClient"] = {}
+
+
+_NON_COALESCIBLE_STREAM_TYPES = frozenset({
+    # Native requests/responses are control traffic.  Losing one without an
+    # explicit resync/close would strand a provider waiting for a decision.
+    "approval.request",
+    "codex.user_input",
+    "codex.elicitation",
+    "codex.terminal_interaction",
+    "claude.permission_resolved",
+    "codex.request_resolved",
+})
+
+
+def _stream_delta_key(data: dict) -> tuple | None:
+    """Return the identity of a safe, coalescible intermediate stream delta.
+
+    The key includes the durable Session address, the temporary Worker
+    identity, its generation, the current task, and the native item/turn.  A
+    delta without an explicit native item falls back to its event kind; the
+    Worker serializes tasks, and the stream broadcast now carries taskSeq so
+    this remains isolated across tasks as well.
     """
-    await asyncio.wait_for(ws.send_json(data), timeout=2)
+    if not isinstance(data, dict) or data.get("type") != "worker.stream":
+        return None
+    event = data.get("event")
+    if not isinstance(event, dict) or event.get("delta") is not True:
+        return None
+    if event.get("type") in _NON_COALESCIBLE_STREAM_TYPES:
+        return None
+    session_id = data.get("sessionId")
+    worker_id = data.get("workerId")
+    if not session_id or not worker_id:
+        return None
+    task_key = data.get("taskId")
+    if task_key is None:
+        task_key = data.get("taskSeq", "implicit-task")
+    item_key = None
+    for candidate in (
+        event.get("item_id"),
+        event.get("itemId"),
+        event.get("turn_id"),
+        event.get("turnId"),
+    ):
+        if candidate is not None:
+            item_key = candidate
+            break
+    if item_key is None:
+        part = event.get("part")
+        part_type = part.get("type") if isinstance(part, dict) else None
+        item_key = (event.get("type"), event.get("role"), part_type)
+    return (
+        str(session_id),
+        str(worker_id),
+        data.get("generation"),
+        str(task_key),
+        str(item_key),
+    )
+
+
+def _append_delta_content(previous, current):
+    """Append compatible delta content without retaining the prior payload."""
+    if isinstance(previous, str) and isinstance(current, str):
+        return previous + current
+    if not isinstance(previous, list) or not isinstance(current, list):
+        return None
+    result = [dict(item) if isinstance(item, dict) else item for item in previous]
+    for item in current:
+        if not isinstance(item, dict):
+            result.append(item)
+            continue
+        if result and isinstance(result[-1], dict):
+            prior = result[-1]
+            if prior.get("type") == item.get("type"):
+                text_key = "text" if isinstance(item.get("text"), str) else None
+                if text_key is None and isinstance(item.get("thinking"), str):
+                    text_key = "thinking"
+                if text_key is None and isinstance(item.get("think"), str):
+                    text_key = "think"
+                if text_key is not None and isinstance(prior.get(text_key), str):
+                    result[-1] = {**prior, text_key: prior[text_key] + item[text_key]}
+                    continue
+        result.append(dict(item))
+    return result
+
+
+def _merge_stream_deltas(previous: dict, current: dict) -> dict | None:
+    """Merge two adjacent deltas while preserving the UI's final text.
+
+    Codex content.part carries a cumulative ``stream_text`` but a delta-sized
+    ``part.text``; in that case the merged event is marked ``replace`` and
+    carries the cumulative text so a client that receives only this event
+    still renders the complete prefix.  Claude/Kimi-style delta blocks are
+    appended instead.  Replace snapshots such as plan/diff simply keep the
+    newest snapshot.
+    """
+    previous_event = previous.get("event")
+    current_event = current.get("event")
+    if not isinstance(previous_event, dict) or not isinstance(current_event, dict):
+        return None
+    merged = dict(current)
+    event = dict(current_event)
+
+    cumulative = current_event.get("stream_text")
+    previous_cumulative = previous_event.get("stream_text")
+    if isinstance(cumulative, str):
+        # The bridge contract defines stream_text as the current cumulative
+        # text.  A non-prefix reset can only be safe when the provider marked
+        # the item as a replacement; otherwise keep the events separate.
+        if (isinstance(previous_cumulative, str)
+                and not (cumulative.startswith(previous_cumulative)
+                         or previous_cumulative.startswith(cumulative))
+                and not current_event.get("replace")):
+            return None
+        part = event.get("part")
+        if isinstance(part, dict):
+            part = dict(part)
+            part_type = part.get("type")
+            part_key = part_type if isinstance(part_type, str) else None
+            if part_key and isinstance(part.get(part_key), str):
+                part[part_key] = cumulative
+                event["part"] = part
+                event["replace"] = True
+        content = event.get("content")
+        if isinstance(content, str):
+            event["content"] = cumulative
+            event["replace"] = True
+        elif isinstance(content, list):
+            replaced = False
+            blocks = []
+            for block in content:
+                if not isinstance(block, dict):
+                    blocks.append(block)
+                    continue
+                block = dict(block)
+                for content_key in ("text", "thinking", "think"):
+                    if isinstance(block.get(content_key), str):
+                        block[content_key] = cumulative
+                        replaced = True
+                        break
+                blocks.append(block)
+            if replaced:
+                event["content"] = blocks
+                event["replace"] = True
+        message = event.get("message")
+        if isinstance(message, dict) and isinstance(message.get("content"), list):
+            blocks = []
+            replaced = False
+            for block in message["content"]:
+                if not isinstance(block, dict):
+                    blocks.append(block)
+                    continue
+                block = dict(block)
+                for content_key in ("text", "thinking", "think"):
+                    if isinstance(block.get(content_key), str):
+                        block[content_key] = cumulative
+                        replaced = True
+                        break
+                blocks.append(block)
+            if replaced:
+                event["message"] = {**message, "content": blocks}
+                event["replace"] = True
+        event["stream_text"] = cumulative
+    elif current_event.get("replace"):
+        # The latest event is already an authoritative item snapshot.
+        merged["event"] = event
+        return merged
+    else:
+        for key in ("content", "text", "thinking", "think", "diff"):
+            old_value = previous_event.get(key)
+            new_value = current_event.get(key)
+            if isinstance(old_value, str) and isinstance(new_value, str):
+                event[key] = old_value + new_value
+
+        for container_key in ("message",):
+            old_container = previous_event.get(container_key)
+            new_container = current_event.get(container_key)
+            if not isinstance(old_container, dict) or not isinstance(new_container, dict):
+                continue
+            old_content = old_container.get("content")
+            new_content = new_container.get("content")
+            appended = _append_delta_content(old_content, new_content)
+            if appended is not None:
+                event[container_key] = {**new_container, "content": appended}
+
+        old_content = previous_event.get("content")
+        new_content = current_event.get("content")
+        appended = _append_delta_content(old_content, new_content)
+        if appended is not None:
+            event["content"] = appended
+
+        old_part = previous_event.get("part")
+        new_part = current_event.get("part")
+        if isinstance(old_part, dict) and isinstance(new_part, dict):
+            part = dict(new_part)
+            part_type = part.get("type")
+            part_key = part_type if isinstance(part_type, str) else None
+            if part_key and isinstance(old_part.get(part_key), str) and isinstance(part.get(part_key), str):
+                part[part_key] = old_part[part_key] + part[part_key]
+                event["part"] = part
+
+    merged["event"] = event
+    return merged
+
+
+def _is_control_event(data: dict) -> bool:
+    """Classify an outbound event for overflow policy, without inspecting body."""
+    return _stream_delta_key(data) is None
+
+
+class _OutboundClient:
+    """One bounded FIFO and sender task for one WebSocket connection."""
+
+    def __init__(self, ws: WebSocket, kind: str):
+        self.ws = ws
+        self.kind = kind
+        self.loop = asyncio.get_running_loop()
+        self._queue: deque[_OutboundMessage] = deque()
+        self._wake = asyncio.Event()
+        self._sender_task: asyncio.Task | None = None
+        self._accepting = True
+        self._closing = False
+        self.closed = False
+        self.resync_required = False
+        self.resync_frame_enqueued = False
+        self.coalesced_deltas = 0
+        self.dropped_deltas = 0
+        self.dropped_control_events = 0
+        self.send_failures = 0
+        # deliverySeq is per connection. It is deliberately separate from
+        # eventSeq: adjacent source deltas may be coalesced into one frame.
+        self._delivery_seq = 0
+
+    @property
+    def queue_depth(self) -> int:
+        return len(self._queue)
+
+    def _ensure_sender(self) -> None:
+        if self.closed or self._sender_task is not None and not self._sender_task.done():
+            return
+        self._sender_task = asyncio.create_task(
+            self._sender_loop(),
+            name=f"pan-ws-sender:{self.kind}",
+        )
+
+    def enqueue(
+        self,
+        data: dict,
+        *,
+        on_delivered: Callable[[], None] | None = None,
+    ) -> bool:
+        """Enqueue without awaiting socket I/O; return False only on eviction."""
+        if self.closed or not self._accepting:
+            self._record_drop(data)
+            return False
+        coalesce_key = _stream_delta_key(data)
+        if coalesce_key is not None and self._queue:
+            tail = self._queue[-1]
+            if tail.coalesce_key == coalesce_key:
+                merged = _merge_stream_deltas(tail.data, data)
+                if merged is not None:
+                    source_start = tail.data.get(
+                        "sourceCursorStart", tail.data.get("eventSeq"),
+                    )
+                    source_end = data.get(
+                        "sourceCursorEnd", data.get("eventSeq"),
+                    )
+                    if isinstance(source_start, int) and isinstance(source_end, int):
+                        merged["sourceCursorStart"] = source_start
+                        merged["sourceCursorEnd"] = max(source_start, source_end)
+                    merged["deliveryEpoch"] = tail.data.get("deliveryEpoch", _EVENT_EPOCH)
+                    merged["deliverySeq"] = tail.data.get("deliverySeq", 0)
+                    tail.data = merged
+                    tail.on_delivered = on_delivered
+                    self.coalesced_deltas += 1
+                    _WS_DIAGNOSTICS["coalescedDeltas"] += 1
+                    self._ensure_sender()
+                    self._wake.set()
+                    return True
+
+        if len(self._queue) >= _WS_OUTBOUND_QUEUE_MAX:
+            if coalesce_key is not None:
+                self._record_drop(data)
+                pending_control = None
+            else:
+                # A control event arriving behind deltas gets priority.  The
+                # overflow handler removes queued deltas first and retains
+                # this event whenever a bounded slot is available.
+                pending_control = data
+            self._require_resync("outbound queue full", pending_control=pending_control)
+            return False
+
+        if isinstance(data.get("eventSeq"), int):
+            self._delivery_seq += 1
+            delivery_data = {
+                **data,
+                "deliveryEpoch": _EVENT_EPOCH,
+                "deliverySeq": self._delivery_seq,
+                "sourceCursorStart": data.get("eventSeq"),
+                "sourceCursorEnd": data.get("eventSeq"),
+            }
+        else:
+            # Legacy direct replay/control frames have no source cursor. Keep
+            # their wire shape compatible with old clients and fixtures.
+            delivery_data = data
+        self._queue.append(_OutboundMessage(
+            data=delivery_data,
+            control=_is_control_event(data),
+            coalesce_key=coalesce_key,
+            on_delivered=on_delivered,
+        ))
+        _WS_DIAGNOSTICS["enqueued"] += 1
+        _WS_DIAGNOSTICS["maxQueueDepth"] = max(
+            _WS_DIAGNOSTICS["maxQueueDepth"], len(self._queue),
+        )
+        self._ensure_sender()
+        self._wake.set()
+        return True
+
+    def _record_drop(self, data_or_item: dict | _OutboundMessage) -> None:
+        data = data_or_item.data if isinstance(data_or_item, _OutboundMessage) else data_or_item
+        if _stream_delta_key(data) is not None:
+            self.dropped_deltas += 1
+            _WS_DIAGNOSTICS["droppedDeltas"] += 1
+        else:
+            self.dropped_control_events += 1
+            _WS_DIAGNOSTICS["droppedControlEvents"] += 1
+
+    def _require_resync(
+        self, reason: str, *, pending_control: dict | None = None,
+    ) -> None:
+        if self.resync_required:
+            self._wake.set()
+            return
+        self.resync_required = True
+        self._accepting = False
+        self._closing = True
+        _WS_DIAGNOSTICS["slowClients"] += 1
+        _WS_DIAGNOSTICS["resyncRequired"] += 1
+        # Preserve queued control events.  Intermediate deltas are explicitly
+        # discarded because the close/resync marker tells the consumer that a
+        # fresh authoritative snapshot is required.
+        retained: deque[_OutboundMessage] = deque()
+        for item in self._queue:
+            if item.coalesce_key is not None:
+                self._record_drop(item)
+            else:
+                retained.append(item)
+        self._queue = retained
+        if pending_control is not None:
+            if len(self._queue) < _WS_OUTBOUND_QUEUE_MAX:
+                self._queue.append(_OutboundMessage(
+                    data=pending_control, control=True,
+                ))
+            else:
+                self._record_drop(pending_control)
+        marker = {
+            "type": "resync_required",
+            "scope": self.kind,
+            "reason": "slow_client_queue_full",
+            "eventEpoch": _EVENT_EPOCH,
+            "eventSeq": _EVENT_SEQ,
+            "queueDepth": len(self._queue),
+            "droppedDeltas": self.dropped_deltas,
+            "coalescedDeltas": self.coalesced_deltas,
+        }
+        if len(self._queue) < _WS_OUTBOUND_QUEUE_MAX:
+            self._queue.append(_OutboundMessage(data=marker, control=True))
+            self.resync_frame_enqueued = True
+            _WS_DIAGNOSTICS["resyncFrames"] += 1
+        _detach_client(self)
+        _log(
+            f"[ws] slow {self.kind} client evicted: depth={len(self._queue)} "
+            f"droppedDeltas={self.dropped_deltas} "
+            f"droppedControlEvents={self.dropped_control_events} reason={reason}"
+        )
+        self._ensure_sender()
+        self._wake.set()
+
+    async def _sender_loop(self) -> None:
+        while True:
+            while not self._queue:
+                if self._closing:
+                    await self._finish_close()
+                    return
+                self._wake.clear()
+                if self._queue:
+                    break
+                await self._wake.wait()
+            item = self._queue.popleft()
+            try:
+                await asyncio.wait_for(
+                    self.ws.send_json(item.data), timeout=_WS_SEND_TIMEOUT_SEC,
+                )
+            except asyncio.CancelledError:
+                raise
+            except asyncio.TimeoutError:
+                self.send_failures += 1
+                self.resync_required = True
+                self._accepting = False
+                self._closing = True
+                _WS_DIAGNOSTICS["sendFailures"] += 1
+                _WS_DIAGNOSTICS["slowClients"] += 1
+                _WS_DIAGNOSTICS["resyncRequired"] += 1
+                self._record_drop(item)
+                for queued in self._queue:
+                    self._record_drop(queued)
+                self._queue.clear()
+                _detach_client(self)
+                _log(
+                    f"[ws] slow {self.kind} client send timeout: "
+                    f"droppedDeltas={self.dropped_deltas}"
+                )
+                await self._finish_close(
+                    code=_WS_RESYNC_CLOSE_CODE, reason="resync_required",
+                )
+                return
+            except Exception:
+                self.send_failures += 1
+                _WS_DIAGNOSTICS["sendFailures"] += 1
+                self._accepting = False
+                self._closing = True
+                self._record_drop(item)
+                for queued in self._queue:
+                    self._record_drop(queued)
+                self._queue.clear()
+                _detach_client(self)
+                await self._finish_close(code=1011, reason="websocket send failed")
+                return
+            if item.on_delivered is not None:
+                try:
+                    item.on_delivered()
+                except Exception:
+                    _log("[ws] delivery callback failed")
+
+    async def _finish_close(
+        self, *, code: int = _WS_RESYNC_CLOSE_CODE,
+        reason: str = "resync_required",
+    ) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        _detach_client(self)
+        if _ws_outbound.get(self.ws) is self:
+            _ws_outbound.pop(self.ws, None)
+        close = getattr(self.ws, "close", None)
+        if close is not None:
+            try:
+                await close(code=code, reason=reason)
+            except Exception:
+                pass
+
+    async def close_now(self) -> None:
+        """Stop a connection from its receive loop without draining it."""
+        self._accepting = False
+        self._closing = True
+        self._queue.clear()
+        _detach_client(self)
+        task = self._sender_task
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        await self._finish_close(code=1000, reason="connection closed")
+
+
+def _detach_client(client: _OutboundClient) -> None:
+    ws = client.ws
+    ws_clients.discard(ws)
+    agent_clients.discard(ws)
+    agent_subscriptions.pop(ws, None)
+
+
+def _client_channel(ws: WebSocket, kind: str) -> _OutboundClient:
+    loop = asyncio.get_running_loop()
+    client = _ws_outbound.get(ws)
+    if client is None or client.loop is not loop or client.closed:
+        if client is not None and client._sender_task is not None:
+            client._sender_task.cancel()
+        client = _OutboundClient(ws, kind)
+        _ws_outbound[ws] = client
+    return client
+
+
+async def _send_ws(
+    ws: WebSocket, data: dict, *,
+    on_delivered: Callable[[], None] | None = None,
+    kind: str | None = None,
+) -> bool:
+    """Queue one outbound frame; never await socket I/O in the caller."""
+    if kind is None:
+        kind = "agent" if ws in agent_clients else "dashboard"
+    accepted = _client_channel(ws, kind).enqueue(
+        data, on_delivered=on_delivered,
+    )
+    # Give the sender one scheduling turn.  This keeps fast in-process test
+    # doubles deterministic while a real slow ``send_json`` remains entirely
+    # inside its own sender task.
+    await asyncio.sleep(0)
+    return accepted
+
+
+async def _close_slow_dashboard(ws: WebSocket) -> None:
+    """Compatibility helper: evict a dashboard with an explicit resync mark."""
+    client = _client_channel(ws, "dashboard")
+    client._require_resync("send timeout")
+    await asyncio.sleep(0)
+
+
+_SUMMARY_WORKER_EVENT_TYPES = frozenset({
+    "worker.spawned", "worker.restarted", "worker.reconfigured",
+    "worker.status", "worker.result", "worker.destroyed", "worker.crashed",
+})
+_SUMMARY_SESSION_EVENT_TYPES = frozenset({
+    "session.created", "session.updated", "session.renamed",
+    "session.workspaceUpdated",
+})
+
+
+def _summary_session_get(session_id: str):
+    """Read Session metadata shallowly, tolerating legacy test embedders."""
+    try:
+        return sess.get(session_id, load_history=False)
+    except TypeError:
+        # Compatibility with callers that replace sess.get with the old
+        # one-argument function; production Session.get supports the keyword.
+        return sess.get(session_id)
+
+
+def _attach_session_summary_patch(data: dict) -> dict:
+    """Attach one revisioned Session summary to low-frequency WS patches."""
+    if not isinstance(data, dict):
+        return data
+    session_id = data.get("sessionId")
+    event_type = data.get("type")
+    if not isinstance(session_id, str) or not session_id:
+        return data
+    if event_type in _SUMMARY_WORKER_EVENT_TYPES:
+        status = data.get("status")
+        worker_id = data.get("workerId")
+        generation = data.get("generation")
+        task_id = data.get("taskId")
+        task_seq = data.get("taskSeq")
+        if event_type in {"worker.destroyed", "worker.crashed"}:
+            status, worker_id, task_id, task_seq = None, None, None, None
+        current = _summary_session_get(session_id)
+        if isinstance(current, sess.Session):
+            sess.update_worker_summary(
+                current,
+                status=status,
+                worker_id=worker_id,
+                generation=generation,
+                task_id=task_id,
+                task_seq=task_seq,
+            )
+    if event_type not in (_SUMMARY_WORKER_EVENT_TYPES | _SUMMARY_SESSION_EVENT_TYPES):
+        return data
+    current = _summary_session_get(session_id)
+    if not isinstance(current, sess.Session):
+        return data
+    # A server-side event is emitted from the current Session object, so its
+    # nested patch is newer than any caller-provided legacy summary payload.
+    return {**data, "session": _session_summary(current)}
+
+
+def _stamp_live_event(data: dict) -> dict:
+    """Attach a process-epoch cursor to one logical broadcast event.
+
+    The cursor is intentionally assigned before fan-out, so every client sees
+    the same boundary for the same event.  It is only a gap detector; durable
+    Session/queue/history projections remain the recovery authority.
+    """
+    global _EVENT_SEQ
+    _EVENT_SEQ += 1
+    return {
+        **data,
+        "eventEpoch": _EVENT_EPOCH,
+        "eventSeq": _EVENT_SEQ,
+        "serverEpoch": _EVENT_EPOCH,
+        "sourceCursorStart": _EVENT_SEQ,
+        "sourceCursorEnd": _EVENT_SEQ,
+    }
+
+
+def _project_worker_event(data: dict) -> dict:
+    """Project local Markdown links before exposing a Worker event to UI.
+
+    Persisted Session history is projected by ``_api_history`` when it is
+    fetched.  Live stream/result events and result replay have a separate
+    outbound path, however, so leaving them raw makes a link clickable but not
+    draggable until the next history refresh.  Keep the stored provider text
+    unchanged and project only the copies sent to browser/agent clients.
+    """
+    if not isinstance(data, dict):
+        return data
+    session_id = data.get("sessionId")
+    if not isinstance(session_id, str) or not session_id:
+        return data
+
+    event_type = data.get("type")
+    if event_type == "worker.result" and isinstance(data.get("result"), str):
+        projected = _project_editor_links(session_id, data["result"])
+        return {**data, "result": projected} if projected != data["result"] else data
+
+    if event_type != "worker.stream" or not isinstance(data.get("event"), dict):
+        return data
+
+    event = dict(data["event"])
+    changed = False
+    for key in ("content", "stream_text"):
+        value = event.get(key)
+        if isinstance(value, str):
+            projected = _project_editor_links(session_id, value)
+            if projected != value:
+                event[key] = projected
+                changed = True
+    message = event.get("message")
+    if isinstance(message, dict):
+        projected_message = dict(message)
+        message_content = message.get("content")
+        if isinstance(message_content, str):
+            projected = _project_editor_links(session_id, message_content)
+            if projected != message_content:
+                projected_message["content"] = projected
+                changed = True
+        elif isinstance(message_content, list):
+            projected_blocks = list(message_content)
+            blocks_changed = False
+            for index, block in enumerate(projected_blocks):
+                if not isinstance(block, dict) or not isinstance(block.get("text"), str):
+                    continue
+                projected = _project_editor_links(session_id, block["text"])
+                if projected != block["text"]:
+                    projected_blocks[index] = {**block, "text": projected}
+                    blocks_changed = True
+            if blocks_changed:
+                projected_message["content"] = projected_blocks
+                changed = True
+        if changed:
+            event["message"] = projected_message
+    return {**data, "event": event} if changed else data
 
 
 def _stamp_ws_event_ts(data: dict):
@@ -582,7 +1437,8 @@ def _stamp_ws_event_ts(data: dict):
 
     只在最终消息上打一次点：queue.item_delivered 的 user 消息（此时历史已
     落盘），以及 worker.stream 的完整 assistant 事件（非 delta chunk）。
-    流式增量（delta）不带 ts，历史条目自身的 ts 由 session 落盘入口打点。
+    流式增量（delta）不带 ts；历史条目自身的 ts 由 history 追加边界打点
+    （packages/core/session.py ``append_history``），导入/替换进来的行不打。
     """
     etype = data.get("type")
     now: str | None = None
@@ -608,24 +1464,21 @@ def _stamp_ws_event_ts(data: dict):
 
 
 async def broadcast(data: dict):
-    """向 dashboard（ws_clients）+ agent（agent_clients）广播。
+    """Enqueue one event for each eligible client and return immediately.
 
-    A4 并行化：asyncio.gather 并发发送，慢客户端只拖自己的 2s 超时，不再串行
-    拖累全部客户端（此前一个 TCP 缓冲满的客户端让整个 broadcast 卡 2s×N）。
-    死连接在 gather 后统一剔除。
+    Socket writes happen in one sender task per connection.  A producer may
+    yield once to let a fast in-process socket make progress, but it never
+    awaits that socket's send or a slow client's timeout.
     """
+    # Keep the persisted provider/history representation untouched.  This is
+    # the common outbound boundary for live browser events and is intentionally
+    # before both dashboard and agent-client fan-out.
+    data = _attach_session_summary_patch(data)
+    data = _project_worker_event(data)
+    data = _stamp_live_event(data)
     _stamp_ws_event_ts(data)
-    dead = set()
-    clients = list(ws_clients)
-    if clients:
-        results = await asyncio.gather(
-            *[_send_ws(ws, data) for ws in clients],
-            return_exceptions=True,
-        )
-        for ws, exc in zip(clients, results):
-            if exc is not None:
-                dead.add(ws)
-    ws_clients.difference_update(dead)
+    for ws in list(ws_clients):
+        _client_channel(ws, "dashboard").enqueue(data)
 
     etype = data.get("type", "")
     data_session_id = data.get("sessionId")
@@ -639,24 +1492,58 @@ async def broadcast(data: dict):
         if etype == "worker.result" and sub.session_ids and data_session_id not in sub.session_ids:
             continue
         targets.append(ws)
-    dead_a = set()
-    if targets:
-        results = await asyncio.gather(
-            *[_send_ws(ws, data) for ws in targets],
-            return_exceptions=True,
+    for ws in targets:
+        callback = None
+        # 记录已消费的 result 序号（实际 sender 成功后才推进）。
+        if etype == "worker.result" and data_session_id:
+            seq = data.get("taskSeq")
+            result_cursor = data.get("resultCursor")
+            if isinstance(seq, int) or isinstance(result_cursor, int):
+                callback = lambda ws=ws, sid=data_session_id, seq=seq, rc=result_cursor: _mark_agent_result_delivered(
+                    ws,
+                    sid,
+                    seq if isinstance(seq, int) else 0,
+                    result_cursor if isinstance(result_cursor, int) else None,
+                )
+        _client_channel(ws, "agent").enqueue(data, on_delivered=callback)
+
+    # Do not wait for any send_json.  This turn only makes fast test doubles
+    # deterministic and starts sender tasks; a real socket is still isolated.
+    await asyncio.sleep(0)
+
+
+def _mark_agent_result_delivered(
+    ws: WebSocket, session_id: str, seq: int, result_cursor: int | None = None,
+) -> None:
+    sub = agent_subscriptions.get(ws)
+    if sub is not None:
+        sub.consumed_seq[session_id] = max(
+            sub.consumed_seq.get(session_id, 0), seq,
         )
-        for ws, exc in zip(targets, results):
-            if exc is not None:
-                dead_a.add(ws)
-                continue
-            # 记录已消费的 result 序号（重连补发用）——发送成功后才推进
-            if etype == "worker.result" and data_session_id:
-                seq = data.get("taskSeq")
-                if isinstance(seq, int):
-                    sub = agent_subscriptions.get(ws)
-                    if sub is not None:
-                        sub.consumed_seq[data_session_id] = max(sub.consumed_seq.get(data_session_id, 0), seq)
-    agent_clients.difference_update(dead_a)
+        if isinstance(result_cursor, int):
+            sub.consumed_cursor[session_id] = max(
+                sub.consumed_cursor.get(session_id, 0), result_cursor,
+            )
+
+
+def websocket_diagnostics() -> dict:
+    """Return bounded live transport counters without retaining message bodies."""
+    return {
+        "totals": dict(_WS_DIAGNOSTICS),
+        "clients": [
+            {
+                "kind": client.kind,
+                "queueDepth": client.queue_depth,
+                "coalescedDeltas": client.coalesced_deltas,
+                "droppedDeltas": client.dropped_deltas,
+                "droppedControlEvents": client.dropped_control_events,
+                "resyncRequired": client.resync_required,
+                "sendFailures": client.send_failures,
+            }
+            for client in tuple(_ws_outbound.values())
+            if not client.closed
+        ],
+    }
 
 
 worker.set_broadcaster(broadcast)
@@ -664,39 +1551,240 @@ worker.load_worker_config()
 worker.load_memory_config()
 
 
-async def _replay_agent_results(ws: WebSocket, session_ids: list[str]) -> None:
-    """补发 agent 尚未消费的终态结果（成功、失败、取消均不能静默丢失）。"""
+def _terminal_result_rows(s) -> list[dict]:
+    """Return a bounded, ordered terminal-result view for replay.
+
+    Old Sessions have only ``last_result``.  They remain replayable as one
+    compatibility row, while new Sessions use the durable result cursor.
+    """
+    rows = [
+        dict(item) for item in (getattr(s, "terminal_results", None) or [])
+        if isinstance(item, dict)
+        and item.get("status") in _AGENT_TERMINAL_RESULT_STATUSES
+    ]
+    rows.sort(key=lambda item: (_result_cursor(item), str(item.get("terminalKey") or "")))
+    if rows:
+        return rows[-sess.RESULT_REPLAY_MAX_ENTRIES:]
+    last = getattr(s, "last_result", None)
+    if isinstance(last, dict) and last.get("status") in _AGENT_TERMINAL_RESULT_STATUSES:
+        return [dict(last)]
+    return []
+
+
+def _result_cursor(row: dict) -> int:
+    value = row.get("resultCursor")
+    if isinstance(value, bool):
+        return 0
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        # Legacy rows only had taskSeq.  This is a compatibility cursor, not
+        # a durable claim that older rows formed a complete result log.
+        try:
+            return max(0, int(row.get("taskSeq", 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+
+def _resync_snapshot(
+    session_ids: list[str] | None = None, *, include_all_sessions: bool = False,
+    include_identity: bool = False,
+) -> dict:
+    """Build a bounded authoritative boundary without copying whole Sessions.
+
+    All visible rows are shallow summary projections.  History and the
+    durable queue are included only for explicitly selected Sessions and use
+    the existing bounded page/queue serializers.  This is deliberately a
+    snapshot fallback, not an in-memory replay cache.
+    """
+    requested = {
+        str(value) for value in (session_ids or [])
+        if isinstance(value, str) and value
+    }
+    all_sessions = sess.list_all(load_history=False)
+    if include_all_sessions or not requested:
+        visible = all_sessions[:_RESYNC_MAX_SESSIONS]
+    else:
+        visible = [s for s in all_sessions if s.id in requested]
+
+    details: dict[str, dict] = {}
+    result_cursors: dict[str, int] = {}
+    results_available_from: dict[str, int] = {}
+    for sid in sorted(requested):
+        current = _summary_session_get(sid)
+        if not isinstance(current, sess.Session):
+            continue
+        page = sess.history_page(sid, limit=_RESYNC_HISTORY_LIMIT) or {
+            "history": [], "total": 0, "hasMore": False, "start": 0,
+        }
+        detail = _session_to_api(
+            current,
+            include_history=False,
+            include_raw_usage=False,
+        )
+        detail["history"] = _api_history(
+            sid,
+            page.get("history") or [],
+            start=page.get("start", 0),
+            history_epoch=page.get("historyEpoch"),
+            include_identity=include_identity,
+        )
+        detail["historyTotal"] = page.get("total", len(detail["history"]))
+        detail["historyTruncated"] = bool(page.get("hasMore"))
+        detail["historyStart"] = page.get("start", 0)
+        detail["historyEpoch"] = page.get("historyEpoch")
+        detail["historyRevision"] = page.get("historyRevision", 0)
+        detail["queue"] = {
+            "items": _session_queue_items(current),
+            "queueRevision": getattr(current, "queue_revision", 0),
+        }
+        rows = _terminal_result_rows(current)
+        result_cursor = max(
+            [int(getattr(current, "result_cursor", 0) or 0)]
+            + [_result_cursor(row) for row in rows]
+        )
+        result_cursors[sid] = result_cursor
+        if rows:
+            available = _result_cursor(rows[0])
+            if available:
+                results_available_from[sid] = available
+        detail["resultCursor"] = result_cursor
+        details[sid] = detail
+
+    workers = []
+    for runtime in worker.list_workers():
+        if worker.find_alive_worker_by_session(runtime.session_id) is not runtime:
+            continue
+        if requested and runtime.session_id not in requested:
+            continue
+        workers.append({
+            "workerId": runtime.worker_id,
+            "sessionId": runtime.session_id,
+            "generation": getattr(runtime, "generation", 0),
+            "status": runtime.status,
+            "taskId": getattr(runtime, "_current_task_id", None),
+            "taskSeq": getattr(runtime, "_current_seq", None),
+        })
+
+    return {
+        "type": "resync.snapshot",
+        "snapshotId": f"{_EVENT_EPOCH}:{_EVENT_SEQ}",
+        "eventEpoch": _EVENT_EPOCH,
+        "eventSeq": _EVENT_SEQ,
+        "serverEpoch": _EVENT_EPOCH,
+        "sourceCursorStart": _EVENT_SEQ,
+        "sourceCursorEnd": _EVENT_SEQ,
+        "boundaryRevision": max(
+            [
+                int(getattr(item, "history_revision", 0) or 0)
+                for item in details.values()
+                if isinstance(item, dict)
+            ] or [0]
+        ),
+        "boundary": "authoritative",
+        "sessions": [_session_summary(s) for s in visible],
+        "sessionsTruncated": len(all_sessions) > len(visible) and not requested,
+        "workers": workers,
+        "details": details,
+        "resultCursors": result_cursors,
+        "resultsAvailableFrom": results_available_from,
+    }
+
+
+async def _send_resync_snapshot(
+    ws: WebSocket, session_ids: list[str] | None = None, *,
+    include_all_sessions: bool = False, include_identity: bool = False,
+) -> bool:
+    return await _send_ws(
+        ws,
+        _resync_snapshot(
+            session_ids,
+            include_all_sessions=include_all_sessions,
+            include_identity=include_identity,
+        ),
+        kind="agent" if ws in agent_clients else "dashboard",
+    )
+
+
+async def _replay_agent_results(
+    ws: WebSocket, session_ids: list[str],
+    result_cursors: dict[str, int] | None = None,
+) -> None:
+    """Replay a bounded cursor window; fall back to a snapshot on expiry."""
     sub = agent_subscriptions.get(ws)
     if sub is None:
         sub = AgentSubscription()
         agent_subscriptions[ws] = sub
+    explicit_cursors = isinstance(result_cursors, dict)
     for sid in session_ids:
-        s = sess.get(sid)
-        if not s or not s.last_result:
+        s = _summary_session_get(sid)
+        if not s:
             continue
-        status = s.last_result.get("status")
-        if status not in _AGENT_TERMINAL_RESULT_STATUSES:
+        rows = _terminal_result_rows(s)
+        if not rows:
             continue
-        # 补发条件：consumed_seq < latest_seq（中途断线、部分消费也补发）
-        latest_seq = s.last_result.get("taskSeq")
-        if latest_seq is None:
-            # 旧数据未存 taskSeq：仅当完全未消费时补发（保持原有行为）
-            if sub.consumed_seq.get(sid, 0) > 0:
+        if explicit_cursors:
+            raw_cursor = result_cursors.get(sid, 0)
+            try:
+                cursor = max(0, int(raw_cursor or 0))
+            except (TypeError, ValueError):
+                cursor = 0
+        else:
+            cursor = max(
+                sub.consumed_cursor.get(sid, 0),
+                sub.consumed_seq.get(sid, 0),
+            )
+
+        cursored_rows = [row for row in rows if _result_cursor(row) > 0]
+        oldest = _result_cursor(cursored_rows[0]) if cursored_rows else 0
+        if explicit_cursors and oldest and cursor < oldest - 1:
+            await _send_ws(ws, {
+                "type": "resync_required",
+                "scope": "agent",
+                "reason": "result_cursor_expired",
+                "sessionId": sid,
+                "eventEpoch": _EVENT_EPOCH,
+                "eventSeq": _EVENT_SEQ,
+                "resultCursor": max(_result_cursor(row) for row in rows),
+            }, kind="agent")
+            await _send_resync_snapshot(ws, [sid])
+            return
+
+        # Legacy reconnect callers receive the latest compatibility result;
+        # clients that send an explicit cursor receive every retained row.
+        pending_rows = (
+            [row for row in rows if _result_cursor(row) > cursor]
+            if explicit_cursors else rows[-1:]
+        )
+        for row in pending_rows:
+            result_cursor = _result_cursor(row)
+            task_seq = row.get("taskSeq")
+            if not explicit_cursors and result_cursor <= cursor:
                 continue
-            latest_seq = 0
-        elif sub.consumed_seq.get(sid, 0) >= latest_seq:
-            continue
-        await ws.send_json({
-            "type": "worker.result",
-            "workerId": "",
-            "sessionId": sid,
-            "status": status,
-            "result": s.last_result.get("result"),
-            "taskSeq": latest_seq,
-            "replayed": True,
-        })
-        # 补发成功后再推进游标，避免下次 reconnect 重复补发
-        sub.consumed_seq[sid] = max(sub.consumed_seq.get(sid, 0), latest_seq)
+            payload = {
+                "type": "worker.result",
+                "workerId": row.get("workerId", ""),
+                "sessionId": sid,
+                "status": row.get("status"),
+                "result": _project_editor_links(
+                    sid, str(row.get("result") or "")),
+                "taskSeq": task_seq,
+                "resultCursor": result_cursor or None,
+                "terminalKey": row.get("terminalKey"),
+                "replayed": True,
+            }
+            accepted = await _send_ws(
+                ws,
+                payload,
+                on_delivered=lambda ws=ws, sid=sid, seq=(
+                    int(task_seq) if isinstance(task_seq, int) else 0
+                ), rc=result_cursor: _mark_agent_result_delivered(
+                    ws, sid, seq, rc or None,
+                ),
+                kind="agent",
+            )
+            if not accepted:
+                return
 
 
 @app.middleware("http")
@@ -726,19 +1814,40 @@ async def no_cache_api(request: Request, call_next):
 
 # ── helpers ──
 
-def _session_to_api(s: sess.Session):
+def _session_to_api(
+    s: sess.Session,
+    *,
+    include_history: bool = True,
+    include_raw_usage: bool = True,
+    include_last_result: bool = True,
+    app_config: dict | None = None,
+):
     """Convert Session to API response dict."""
     w = worker.find_alive_worker_by_session(s.id)
-    history_payload = _api_history(s.id, s.history, include_ids=False)
-    if w and w.status in {"running", "queued"}:
+    a = get_adapter(s.adapter)
+    config = (load_config() if app_config is None else app_config).get(s.adapter, {})
+    ac = s.adapter_config
+    last_result = s.last_result if include_last_result else None
+    if include_last_result and isinstance(last_result, dict) and isinstance(last_result.get("result"), str):
+        last_result = {
+            **last_result,
+            "result": _project_editor_links(s.id, last_result["result"]),
+        }
+    mcp_lock_reason = _get_mcp_locked_state(s)
+    projection = sess.summary_projection(s)
+    history_payload = (
+        _api_history(
+            s.id, s.history, start=0, history_epoch=getattr(s, "history_epoch", None),
+        )
+        if include_history else None
+    )
+    if history_payload is not None and w and w.status in {"running", "queued"}:
+        # Mark the newest assistant entry as streaming so the frontend can
+        # distinguish an in-flight reply from a settled one (delete guard).
         for item in reversed(history_payload):
             if isinstance(item, dict) and item.get("role") == "assistant":
                 item["streaming"] = True
                 break
-    a = get_adapter(s.adapter)
-    config = load_config().get(s.adapter, {})
-    ac = s.adapter_config
-    mcp_lock_reason = _get_mcp_locked_state(s)
     return {
         "id": s.id,
         "name": s.name,
@@ -766,18 +1875,21 @@ def _session_to_api(s: sess.Session):
         "modelContextWindow": ac.get("model_context_window"),
         "modelAutoCompactTokenLimit": ac.get("model_auto_compact_token_limit"),
         "workdir": s.workdir,
-        "history": history_payload,
-        "lastResult": s.last_result,
+        **({"history": history_payload} if include_history else {}),
+        **({"lastResult": last_result} if include_last_result else {}),
+        "activeTaskId": s.active_task_id,
         "lastLegalWorkerState": s.last_legal_worker_state,
-        "rawUsage": s.raw_usage,
+        **({"rawUsage": s.raw_usage} if include_raw_usage else {}),
         "totalUsage": s.total_usage,
+        "usageEnrichmentPending": s.usage_enrichment_pending,
         "createdAt": s.created_at,
         "updatedAt": s.updated_at,
         "order": s.order,
+        "workspaceIds": sess.effective_workspace_ids(s),
         "managed": s.managed,
         "managedBy": s.managed_by,
         "readonlySession": s.readonly_session,
-        "agentLevel": sess.agent_level(s.id),
+        "agentLevel": sess.agent_level(s.id, load_history=False),
         "reportSubscriptions": sorted(s.report_subscriptions),
         "qqSubscriptions": sorted(s.qq_subscriptions),
         "wechatSubscriptions": sorted(s.wechat_subscriptions),
@@ -798,7 +1910,137 @@ def _session_to_api(s: sess.Session):
         "outputMode": ac.get("output_mode"),
         "executionModes": list(a.execution_modes),
         "gameId": s.game_id,
+        # Bounded, raw summary projection.  The full view keeps its existing
+        # history/attachment behavior; these fields let metadata/detail
+        # consumers share the same revisioned summary contract.
+        "summaryRevision": projection["revision"],
+        "lastUserPreview": projection["last_user_preview"],
+        "lastAssistantPreview": projection["last_assistant_preview"],
+        "lastDisplayPreview": projection["last_display_preview"],
+        "historyTotal": projection["history_total"],
+        "historyEpoch": getattr(s, "history_epoch", None),
+        "historyRevision": getattr(s, "history_revision", 0),
     }
+
+
+# ── BE-3: Session-store reads scheduled off the event loop ──
+#
+# ``/api/sessions`` and ``/api/sessions/{id}/history`` are the dashboard's cold
+# load.  A cold tail-page read may need to inspect its companion
+# ``.history.jsonl``; unchanged default-tail pages reuse a bounded,
+# file-signature-checked snapshot. Non-tail and unknown-total reads retain the
+# compatibility scan. Keep this store work and the bounded nested-row copies
+# off the FastAPI event loop so history traffic cannot starve dashboard
+# WebSocket messages and worker streaming.
+#
+# The helpers below are the blocking halves of those endpoints.  They are
+# deliberately restricted to what is already thread-safe in the Session store:
+#
+#   * ``list_all`` is serialized by the existing ``_STORE_LOCK`` (it is
+#     ``@_store_serialized``), so concurrent loads cannot build two objects for
+#     one Session id;
+#   * ``history_page`` only reads the store (it never writes ``_cache``) and its
+#     in-memory branch now copies the rows it returns, so it never publishes or
+#     rewrites live Session history from a worker thread;
+#   * ``_summary_session_get`` uses ``load_history=False``, which never
+#     hydrates the cache or adopts a shallow entry.
+#
+# Response shaping (``_api_history``, ``_session_to_api``, ``_session_summary``)
+# stays on the event loop: it mutates the bounded summary projection and the
+# session attachment registry (``_editor_reference_id`` can register a new
+# reference), and those read-modify-write paths remain single-threaded.
+_PAGE_UNSET = object()
+_NOT_FOUND = object()
+
+# One dedicated thread serves every offloaded store read.  The reads are
+# store reads include Python JSON parsing and nested page copies, so a pool
+# cannot make one read faster. An unbounded pool (the default executor's
+# min(32, cpu+4)) also lets a cold-read storm create many competing Python
+# threads. A single worker preserves the previous store serialization while
+# the bounded tail-page cache avoids repeating full-file work for unchanged
+# default-tail requests.
+_STORE_READ_EXECUTOR = ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="pan-store-read")
+
+
+async def _store_read(func, /, *args, **kwargs):
+    """Run one blocking Session-store read on the dedicated store-read thread."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _STORE_READ_EXECUTOR, functools.partial(func, *args, **kwargs))
+
+
+def _history_pages_for(session_ids: list[str], limit: int) -> dict:
+    """Read one bounded history page per Session in a single blocking call."""
+    return {sid: sess.history_page(sid, limit=limit) for sid in session_ids}
+
+
+def _history_page_lookup(session_id: str, before: int, limit: int):
+    """Shallow membership check plus one bounded page, in one blocking call.
+
+    ``_NOT_FOUND`` covers both "no such Session" and "unreadable main file",
+    which the HTTP layer reports as the historical
+    ``{"error": "Session not found"}`` payload.
+    """
+    if not _summary_session_get(session_id):
+        return _NOT_FOUND
+    page = sess.history_page(session_id, before=before, limit=limit)
+    return _NOT_FOUND if page is None else page
+
+
+def _session_list_api(
+    s: sess.Session,
+    *,
+    history_limit: int = 50,
+    page=_PAGE_UNSET,
+    app_config: dict | None = None,
+) -> dict:
+    """Serialize the list view without hydrating a Session's full history.
+
+    ``page`` is the BE-3 seam: an async caller may pass a history page that was
+    already read on a worker thread, so the cold dashboard load never parses
+    the companion JSONL on the event loop.  Omitting it keeps the historical
+    inline read for the remaining synchronous callers.
+    """
+    api = _session_to_api(s, include_history=False, app_config=app_config)
+    if page is _PAGE_UNSET:
+        page = sess.history_page(s.id, limit=history_limit)
+    if page is None:
+        history = []
+        total = 0
+        has_more = False
+    else:
+        history = page.get("history") or []
+        total = page.get("total", len(history))
+        has_more = bool(page.get("hasMore"))
+    api["history"] = _api_history(
+        s.id,
+        history,
+        start=page.get("start", 0) if page else 0,
+        history_epoch=page.get("historyEpoch") if page else getattr(s, "history_epoch", None),
+    )
+    api["historyTruncated"] = has_more
+    api["historyTotal"] = total
+    if page:
+        api["historyStart"] = page.get("start", 0)
+        api["historyEpoch"] = page.get("historyEpoch")
+        api["historyRevision"] = page.get("historyRevision", 0)
+    return api
+
+
+def _session_import_api(s: sess.Session) -> dict:
+    """Compatibility view for native import endpoints.
+
+    Import responses historically exposed provider-shaped history rows. The
+    normal history/page APIs carry the newer stable message identity fields;
+    keeping this one response shape avoids breaking older import clients.
+    """
+    response = _session_to_api(s)
+    response["history"] = [
+        {key: value for key, value in row.items() if key != "messageId"}
+        for row in response.get("history", [])
+    ]
+    return response
 
 
 def _session_summary(s: sess.Session) -> dict:
@@ -810,41 +2052,59 @@ def _session_summary(s: sess.Session) -> dict:
     cliSessionId lets MCP session_import locate the session that a reimport
     would overwrite (§8.2).
 
-    Since 2026-08-23: also exposes lastMessage / historyTotal / totalUsage so
-    the React sidebar can be driven entirely by summary=1 (no per-session
-    history download for hidden sessions). lastMessage is the last history
-    item's text truncated to 200 chars (no full message bodies).
+    The preview fields are a bounded in-memory/persisted projection.  This
+    function must not load config.json, parse attachment links, touch the
+    attachment registry, stat a local path, register an editor reference, or
+    traverse the full history. ``lastMessage`` remains the old API alias for
+    the raw ``lastDisplayPreview`` value.
 
     Since 2026-09-01: also exposes managed / mcpServers / mcpLockReason so the
     sidebar can run the "has subagent" and "is MetaAgent" special filters
     without per-session detail calls (mirrors _session_to_api).
     """
     w = worker.find_alive_worker_by_session(s.id)
-    a = get_adapter(s.adapter)
-    config = load_config().get(s.adapter, {})
+    projection = sess.summary_projection(s)
+    worker_state = getattr(s, "_summary_worker_state", None) or {}
+    worker_status = w.status if w else worker_state.get("status")
+    worker_id = w.worker_id if w else worker_state.get("worker_id")
+    worker_generation = (
+        getattr(w, "generation", None) if w else worker_state.get("generation")
+    )
+    worker_task_id = (
+        worker_state.get("task_id") if worker_state else
+        (getattr(w, "_current_task_id", None) if w else None)
+    )
+    worker_task_seq = (
+        worker_state.get("task_seq") if worker_state else
+        (getattr(w, "_current_seq", None) if w else None)
+    )
+    updated_at = projection["updated_at"] or s.updated_at
     ac = s.adapter_config
-    last_text = ""
-    if s.history:
-        last = s.history[-1]
-        if isinstance(last, dict):
-            last_text = _normalize_legacy_attachment_links(
-                s.id,
-                str(last.get("content") or ""),
-            )[:200]
     return {
         "id": s.id,
         "name": s.name,
         "adapter": s.adapter,
         "cliSessionId": s.cli_session_id,
-        "workerStatus": w.status if w else None,
+        "workerStatus": worker_status,
+        "workerId": worker_id,
+        "workerGeneration": worker_generation,
+        "workerTaskId": worker_task_id,
+        "workerTaskSeq": worker_task_seq,
         "lastLegalWorkerState": s.last_legal_worker_state,
-        "updatedAt": s.updated_at,
+        "updatedAt": updated_at,
+        "summaryRevision": projection["revision"],
         "order": s.order,
+        "workspaceIds": sess.effective_workspace_ids(s),
         "managedBy": s.managed_by,
         "readonlySession": s.readonly_session,
-        "agentLevel": sess.agent_level(s.id),
-        "lastMessage": last_text,
-        "historyTotal": len(s.history),
+        "agentLevel": sess.agent_level(s.id, load_history=False),
+        "lastUserPreview": projection["last_user_preview"],
+        "lastAssistantPreview": projection["last_assistant_preview"],
+        "lastDisplayPreview": projection["last_display_preview"],
+        "lastMessage": projection["last_display_preview"],
+        "historyTotal": projection["history_total"],
+        "historyEpoch": getattr(s, "history_epoch", None),
+        "historyRevision": getattr(s, "history_revision", 0),
         "totalUsage": s.total_usage,
         "managed": s.managed,
         "mcpServers": [
@@ -854,10 +2114,13 @@ def _session_summary(s: sess.Session) -> dict:
         ],
         "mcpLockReason": _get_mcp_locked_state(s),
         # 设置字段（供前端列表/InputRow 显示真实值，避免未打开设置弹窗时回退默认）
-        "model": s.model or a.default_model,
-        "permissionMode": s.permission_mode or config.get("permission_mode") or None,
+        # Do not resolve defaults here.  A list summary is a projection of
+        # persisted Session state; configuration/default resolution belongs to
+        # the detail/settings path.
+        "model": s.model,
+        "permissionMode": s.permission_mode,
         "alwaysThinkingEnabled": ac.get("always_thinking_enabled", False),
-        "effort": ac.get("effort") or config.get("effort", ""),
+        "effort": ac.get("effort", ""),
         "modelContextWindow": ac.get("model_context_window"),
         "modelAutoCompactTokenLimit": ac.get("model_auto_compact_token_limit"),
         "workdir": s.workdir,
@@ -894,7 +2157,7 @@ def _check_session_name(name: str) -> str | None:
         return f"Session name too long (max {_MAX_NAME_LEN})"
     if not _NAME_RE.match(name):
         return "Session name cannot contain spaces"
-    for s in sess.list_all():
+    for s in sess.list_all(load_history=False):
         if s.name == name:
             return f"Session name '{name}' already exists"
     return None
@@ -1021,24 +2284,26 @@ def _create_directory(path: str) -> Path:
 def _resolve_fs_path(session_id: str, rel_path: str) -> Path:
     """Resolve a session-relative or absolute path on the Pan server.
 
-    The web editor intentionally permits opening files anywhere on the server
-    for now. A future security policy can add containment checks here without
-    changing the client-side link or editor flow.
+    Absolute paths are honored as-is so the editor can browse any server
+    directory a root points at (CWD, Workspace, or Temp roots may all live
+    outside the Session workdir). Relative paths stay confined to the Session
+    workdir, preserving the existing Markdown-link safety boundary. A Session
+    with no workdir can still address absolute paths.
     """
-    s = sess.get(session_id)
+    target = Path(rel_path)
+    if target.is_absolute():
+        return target.resolve()
+    s = _summary_session_get(session_id)
     if not s or not s.workdir:
         raise ValueError("session has no workdir")
-    target = Path(rel_path)
-    if not target.is_absolute():
-        target = Path(s.workdir) / target
-    return target.resolve()
+    return (Path(s.workdir) / target).resolve()
 
 
 def _resolve_attachment_source_path(session_id: str, raw_path: str) -> Path:
     """Resolve an attachment source and reject relative workdir escape."""
     target = _resolve_fs_path(session_id, raw_path)
     if not Path(raw_path).is_absolute():
-        session = sess.get(session_id)
+        session = _summary_session_get(session_id)
         if not session or not session.workdir:
             raise ValueError("session has no workdir")
         try:
@@ -1336,6 +2601,17 @@ def _build_session_params(
         "handoff_prompt": data.get("handoffPrompt"),
         "game_id": data.get("gameId") or None,
     }
+    requested_workspace_ids = data.get("workspaceIds", data.get("workspace_ids"))
+    if requested_workspace_ids is not None:
+        if (not isinstance(requested_workspace_ids, list)
+                or not all(isinstance(wid, str) and wid for wid in requested_workspace_ids)
+                or len(set(requested_workspace_ids)) != len(requested_workspace_ids)
+                or not all(isinstance(wid, str) and workspaces.get(wid)
+                           for wid in requested_workspace_ids)):
+            raise ValueError("workspaceIds must contain existing unique workspace ids")
+        if len(requested_workspace_ids) > 1:
+            raise ValueError("A Session can belong to at most one Workspace")
+        params["workspace_ids"] = list(requested_workspace_ids)
     # These are deliberately added only when explicitly supplied.  In
     # particular, do not synthesize a model/default value into Session JSON.
     for api_key, native_key in _CODEX_CONTEXT_SETTING_KEYS:
@@ -1697,6 +2973,33 @@ async def health():
     return {"status": "ok", "version": __version__}
 
 
+@app.post("/api/internal/main/shutdown")
+async def api_internal_main_shutdown():
+    """Ask the owning Uvicorn server to perform its normal lifespan shutdown.
+
+    This loopback-only coordination point is used by ``launcher.exit`` and
+    ``launcher.restart`` after the durable supervisor has verified the target
+    PID.  It does not terminate a process and therefore cannot replace the
+    identity checks in the launcher.
+    """
+    server = getattr(app.state, "pan_uvicorn_server", None)
+    if server is None:
+        return {"ok": False, "error": "Pan Uvicorn server is not registered"}
+    server.should_exit = True
+    return {"ok": True, "status": "stopping"}
+
+
+@app.get("/api/diagnostics/persistence")
+async def api_persistence_diagnostics(session_id: str | None = None,
+                                      limit: int = 32):
+    """Return bounded per-Session save contention counters.
+
+    The response contains queue depth and timings only; it deliberately never
+    exposes history/queue message bodies or durable Session state.
+    """
+    return sess.save_diagnostics(session_id, limit=limit)
+
+
 @app.get("/api/main/restart/status")
 async def api_main_restart_status():
     """Report whether the safe Windows main-service restart is available."""
@@ -1709,12 +3012,27 @@ async def api_main_restart(payload: Annotated[dict | None, Body()] = None):
 
     Returning before the supervisor stops this process is essential: waiting
     for stop/start inside this request would turn the expected disconnect into
-    an HTTP failure in the browser.  ``restart_pan.ps1`` owns the subsequent
-    stop/start chain and uses this checkout's scripts only.
+    an HTTP failure in the browser. The detached Python lifecycle supervisor
+    owns the subsequent launcher stop/start chain.
     """
+    options = _parse_main_lifecycle_options(payload, "restart")
+    async with _lifecycle_operation_lock:
+        return await _schedule_main_restart(options)
+
+
+async def _schedule_main_restart(options: dict) -> dict:
+    """Serialize main-service restart against startup recovery and Exit."""
     global _main_restart_pending, _main_restart_request_id
 
-    options = _parse_main_lifecycle_options(payload, "restart")
+    with _main_exit_lock:
+        if _main_exit_pending:
+            return {
+                "ok": False,
+                "status": "busy",
+                "pending": True,
+                "error": "Pan main-service exit is already scheduled",
+                "requestId": _main_exit_request_id,
+            }
 
     status = _main_restart_status()
     if not status["available"]:
@@ -1806,7 +3124,18 @@ async def _perform_main_exit(request_id: str) -> None:
         _log(f"[main-exit] failed to record worker-stop phase: {exc}")
         return
     try:
-        await worker.shutdown_all(mark_legal_offline=True)
+        options = job.get("options") or {}
+        running_session_ids = list(options.get("runningSessionIds") or [])
+        mark_running_offline = options.get("markRunningSessionsOffline", True)
+        await worker.shutdown_all(
+            mark_legal_offline=True,
+            mark_legal_offline_session_ids=(
+                running_session_ids if mark_running_offline else ()
+            ),
+            preserve_legal_running_session_ids=(
+                () if mark_running_offline else running_session_ids
+            ),
+        )
     except Exception as exc:  # still hand off to the stop-only supervisor
         _log(f"[main-exit] worker shutdown failed: {exc}")
         with _main_exit_lock:
@@ -1854,9 +3183,14 @@ async def api_main_exit(payload: Annotated[dict | None, Body()] = None):
     health-recovery wait follows: this operation intentionally makes the
     service unavailable.
     """
-    global _main_exit_pending, _main_exit_request_id, _main_exit_stage, _main_exit_error
-
     options = _parse_main_lifecycle_options(payload, "exit")
+    async with _lifecycle_operation_lock:
+        return await _schedule_main_exit(options)
+
+
+async def _schedule_main_exit(options: dict) -> dict:
+    """Persist the pre-exit legal-running snapshot before closing Worker gates."""
+    global _main_exit_pending, _main_exit_request_id, _main_exit_stage, _main_exit_error
 
     status = _main_exit_status()
     if not status["available"]:
@@ -1884,6 +3218,30 @@ async def api_main_exit(payload: Annotated[dict | None, Body()] = None):
                 "error": "Pan main-service exit is already scheduled",
                 "requestId": _main_exit_request_id,
             }
+    # Snapshot the Session ledger immediately before recording the Exit Job.
+    # The lifecycle lock ensures a startup recovery decision cannot race this
+    # snapshot; begin_shutdown below closes later Worker mutations.
+    sessions = await _store_read(sess.list_all, load_history=False)
+    running_session_ids = sorted(
+        session.id for session in sessions
+        if session.last_legal_worker_state == "running"
+    )
+    exit_strategy = _session_lifecycle_preferences()["exitStrategy"]
+    if exit_strategy == "offline":
+        mark_running_offline = True
+    elif exit_strategy == "preserve-running":
+        mark_running_offline = False
+    else:
+        # Keep the legacy API's omitted-field behavior, while the current UI
+        # requires an explicit selection whenever the saved policy is ask.
+        mark_running_offline = options.get("markRunningSessionsOffline", True)
+    options = {
+        **options,
+        "exitStrategy": exit_strategy,
+        "markRunningSessionsOffline": mark_running_offline,
+        "runningSessionIds": running_session_ids,
+    }
+
     registry_root = _main_restart_registry_root()
     port = status.get("port", _main_restart_port())
     old_pid = main_lifecycle.listener_owner(port)
@@ -2086,13 +3444,14 @@ def _attachment_owner_dir(attachment_id: str) -> Path | None:
 
 
 def _register_attachment(session_id: str, attachment_id: str, record: dict) -> None:
-    registry = _read_attachment_registry(session_id)
-    registry[attachment_id] = {
-        **record,
-        "completed": record.get("completed", True),
-        "sessionId": session_id,
-    }
-    _write_attachment_registry(session_id, registry)
+    with _ATTACHMENT_REGISTRY_LOCK:
+        registry = _read_attachment_registry(session_id)
+        registry[attachment_id] = {
+            **record,
+            "completed": record.get("completed", True),
+            "sessionId": session_id,
+        }
+        _write_attachment_registry(session_id, registry)
 
 
 def _attachment_href(session_id: str, storage_filename: str) -> str:
@@ -2349,7 +3708,7 @@ def _validate_message_attachment_references(session_id: str, text: str) -> dict 
     """Return the first invalid internal attachment reference in message text."""
     # Preserve the queue endpoint's established session-not-found response;
     # worker.enqueue_user_message remains authoritative for that case.
-    if sess.get(session_id) is None:
+    if _summary_session_get(session_id) is None:
         return None
     for match in _MESSAGE_ATTACHMENT_HREF_RE.finditer(text):
         error = _attachment_reference_error(session_id, match.group("href"))
@@ -2569,32 +3928,66 @@ def _normalize_text_attachment_parts(
     return normalized, "".join(fallback), None
 
 
-def _api_history(session_id: str, history: list[dict], *, include_ids: bool = False) -> list[dict]:
+def _api_history(
+    session_id: str,
+    history: list[dict],
+    *,
+    start: int = 0,
+    history_epoch: str | None = None,
+    include_identity: bool = True,
+) -> list[dict]:
     """Serialize history with a compatibility view for old attachment text."""
     normalized: list[dict] = []
-    for message in history:
-        if isinstance(message, dict):
-            public_message = {key: value for key, value in message.items()
-                              if key not in {"_pan_message_id", "messageId"}}
-            if include_ids and message.get("role") in {"user", "assistant"} and isinstance(message.get("_pan_message_id"), str):
-                public_message["messageId"] = message["_pan_message_id"]
-        else:
-            public_message = message
+    for offset, message in enumerate(history):
+        absolute_index = max(0, int(start or 0)) + offset
+        delivery_keys = (
+            message.get("delivered_keys")
+            if isinstance(message, dict) and isinstance(message.get("delivered_keys"), list)
+            else None
+        )
+        public_message = (
+            {key: value for key, value in message.items()
+             if key not in {"delivered_keys", "_pan_message_id"}}
+            if isinstance(message, dict) else message
+        )
+        if isinstance(public_message, dict) and delivery_keys:
+            public_message["deliveryKeys"] = [
+                key for key in delivery_keys if isinstance(key, str) and key
+            ]
+        wire_identity = None
+        if include_identity:
+            # Durable in-history identity (msg_*) wins; provider/legacy
+            # messageId next; index-derived legacy id as last resort.
+            if isinstance(message, dict):
+                wire_identity = message.get("_pan_message_id")
+                if not isinstance(wire_identity, str) or not wire_identity:
+                    wire_identity = message.get("messageId")
+            if not isinstance(wire_identity, str) or not wire_identity:
+                epoch = history_epoch or "legacy"
+                wire_identity = f"legacy:{session_id}:{epoch}:{absolute_index}"
         if not isinstance(message, dict) or not isinstance(message.get("content"), str):
             if isinstance(message, dict) and isinstance(message.get("parts"), list):
                 normalized.append({
                     **public_message,
+                    **({"messageId": wire_identity} if wire_identity else {}),
                     "parts": [
                         {key: value for key, value in part.items() if key != "__serverPath"}
                         for part in message["parts"] if isinstance(part, dict)
                     ],
                 })
             else:
-                normalized.append(public_message)
+                normalized.append(
+                    {**public_message, **({"messageId": wire_identity} if wire_identity else {})}
+                    if isinstance(message, dict) else message
+                )
             continue
         content = _normalize_legacy_attachment_links(session_id, message["content"])
         content = _project_editor_links(session_id, content)
-        safe_message = {**public_message, "content": content}
+        safe_message = {
+            **public_message,
+            "content": content,
+            **({"messageId": wire_identity} if wire_identity else {}),
+        }
         if isinstance(message.get("parts"), list):
             safe_message["parts"] = [
                 {key: value for key, value in part.items() if key != "__serverPath"}
@@ -2612,7 +4005,7 @@ async def upload_session_attachment(session_id: str, request: Request, filename:
     names containing non-ASCII characters survive URL handling; the query
     parameter remains a simple fallback for clients that cannot set headers.
     """
-    if sess.get(session_id) is None:
+    if _summary_session_get(session_id) is None:
         raise HTTPException(status_code=404, detail="Session not found")
     raw_name = request.headers.get("x-filename") or filename
     display_name = _attachment_filename(raw_name)
@@ -2741,6 +4134,11 @@ async def resolve_editor_attachment(attachment_id: str, session_id: str):
         "ok": True,
         "attachmentId": attachment_id,
         "displayName": _attachment_filename(record.get("displayName") or Path(str(record.get("path", ""))).name),
+        "mimeType": (
+            record.get("mimeType")
+            or mimetypes.guess_type(Path(str(record.get("path", ""))).name)[0]
+            or "application/octet-stream"
+        ),
         "path": str(Path(str(record.get("path", ""))).resolve()),
         "line": record.get("line"),
         "endLine": record.get("endLine"),
@@ -2871,6 +4269,7 @@ async def dashboard():
 
 async def _replay_pending_interactions(
     ws: WebSocket, session_ids: list[str] | None = None,
+    *, replay_generation: int | None = None, replay_request_id: str | None = None,
 ) -> None:
     """Restore live native prompts to a dashboard that just reconnected.
 
@@ -2879,6 +4278,11 @@ async def _replay_pending_interactions(
     dead/restarted worker cannot safely receive the old response.
     """
     selected = {str(sid) for sid in session_ids or []}
+    replay_identity = {}
+    if replay_generation is not None:
+        replay_identity["replayGeneration"] = replay_generation
+    if replay_request_id is not None:
+        replay_identity["replayRequestId"] = replay_request_id
     for w in worker.list_workers():
         if selected and w.session_id not in selected:
             continue
@@ -2886,61 +4290,67 @@ async def _replay_pending_interactions(
             continue
         status_event = worker.native_status_event(w)
         if status_event is not None:
-            await ws.send_json({
+            await _send_ws(ws, {
                 "type": "worker.stream",
                 "workerId": w.worker_id,
                 "sessionId": w.session_id,
                 "generation": getattr(w, "generation", 0),
                 "event": status_event,
                 "replayed": True,
+                **replay_identity,
             })
         usage_event = worker.native_usage_event(w)
         if usage_event is not None:
-            await ws.send_json({
+            await _send_ws(ws, {
                 "type": "worker.stream",
                 "workerId": w.worker_id,
                 "sessionId": w.session_id,
                 "generation": getattr(w, "generation", 0),
                 "event": usage_event,
                 "replayed": True,
+                **replay_identity,
             })
         rate_limits_event = worker.native_rate_limits_event(w)
         if rate_limits_event is not None:
-            await ws.send_json({
+            await _send_ws(ws, {
                 "type": "worker.stream",
                 "workerId": w.worker_id,
                 "sessionId": w.session_id,
                 "generation": getattr(w, "generation", 0),
                 "event": rate_limits_event,
                 "replayed": True,
+                **replay_identity,
             })
         for native_event in (
             worker.native_plan_event(w),
             worker.native_diff_event(w),
         ):
             if native_event is not None:
-                await ws.send_json({
+                await _send_ws(ws, {
                     "type": "worker.stream",
                     "workerId": w.worker_id,
                     "sessionId": w.session_id,
                     "generation": getattr(w, "generation", 0),
                     "event": native_event,
                     "replayed": True,
+                    **replay_identity,
                 })
         for event in worker.pending_interaction_events(w):
-            await ws.send_json({
+            await _send_ws(ws, {
                 "type": "worker.stream",
                 "workerId": w.worker_id,
                 "sessionId": w.session_id,
                 "generation": getattr(w, "generation", 0),
                 "event": event,
                 "replayed": True,
+                **replay_identity,
             })
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     ws_clients.add(ws)
+    last_replay_request_id: str | None = None
     try:
         while True:
             raw = await ws.receive_text()
@@ -2950,7 +4360,12 @@ async def ws_endpoint(ws: WebSocket):
                 continue
 
             msg_type = msg.get("type")
-            if msg_type == "user_inject":
+            if msg_type == "ping":
+                # Browser heartbeats are application-level JSON frames. A
+                # pong updates the client's inbound activity timestamp and
+                # prevents an OPEN-but-silent connection from lingering.
+                await _send_ws(ws, {"type": "pong"})
+            elif msg_type == "user_inject":
                 session_id = msg.get("sessionId")
                 text = msg.get("text")
                 parts = msg.get("parts")
@@ -2960,7 +4375,7 @@ async def ws_endpoint(ws: WebSocket):
                         normalized_parts, generated_text, parts_error = _normalize_message_parts(
                             session_id, parts)
                         if parts_error is not None:
-                            await ws.send_json({
+                            await _send_ws(ws, {
                                 "type": "user_inject.rejected",
                                 "sessionId": session_id,
                                 "message": parts_error["message"],
@@ -2971,7 +4386,7 @@ async def ws_endpoint(ws: WebSocket):
                     elif isinstance(text, str):
                         attachment_error = _validate_message_attachment_references(session_id, text)
                         if attachment_error is not None:
-                            await ws.send_json({
+                            await _send_ws(ws, {
                                 "type": "user_inject.rejected",
                                 "sessionId": session_id,
                                 "message": attachment_error["message"],
@@ -2979,7 +4394,7 @@ async def ws_endpoint(ws: WebSocket):
                             })
                             continue
                     if not isinstance(text, str) or not text.strip():
-                        await ws.send_json({
+                        await _send_ws(ws, {
                             "type": "user_inject.rejected",
                             "sessionId": session_id,
                             "message": "text is required",
@@ -2988,12 +4403,12 @@ async def ws_endpoint(ws: WebSocket):
                         continue
                     client_message_id = msg.get("clientMessageId")
                     if client_message_id is not None and not isinstance(client_message_id, str):
-                        await ws.send_json({"type": "user_inject.rejected",
+                        await _send_ws(ws, {"type": "user_inject.rejected",
                                             "sessionId": session_id,
                                             "message": "clientMessageId must be a string"})
                         continue
                     if isinstance(client_message_id, str) and len(client_message_id) > 512:
-                        await ws.send_json({"type": "user_inject.rejected",
+                        await _send_ws(ws, {"type": "user_inject.rejected",
                                             "sessionId": session_id,
                                             "clientMessageId": client_message_id,
                                             "message": "clientMessageId is too long"})
@@ -3009,18 +4424,20 @@ async def ws_endpoint(ws: WebSocket):
                         result = await worker.enqueue_user_message(
                             session_id, text, client_message_id, parts=normalized_parts)
                     if result.get("status") == "error":
-                        await ws.send_json({"type": "user_inject.rejected",
+                        await _send_ws(ws, {"type": "user_inject.rejected",
                                             "sessionId": session_id,
                                             "clientMessageId": client_message_id,
                                             "queueItemId": result.get("queueItemId"),
                                             "message": result.get("result", "send failed")})
                     else:
-                        await ws.send_json({"type": "user_inject.accepted",
+                        await _send_ws(ws, {"type": "user_inject.accepted",
                                             "sessionId": session_id,
                                             "workerId": result.get("workerId"),
                                             "clientMessageId": client_message_id,
                                             "queueItemId": result.get("queueItemId"),
-                                            "queueRevision": getattr(sess.get(session_id), "queue_revision", 0)})
+                                            "queueRevision": getattr(
+                                                _summary_session_get(session_id),
+                                                "queue_revision", 0)})
             elif msg_type == "worker_control":
                 session_id = msg.get("sessionId")
                 worker_id = msg.get("workerId")
@@ -3028,29 +4445,80 @@ async def ws_endpoint(ws: WebSocket):
                 if session_id and isinstance(control, dict):
                     result = await worker.send_session_control(session_id, control)
                     if isinstance(result, str):
-                        await ws.send_json({"type": "error", "message": result})
+                        await _send_ws(ws, {"type": "error", "message": result})
                     elif result is None:
-                        await ws.send_json({"type": "error", "message": "Worker not found"})
+                        await _send_ws(ws, {"type": "error", "message": "Worker not found"})
                 elif worker_id and isinstance(control, dict):
                     err = await worker.send_control_message(worker_id, control)
                     if err:
-                        await ws.send_json({"type": "error", "message": err})
+                        await _send_ws(ws, {"type": "error", "message": err})
             elif msg_type == "sync_interactive":
                 # Optional sessionIds narrows the replay; omitted means all
                 # live workers visible to this dashboard, matching /ws's
                 # existing broadcast scope.
                 raw_session_ids = msg.get("sessionIds")
                 if raw_session_ids is not None and not isinstance(raw_session_ids, list):
-                    await ws.send_json({
+                    await _send_ws(ws, {
                         "type": "error",
                         "message": "sessionIds must be a list",
                     })
                     continue
-                await _replay_pending_interactions(ws, raw_session_ids)
+                replay_request_id = msg.get("replayRequestId")
+                if replay_request_id is not None and (
+                    not isinstance(replay_request_id, str) or not replay_request_id
+                    or len(replay_request_id) > 512
+                ):
+                    await _send_ws(ws, {
+                        "type": "error",
+                        "message": "replayRequestId must be a non-empty string of at most 512 characters",
+                    })
+                    continue
+                replay_generation = msg.get("replayGeneration")
+                if replay_generation is not None and (
+                    not isinstance(replay_generation, int)
+                    or isinstance(replay_generation, bool)
+                ):
+                    await _send_ws(ws, {
+                        "type": "error",
+                        "message": "replayGeneration must be an integer",
+                    })
+                    continue
+                # A reconnecting client can reach this branch from both its
+                # open callback and its already-open mount path. A request ID
+                # makes that handshake idempotent at the server boundary too;
+                # no message/content dedupe is involved here.
+                if replay_request_id is not None and replay_request_id == last_replay_request_id:
+                    continue
+                if replay_request_id is not None:
+                    last_replay_request_id = replay_request_id
+                await _replay_pending_interactions(
+                    ws,
+                    raw_session_ids,
+                    replay_generation=replay_generation,
+                    replay_request_id=replay_request_id,
+                )
+            elif msg_type == "resync":
+                raw_session_ids = msg.get("sessionIds")
+                if raw_session_ids is not None and not isinstance(raw_session_ids, list):
+                    await _send_ws(ws, {
+                        "type": "error",
+                        "message": "sessionIds must be a list",
+                    })
+                    continue
+                await _send_resync_snapshot(
+                    ws,
+                    raw_session_ids,
+                    include_all_sessions=bool(msg.get("includeAllSessions", True)),
+                    include_identity=bool(msg.get("includeIdentity", False)),
+                )
     except WebSocketDisconnect:
         pass
     finally:
-        ws_clients.discard(ws)
+        client = _ws_outbound.get(ws)
+        if client is not None:
+            await client.close_now()
+        else:
+            ws_clients.discard(ws)
 
 
 # ── WebSocket: Main Agent ──
@@ -3080,17 +4548,17 @@ async def ws_agent_endpoint(ws: WebSocket):
                 raw_types = msg.get("eventTypes")
                 if raw_types is not None:
                     if not isinstance(raw_types, list):
-                        await ws.send_json({"type": "error", "message": "eventTypes must be a list"})
+                        await _send_ws(ws, {"type": "error", "message": "eventTypes must be a list"})
                         continue
                     types = set(str(t) for t in raw_types)
                     sub.event_types = types if types else set(_AGENT_DEFAULT_SUBSCRIPTION)
                 raw_sids = msg.get("sessionIds")
                 if raw_sids is not None:
                     if not isinstance(raw_sids, list):
-                        await ws.send_json({"type": "error", "message": "sessionIds must be a list"})
+                        await _send_ws(ws, {"type": "error", "message": "sessionIds must be a list"})
                         continue
                     sub.session_ids = set(str(s) for s in raw_sids)
-                await ws.send_json({
+                await _send_ws(ws, {
                     "type": "subscribed",
                     "eventTypes": sorted(sub.event_types),
                     "sessionIds": sorted(sub.session_ids),
@@ -3098,8 +4566,36 @@ async def ws_agent_endpoint(ws: WebSocket):
 
             elif msg_type == "reconnect":
                 # 断线重连补发：{"type":"reconnect","sessionIds":[...]}
-                # 补发各 session 未消费的终态 worker.result（成功/失败/取消）
-                await _replay_agent_results(ws, msg.get("sessionIds") or [])
+                # 补发各 session 未消费的终态 worker.result（成功/失败/取消）。
+                # resultCursors 是新的 durable cursor；缺失时保留旧版 latest
+                # compatibility 行为。
+                raw_session_ids = msg.get("sessionIds") or []
+                if not isinstance(raw_session_ids, list):
+                    await _send_ws(ws, {"type": "error", "message": "sessionIds must be a list"}, kind="agent")
+                    continue
+                cursors = msg.get("resultCursors")
+                if cursors is not None and not isinstance(cursors, dict):
+                    await _send_ws(ws, {"type": "error", "message": "resultCursors must be an object"}, kind="agent")
+                    continue
+                await _replay_agent_results(ws, raw_session_ids, cursors)
+
+            elif msg_type == "resync":
+                raw_session_ids = msg.get("sessionIds") or []
+                if not isinstance(raw_session_ids, list):
+                    await _send_ws(ws, {"type": "error", "message": "sessionIds must be a list"}, kind="agent")
+                    continue
+                cursors = msg.get("resultCursors")
+                if cursors is not None and not isinstance(cursors, dict):
+                    await _send_ws(ws, {"type": "error", "message": "resultCursors must be an object"}, kind="agent")
+                    continue
+                await _send_resync_snapshot(
+                    ws,
+                    raw_session_ids,
+                    include_all_sessions=bool(msg.get("includeAllSessions", False)),
+                    include_identity=bool(msg.get("includeIdentity", False)),
+                )
+                if cursors is not None:
+                    await _replay_agent_results(ws, raw_session_ids, cursors)
 
             elif msg_type == "task":
                 session_id = msg.get("sessionId")
@@ -3109,31 +4605,31 @@ async def ws_agent_endpoint(ws: WebSocket):
                     if not w:
                         result = await worker.create_worker(session_id)
                         if isinstance(result, str):
-                            await ws.send_json({"type": "error", "message": result})
+                            await _send_ws(ws, {"type": "error", "message": result})
                             continue
                         else:
                             w = result
                     err = await worker.send_task(w.worker_id, text, source="agent")
                     if err:
-                        await ws.send_json({"type": "error", "message": err})
+                        await _send_ws(ws, {"type": "error", "message": err})
 
             elif msg_type == "spawn":
                 try:
                     params = _build_session_params(msg)
                 except ValueError as exc:
-                    await ws.send_json({"type": "error", "message": str(exc)})
+                    await _send_ws(ws, {"type": "error", "message": str(exc)})
                     continue
                 # 名称校验与 HTTP spawn 对齐（缺名/重名此前会静默建出重复名 session）
                 err_name = _check_session_name(params.get("name", "default"))
                 if err_name:
-                    await ws.send_json({"type": "error", "message": err_name})
+                    await _send_ws(ws, {"type": "error", "message": err_name})
                     continue
                 s = sess.create(**params)
                 result = await worker.create_worker(s.id)
                 if isinstance(result, str):
-                    await ws.send_json({"type": "error", "message": result})
+                    await _send_ws(ws, {"type": "error", "message": result})
                 else:
-                    await ws.send_json({
+                    await _send_ws(ws, {
                         "type": "worker.spawned",
                         "sessionId": s.id,
                         "workerId": result.worker_id,
@@ -3147,38 +4643,47 @@ async def ws_agent_endpoint(ws: WebSocket):
                 session_id = msg.get("sessionId")
                 text = msg.get("text")
                 if not session_id or not text:
-                    await ws.send_json({"type": "error", "message": "sessionId and text required"})
+                    await _send_ws(ws, {"type": "error", "message": "sessionId and text required"})
                     continue
                 result = await worker.assign(session_id, text, source="agent")
-                await ws.send_json({"type": "assign.result", **result})
+                await _send_ws(ws, {"type": "assign.result", **result})
 
             elif msg_type == "send":
                 worker_id = msg.get("workerId")
                 text = msg.get("text")
                 if not worker_id or not text:
-                    await ws.send_json({"type": "error", "message": "workerId and text required"})
+                    await _send_ws(ws, {"type": "error", "message": "workerId and text required"})
                     continue
                 result = await worker.send(worker_id, text, source="agent")
-                await ws.send_json({"type": "send.result", **result})
+                await _send_ws(ws, {"type": "send.result", **result})
 
             elif msg_type == "kill":
                 session_id = msg.get("sessionId") or msg.get("workerId")
                 result = await worker.kill_session_worker(session_id)
                 if isinstance(result, str):
-                    await ws.send_json({"type": "error", "message": result})
+                    await _send_ws(ws, {"type": "error", "message": result})
 
             elif msg_type == "list":
-                sessions = sess.list_all()
-                await ws.send_json({
+                sessions = await _store_read(sess.list_all, load_history=False)
+                pages = await _store_read(
+                    _history_pages_for, [s.id for s in sessions], 50)
+                app_config = load_config()
+                await _send_ws(ws, {
                     "type": "session.list",
-                    "sessions": [_session_to_api(s) for s in sessions],
+                    "sessions": [_session_list_api(
+                        s, page=pages.get(s.id), app_config=app_config)
+                                 for s in sessions],
                 })
 
     except WebSocketDisconnect:
         pass
     finally:
-        agent_clients.discard(ws)
-        agent_subscriptions.pop(ws, None)
+        client = _ws_outbound.get(ws)
+        if client is not None:
+            await client.close_now()
+        else:
+            agent_clients.discard(ws)
+            agent_subscriptions.pop(ws, None)
 
 
 # ── Session API ──
@@ -3222,7 +4727,7 @@ async def api_cancel_reminder(session_id: str, reminder_id: str):
     return {"ok": True, "reminder": item}
 
 @app.get("/api/sessions")
-async def api_list_sessions(summary: int = 0):
+async def api_list_sessions(summary: int = 0, workspaceId: str | None = None):
     """List all sessions (includes worker status if active).
 
     summary=1 → lean payload [{id, name, adapter, workerStatus, updatedAt,
@@ -3230,18 +4735,636 @@ async def api_list_sessions(summary: int = 0):
     轻量巡检，避免全量传输再过滤). Default stays the full payload for
     backward compatibility.
     """
-    sessions = sess.list_all()
+    # Both list variants use the shallow metadata loader.  The legacy full
+    # list shape still contains its bounded 50-message tail, but the tail is
+    # read through the paging boundary instead of hydrating the JSONL file.
+    # The store read and every per-Session page read are blocking filesystem
+    # work, so they run on a worker thread (BE-3); the response shaping below
+    # stays on the event loop.
+    if workspaceId is not None and workspaceId not in ("", "ungrouped"):
+        # The workspace store has no lock of its own; keep its (bounded,
+        # cached) lookup on the event loop rather than sharing it with a
+        # worker thread.
+        if workspaces.get(workspaceId) is None:
+            return {"sessions": [], "workspaceId": workspaceId}
+    sessions = await _store_read(sess.list_all, load_history=False)
+    if workspaceId == "ungrouped":
+        # ``ungrouped`` is a stable query alias; an empty workspaceId is kept
+        # equivalent to the historical all-sessions response.
+        sessions = [s for s in sessions if not sess.effective_workspace_ids(s)]
+    elif workspaceId:
+        sessions = [s for s in sessions if workspaceId in sess.effective_workspace_ids(s)]
     if summary:
         return {"sessions": [_session_summary(s) for s in sessions]}
-    result = []
+    pages = await _store_read(
+        _history_pages_for, [s.id for s in sessions], 50)
+    # Resolve dynamic configuration once per response. Reading and deep-merging
+    # config.json for each Session made list shaping perform one filesystem
+    # read per row while the event loop was also serving dashboard heartbeats.
+    app_config = load_config()
+    return {"sessions": [_session_list_api(
+                s, page=pages.get(s.id), app_config=app_config)
+            for s in sessions]}
+
+
+def _startup_recovery_candidates(sessions) -> list[dict]:
+    """Snapshot persisted legal-running Sessions with no live Worker."""
+    candidates = []
     for s in sessions:
-        api = _session_to_api(s)
-        full_history = api.get("history") or []
-        api["history"] = full_history[-50:] if len(full_history) > 50 else full_history
-        api["historyTruncated"] = len(full_history) > 50
-        api["historyTotal"] = len(full_history)
-        result.append(api)
-    return {"sessions": result}
+        if s.last_legal_worker_state != "running":
+            continue
+        if worker.find_alive_worker_by_session(s.id) is not None:
+            continue
+        candidates.append({
+            "id": s.id,
+            "name": s.name,
+            "adapter": s.adapter,
+            "workdir": s.workdir,
+            "updatedAt": s.updated_at,
+            "lastLegalWorkerState": s.last_legal_worker_state,
+        })
+    return candidates
+
+
+def _startup_recovery_record_path() -> Path:
+    return (_PROJECT_DIR / "data" / "startup_recovery"
+            / f"{_STARTUP_RECOVERY_GENERATION}.json")
+
+
+def _write_startup_recovery_record(record: dict) -> None:
+    path = _startup_recovery_record_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(".tmp")
+    temp_path.write_text(
+        json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+    os.replace(temp_path, path)
+
+
+def _ensure_startup_recovery_record(candidates: list[dict]) -> dict:
+    """Create one durable candidate snapshot per Pan process generation."""
+    path = _startup_recovery_record_path()
+    with _STARTUP_RECOVERY_LOCK:
+        if path.exists():
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                record = None
+            if (isinstance(record, dict)
+                    and record.get("generation") == _STARTUP_RECOVERY_GENERATION):
+                return record
+        now = time.time()
+        record = {
+            "generation": _STARTUP_RECOVERY_GENERATION,
+            "state": "pending" if candidates else "no_candidates",
+            "candidateSnapshot": candidates,
+            "decision": None,
+            "decisionId": None,
+            "attempts": 0,
+            "results": [],
+            "error": None,
+            "claim": None,
+            "createdAt": now,
+            "updatedAt": now,
+        }
+        _write_startup_recovery_record(record)
+        return record
+
+
+async def _initialize_startup_recovery(sessions) -> dict:
+    """Snapshot startup candidates and apply any configured server-side policy."""
+    record = _ensure_startup_recovery_record(_startup_recovery_candidates(sessions))
+    preference = _session_lifecycle_preferences()["startupPreference"]
+    if preference != "ask" and record.get("candidateSnapshot"):
+        return await _run_automatic_startup_recovery(record, preference)
+    return record
+
+
+def _read_startup_recovery_record() -> dict | None:
+    path = _startup_recovery_record_path()
+    if not path.exists():
+        return None
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return (record if isinstance(record, dict)
+            and record.get("generation") == _STARTUP_RECOVERY_GENERATION else None)
+
+
+def _startup_recovery_public_record() -> dict:
+    with _STARTUP_RECOVERY_LOCK:
+        record = _read_startup_recovery_record()
+        if record is None:
+            return {
+                "generation": _STARTUP_RECOVERY_GENERATION,
+                "state": "initializing",
+                "candidateSnapshot": [],
+                "decision": None,
+                "attempts": 0,
+                "results": [],
+                "error": None,
+            }
+        if (record.get("state") == "processing"
+                and _STARTUP_RECOVERY_GENERATION not in _STARTUP_RECOVERY_INFLIGHT):
+            # An interrupted request is recoverable only by retrying the same
+            # persisted choice. Broadcast retries use stable message ids.
+            record["state"] = "failed"
+            record["error"] = "The previous recovery attempt was interrupted; retry the same choice."
+            record["updatedAt"] = time.time()
+            _write_startup_recovery_record(record)
+        return json.loads(json.dumps(record, ensure_ascii=False))
+
+
+def _startup_recovery_failed_results(
+    candidates: list[dict], results: object, message: str,
+) -> list[dict]:
+    """Ensure recovery failures have rows the existing prompt can diagnose."""
+    rows = results if isinstance(results, list) else []
+    by_session = {
+        row.get("sessionId"): row for row in rows
+        if isinstance(row, dict) and isinstance(row.get("sessionId"), str)
+    }
+    for candidate in candidates:
+        session_id = candidate.get("id")
+        existing = by_session.get(session_id)
+        if existing is None:
+            row = {
+                "sessionId": session_id,
+                "status": "error",
+                "error": message,
+            }
+            rows.append(row)
+            by_session[session_id] = row
+    if not any(
+        isinstance(row, dict)
+        and row.get("status") not in {"queued", "preserved", "updated"}
+        for row in rows
+    ):
+        rows.append({
+            "sessionId": "startup-recovery",
+            "status": "error",
+            "error": message,
+        })
+    return rows
+
+
+async def _apply_startup_recovery_choice(record: dict, choice: str) -> dict:
+    """Apply one already-durable startup choice and persist its outcome."""
+    results: list[dict] = []
+    error = None
+    try:
+        candidates = record.get("candidateSnapshot", [])
+        if choice == "restart":
+            response = await api_sessions_broadcast({
+                "sessionIds": [candidate["id"] for candidate in candidates],
+                "text": "继续",
+                "source": "user",
+                "clientMessageId": f"startup-recovery:{record['generation']}",
+            })
+            results = response.get("results", [])
+            expected_ids = {candidate["id"] for candidate in candidates}
+            queued_ids = {
+                item.get("sessionId") for item in results
+                if item.get("status") == "queued"
+            }
+            if not response.get("ok") or queued_ids != expected_ids:
+                error = "One or more recovery messages could not be queued. Retry this same choice."
+        elif choice == "preserve-running":
+            results = [
+                {"sessionId": candidate["id"], "status": "preserved",
+                 "legalWorkerState": "running"}
+                for candidate in candidates
+            ]
+        else:
+            for candidate in candidates:
+                try:
+                    results.append(await worker.sync_legal_worker_state_to_runtime(
+                        candidate["id"], source="session-recovery/startup-sync-actual",
+                    ))
+                except Exception as exc:
+                    results.append({
+                        "sessionId": candidate["id"],
+                        "status": "error",
+                        "error": str(exc),
+                    })
+            if any(item.get("status") != "updated" for item in results):
+                error = "One or more Session legal states could not be synchronized. Retry this same choice."
+    except asyncio.CancelledError:
+        error = "Startup recovery request was interrupted; retry the same choice."
+        raise
+    except Exception as exc:
+        error = f"Startup recovery failed: {exc}"
+    finally:
+        if error and choice == "restart":
+            results = _startup_recovery_failed_results(
+                record.get("candidateSnapshot", []), results, error,
+            )
+        with _STARTUP_RECOVERY_LOCK:
+            current = _read_startup_recovery_record()
+            if (current is not None
+                    and current.get("decisionId") == record.get("decisionId")):
+                current["state"] = "failed" if error else "completed"
+                current["results"] = results
+                current["error"] = error
+                current["updatedAt"] = time.time()
+                try:
+                    _write_startup_recovery_record(current)
+                finally:
+                    _STARTUP_RECOVERY_INFLIGHT.discard(record["generation"])
+            else:
+                _STARTUP_RECOVERY_INFLIGHT.discard(record["generation"])
+    return _startup_recovery_public_record()
+
+
+async def _run_automatic_startup_recovery(
+    record: dict, preference: str,
+) -> dict:
+    """Persist and apply the configured startup policy before serving requests."""
+    choice = {
+        "wake-running": "restart",
+        "sync-actual": "sync-actual",
+        "preserve-running": "preserve-running",
+    }.get(preference)
+    if choice is None or not record.get("candidateSnapshot"):
+        return record
+
+    async with _lifecycle_operation_lock:
+        with _STARTUP_RECOVERY_LOCK:
+            current = _read_startup_recovery_record()
+            if (current is None
+                    or current.get("generation") != record.get("generation")
+                    or current.get("decision") is not None
+                    or current.get("state") != "pending"):
+                return _startup_recovery_public_record()
+            current["state"] = "processing"
+            current["decision"] = choice
+            current["decisionId"] = current.get("decisionId") or uuid.uuid4().hex
+            current["autoPreference"] = preference
+            current["attempts"] = int(current.get("attempts", 0)) + 1
+            current["error"] = None
+            current["updatedAt"] = time.time()
+            # The decision is durable before any broadcast or runtime sync.
+            _write_startup_recovery_record(current)
+            _STARTUP_RECOVERY_INFLIGHT.add(current["generation"])
+
+        result = await _apply_startup_recovery_choice(current, choice)
+        if result.get("state") == "failed":
+            _log(
+                "[startup-recovery] automatic "
+                f"{preference} failed: {result.get('error')}"
+            )
+        return result
+
+
+@app.get("/api/sessions/recovery-candidates")
+async def api_session_recovery_candidates():
+    """Read-only scan of persisted legal-running Sessions with no live Worker."""
+    sessions = await _store_read(sess.list_all, load_history=False)
+    return {"sessions": _startup_recovery_candidates(sessions)}
+
+
+@app.get("/api/main/startup-recovery")
+async def api_main_startup_recovery():
+    """Return this Pan process generation's durable recovery decision record."""
+    record = _read_startup_recovery_record()
+    if record is None:
+        sessions = await _store_read(sess.list_all, load_history=False)
+        record = await asyncio.to_thread(
+            _ensure_startup_recovery_record, _startup_recovery_candidates(sessions),
+        )
+    if record.get("state") == "processing":
+        record = _startup_recovery_public_record()
+    return record
+
+
+@app.post("/api/main/startup-recovery/claim")
+async def api_main_startup_recovery_claim(data: dict):
+    """Claim or renew the single browser tab allowed to show this prompt."""
+    generation = data.get("generation")
+    tab_id = data.get("tabId")
+    if generation != _STARTUP_RECOVERY_GENERATION:
+        raise HTTPException(status_code=409, detail="startup generation changed")
+    if not isinstance(tab_id, str) or not tab_id or len(tab_id) > 128:
+        raise HTTPException(status_code=400, detail="tabId must be a non-empty string")
+    record = _startup_recovery_public_record()
+    if record.get("state") == "initializing":
+        sessions = await _store_read(sess.list_all, load_history=False)
+        record = _ensure_startup_recovery_record(_startup_recovery_candidates(sessions))
+    if record.get("state") in {"no_candidates", "completed"}:
+        return {"ok": True, "claimed": False, "state": record["state"]}
+    now = time.time()
+    with _STARTUP_RECOVERY_LOCK:
+        record = _read_startup_recovery_record()
+        if record is None:
+            raise HTTPException(status_code=503, detail="startup recovery record is unavailable")
+        claim = record.get("claim") or {}
+        same_owner = claim.get("tabId") == tab_id
+        available = not claim.get("tabId") or float(claim.get("leaseUntil", 0)) <= now
+        claimed = same_owner or available
+        if claimed:
+            claim = {"tabId": tab_id, "leaseUntil": now + _STARTUP_RECOVERY_CLAIM_SECONDS}
+            record["claim"] = claim
+            record["updatedAt"] = now
+            _write_startup_recovery_record(record)
+        return {
+            "ok": True,
+            "claimed": claimed,
+            "state": record["state"],
+            "leaseUntil": (claim.get("leaseUntil") if claimed else None),
+            "decision": record.get("decision"),
+            "attempts": record.get("attempts", 0),
+            "error": record.get("error"),
+            "results": record.get("results", []),
+            "candidates": record.get("candidateSnapshot", []),
+        }
+
+
+@app.post("/api/main/startup-recovery/decision")
+async def api_main_startup_recovery_decision(data: dict):
+    """Persist one startup choice before applying its idempotent side effects."""
+    generation = data.get("generation")
+    tab_id = data.get("tabId")
+    choice = data.get("choice")
+    choices = {"restart", "preserve-running", "sync-actual"}
+    if generation != _STARTUP_RECOVERY_GENERATION:
+        raise HTTPException(status_code=409, detail="startup generation changed")
+    if not isinstance(tab_id, str) or not tab_id or len(tab_id) > 128:
+        raise HTTPException(status_code=400, detail="tabId must be a non-empty string")
+    if choice not in choices:
+        raise HTTPException(status_code=400, detail="unsupported startup recovery choice")
+
+    async with _lifecycle_operation_lock:
+        if _main_exit_pending or worker._shutdown_started:
+            raise HTTPException(status_code=409, detail="Pan is shutting down")
+        with _STARTUP_RECOVERY_LOCK:
+            record = _read_startup_recovery_record()
+            if record is None:
+                raise HTTPException(status_code=409, detail="startup recovery is not initialized")
+            if not record.get("candidateSnapshot"):
+                raise HTTPException(status_code=409, detail="there are no recovery candidates")
+            if record.get("state") == "completed":
+                if record.get("decision") != choice:
+                    raise HTTPException(status_code=409, detail="a different decision is already complete")
+                return json.loads(json.dumps(record, ensure_ascii=False))
+            if record.get("decision") not in {None, choice}:
+                raise HTTPException(status_code=409, detail="only the original decision may be retried")
+            claim = record.get("claim") or {}
+            if (claim.get("tabId") != tab_id
+                    or float(claim.get("leaseUntil", 0)) <= time.time()):
+                raise HTTPException(status_code=409, detail="startup recovery tab claim expired")
+            if (record.get("state") == "processing"
+                    and _STARTUP_RECOVERY_GENERATION in _STARTUP_RECOVERY_INFLIGHT):
+                return json.loads(json.dumps(record, ensure_ascii=False))
+            record["state"] = "processing"
+            record["decision"] = choice
+            record["decisionId"] = record.get("decisionId") or uuid.uuid4().hex
+            record["attempts"] = int(record.get("attempts", 0)) + 1
+            record["error"] = None
+            record["updatedAt"] = time.time()
+            _write_startup_recovery_record(record)
+            _STARTUP_RECOVERY_INFLIGHT.add(_STARTUP_RECOVERY_GENERATION)
+
+        return await _apply_startup_recovery_choice(record, choice)
+
+
+@app.get("/api/sessions/summary-repair")
+async def api_summary_projection_repair_status():
+    """Expose cold-start summary repair progress without touching history."""
+    return sess.summary_backfill_status()
+
+
+def _workspace_view(workspace: workspaces.Workspace) -> dict:
+    members = [s.id for s in sess.list_all(load_history=False)
+               if workspace.id in sess.effective_workspace_ids(s)]
+    return {
+        "id": workspace.id,
+        "name": workspace.name,
+        "order": workspace.order,
+        "dirs": list(workspace.dirs),
+        "createdAt": workspace.created_at,
+        "updatedAt": workspace.updated_at,
+        "sessionCount": len(members),
+        "sessionIds": members,
+    }
+
+
+def _workspace_name_error(name) -> str | None:
+    if not isinstance(name, str) or not name.strip():
+        return "Workspace name is required"
+    if len(name.strip()) > 128:
+        return "Workspace name too long (max 128)"
+    return None
+
+
+def _workspace_dirs_result(dirs) -> tuple[list[str] | None, str | None]:
+    """Validate a Workspace directory list.
+
+    Every entry must be an absolute path to an existing directory on the Pan
+    server. Paths are canonicalized and de-duplicated; nothing is created or
+    written. Returns ``(normalized, None)`` on success and ``(None, message)``
+    on the first invalid entry.
+    """
+    if not isinstance(dirs, list):
+        return None, "dirs must be an array of absolute paths"
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in dirs:
+        if not isinstance(raw, str) or not raw.strip():
+            return None, "dirs must contain non-empty string paths"
+        candidate = Path(raw.strip())
+        if not candidate.is_absolute():
+            return None, f"Workspace directory must be an absolute path: {raw!r}"
+        try:
+            resolved = candidate.resolve(strict=True)
+        except (OSError, RuntimeError):
+            return None, f"Workspace directory does not exist: {raw!r}"
+        if not resolved.is_dir():
+            return None, f"Workspace directory is not a directory: {raw!r}"
+        text = str(resolved)
+        if text not in seen:
+            seen.add(text)
+            normalized.append(text)
+    return normalized, None
+
+
+def _workspace_write_allowed(actor_id: str | None, session: sess.Session) -> bool:
+    """Apply Session's existing managed-scope permission when an actor is given.
+
+    Browser/legacy callers omit actorSessionId and retain the historical
+    trusted local-web behavior.  MCP/future callers can provide it to get an
+    explicit permission check without coupling workspaces to managedBy.
+    """
+    if not actor_id or not session.restrict_to_managed:
+        return True
+    actor = sess.get(actor_id)
+    return bool(actor and (session.managed_by == actor_id or session.id == actor_id
+                           or session.id in actor.managed))
+
+
+@app.get("/api/workspaces")
+async def api_list_workspaces():
+    """List durable workspaces in their independent display order."""
+    return {"workspaces": [_workspace_view(w) for w in workspaces.list_all()]}
+
+
+@app.post("/api/workspaces")
+async def api_create_workspace(data: dict):
+    error = _workspace_name_error(data.get("name"))
+    if error:
+        return {"ok": False, "error": {"code": "invalid_name", "message": error}}
+    name = data["name"].strip()
+    if any(w.name == name for w in workspaces.list_all()):
+        return {"ok": False, "error": {"code": "name_taken", "message": "Workspace name already exists"}}
+    workspace = workspaces.create(name)
+    await broadcast({"type": "workspace.created", "workspaceId": workspace.id})
+    return {"ok": True, "workspace": _workspace_view(workspace)}
+
+
+@app.get("/api/workspaces/{workspace_id}")
+async def api_get_workspace(workspace_id: str):
+    workspace = workspaces.get(workspace_id)
+    if workspace is None:
+        return {"ok": False, "error": {"code": "workspace_not_found", "message": "Workspace not found"}}
+    return {"ok": True, "workspace": _workspace_view(workspace)}
+
+
+@app.patch("/api/workspaces/{workspace_id}")
+async def api_update_workspace(workspace_id: str, data: dict):
+    workspace = workspaces.get(workspace_id)
+    if workspace is None:
+        return {"ok": False, "error": {"code": "workspace_not_found", "message": "Workspace not found"}}
+    changes: dict = {}
+    if "name" in data:
+        error = _workspace_name_error(data["name"])
+        if error:
+            return {"ok": False, "error": {"code": "invalid_name", "message": error}}
+        name = data["name"].strip()
+        if any(w.id != workspace_id and w.name == name for w in workspaces.list_all()):
+            return {"ok": False, "error": {"code": "name_taken", "message": "Workspace name already exists"}}
+        changes["name"] = name
+    if "dirs" in data:
+        dirs, dirs_error = _workspace_dirs_result(data["dirs"])
+        if dirs_error:
+            return {"ok": False, "error": {"code": "invalid_dirs", "message": dirs_error}}
+        changes["dirs"] = dirs
+    if changes:
+        workspaces.update(workspace, **changes)
+        await broadcast({"type": "workspace.updated", "workspaceId": workspace_id})
+    return {"ok": True, "workspace": _workspace_view(workspace)}
+
+
+@app.post("/api/workspaces/order")
+async def api_workspaces_order(data: dict):
+    ids = data.get("workspaceIds")
+    if not isinstance(ids, list) or not all(isinstance(i, str) and i.strip() for i in ids):
+        return {"ok": False, "error": {"code": "invalid_params", "message": "workspaceIds is required"}}
+    error = workspaces.apply_order([i.strip() for i in ids])
+    if error:
+        return {"ok": False, "error": {"code": "workspace_not_found", "message": error}}
+    order = [w.id for w in workspaces.list_all()]
+    await broadcast({"type": "workspace.orderUpdated", "order": order})
+    return {"ok": True, "order": order}
+
+
+@app.delete("/api/workspaces/{workspace_id}")
+async def api_delete_workspace(workspace_id: str):
+    if workspaces.get(workspace_id) is None:
+        return {"ok": False, "error": {"code": "workspace_not_found", "message": "Workspace not found"}}
+    for session in sess.list_all(load_history=False):
+        # Only roots persist membership. Children follow automatically.
+        if not session.managed_by and workspace_id in session.workspace_ids:
+            session.workspace_ids.remove(workspace_id)
+            sess.save(session)
+    workspaces.delete(workspace_id)
+    await broadcast({"type": "workspace.deleted", "workspaceId": workspace_id})
+    return {"ok": True, "workspaceId": workspace_id}
+
+
+async def _set_workspace_membership(workspace_id: str, session_ids, actor_id=None):
+    workspace = workspaces.get(workspace_id)
+    if workspace is None:
+        return {"ok": False, "error": {"code": "workspace_not_found", "message": "Workspace not found"}}
+    if (not isinstance(session_ids, list)
+            or not all(isinstance(sid, str) and sid for sid in session_ids)
+            or len(set(session_ids)) != len(session_ids)):
+        return {"ok": False, "error": {"code": "invalid_session_ids", "message": "sessionIds must be a unique array"}}
+    for session_id in session_ids:
+        session = sess.get(session_id) if isinstance(session_id, str) else None
+        if session is None:
+            return {"ok": False, "error": {"code": "session_not_found", "message": f"Session {session_id} not found"}}
+        if session.managed_by:
+            return {"ok": False, "error": {"code": "managed_session", "message": f"Detach Session {session_id} before changing its workspace"}}
+        if not _workspace_write_allowed(actor_id, session):
+            return {"ok": False, "error": {"code": "forbidden", "message": "Workspace membership is restricted"}}
+    wanted = set(session_ids)
+    for session in sess.list_all(load_history=False):
+        if not _workspace_write_allowed(actor_id, session):
+            continue
+        if session.managed_by:
+            continue
+        has = workspace_id in session.workspace_ids
+        should = session.id in wanted
+        if should and session.workspace_ids != [workspace_id]:
+            # A Workspace membership update is a move: replace any previous
+            # membership instead of accumulating another Workspace id.
+            session.workspace_ids = [workspace_id]
+            sess.save(session)
+        elif has and not should:
+            session.workspace_ids = []
+            sess.save(session)
+    await broadcast({"type": "workspace.membershipUpdated", "workspaceId": workspace_id,
+                     "sessionIds": [s.id for s in sess.list_all(load_history=False)
+                                     if workspace_id in sess.effective_workspace_ids(s)]})
+    return {"ok": True, "workspace": _workspace_view(workspace)}
+
+
+@app.put("/api/workspaces/{workspace_id}/sessions")
+async def api_set_workspace_sessions(workspace_id: str, data: dict):
+    return await _set_workspace_membership(workspace_id, data.get("sessionIds"), data.get("actorSessionId"))
+
+
+@app.get("/api/workspaces/{workspace_id}/sessions")
+async def api_get_workspace_sessions(workspace_id: str, summary: int = 0):
+    if workspaces.get(workspace_id) is None:
+        return {"ok": False, "error": {"code": "workspace_not_found", "message": "Workspace not found"}}
+    sessions = [s for s in await _store_read(sess.list_all, load_history=False)
+                if workspace_id in sess.effective_workspace_ids(s)]
+    if summary:
+        return {"ok": True, "workspaceId": workspace_id,
+                "sessions": [_session_summary(s) for s in sessions]}
+    pages = await _store_read(
+        _history_pages_for, [s.id for s in sessions], 50)
+    app_config = load_config()
+    return {"ok": True, "workspaceId": workspace_id,
+            "sessions": [_session_list_api(
+                s, page=pages.get(s.id), app_config=app_config)
+                         for s in sessions]}
+
+
+@app.put("/api/sessions/{session_id}/workspaces")
+async def api_set_session_workspaces(session_id: str, data: dict):
+    session = sess.get(session_id)
+    if session is None:
+        return {"ok": False, "error": {"code": "session_not_found", "message": "Session not found"}}
+    workspace_ids = data.get("workspaceIds")
+    if (not isinstance(workspace_ids, list)
+            or not all(isinstance(wid, str) and wid for wid in workspace_ids)
+            or len(set(workspace_ids)) != len(workspace_ids)):
+        return {"ok": False, "error": {"code": "invalid_workspace_ids", "message": "workspaceIds must be a unique array"}}
+    if len(workspace_ids) > 1:
+        return {"ok": False, "error": {"code": "invalid_workspace_ids", "message": "A Session can belong to at most one Workspace"}}
+    if not all(isinstance(wid, str) and workspaces.get(wid) for wid in workspace_ids):
+        return {"ok": False, "error": {"code": "workspace_not_found", "message": "Workspace not found"}}
+    if not _workspace_write_allowed(data.get("actorSessionId"), session):
+        return {"ok": False, "error": {"code": "forbidden", "message": "Workspace membership is restricted"}}
+    if session.managed_by:
+        return {"ok": False, "error": {"code": "managed_session", "message": "Detach a managed Session before changing its workspace"}}
+    session.workspace_ids = list(workspace_ids)
+    sess.save(session)
+    await broadcast({"type": "session.workspaceUpdated", "sessionId": session_id,
+                     "workspaceIds": sess.effective_workspace_ids(session)})
+    return {"ok": True, "session": _session_to_api(session)}
 
 
 @app.post("/api/sessions")
@@ -3299,17 +5422,75 @@ async def api_sessions_order(data: dict):
         return {"ok": False, "error": {
             "code": "session_not_found",
             "message": err}}
-    order = [s.id for s in sess.list_all()]
+    order = [s.id for s in sess.list_all(load_history=False)]
     await broadcast({"type": "session.orderUpdated", "order": order})
     return {"ok": True, "order": order}
 
 
 @app.get("/api/sessions/{session_id}")
-async def api_get_session(session_id: str):
-    s = sess.get(session_id)
+async def api_get_session(session_id: str, view: str = "full",
+                          historyLimit: int = 0):
+    bounded_history = historyLimit > 0
+    if view in {"metadata", "detail"} or bounded_history:
+        s = await _store_read(_summary_session_get, session_id)
+    else:
+        # The explicit full-history GET still hydrates the in-memory Session
+        # cache, which owns the store's read/write cache contract; BE-3 only
+        # moves the bounded list/history reads that back the cold dashboard
+        # load.  See the BE-3 note above _session_list_api.
+        s = sess.get(session_id)
     if not s:
         return {"error": "Session not found"}
+    if view in {"metadata", "detail"}:
+        # Keep relationship/settings/system-prompt fields while avoiding the
+        # expensive and potentially large history/rawUsage/lastResult payloads.
+        # The default full view is unchanged for API/MCP compatibility.
+        return _session_to_api(
+            s,
+            include_history=False,
+            include_raw_usage=False,
+            include_last_result=False,
+        )
+    if bounded_history:
+        result = _session_to_api(s, include_history=False)
+        page = await _store_read(
+            sess.history_page, session_id, limit=historyLimit)
+        page = page or {"history": [], "total": 0, "hasMore": False, "start": 0}
+        result["history"] = _api_history(
+            session_id,
+            page["history"],
+            start=page.get("start", 0),
+            history_epoch=page.get("historyEpoch"),
+        )
+        result["historyTruncated"] = bool(page["hasMore"])
+        result["historyTotal"] = page["total"]
+        result["historyStart"] = page.get("start", 0)
+        result["historyEpoch"] = page.get("historyEpoch")
+        result["historyRevision"] = page.get("historyRevision", 0)
+        return result
     return _session_to_api(s)
+
+
+@app.post("/api/sessions/{session_id}/legal-state/sync")
+async def api_sync_session_legal_worker_state(session_id: str):
+    """Synchronize legal state through the shared runtime-observation helper."""
+    session = await _store_read(_summary_session_get, session_id)
+    if not session:
+        return {
+            "sessionId": session_id,
+            "status": "error",
+            "error": f"Session {session_id} not found",
+        }
+    try:
+        return await worker.sync_legal_worker_state_to_runtime(
+            session_id, source="session-details/sync-actual",
+        )
+    except Exception as exc:
+        return {
+            "sessionId": session_id,
+            "status": "error",
+            "error": str(exc),
+        }
 
 
 @app.get("/api/sessions/{session_id}/usage")
@@ -3317,10 +5498,12 @@ async def api_get_session_usage(session_id: str):
     """Return the stable persisted input/output/cache usage projection.
 
     This is a read-only view over Session.raw_usage / Session.total_usage. It
-    does not refresh provider state and, unlike the full session response, does
-    not expose the historical raw payload.
+    does not wait for an active provider refresh and, unlike the full session
+    response, does not expose the historical raw payload. Codex receives the
+    last persisted quota snapshot only; callers that need a best-effort live
+    refresh use ``/api/codex/quota`` separately.
     """
-    s = sess.get(session_id)
+    s = _summary_session_get(session_id)
     if not s:
         return {"ok": False, "error": {
             "code": "session_not_found",
@@ -3328,7 +5511,7 @@ async def api_get_session_usage(session_id: str):
         }}
     result = sess.session_usage_view(s)
     if s.adapter == "codex":
-        quota = await api_codex_quota(session_id=session_id)
+        quota = await api_codex_quota(session_id=session_id, refresh=False)
         result["codexQuota"] = quota if quota.get("ok") else None
     return result
 
@@ -3350,7 +5533,7 @@ async def api_session_managers(session_id: str):
     - Unknown session_id → {"error": "Session not found"}.
     - Session with no manager → {"managers": []}.
     """
-    s = sess.get(session_id)
+    s = _summary_session_get(session_id)
     if not s:
         return {"error": "Session not found"}
     chain: list[sess.Session] = []
@@ -3360,7 +5543,7 @@ async def api_session_managers(session_id: str):
         mb = cur.managed_by
         if not mb or mb in seen:
             break
-        manager = sess.get(mb)
+        manager = _summary_session_get(mb)
         if manager is None:
             break  # dangling reference → chain ends here
         seen.add(mb)
@@ -3384,43 +5567,73 @@ async def api_session_managers(session_id: str):
 @app.get("/api/sessions/{session_id}/history")
 async def api_session_history(session_id: str, before: int = 0, limit: int = 50):
     """Paginated session history for lazy-loading older messages."""
-    s = sess.get(session_id)
-    if not s:
+    page = await _store_read(_history_page_lookup, session_id, before, limit)
+    if page is _NOT_FOUND:
         return {"error": "Session not found"}
-    sess.ensure_history_message_ids(s)
-    total = len(s.history)
-    if before <= 0:
-        before = total
-    start = max(0, before - limit)
-    page = _api_history(session_id, s.history[start:before], include_ids=True)
-    if (active_worker := worker.find_alive_worker_by_session(s.id)) and active_worker.status in {"running", "queued"}:
-        for item in reversed(page):
+    page_history = _api_history(
+        session_id,
+        page["history"],
+        start=page.get("start", 0),
+        history_epoch=page.get("historyEpoch"),
+    )
+    active_worker = worker.find_alive_worker_by_session(session_id)
+    if active_worker and active_worker.status in {"running", "queued"}:
+        for item in reversed(page_history):
             if isinstance(item, dict) and item.get("role") == "assistant":
                 item["streaming"] = True
                 break
     return {
-        "history": page,
-        "total": total,
-        "hasMore": start > 0,
-        "start": start,
+        "history": page_history,
+        "total": page["total"],
+        "hasMore": page["hasMore"],
+        "start": page["start"],
+        "historyEpoch": page.get("historyEpoch"),
+        "historyRevision": page.get("historyRevision", 0),
     }
+
+
+def _delete_history_message(session_id: str, message_id: str):
+    """Resolve one entry by ``msg_*`` or ``legacy:{sid}:{epoch}:{index}`` id.
+
+    Runs on the store thread: hydration and the delete rewrite are blocking
+    disk I/O. The legacy identity is resolved against the *current* history
+    epoch so a stale page cannot delete the wrong row.
+    """
+    s = sess.get(session_id)
+    if s is None:
+        return None
+    if message_id.startswith("msg_"):
+        return s, sess.delete_history_item(s, message_id)
+    parts = message_id.split(":")
+    if len(parts) != 4 or parts[0] != "legacy" or parts[1] != session_id:
+        return s, "message_not_found"
+    epoch_value = getattr(s, "history_epoch", None)
+    current_epoch = str(epoch_value) if epoch_value else "legacy"
+    if parts[2] != current_epoch:
+        return s, "message_not_found"
+    try:
+        index = int(parts[3])
+    except ValueError:
+        return s, "message_not_found"
+    return s, sess.delete_history_item_at(s, index)
 
 
 @app.delete("/api/sessions/{session_id}/history/{message_id}")
 async def api_delete_session_history(session_id: str, message_id: str):
     """Delete one user/assistant history entry after idempotent identity checks."""
-    s = sess.get(session_id)
-    if not s:
-        return {"ok": False, "error": {"code": "session_not_found", "message": "Session not found"}}
-    active_worker = worker.find_alive_worker_by_session(s.id)
+    active_worker = worker.find_alive_worker_by_session(session_id)
     if active_worker and active_worker.status in {"running", "queued"}:
         return {"ok": False, "error": {
             "code": "session_busy",
             "message": "任务运行中，无法删除消息",
         }}
-    if not isinstance(message_id, str) or not message_id.startswith("msg_"):
+    if (not isinstance(message_id, str)
+            or not (message_id.startswith("msg_") or message_id.startswith("legacy:"))):
         return {"ok": False, "error": {"code": "invalid_message_id", "message": "Invalid message id"}}
-    error_code = sess.delete_history_item(s, message_id)
+    result = await _store_read(_delete_history_message, session_id, message_id)
+    if result is None:
+        return {"ok": False, "error": {"code": "session_not_found", "message": "Session not found"}}
+    s, error_code = result
     if error_code:
         error_message = "This message cannot be deleted" if error_code == "message_not_deletable" else "Message not found"
         return {"ok": False, "error": {"code": error_code, "message": error_message}}
@@ -3544,6 +5757,15 @@ def _serialize_queue_item(item, session=None) -> dict | None:
         "revision": item.get("revision", 1),
         "dispatchState": _queue_dispatch_state(session, item) if session else worker._delivery_state(item),
     }
+    # Preserve structured system-Job metadata in the queue API.  The text
+    # remains available for the Agent/CLI, but clients must not parse jobId or
+    # routing identity back out of result text.
+    for key in (
+        "noticeKind", "jobId", "targetSessionId", "targetSessionIds",
+        "creatorSessionId", "eventId",
+    ):
+        if key in item:
+            meta[key] = item[key]
     if item.get("sourceSessionId") is not None:
         meta["sourceSessionId"] = item.get("sourceSessionId")
     return {
@@ -3580,13 +5802,13 @@ def _session_queue_items(s) -> list[dict]:
 @app.get("/api/sessions/{session_id}/queue")
 async def api_session_queue(session_id: str):
     """Normalized agent queue (session.queue_pending) for the frontend panel."""
-    s = sess.get(session_id)
+    s = _summary_session_get(session_id)
     if not s:
         return {"error": "Session not found"}
     migrated = worker._migrate_queue_delivery_state(s)
     migrated = worker._sync_queued_ledger(s) or migrated
     if migrated:
-        await sess.save_async(s)
+        await worker._save_receipt(s)
     return {"items": _session_queue_items(s),
             "queueRevision": getattr(s, "queue_revision", 0)}
 
@@ -3654,7 +5876,7 @@ async def api_session_queue_enqueue(session_id: str, data: dict):
     if result.get("status") == "error":
         return {"ok": False, "error": {"code": "enqueue_failed",
                                          "message": result.get("result", "enqueue failed")}}
-    s = sess.get(session_id)
+    s = _summary_session_get(session_id)
     return {"ok": True,
             "item": _serialize_queue_item(result.get("item") or {}, s),
             "queueRevision": getattr(s, "queue_revision", 0),
@@ -3675,14 +5897,77 @@ async def api_session_queue_order_route(session_id: str, data: dict):
     return await api_session_queue_order(session_id, data)
 
 
+@app.post("/api/sessions/{session_id}/queue/{item_id}/edit")
+async def api_session_queue_edit_lock(session_id: str, item_id: str, data: dict):
+    """Acquire or renew the lease that keeps an edited item out of Worker hand-off."""
+    s = _summary_session_get(session_id)
+    if not s:
+        return {"ok": False, "error": "Session not found"}
+    token = data.get("editToken")
+    if not isinstance(token, str) or not token or len(token) > 200:
+        return _queue_error("invalid_edit_token", "editToken is required", s)
+    expected = data.get("expectedRevision")
+    async with worker.queue_lock(session_id):
+        target = next((it for it in s.queue_pending or []
+                       if isinstance(it, dict) and _queue_item_id(it) == item_id), None)
+        if target is None:
+            return _queue_error("queue_item_not_editable", "Queue item is no longer queued", s)
+        if (worker._queue_item_kind(target) != "task"
+                or worker._task_source(target) != "user"):
+            return _queue_error("queue_item_readonly", "Only user task queue items can be edited", s)
+        if worker._delivery_state(target) != worker._DELIVERY_QUEUED:
+            return _queue_error("queue_item_not_editable", "Queue item is no longer queued", s)
+        current_revision = int(target.get("revision", 1))
+        if expected is not None and expected != current_revision:
+            return _queue_error("queue_revision_conflict", "Queue item revision conflict", s)
+        previous = dict(getattr(s, "queue_edit_locks", {}).get(item_id, {}))
+        lease, conflict = worker.acquire_queue_edit_lock(s, item_id, token)
+        if conflict or lease is None:
+            return _queue_error("queue_item_edit_locked", "Queue item is being edited elsewhere", s)
+        try:
+            await worker._save_receipt(s)
+        except Exception:
+            if previous:
+                s.queue_edit_locks[item_id] = previous
+            else:
+                s.queue_edit_locks.pop(item_id, None)
+            raise
+    return {"ok": True, "editToken": token, "expiresAt": lease["expiresAt"]}
+
+
+@app.post("/api/sessions/{session_id}/queue/{item_id}/edit/release")
+async def api_session_queue_edit_release(session_id: str, item_id: str, data: dict):
+    """Release a matching edit lease and wake the Worker if it was holding the FIFO head."""
+    s = _summary_session_get(session_id)
+    if not s:
+        return {"ok": False, "error": "Session not found"}
+    token = data.get("editToken")
+    if not isinstance(token, str) or not token:
+        return _queue_error("invalid_edit_token", "editToken is required", s)
+    async with worker.queue_lock(session_id):
+        previous = dict(getattr(s, "queue_edit_locks", {}).get(item_id, {}))
+        released = worker.release_queue_edit_lock(s, item_id, token)
+        if released:
+            try:
+                await worker._save_receipt(s)
+            except Exception:
+                s.queue_edit_locks[item_id] = previous
+                raise
+    await worker._wake_worker(session_id, auto_spawn=False)
+    return {"ok": True, "released": released}
+
+
 @app.patch("/api/sessions/{session_id}/queue/{item_id}")
 async def api_session_queue_update(session_id: str, item_id: str, data: dict):
     """Edit only a queued user task, retaining its durable identity."""
-    s = sess.get(session_id)
+    s = _summary_session_get(session_id)
     if not s:
         return {"ok": False, "error": "Session not found"}
     text = data.get("text")
     expected = data.get("expectedRevision")
+    edit_token = data.get("editToken")
+    if not isinstance(edit_token, str) or not edit_token:
+        return _queue_error("invalid_edit_token", "editToken is required", s)
     async with worker.queue_lock(session_id):
         target = next((it for it in s.queue_pending or []
                        if isinstance(it, dict) and _queue_item_id(it) == item_id), None)
@@ -3695,11 +5980,23 @@ async def api_session_queue_update(session_id: str, item_id: str, data: dict):
             return _queue_error("queue_item_readonly", "Only user task queue items can be edited", s)
         if worker._delivery_state(target) != worker._DELIVERY_QUEUED:
             return _queue_error("queue_item_not_editable", "Queue item is no longer queued", s)
+        lease = worker._active_queue_edit_lock(s, item_id)
+        if (lease is None
+                or lease.get("tokenHash") != worker._queue_edit_token_digest(edit_token)):
+            return _queue_error("queue_item_edit_expired", "Edit lease expired; reopen the editor", s)
         if not isinstance(text, str) or not text.strip():
             return _queue_error("text_required", "text is required", s)
+        normalized_parts = None
         if isinstance(target.get("parts"), list):
+            parts = target["parts"]
+            # The rich-text composer also supplies parts for plain text.
+            # Editing that queue row must update both representations. Keep
+            # attachment-bearing parts immutable here: the plain queue editor
+            # cannot safely remap attachment occurrences from arbitrary text.
+            if all(isinstance(part, dict) and part.get("type") == "text" for part in parts):
+                parts = [{"type": "text", "text": text}]
             normalized_parts, canonical_text, parts_error = _normalize_message_parts(
-                session_id, target["parts"])
+                session_id, parts)
             if parts_error is not None:
                 return _queue_error(parts_error["code"], parts_error["message"], s)
             if text != canonical_text:
@@ -3708,14 +6005,16 @@ async def api_session_queue_update(session_id: str, item_id: str, data: dict):
                     "Queued message text must match its structured attachment parts",
                     s,
                 )
-            target["parts"] = normalized_parts
         current_revision = int(target.get("revision", 1))
         if expected is not None and expected != current_revision:
             return _queue_error("queue_revision_conflict", "Queue item revision conflict", s)
         old_target = dict(target)
         old_ledger = dict(s.queue_delivery_ledger.get(item_id, {}))
+        old_edit_lease = dict(lease)
         old_queue_revision = s.queue_revision
         target["text"] = text
+        if normalized_parts is not None:
+            target["parts"] = normalized_parts
         target["revision"] = current_revision + 1
         target["updatedAt"] = datetime.now().isoformat()
         _ledger = s.queue_delivery_ledger.get(item_id)
@@ -3723,9 +6022,10 @@ async def api_session_queue_update(session_id: str, item_id: str, data: dict):
             _ledger = dict(old_target)
             s.queue_delivery_ledger[item_id] = _ledger
         _ledger.update(target)
+        s.queue_edit_locks.pop(item_id, None)
         s.queue_revision += 1
         try:
-            await sess.save_async(s)
+            await worker._save_receipt(s)
         except Exception:
             target.clear()
             target.update(old_target)
@@ -3734,6 +6034,7 @@ async def api_session_queue_update(session_id: str, item_id: str, data: dict):
                 _ledger.update(old_ledger)
             else:
                 s.queue_delivery_ledger.pop(item_id, None)
+            s.queue_edit_locks[item_id] = old_edit_lease
             s.queue_revision = old_queue_revision
             raise
     await worker._bcast({
@@ -3743,6 +6044,7 @@ async def api_session_queue_update(session_id: str, item_id: str, data: dict):
         "queueRevision": s.queue_revision,
         "item": _serialize_queue_item(target, s),
     })
+    await worker._wake_worker(session_id, auto_spawn=False)
     return {"ok": True, "item": _serialize_queue_item(target, s),
             "queueRevision": s.queue_revision}
 
@@ -3750,7 +6052,7 @@ async def api_session_queue_update(session_id: str, item_id: str, data: dict):
 @app.delete("/api/sessions/{session_id}/queue/{item_id}")
 async def api_session_queue_delete(session_id: str, item_id: str):
     """Remove one still-queued item; delivery receipts remain auditable."""
-    s = sess.get(session_id)
+    s = _summary_session_get(session_id)
     if not s:
         return {"error": "Session not found"}
     async with worker.queue_lock(session_id):
@@ -3765,25 +6067,36 @@ async def api_session_queue_delete(session_id: str, item_id: str):
             return _queue_error("queue_item_not_deletable", "Queue item is no longer queued", s)
         old_pending = list(pending)
         old_record = dict(s.queue_delivery_ledger.get(item_id, {}))
+        was_edit_locked = worker.queue_item_edit_locked(s, item_id)
+        old_edit_lock = dict(getattr(s, "queue_edit_locks", {}).get(item_id, {}))
         old_queue_revision = s.queue_revision
         s.queue_pending = [it for it in pending if it is not target]
+        s.queue_edit_locks.pop(item_id, None)
         record = s.queue_delivery_ledger.get(item_id)
-        if isinstance(record, dict):
-            record["deliveryState"] = "deleted"
-            record["dispatchState"] = "deleted"
+        if not isinstance(record, dict):
+            record = dict(target)
+            s.queue_delivery_ledger[item_id] = record
+        worker._set_delivery_state(s, record, worker._DELIVERY_DELETED)
         s.queue_revision += 1
         try:
-            await sess.save_async(s)
+            await worker._save_receipt(s)
         except Exception:
             s.queue_pending = old_pending
             if old_record:
                 s.queue_delivery_ledger[item_id] = old_record
             else:
                 s.queue_delivery_ledger.pop(item_id, None)
+            if old_edit_lock:
+                s.queue_edit_locks[item_id] = old_edit_lock
+            else:
+                s.queue_edit_locks.pop(item_id, None)
             s.queue_revision = old_queue_revision
             raise
     await worker._bcast({"type": "queue.item_removed", "sessionId": session_id,
                          "queueItemId": item_id, "queueRevision": s.queue_revision})
+    if was_edit_locked:
+        # Removing the locked FIFO head can unblock later queue items.
+        await worker._wake_worker(session_id, auto_spawn=False)
     return {"ok": True, "queueItemId": item_id,
             "queueRevision": s.queue_revision}
 
@@ -3795,7 +6108,8 @@ async def api_session_queue_retry(session_id: str, item_id: str):
     if isinstance(result, str):
         return {"ok": False, "error": result}
     item = result.get("item", result) if isinstance(result, dict) else result
-    return {"ok": True, "item": _serialize_queue_item(item, sess.get(session_id)),
+    return {"ok": True, "item": _serialize_queue_item(
+                item, _summary_session_get(session_id)),
             "status": result.get("status") if isinstance(result, dict) else None}
 
 
@@ -3807,7 +6121,7 @@ async def api_session_queue_order(session_id: str, data: dict):
     pending sequence; omitted queued items keep their relative order at the end.
     Returns the reordered normalized items.
     """
-    s = sess.get(session_id)
+    s = _summary_session_get(session_id)
     if not s:
         return {"error": "Session not found"}
     order = data.get("orderedIds", data.get("order"))
@@ -3842,7 +6156,7 @@ async def api_session_queue_order(session_id: str, data: dict):
             it["position"] = position
         s.queue_revision += 1
         try:
-            await sess.save_async(s)
+            await worker._save_receipt(s)
         except Exception:
             s.queue_pending = old_pending
             for it in old_pending:
@@ -3879,6 +6193,9 @@ async def api_update_session(session_id: str, data: dict):
     await broadcast({
         "type": "session.updated",
         "sessionId": s.id,
+        # Safe summary fields let connected routes update immediately; the
+        # debounced list refresh below remains the final reconciliation.
+        "session": _session_summary(s),
     })
     result = _session_to_api(s)
     # 进程相关字段变更（model/effort/thinking/MCP 等）：idle worker 立即
@@ -3938,6 +6255,8 @@ async def api_rename_session(session_id: str, data: dict):
         "sessionId": s.id,
         "oldName": old_name,
         "newName": new_name,
+        "name": new_name,
+        "session": _session_summary(s),
     })
     return {"sessionId": s.id, "name": new_name, "status": "renamed"}
 
@@ -4059,6 +6378,8 @@ async def api_session_handoff(session_id: str, data: dict):
     session_a = sess.get(session_id)
     if session_a is None:
         return {"error": f"Session {session_id} not found"}
+    if len(sess.effective_workspace_ids(session_a)) > 1:
+        return {"error": "Session has multiple Workspace memberships; resolve its legacy membership before handoff"}
     new_adapter_name = adapter or (session_a.adapter if copy_settings else "cbc")
     switched = new_adapter_name != session_a.adapter
     try:
@@ -4099,6 +6420,25 @@ async def api_session_handoff(session_id: str, data: dict):
     if isinstance(result, str):
         return {"error": result}
     a, b = result
+    # Retarget immediately after handoff commits.  This per-record pass is
+    # intentionally recoverable: Job write failures must not hide or roll back
+    # the already-created successor Session.
+    try:
+        # Resolve both active API roots (the unified Jobs API and legacy
+        # background-job routes may use distinct directories).
+        job_retarget = background_jobs.retarget_session_jobs(session_id, b.id)
+    except Exception as exc:
+        job_retarget = {
+            "oldSessionId": session_id,
+            "newSessionId": b.id,
+            "scanned": 0,
+            "updated": 0,
+            "unchanged": 0,
+            "errors": [{
+                "jobId": None,
+                "error": f"retarget pass failed: {type(exc).__name__}: {exc}",
+            }],
+        }
     # 跨 adapter 复制设置时，清洗 adapter_config：源 adapter 的 effort /
     # thinking / output_mode / maxThinkingTokens 对新 adapter 不成立的降级为
     # 默认（复制残值的既有降级语义；显式传参已在上面硬校验）。
@@ -4117,10 +6457,17 @@ async def api_session_handoff(session_id: str, data: dict):
         "sessionId": b.id,
         "name": b.name,
     })
+    await broadcast({
+        "type": "session.handoff.jobs_retargeted",
+        "sessionId": a.id,
+        "newSessionId": b.id,
+        "jobRetarget": job_retarget,
+    })
     return {
         "ok": True,
         "archivedSession": _session_to_api(a),
         "session": _session_to_api(b),
+        "jobRetarget": job_retarget,
     }
 
 
@@ -4152,23 +6499,515 @@ def _cleanup_kimi_home(session_id: str) -> None:
         _log(f"[kimi-home] 清理失败 {p}: {e}")
 
 
-@app.delete("/api/sessions/{session_id}")
-async def api_delete_session(session_id: str):
-    """Delete a session and its worker if running."""
-    sess.release(session_id)  # 清理 managed 关系 + 各 manager 的 report 订阅残留（B1）
+def _session_targets_from_item(value: object) -> set[str]:
+    if not isinstance(value, dict):
+        return set()
+    targets = set()
+    one = (value.get("targetSessionId") or value.get("target_session_id")
+           or value.get("sessionId"))
+    if isinstance(one, str) and one:
+        targets.add(one)
+    many = value.get("targetSessionIds")
+    if isinstance(many, list):
+        targets.update(item for item in many if isinstance(item, str) and item)
+    for key in ("target", "targetStruct"):
+        target = value.get(key)
+        if isinstance(target, dict):
+            target_id = target.get("sessionId")
+            if isinstance(target_id, str) and target_id:
+                targets.add(target_id)
+            target_ids = target.get("sessionIds")
+            if isinstance(target_ids, list):
+                targets.update(item for item in target_ids if isinstance(item, str) and item)
+    return targets
+
+
+def _retention_session_reference_reason(session_id: str, record: dict) -> str | None:
+    if record.get("managed") or record.get("managed_by") or record.get("managedBy"):
+        return "managed_relationship"
+    if record.get("queue_pending") or record.get("queuePending"):
+        return "queue_pending"
+    if record.get("queue_edit_locks") or record.get("usage_enrichment_pending"):
+        return "session_background_work_pending"
+    subscriptions = (record.get("report_subscriptions") or [])
+    if subscriptions:
+        return "pending_report_subscription"
+    ledger = record.get("queue_delivery_ledger") or {}
+    if not isinstance(ledger, dict):
+        return "delivery_ledger_unclear"
+    terminal_states = {"sent_to_cli", "deleted"}
+    for item in ledger.values():
+        if not isinstance(item, dict):
+            return "delivery_ledger_unclear"
+        state = item.get("deliveryState")
+        if state not in terminal_states:
+            return "pending_delivery_notification"
+    try:
+        if reminders.list_for_session(session_id):
+            return "pending_reminder"
+    except Exception:
+        return "pending_notification_state_unclear"
+    return None
+
+
+def _retention_safe_root(root: Path) -> Path | None:
+    try:
+        info = root.lstat()
+        resolved = root.resolve(strict=True)
+    except OSError:
+        return None
+    if (not stat.S_ISDIR(info.st_mode) or root.is_symlink()
+            or getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+            or os.path.normcase(str(resolved)) != os.path.normcase(str(Path(os.path.abspath(root))))):
+        return None
+    return resolved
+
+
+def _retention_safe_session_file(root: Path, path: Path) -> Path | None:
+    try:
+        info = path.lstat()
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(root)
+    except (OSError, ValueError):
+        return None
+    if (not stat.S_ISREG(info.st_mode) or path.is_symlink()
+            or getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+            or getattr(info, "st_nlink", 1) != 1
+            or os.path.normcase(str(resolved)) != os.path.normcase(str(Path(os.path.abspath(path))))):
+        return None
+    return resolved
+
+
+def _retention_disk_session_record(session_id: str) -> tuple[dict, float | None, str | None] | None:
+    root = _retention_safe_root(Path(sess.SESSION_DIR))
+    if root is None or not session_id or Path(session_id).name != session_id:
+        return None
+    metadata_path = _retention_safe_session_file(root, root / f"{session_id}.json")
+    if metadata_path is None:
+        return None
+    try:
+        record = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(record, dict) or record.get("id") != session_id:
+        return None
+    history_path = root / f"{session_id}.history.jsonl"
+    try:
+        history_path.lstat()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return None
+    else:
+        if _retention_safe_session_file(root, history_path) is None:
+            return None
+    activity, error = _retention_history_activity(history_path, record)
+    return record, activity, error
+
+
+def _retention_all_session_records() -> list[dict] | None:
+    root = Path(sess.SESSION_DIR)
+    try:
+        resolved_root = _retention_safe_root(root)
+        if resolved_root is None:
+            return None
+        records = []
+        for path in resolved_root.iterdir():
+            if path.suffix != ".json" or path.name.endswith(".history.jsonl"):
+                continue
+            safe_path = _retention_safe_session_file(resolved_root, path)
+            if safe_path is None:
+                return None
+            raw = json.loads(safe_path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict) or not isinstance(raw.get("id"), str):
+                return None
+            records.append(raw)
+        return records
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _retention_job_reference_reason(session_id: str) -> str | None:
+    roots = []
+    background = os.environ.get("PAN_BACKGROUND_JOBS_DIR")
+    scheduler = os.environ.get("PAN_SCHEDULER_DIR")
+    roots.append(Path(background).expanduser() if background else DATA_DIR / "background_jobs")
+    scheduler_root = Path(scheduler).expanduser() if scheduler else (
+        Path(background).expanduser() if background else DATA_DIR / "background_jobs")
+    roots.append(scheduler_root)
+    seen = set()
+    locations = [root / "jobs" for root in roots]
+    locations.append(DATA_DIR / "scheduler" / "tasks")
+    for jobs_dir in locations:
+        key = os.path.normcase(str(jobs_dir.resolve(strict=False)))
+        if key in seen:
+            continue
+        seen.add(key)
+        if not jobs_dir.exists():
+            continue
+        try:
+            dir_info = jobs_dir.lstat()
+            if (not stat.S_ISDIR(dir_info.st_mode) or jobs_dir.is_symlink()
+                    or getattr(dir_info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)):
+                return "job_registry_path_unclear"
+            for path in jobs_dir.glob("*.json"):
+                info = path.lstat()
+                if (not stat.S_ISREG(info.st_mode) or path.is_symlink()
+                        or getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)):
+                    return "job_registry_path_unclear"
+                job = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(job, dict):
+                    return "job_registry_record_unclear"
+                targets = _session_targets_from_item(job)
+                if session_id not in targets:
+                    continue
+                status = str(job.get("status") or "").lower()
+                if status in {"running", "starting"}:
+                    return "running_job_reference"
+                if status in {"queued", "pending"}:
+                    return "pending_job_reference"
+                enabled_scheduled = (
+                    job.get("kind") == "scheduled-task"
+                    and job.get("enabled") is True
+                    and status not in {"cancelled", "canceled", "completed", "deleted", "disabled"}
+                )
+                if enabled_scheduled:
+                    return "enabled_scheduled_job_reference"
+                if (
+                    status in {"scheduled", "pending"}
+                    and isinstance(job.get("schedule"), (dict, list))
+                ):
+                    return "scheduled_job_reference"
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return "job_registry_record_unclear"
+    return None
+
+
+def _retention_reference_reason(session_id: str, record: dict) -> str | None:
+    reason = _retention_session_reference_reason(session_id, record)
+    if reason:
+        return reason
+    records = _retention_all_session_records()
+    if records is None:
+        return "session_reference_scan_unclear"
+    for other in records:
+        if other.get("id") == session_id:
+            continue
+        managed = other.get("managed") or []
+        subscriptions = other.get("report_subscriptions") or []
+        manager = other.get("managed_by") or other.get("managedBy")
+        if (not isinstance(managed, list) or not isinstance(subscriptions, list)
+                or (manager is not None and not isinstance(manager, str))):
+            return "session_reference_scan_unclear"
+        if (session_id in managed or manager == session_id
+                or session_id in subscriptions):
+            return "referenced_by_other_session"
+        queue = other.get("queue_pending") or []
+        ledger = other.get("queue_delivery_ledger") or {}
+        if (not isinstance(queue, list) or not isinstance(ledger, dict)):
+            return "session_reference_scan_unclear"
+        if any(not isinstance(item, dict) for item in queue):
+            return "session_reference_scan_unclear"
+        if any(not isinstance(item, dict) for item in ledger.values()):
+            return "session_reference_scan_unclear"
+        if any(session_id in _session_targets_from_item(item) for item in queue):
+            return "referenced_by_pending_queue"
+        if any(session_id in _session_targets_from_item(item) for item in ledger.values() if isinstance(item, dict)):
+            return "referenced_by_delivery_ledger"
+    return _retention_job_reference_reason(session_id)
+
+
+def _retention_plain_tree(path: Path, root: Path) -> bool:
+    """Validate every descendant before retention removes an owned directory."""
+    safe_root = _retention_safe_root(root)
+    if safe_root is None:
+        return False
+    try:
+        info = path.lstat()
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(safe_root)
+    except (OSError, ValueError):
+        return False
+    if (not stat.S_ISDIR(info.st_mode) or path.is_symlink()
+            or getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+            or os.path.normcase(str(resolved)) != os.path.normcase(str(Path(os.path.abspath(path))))):
+        return False
+    try:
+        entries = list(path.iterdir())
+    except OSError:
+        return False
+    for child in entries:
+        try:
+            child_info = child.lstat()
+            child_resolved = child.resolve(strict=True)
+            child_resolved.relative_to(safe_root)
+        except (OSError, ValueError):
+            return False
+        if (child.is_symlink()
+                or getattr(child_info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+                or os.path.normcase(str(child_resolved)) != os.path.normcase(str(Path(os.path.abspath(child))))):
+            return False
+        if stat.S_ISDIR(child_info.st_mode):
+            if not _retention_plain_tree(child, root):
+                return False
+        elif not stat.S_ISREG(child_info.st_mode) or getattr(child_info, "st_nlink", 1) != 1:
+            return False
+    return True
+
+
+def _retention_workdir_candidate(record: dict) -> tuple[Path | None, str | None]:
+    raw = record.get("workdir")
+    if not raw:
+        return None, None
+    if not isinstance(raw, str):
+        return None, "workdir_path_unclear"
+    root = Path(WORKDIRS_DIR)
+    safe_root = _retention_safe_root(root)
+    if safe_root is None:
+        return None, "workdir_root_missing_or_unsafe"
+    try:
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            return None, "workdir_not_absolute"
+        info = candidate.lstat()
+        resolved = candidate.resolve(strict=True)
+        resolved_parent = candidate.parent.resolve(strict=True)
+        resolved.relative_to(safe_root)
+    except (OSError, ValueError):
+        return None, "workdir_outside_pan_root"
+    if (resolved.parent != safe_root or resolved_parent != safe_root
+            or candidate.is_symlink() or not stat.S_ISDIR(info.st_mode)
+            or getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+            or os.path.normcase(str(resolved)) != os.path.normcase(str(Path(os.path.abspath(candidate))))):
+        return None, "workdir_not_direct_plain_child"
+    if not _retention_plain_tree(resolved, root):
+        return None, "workdir_tree_unsafe"
+    return resolved, None
+
+
+def _retention_workdir_reference_state(session_id: str, candidate: Path) -> tuple[bool | None, str | None]:
+    records = _retention_all_session_records()
+    if records is None:
+        return None, "workdir_session_references_unclear"
+
+    def overlaps(raw_path: str) -> bool:
+        resolved = Path(raw_path).resolve(strict=False)
+        return (resolved == candidate or resolved in candidate.parents
+                or candidate in resolved.parents)
+
+    for row in records:
+        if row.get("id") == session_id:
+            continue
+        raw = row.get("workdir")
+        if raw is not None and not isinstance(raw, str):
+            return None, "workdir_session_references_unclear"
+        if isinstance(raw, str) and raw:
+            try:
+                if overlaps(raw):
+                    return True, "workdir_referenced_by_session"
+            except (OSError, ValueError):
+                return None, "workdir_session_references_unclear"
+    workspace_root = Path(workspaces.WORKSPACE_DIR)
+    if not workspace_root.exists():
+        return False, None
+    safe_root = _retention_safe_root(workspace_root)
+    if safe_root is None:
+        return None, "workdir_workspace_references_unclear"
+    try:
+        for path in safe_root.glob("*.json"):
+            safe = _retention_safe_session_file(safe_root, path)
+            if safe is None:
+                return None, "workdir_workspace_references_unclear"
+            data = json.loads(safe.read_text(encoding="utf-8"))
+            if not isinstance(data, dict) or not isinstance(data.get("dirs", []), list):
+                return None, "workdir_workspace_references_unclear"
+            for raw in data.get("dirs", []):
+                if not isinstance(raw, str):
+                    return None, "workdir_workspace_references_unclear"
+                try:
+                    if overlaps(raw):
+                        return True, "workdir_referenced_by_workspace"
+                except (OSError, ValueError):
+                    return None, "workdir_workspace_references_unclear"
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None, "workdir_workspace_references_unclear"
+    return False, None
+
+
+def _retention_remove_workdir(session_id: str, record: dict) -> tuple[bool, str | None]:
+    candidate, reason = _retention_workdir_candidate(record)
+    if candidate is None:
+        return (not bool(record.get("workdir")), reason)
+    referenced, reason = _retention_workdir_reference_state(session_id, candidate)
+    if referenced is None or referenced:
+        return False, reason or "workdir_ownership_unclear"
+    # Repeat the complete path/tree check directly before recursive deletion.
+    current, reason = _retention_workdir_candidate(record)
+    referenced, reference_reason = _retention_workdir_reference_state(session_id, candidate)
+    if current != candidate or reason or referenced is not False:
+        return False, reason or reference_reason or "workdir_changed_or_referenced"
+    try:
+        shutil.rmtree(candidate)
+        return True, None
+    except OSError:
+        return False, "workdir_delete_failed"
+
+
+def _retention_cleanup_auxiliary(session_id: str) -> list[str]:
+    """Delete only this Session's fixed MCP config and isolated Kimi HOME."""
+    skipped: list[str] = []
+    if not session_id or Path(session_id).name != session_id or any(c in session_id for c in "\\/:\0"):
+        return ["session_auxiliary_id_unclear"]
+    mcp_root = DATA_DIR / "mcp-configs"
+    safe_mcp_root = _retention_safe_root(mcp_root)
+    mcp_path = mcp_root / f"{session_id}.mcp.json"
+    if safe_mcp_root is not None:
+        if mcp_path.exists() or mcp_path.is_symlink():
+            safe_mcp = _retention_safe_session_file(safe_mcp_root, mcp_path)
+            if safe_mcp is None:
+                skipped.append("mcp_session_config_unsafe")
+            else:
+                try:
+                    safe_mcp.unlink()
+                except OSError as exc:
+                    skipped.append("mcp_session_config_cleanup_failed")
+                    _log(f"[retention] MCP Session config cleanup skipped: {type(exc).__name__}")
+    elif mcp_root.exists() or mcp_root.is_symlink():
+        skipped.append("mcp_config_root_unsafe")
+    kimi_root = DATA_DIR / "kimi-homes"
+    safe_kimi_root = _retention_safe_root(kimi_root)
+    kimi_home = kimi_root / session_id
+    if safe_kimi_root is not None and (kimi_home.exists() or kimi_home.is_symlink()):
+        if _retention_plain_tree(kimi_home, kimi_root):
+            try:
+                shutil.rmtree(kimi_home)
+            except OSError as exc:
+                skipped.append("kimi_session_home_cleanup_failed")
+                _log(f"[retention] Kimi Session HOME cleanup skipped: {type(exc).__name__}")
+        else:
+            skipped.append("kimi_session_home_unsafe")
+    elif (kimi_root.exists() or kimi_root.is_symlink()) and safe_kimi_root is None:
+        skipped.append("kimi_home_root_unsafe")
+    return skipped
+
+
+def _delete_session_storage(session_id: str, *, cleanup_auxiliary: bool,
+                            retention_cleanup: bool = False) -> list[str]:
+    sess.release(session_id)  # Clear manager links and report subscriptions through the Session store.
+    sess.delete(session_id)    # The store serializes metadata and history removal.
+    if cleanup_auxiliary:
+        if retention_cleanup:
+            return _retention_cleanup_auxiliary(session_id)
+        else:
+            _cleanup_mcp_config(session_id)
+            _cleanup_kimi_home(session_id)
+    return []
+
+
+async def _delete_session_records(session_id: str, *, cleanup_auxiliary: bool = True,
+                                  storage_in_thread: bool = False,
+                                  retention_cleanup: bool = False):
+    if storage_in_thread:
+        lifecycle_skips = await asyncio.to_thread(
+            _delete_session_storage, session_id,
+            cleanup_auxiliary=cleanup_auxiliary,
+            retention_cleanup=retention_cleanup,
+        )
+    else:
+        lifecycle_skips = _delete_session_storage(
+            session_id, cleanup_auxiliary=cleanup_auxiliary,
+            retention_cleanup=retention_cleanup,
+        )
     w = worker.find_worker_by_session(session_id)
     if w:
         asyncio.create_task(
             worker.cleanup_worker_background(w.worker_id, w.session_id)
         )
-    sess.delete(session_id)
-    _cleanup_mcp_config(session_id)
-    _cleanup_kimi_home(session_id)
     await broadcast({
         "type": "session.deleted",
         "sessionId": session_id,
     })
-    return {"sessionId": session_id, "status": "deleted"}
+    response = {"sessionId": session_id, "status": "deleted"}
+    if retention_cleanup:
+        response["lifecycleSkipReasons"] = lifecycle_skips
+    return response
+
+
+async def _retention_delete_session(session_id: str, expected: dict) -> dict:
+    spawn_lock = await worker._session_spawn_lock(session_id)
+    async with spawn_lock:
+        async with worker.queue_lock(session_id):
+            current = await asyncio.to_thread(sess.get, session_id, load_history=False)
+            if current is None:
+                return {"reason": "session_already_missing"}
+            current_record = current.to_dict()
+            disk = await asyncio.to_thread(_retention_disk_session_record, session_id)
+            if disk is None:
+                return {"reason": "session_path_or_metadata_unclear"}
+            disk_record, disk_activity, history_error = disk
+            expected_updated = expected.get("updated_at") or expected.get("updatedAt")
+            if (current.updated_at != expected_updated
+                    or disk_record.get("updated_at") != expected_updated):
+                return {"reason": "session_changed_during_scan"}
+            if history_error:
+                return {"reason": history_error}
+            if (disk_activity != expected.get("__retentionHistoryActivity")
+                    or getattr(current, "history_revision", 0) != expected.get("history_revision", 0)):
+                return {"reason": "history_changed_during_scan"}
+            if worker.find_alive_worker_by_session(session_id) is not None:
+                return {"reason": "live_worker"}
+            if worker.find_worker_by_session(session_id) is not None:
+                return {"reason": "worker_reference_unclear"}
+            reason = await asyncio.to_thread(
+                _retention_session_reference_reason, session_id, current_record,
+            )
+            if not reason:
+                reason = await asyncio.to_thread(
+                    _retention_reference_reason, session_id, disk_record,
+                )
+            if reason:
+                return {"reason": reason}
+            final_disk = await asyncio.to_thread(_retention_disk_session_record, session_id)
+            if final_disk is None:
+                return {"reason": "session_path_or_metadata_unclear"}
+            final_record, final_activity, final_history_error = final_disk
+            if final_history_error:
+                return {"reason": final_history_error}
+            if (final_record.get("updated_at") != expected_updated
+                    or final_activity != expected.get("__retentionHistoryActivity")):
+                return {"reason": "session_changed_during_scan"}
+            reason = await asyncio.to_thread(
+                _retention_reference_reason, session_id, final_record,
+            )
+            if reason:
+                return {"reason": reason}
+            if worker.find_alive_worker_by_session(session_id) is not None:
+                return {"reason": "live_worker"}
+            if worker.find_worker_by_session(session_id) is not None:
+                return {"reason": "worker_reference_unclear"}
+            workdir_record = dict(final_record)
+            # The existing Session store owns the JSON + JSONL delete. Session
+            # scoped MCP/Kimi state is cleaned only after this Session is safe.
+            deletion = await _delete_session_records(
+                session_id, cleanup_auxiliary=True, storage_in_thread=True,
+                retention_cleanup=True,
+            )
+            workdir_removed, workdir_reason = await asyncio.to_thread(
+                _retention_remove_workdir, session_id, workdir_record,
+            )
+            workdir_skipped = bool(workdir_record.get("workdir")) and not workdir_removed
+            return {
+                "deleted": True,
+                "workdirSkipped": workdir_skipped,
+                "workdirSkipReason": workdir_reason,
+                "lifecycleSkipReasons": deletion.get("lifecycleSkipReasons", []),
+            }
+
+
+@app.delete("/api/sessions/{session_id}")
+async def api_delete_session(session_id: str):
+    """Delete a session and its worker if running."""
+    return await _delete_session_records(session_id)
 
 
 @app.post("/api/sessions/batch-delete")
@@ -4218,15 +7057,67 @@ async def api_models(adapter: str = "cbc"):
     return {"models": a.supported_models, "default": a.default_model}
 
 
+@app.post("/api/sessions/broadcast")
+async def api_sessions_broadcast(data: dict):
+    """Send one message to selected Sessions through the normal send path.
+
+    This is an immediate fan-out primitive.  Scheduled fan-out uses the same
+    per-target send semantics through the durable time-Job endpoint below.
+    """
+    session_ids = data.get("sessionIds")
+    text = data.get("text")
+    if not isinstance(session_ids, list) or not session_ids:
+        return {"ok": False, "error": {"code": "missing_session_ids",
+                                         "message": "sessionIds must be a non-empty array"}}
+    if not isinstance(text, str) or not text:
+        return {"ok": False, "error": {"code": "missing_text",
+                                         "message": "text is required"}}
+    client_message_id = data.get("clientMessageId")
+    if client_message_id is not None and (
+            not isinstance(client_message_id, str)
+            or not client_message_id
+            or len(client_message_id) > 256):
+        return {"ok": False, "error": {"code": "invalid_client_message_id",
+                                         "message": "clientMessageId must be a non-empty string up to 256 characters"}}
+    source_type, source_session_id, source_error = _request_source_metadata(data)
+    if source_error:
+        return source_error
+    unique_ids = list(dict.fromkeys(str(value) for value in session_ids))
+    results = []
+    for session_id in unique_ids:
+        target = sess.get(session_id)
+        if not target:
+            results.append({"sessionId": session_id, "status": "error",
+                            "result": f"Session {session_id} not found"})
+            continue
+        denied = _source_access_error(target, source_session_id)
+        if denied:
+            results.append({"sessionId": session_id, "status": "error",
+                            "error": denied["error"]})
+            continue
+        result = await worker.send_session(
+            session_id, text, source=source_type, force=bool(data.get("force")),
+            client_message_id=client_message_id,
+            source_session_id=source_session_id)
+        results.append({"sessionId": session_id, **result})
+    failed = [item for item in results if item.get("status") == "error"]
+    return {"ok": not failed, "status": "partial" if failed and len(failed) < len(results)
+            else ("error" if failed else "queued"), "results": results}
+
+
 # ── Durable background jobs ──
 
 @app.post("/api/background-jobs")
 async def api_background_job_start(data: dict):
+    """Create a durable process Job with independent creator/target fields."""
     target = data.get("targetSessionId")
     argv = data.get("argv")
     cwd = data.get("cwd")
     try:
-        return background_jobs.start(target, argv, cwd, label=data.get("label"))
+        return background_jobs.start(
+            target, argv, cwd, label=data.get("label"),
+            creator_session_id=data.get("creatorSessionId"),
+        )
     except ValueError as exc:
         return {"ok": False, "error": {"code": "invalid_job", "message": str(exc)}}
     except OSError as exc:
@@ -4238,9 +7129,13 @@ async def api_background_job_list(targetSessionId: str | None = None):
     # Service lifecycle Jobs share the durable Registry but are not ordinary
     # Session-targeted background commands and must not leak into this API.
     jobs = [job for job in background_jobs.list_jobs()
-            if job.get("kind") == background_jobs.BACKGROUND_PROCESS_KIND]
+            if job.get("kind") in {background_jobs.BACKGROUND_PROCESS_KIND,
+                                    background_jobs.SESSION_MESSAGE_KIND,
+                                    background_jobs.SESSION_BROADCAST_KIND}
+            and not job.get("scheduledParentJobId")]
     if targetSessionId:
-        jobs = [j for j in jobs if j.get("targetSessionId") == targetSessionId]
+        jobs = [j for j in jobs if (j.get("targetSessionId") == targetSessionId
+                                   or targetSessionId in (j.get("targetSessionIds") or []))]
     return {"jobs": jobs}
 
 
@@ -4259,6 +7154,72 @@ async def api_background_job_cancel(job_id: str):
         return {"ok": False, "error": {"code": code, "message": str(exc)}}
 
 
+@app.post("/api/session-message-jobs")
+async def api_session_message_job_start(data: dict):
+    """Create a durable Session message or scheduled broadcast.
+
+    ``text`` is delivered as message text; it is never an OS command.
+    """
+    target = data.get("targetSessionId")
+    target_ids = data.get("targetSessionIds")
+    text = data.get("text")
+    source_type, source_session_id, source_error = _request_source_metadata(data)
+    if source_error:
+        return source_error
+    if target_ids is not None and target is not None:
+        return {"ok": False, "error": {"code": "invalid_job",
+                                         "message": "provide targetSessionId or targetSessionIds, not both"}}
+    if target_ids is None:
+        target_ids = [target] if isinstance(target, str) else None
+    if not isinstance(target_ids, list) or not target_ids:
+        return {"ok": False, "error": {"code": "invalid_job",
+                                         "message": "targetSessionId or targetSessionIds is required"}}
+    if any(not isinstance(target_id, str) or not target_id.strip()
+           for target_id in target_ids):
+        return {"ok": False, "error": {"code": "invalid_job",
+                                         "message": "target session IDs must be non-empty strings"}}
+    target_ids = list(dict.fromkeys(target_ids))
+    for target_id in target_ids:
+        target_session = sess.get(target_id) if isinstance(target_id, str) else None
+        if not target_session:
+            return {"ok": False, "error": {"code": "invalid_job",
+                                             "message": "target session does not exist"}}
+        denied = _source_access_error(target_session, source_session_id)
+        if denied:
+            return denied
+    try:
+        common = {
+            "description": data.get("description", data.get("label")),
+            "source": source_type, "source_session_id": source_session_id,
+            "creator_session_id": data.get("creatorSessionId") or source_session_id,
+        }
+        if len(target_ids) == 1 and data.get("targetSessionIds") is None:
+            return background_jobs.start_message(
+                target_ids[0], text, data.get("schedule"), **common)
+        return background_jobs.start_broadcast(
+            target_ids, text, data.get("schedule"), **common)
+    except ValueError as exc:
+        return {"ok": False, "error": {"code": "invalid_job", "message": str(exc)}}
+
+
+@app.patch("/api/background-jobs/{job_id}")
+async def api_background_job_update(job_id: str, data: dict):
+    try:
+        job = background_jobs.get(job_id)
+        if not job or job.get("kind") not in {
+            background_jobs.SESSION_MESSAGE_KIND,
+            background_jobs.SESSION_BROADCAST_KIND,
+        }:
+            raise ValueError("message Job not found")
+        return background_jobs.update_message(
+            job_id, text=data.get("text"), schedule=data.get("schedule"),
+            description=data.get("description"),
+            target_session_ids=data.get("targetSessionIds"))
+    except ValueError as exc:
+        code = "job_not_found" if "not found" in str(exc) else "invalid_job"
+        return {"ok": False, "error": {"code": code, "message": str(exc)}}
+
+
 @app.post("/api/background-jobs/{job_id}/retry")
 async def api_background_job_retry(job_id: str):
     try:
@@ -4271,6 +7232,12 @@ async def api_background_job_retry(job_id: str):
 # ── 定时任务（scheduler 插件） ──
 scheduler_api.bind(broadcast=broadcast)
 app.include_router(scheduler_api.router)
+
+# ── Job 统一 API（P2：全 kind 一览/管理；/api/scheduler/* 兼容别名照旧） ──
+from packages.jobs import api as jobs_api  # noqa: E402  延迟导入避免启动期循环
+
+jobs_api.bind(broadcast=broadcast)
+app.include_router(jobs_api.router)
 
 
 @app.get("/api/adapter/config")
@@ -4310,6 +7277,77 @@ async def api_list_adapters():
 
 # ── App settings (config.json ui) ──
 
+_NEW_SESSION_DEFAULT_KEYS = {"adapter", "outputMode", "sessionTemplate", "workdir"}
+
+
+@app.get("/api/new-session-defaults")
+async def api_get_new_session_defaults():
+    """Return saved New Session form defaults, if configured."""
+    return {"defaults": load_config().get("new_session_defaults")}
+
+
+@app.put("/api/new-session-defaults")
+async def api_put_new_session_defaults(data: dict):
+    """Strictly validate and atomically persist New Session form defaults."""
+    unknown = set(data) - _NEW_SESSION_DEFAULT_KEYS
+    missing = _NEW_SESSION_DEFAULT_KEYS - set(data)
+    if unknown or missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Expected exactly {sorted(_NEW_SESSION_DEFAULT_KEYS)}; "
+            f"missing={sorted(missing)}, unknown={sorted(unknown)}",
+        )
+
+    adapter_name = data["adapter"]
+    if not isinstance(adapter_name, str) or not adapter_name:
+        raise HTTPException(status_code=400, detail="adapter must be a non-empty string")
+    try:
+        adapter = get_adapter(adapter_name)
+    except KeyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    output_mode = data["outputMode"]
+    if not isinstance(output_mode, str):
+        raise HTTPException(status_code=400, detail="outputMode must be a string")
+    if output_mode:
+        try:
+            validate_output_mode(adapter, output_mode)
+        except AdapterCapabilityError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    template_name = data["sessionTemplate"]
+    if not isinstance(template_name, str):
+        raise HTTPException(status_code=400, detail="sessionTemplate must be a string")
+    if template_name:
+        _ensure_manifest_fresh()
+        template = (
+            _character_manager.get_session_template(template_name)
+            if _character_manager is not None
+            else None
+        )
+        if template is None:
+            raise HTTPException(status_code=400, detail=f"Unknown session template: {template_name}")
+        if template.adapter and template.adapter != adapter_name:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Template {template_name!r} requires adapter {template.adapter!r}",
+            )
+
+    workdir = data["workdir"]
+    if not isinstance(workdir, str):
+        raise HTTPException(status_code=400, detail="workdir must be a string")
+
+    defaults = {
+        "adapter": adapter_name,
+        "outputMode": output_mode,
+        "sessionTemplate": template_name,
+        "workdir": workdir.strip(),
+    }
+    raw = read_config_file()
+    raw["new_session_defaults"] = defaults
+    save_config(raw)
+    return {"defaults": defaults}
+
 @app.get("/api/settings/ui")
 async def api_get_settings_ui():
     """Return the app-settings ``ui`` object (merged with defaults).
@@ -4319,6 +7357,56 @@ async def api_get_settings_ui():
     browsers/sessions (previously they lived in browser localStorage).
     """
     return load_config().get("ui") or {}
+
+
+@app.get("/api/data/catalog")
+async def api_get_data_catalog():
+    """Return the read-only inventory of registered Pan storage locations.
+
+    The catalog contains resolved paths and existence flags only. It does not
+    traverse directories, inspect file contents, or accept path filters.
+    """
+    return get_data_catalog()
+
+
+@app.get("/api/settings/data-retention")
+async def api_get_data_retention():
+    """Read Data-owned retention policies and recent scan results."""
+    config = load_config()
+    raw_retention = config.get("data_retention") or {}
+    return {
+        "policies": normalize_data_retention_policies(raw_retention),
+        "configKey": "data_retention",
+        "lastScans": _get_data_retention_service().get_status(),
+    }
+
+
+@app.put("/api/settings/data-retention")
+async def api_put_data_retention(data: dict = Body(...)):
+    """Strictly save Data-owned policies; Jobs settings have their own API."""
+    if not isinstance(data, dict) or set(data) != {"policies"}:
+        raise HTTPException(status_code=422, detail="expected policies only")
+    config = load_config()
+    current = normalize_data_retention_policies(config.get("data_retention"))
+    try:
+        policies = validate_data_retention_update({"policies": data["policies"]}, current)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    raw = read_config_file()
+    retention = raw.get("data_retention")
+    if not isinstance(retention, dict):
+        retention = {}
+    # Remove the short-lived Data-owned Jobs slot introduced by the earlier
+    # integration draft. Canonical Jobs settings live under config.jobs.
+    retention.pop("jobs", None)
+    retention.update(policies)
+    raw["data_retention"] = retention
+    save_config(raw)
+    return {
+        "policies": policies,
+        "configKey": "data_retention",
+        "lastScans": _get_data_retention_service().get_status(),
+    }
 
 
 @app.put("/api/settings/ui")
@@ -4336,6 +7424,54 @@ async def api_put_settings_ui(data: dict):
     raw["ui"] = ui
     save_config(raw)
     return ui
+
+
+@app.get("/api/settings/session-lifecycle")
+async def api_get_settings_session_lifecycle():
+    """Read cross-browser Exit and startup legal-state preferences."""
+    return _session_lifecycle_preferences()
+
+
+@app.put("/api/settings/session-lifecycle")
+async def api_put_settings_session_lifecycle(data: dict = Body(...)):
+    """Strictly merge lifecycle preferences into config.json.
+
+    Only the two enum fields are accepted. The raw config object is updated so
+    unrelated project configuration and future keys remain intact.
+    """
+    if not isinstance(data, dict) or not data:
+        raise HTTPException(status_code=422, detail="expected lifecycle preference fields")
+    unknown = sorted(set(data) - set(_SESSION_LIFECYCLE_DEFAULTS))
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "unsupported_session_lifecycle_fields", "fields": unknown},
+        )
+    allowed = {
+        "exitStrategy": _SESSION_LIFECYCLE_EXIT_STRATEGIES,
+        "startupPreference": _SESSION_LIFECYCLE_STARTUP_PREFERENCES,
+    }
+    for field_name, value in data.items():
+        if not isinstance(value, str) or value not in allowed[field_name]:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "invalid_session_lifecycle_preference",
+                    "field": field_name,
+                    "allowed": sorted(allowed[field_name]),
+                },
+            )
+
+    current = _session_lifecycle_preferences()
+    updated = {**current, **data}
+    raw = read_config_file()
+    section = raw.get("session_lifecycle")
+    if not isinstance(section, dict):
+        section = {}
+    section.update(updated)
+    raw["session_lifecycle"] = section
+    save_config(raw)
+    return updated
 
 
 # ── Worker settings (config.json worker, hot-applied) ──
@@ -4380,15 +7516,18 @@ async def api_put_settings_worker(data: dict):
     return worker.reload_worker_config()
 
 
-# ── Remote tunnel (cloudflared, scripts/start_cf.ps1) ──
+# ── Remote tunnel (cloudflared, owned by packages.core.launcher) ──
 #
-# Pan's own tunnel cloudflared is started by scripts/start_cf.ps1 with a
-# generated temp yml (%TEMP%/pan_cf_config_<port>.yml). PidFiles written at
-# start are deleted by start_pan.bat, so running processes are identified by
-# command line instead — the temp-yml marker is unique to Pan's tunnel and
-# never matches service installs (e.g. cloudflared-ssh).
+# The launcher writes a checkout-scoped state record containing the PID,
+# creation time, port-specific marker, argv and process type.  The web API
+# never scans or kills an unrecorded cloudflared process.
 
 _PAN_TUNNEL_MARKER = "pan_cf_config_"
+
+
+def _owned_tunnel() -> dict[str, Any] | None:
+    """Read only the launcher-recorded cloudflared process for this checkout."""
+    return launcher.owned_cloudflared(_PROJECT_DIR)
 
 
 def _matches_pan_tunnel(name: str, cmdline: str) -> bool:
@@ -4397,7 +7536,8 @@ def _matches_pan_tunnel(name: str, cmdline: str) -> bool:
     True only when the process is a cloudflared binary AND its command line
     references the temp tunnel config marker (pan_cf_config_<port>.yml).
     Service processes (cloudflared-ssh etc.) never reference that file and
-    are never matched — mirrors scripts/stop_pan.bat's precise 5c fallback.
+    are never matched; the actual lifecycle operation is delegated to the
+    launcher-owned state record below.
     """
     if not cmdline:
         return False
@@ -4408,65 +7548,21 @@ def _matches_pan_tunnel(name: str, cmdline: str) -> bool:
 
 
 def _find_pan_tunnel_processes() -> list[dict]:
-    """Return [{pid, name, cmdline}] for Pan's cloudflared tunnel processes."""
-    procs: list[dict] = []
-    try:
-        import psutil
-
-        for p in psutil.process_iter(["pid", "name", "cmdline"]):
-            try:
-                info = p.info
-                cmdline = " ".join(info.get("cmdline") or [])
-                if _matches_pan_tunnel(info.get("name") or "", cmdline):
-                    procs.append({
-                        "pid": info["pid"],
-                        "name": info.get("name") or "",
-                        "cmdline": cmdline,
-                    })
-            except Exception:
-                continue
-    except ImportError:
-        # PowerShell fallback (same matcher as scripts/stop_pan.bat 5c).
-        try:
-            out = subprocess.run(
-                [
-                    "powershell", "-NoProfile", "-Command",
-                    "Get-CimInstance Win32_Process -Filter \"Name='cloudflared.exe'\""
-                    " | Select-Object ProcessId,CommandLine | ConvertTo-Json",
-                ],
-                capture_output=True, text=True, timeout=15,
-            )
-            data = json.loads(out.stdout or "null")
-            items = data if isinstance(data, list) else ([data] if data else [])
-            for it in items:
-                cmdline = it.get("CommandLine") or ""
-                if _matches_pan_tunnel("cloudflared.exe", cmdline):
-                    procs.append({
-                        "pid": int(it["ProcessId"]),
-                        "name": "cloudflared.exe",
-                        "cmdline": cmdline,
-                    })
-        except Exception as e:
-            _log(f"[remote] cloudflared process scan failed: {e}")
-    return procs
+    """Return only the launcher-recorded tunnel after identity validation."""
+    owned = launcher.owned_cloudflared(_PROJECT_DIR)
+    if not owned or not owned.get("identity", {}).get("ok"):
+        return []
+    record = owned["record"]
+    return [{
+        "pid": record.get("pid"), "name": "cloudflared.exe",
+        "cmdline": " ".join(record.get("argv") or []),
+        "createdAt": record.get("createdAt"),
+    }]
 
 
 def _kill_pan_tunnel_processes(procs: list[dict]) -> list[int]:
-    """Kill the given processes (tree-kill); returns pids actually killed."""
-    killed: list[int] = []
-    for pr in procs:
-        try:
-            r = subprocess.run(
-                ["taskkill", "/PID", str(pr["pid"]), "/T", "/F"],
-                capture_output=True, text=True, timeout=10,
-            )
-            if r.returncode == 0:
-                killed.append(pr["pid"])
-            else:
-                _log(f"[remote] kill pid {pr['pid']} failed: {r.stderr.strip()}")
-        except Exception as e:
-            _log(f"[remote] kill pid {pr['pid']} error: {e}")
-    return killed
+    """Deprecated compatibility hook; destructive work belongs to launcher."""
+    return []
 
 
 @app.get("/api/remote/status")
@@ -4474,8 +7570,8 @@ async def api_remote_status():
     """Remote tunnel status for the App Settings modal.
 
     ``available`` reflects the raw on-disk config (remote section present);
-    ``enabled`` comes from the merged config. ``running`` = a Pan tunnel
-    cloudflared process was found by command-line match.
+    ``enabled`` comes from the merged config. ``running`` is true only for
+    the launcher-recorded tunnel whose identity still matches.
     """
     config = load_config()
     raw = read_config_file()
@@ -4487,48 +7583,25 @@ async def api_remote_status():
         "quickTunnel": bool(remote.get("quick_tunnel")),
         "protocol": remote.get("protocol") or "",
         "port": config.get("port"),
-        "running": bool(_find_pan_tunnel_processes()),
+        "running": bool((_owned_tunnel() or {}).get("identity", {}).get("ok")),
     }
 
 
 @app.post("/api/remote/restart")
 async def api_remote_restart():
-    """Restart Pan's cloudflared tunnel via scripts/start_cf.ps1.
-
-    Only processes whose command line carries the temp-yml marker are killed
-    (never the cloudflared-ssh service). Restarting re-runs start_cf.ps1 —
-    the same entry point start_pan.bat uses — so the freshly generated temp
-    yml picks up current config.json values (port + remote.protocol).
-    """
+    """Restart only this checkout's launcher-recorded cloudflared tunnel."""
     config = load_config()
     remote = config.get("remote") or {}
     if not remote.get("enabled"):
         return {"ok": False, "error": "remote is not enabled in config.json"}
 
-    killed = _kill_pan_tunnel_processes(_find_pan_tunnel_processes())
-
-    script = _PROJECT_DIR / "scripts" / "start_cf.ps1"
-    if not script.exists():
-        return {"ok": False, "error": f"start script not found: {script}",
-                "killed": killed}
     try:
-        r = subprocess.run(
-            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-             "-File", str(script)],
-            capture_output=True, text=True, timeout=30,
-            cwd=str(_PROJECT_DIR),
-        )
-    except Exception as e:
-        return {"ok": False, "error": str(e), "killed": killed}
-    if r.returncode != 0:
-        err = (r.stderr or r.stdout or "").strip()[-500:]
-        return {"ok": False, "error": f"start_cf.ps1 failed: {err}",
-                "killed": killed}
-
-    # Give cloudflared a moment to appear, then confirm via process scan.
-    await asyncio.sleep(2)
-    restarted = bool(_find_pan_tunnel_processes())
-    return {"ok": True, "killed": killed, "restarted": restarted}
+        result = launcher.restart_cloudflared(_PROJECT_DIR)
+    except launcher.LauncherError as exc:
+        return {"ok": False, "error": str(exc), "killed": []}
+    await asyncio.sleep(0.2)
+    result["restarted"] = bool((_owned_tunnel() or {}).get("identity", {}).get("ok"))
+    return result
 
 
 # ── Config hot-reload ──
@@ -4563,38 +7636,156 @@ def _reload_adapter_models() -> tuple[list[dict], list[str]]:
 async def api_codex_refresh_official_models():
     """Replace the Codex whitelist with the visible official model catalog."""
     try:
+        codex_argv = [str(part) for part in get_adapter("codex").resolved_cli_argv()]
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"failed to resolve codex executable: {e}",
+        ) from e
+    if not codex_argv:
+        raise HTTPException(status_code=502, detail="failed to resolve codex executable: empty argv")
+
+    command = [*codex_argv, "debug", "models"]
+    try:
         completed = subprocess.run(
-            ["codex", "debug", "models"],
+            command,
             capture_output=True,
-            text=True,
             timeout=30,
             cwd=str(_PROJECT_DIR),
         )
     except subprocess.TimeoutExpired:
         raise HTTPException(status_code=504, detail="codex debug models timed out")
     except OSError as e:
-        raise HTTPException(status_code=502, detail=f"failed to run codex: {e}")
+        raise HTTPException(status_code=502, detail=f"failed to run codex debug models: {e}") from e
+
+    stdout_raw = completed.stdout
+    stderr_raw = completed.stderr
+
+    def _capture_bytes(value) -> bytes | None:
+        # ``capture_output=True`` returns bytes. Accept strings too for older
+        # subprocess shims and callers, encoding them explicitly as UTF-8.
+        if isinstance(value, bytes):
+            return value
+        if isinstance(value, str):
+            return value.encode("utf-8")
+        return None
+
+    stdout_bytes = _capture_bytes(stdout_raw)
+    stderr_bytes = _capture_bytes(stderr_raw)
+    stdout_size = len(stdout_bytes) if stdout_bytes is not None else 0
+    stderr_size = len(stderr_bytes) if stderr_bytes is not None else 0
 
     if completed.returncode != 0:
-        message = (completed.stderr or completed.stdout or "command failed").strip()
-        raise HTTPException(status_code=502, detail=f"codex debug models failed: {message[-500:]}")
+        detail = (
+            "codex debug models failed "
+            f"(exit code {completed.returncode}; stdout {stdout_size} bytes; "
+            f"stderr {stderr_size} bytes)"
+        )
+        # Include only a short, plain-text first line from a small stderr. Never
+        # echo JSON/model payloads or large CLI output into the settings UI.
+        if stderr_bytes and stderr_size <= 200:
+            hint = stderr_bytes.decode("utf-8", errors="replace").strip().splitlines()
+            if hint:
+                first_line = " ".join(hint[0].split())
+                if first_line and not any(char in first_line for char in "{}[]"):
+                    detail += f": {first_line}"
+        raise HTTPException(status_code=502, detail=detail)
+
+    if stdout_bytes is None:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "invalid codex model catalog: stdout was not captured "
+                f"(stderr {stderr_size} bytes)"
+            ),
+        )
+    if not stdout_bytes.strip():
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "invalid codex model catalog: stdout is empty "
+                f"(stderr {stderr_size} bytes)"
+            ),
+        )
+
     try:
-        catalog = json.loads(completed.stdout)
-        if isinstance(catalog, dict):
-            catalog = catalog.get("models")  # actual `codex debug models` shape
-        if not isinstance(catalog, list):
-            raise ValueError("expected a JSON object with models[] or a JSON array")
-        models = []
-        for item in catalog:
-            if not isinstance(item, dict):
-                raise ValueError("catalog entries must be objects")
-            if item.get("visibility") in (None, "list"):
-                slug = item.get("slug")
-                if not isinstance(slug, str) or not slug:
-                    raise ValueError("visible catalog entry has no valid slug")
+        # Codex CLI writes UTF-8 JSON, including large model descriptions and
+        # instruction fields. Decode explicitly instead of using the Windows
+        # locale codec (which can fail and leave CompletedProcess.stdout=None).
+        stdout_text = stdout_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "invalid codex model catalog: stdout is not valid UTF-8 "
+                f"at byte {e.start} ({stdout_size} bytes)"
+            ),
+        ) from e
+
+    try:
+        catalog = json.loads(stdout_text)
+    except json.JSONDecodeError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "invalid codex model catalog: stdout is not valid JSON "
+                f"at line {e.lineno}, column {e.colno} ({stdout_size} bytes)"
+            ),
+        ) from e
+
+    if isinstance(catalog, dict):
+        if "models" not in catalog:
+            keys = ", ".join(sorted(str(key) for key in catalog.keys()))
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "invalid codex model catalog: expected a JSON object with "
+                    f"models[] or a JSON array (object keys: {keys or '(none)'})"
+                ),
+            )
+        catalog = catalog["models"]
+    if not isinstance(catalog, list):
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "invalid codex model catalog: expected models[] or a JSON "
+                f"array, got {type(catalog).__name__}"
+            ),
+        )
+
+    models = []
+    seen_models = set()
+    for index, item in enumerate(catalog):
+        if not isinstance(item, dict):
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "invalid codex model catalog: "
+                    f"entry {index} is {type(item).__name__}, expected an object"
+                ),
+            )
+        if item.get("visibility") in (None, "list"):
+            slug = item.get("slug")
+            if not isinstance(slug, str) or not slug.strip():
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        "invalid codex model catalog: "
+                        f"visible entry {index} has no valid slug"
+                    ),
+                )
+            slug = slug.strip()
+            if slug not in seen_models:
                 models.append(slug)
-    except (json.JSONDecodeError, ValueError) as e:
-        raise HTTPException(status_code=502, detail=f"invalid codex model catalog: {e}")
+                seen_models.add(slug)
+    if not models:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "invalid codex model catalog: catalog contains no visible models "
+                f"({len(catalog)} entries)"
+            ),
+        )
 
     before = list(get_adapter("codex").supported_models)
     raw = read_config_file()
@@ -4846,6 +8037,12 @@ async def api_task(data: dict):
     send_kwargs = {"source": source_type}
     if data.get("taskId") is not None:
         send_kwargs["task_id"] = data.get("taskId")
+    elif data.get("inheritTaskId") and source_type == "agent" and session_id:
+        # agent_send_force uses this legacy task route after restarting.  Keep
+        # the same enqueue-time snapshot as /api/send without turning the
+        # inherited id into a second assign idempotency key.
+        send_kwargs["task_id"] = target.active_task_id if target else None
+        send_kwargs["idempotent_task_id"] = False
     if data.get("clientMessageId") is not None:
         send_kwargs["client_message_id"] = data.get("clientMessageId")
     if source_session_id is not None:
@@ -4871,7 +8068,8 @@ async def api_task(data: dict):
         "sessionId": w.session_id if w else session_id,
         "status": "queued",
         "queueItemId": (worker._find_queue_item_by_idempotency(
-            sess.get(session_id), client_message_id=data.get("clientMessageId"),
+            _summary_session_get(session_id),
+            client_message_id=data.get("clientMessageId"),
             task_id=data.get("taskId")) or {}).get("queueItemId"),
     }
 
@@ -4884,6 +8082,8 @@ async def api_send(data: dict):
     sessionId 无活 worker 时**不报错**：消息入 Session.queue_pending
     （type=task），由全局 watchdog spawn 后经 _recover_pending_signals
     分发。force=true 时对活 worker 先 restart 再投递（worker_send_force 语义）。
+    source=agent 的消息在入队时继承目标 Session.active_task_id 作为 report
+    配对上下文；该值不参加 assign 幂等，source=user 不继承。
     隔离由 MCP 层实施（与 /api/claim 同约定），本端点不检查 pan_access。
     """
     worker_id = data.get("workerId")
@@ -4963,7 +8163,8 @@ async def api_notify(data: dict):
 async def api_assign(data: dict):
     """异步分派：发任务后立即返回 queued，完成时通过 worker.result 事件回调。
 
-    taskId 可选：带 taskId 时走幂等语义（同 taskId 重发不双跑），见 worker.assign。
+    taskId 可选：带 taskId 时走幂等语义（同 taskId 重发不双跑），见 worker.assign；
+    成功入队后该值成为 Session 的持久 active_task_id。
     """
     session_id = data.get("sessionId")
     text = data.get("text")
@@ -5374,6 +8575,8 @@ async def api_claim(data: dict):
         return {"ok": False, "error": {
             "code": "claim_failed",
             "message": err}}
+    await broadcast({"type": "session.updated", "sessionId": session_id})
+    await broadcast({"type": "session.updated", "sessionId": manager_id})
     return {
         "ok": True,
         "managerId": manager_id,
@@ -5403,6 +8606,8 @@ async def api_unclaim(data: dict):
         return {"ok": False, "error": {
             "code": "unclaim_failed",
             "message": err}}
+    await broadcast({"type": "session.updated", "sessionId": session_id})
+    await broadcast({"type": "session.updated", "sessionId": manager_id})
     manager = sess.get(manager_id)
     return {
         "ok": True,
@@ -5526,6 +8731,7 @@ async def _codex_quota_for_request(
     target_worker=None,
     candidates: list | None = None,
     requested_window: str = "all",
+    refresh: bool = True,
 ) -> dict:
     base_profile = resolve_profile_identity()
     live_worker = target_worker
@@ -5586,9 +8792,12 @@ async def _codex_quota_for_request(
         live_snapshot_updated = await _persist_live_codex_quota(live_worker, store)
 
     record = store.load()
-    refresh = await _codex_wham_provider.maybe_refresh(store)
-    if refresh.record is not None:
-        record = refresh.record
+    refresh_result = (
+        await _codex_wham_provider.maybe_refresh(store)
+        if refresh else None
+    )
+    if refresh_result is not None and refresh_result.record is not None:
+        record = refresh_result.record
     if record is None:
         error = {
             "code": "quota_unavailable",
@@ -5596,10 +8805,10 @@ async def _codex_quota_for_request(
             "provider": "codex",
             "sessionId": session_id,
         }
-        if refresh.error_code:
-            error["refresh"] = refresh.error_code
-        if refresh.credential_status:
-            error["credentialStatus"] = refresh.credential_status
+        if refresh_result is not None and refresh_result.error_code:
+            error["refresh"] = refresh_result.error_code
+        if refresh_result is not None and refresh_result.credential_status:
+            error["credentialStatus"] = refresh_result.credential_status
         return {"ok": False, "error": error}
 
     stale = is_stale(record, _codex_wham_provider.ttl_seconds)
@@ -5612,15 +8821,15 @@ async def _codex_quota_for_request(
     )
     result["cacheMode"] = "live" if live_snapshot_updated else "persisted"
     result["profileKey"] = profile.profile_key
-    if refresh.error_code and refresh.error_code != "feature_disabled":
-        result["refreshError"] = refresh.error_code
-        if refresh.credential_status:
-            result["credentialStatus"] = refresh.credential_status
+    if refresh_result is not None and refresh_result.error_code and refresh_result.error_code != "feature_disabled":
+        result["refreshError"] = refresh_result.error_code
+        if refresh_result.credential_status:
+            result["credentialStatus"] = refresh_result.credential_status
     return result
 
 
 @app.get("/api/codex/quota")
-async def api_codex_quota(session_id: str = "", window: str = "all"):
+async def api_codex_quota(session_id: str = "", window: str = "all", refresh: bool = True):
     """Query global Codex account windows, preferring live push data.
 
     ``first`` is the five-hour window and ``secondary`` is the weekly window;
@@ -5634,8 +8843,10 @@ async def api_codex_quota(session_id: str = "", window: str = "all"):
     is enforced by the MCP caller layer before it calls this endpoint.
 
     The response may be a live app-server push, a persisted last-good value, or
-    an optional WHAM refresh. ``observedAt``/``receivedAt`` are local Pan
-    times; the provider's original update time is not fabricated or exposed.
+    an optional WHAM refresh. ``refresh=false`` is the cache-only form used by
+    the Session usage endpoint and never waits for WHAM. ``observedAt``/
+    ``receivedAt`` are local Pan times; the provider's original update time is
+    not fabricated or exposed.
     """
     if not validate_quota_window(window):
         return {"ok": False, "error": {
@@ -5660,6 +8871,7 @@ async def api_codex_quota(session_id: str = "", window: str = "all"):
             session_id=session_id,
             target_worker=selected,
             requested_window=window,
+            refresh=refresh,
         )
     else:
         candidates = [w for w in worker.list_live_workers() if _is_codex_worker(w)]
@@ -5667,6 +8879,7 @@ async def api_codex_quota(session_id: str = "", window: str = "all"):
         session_id="",
         candidates=candidates,
         requested_window=window,
+        refresh=refresh,
     )
 
 
@@ -5847,7 +9060,7 @@ async def _import_session(provider, adapter: str, data: dict) -> dict:
 
     # Dedup by cli_session_id（限定同 adapter）
     existing = None
-    for s in sess.list_all():
+    for s in sess.list_all(load_history=False):
         if s.cli_session_id == session_id and s.adapter == adapter:
             existing = s
             break
@@ -5867,7 +9080,7 @@ async def _import_session(provider, adapter: str, data: dict) -> dict:
             # which would otherwise duplicate agent-side messages.
             w._replaying = True
             try:
-                existing.history = history
+                sess.replace_history(existing, history)
                 existing.raw_usage = raw_usage
                 existing.total_usage = total_usage
                 # history 整体替换 → 全量重写 jsonl（增量 append 会把新历史
@@ -5879,11 +9092,12 @@ async def _import_session(provider, adapter: str, data: dict) -> dict:
                 })
             finally:
                 w._replaying = False
-            return {**_session_to_api(existing), "reimported": True}
+            response = _session_import_api(existing)
+            return {**response, "reimported": True}
         w = worker.find_worker_by_session(existing.id)
         if w:
             await worker.kill_worker(w.worker_id)
-        existing.history = history
+        sess.replace_history(existing, history)
         existing.raw_usage = raw_usage
         existing.total_usage = total_usage
         existing.last_result = None
@@ -5892,7 +9106,8 @@ async def _import_session(provider, adapter: str, data: dict) -> dict:
             "type": "session.updated",
             "sessionId": existing.id,
         })
-        return {**_session_to_api(existing), "reimported": True}
+        response = _session_import_api(existing)
+        return {**response, "reimported": True}
 
     name = (
         data.get("name", "")
@@ -5909,6 +9124,7 @@ async def _import_session(provider, adapter: str, data: dict) -> dict:
                 "adapter": adapter,
                 "name": name,
                 "sessionTemplate": data.get("sessionTemplate"),
+                **({"workspaceIds": data["workspaceIds"]} if "workspaceIds" in data else {}),
                 **({"panAccess": data["panAccess"]} if "panAccess" in data else {}),
                 **({key: data[key] for key in (
                     "modelContextWindow", "modelAutoCompactTokenLimit",
@@ -5944,6 +9160,7 @@ async def _import_session(provider, adapter: str, data: dict) -> dict:
         handoff_prompt=params.get("handoff_prompt"),
         pan_access=params.get("pan_access"),
         adapter_config=params.get("adapter_config"),
+        workspace_ids=params.get("workspace_ids", []),
     )
 
     await broadcast({
@@ -5952,7 +9169,7 @@ async def _import_session(provider, adapter: str, data: dict) -> dict:
         "name": s.name,
     })
 
-    return _session_to_api(s)
+    return _session_import_api(s)
 
 
 @app.get("/api/adapters/{adapter}/sessions")
@@ -6167,7 +9384,8 @@ async def api_session_worker_control(session_id: str, data: dict):
 async def api_worker_steer(worker_id: str, data: dict):
     """Inject text into a running native turn (Claude stream / Codex)."""
     err = await worker.steer_worker(
-        worker_id, data.get("text") if isinstance(data, dict) else ""
+        worker_id, data.get("text") if isinstance(data, dict) else "",
+        data.get("messageId") if isinstance(data, dict) else None,
     )
     if err:
         return {"error": err}
@@ -6178,6 +9396,7 @@ async def api_worker_steer(worker_id: str, data: dict):
 async def api_session_worker_steer(session_id: str, data: dict):
     result = await worker.steer_session_worker(
         session_id, data.get("text") if isinstance(data, dict) else "",
+        data.get("messageId") if isinstance(data, dict) else None,
     )
     if isinstance(result, str):
         return {"error": result}

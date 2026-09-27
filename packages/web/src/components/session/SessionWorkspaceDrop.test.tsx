@@ -3,10 +3,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, fireEvent, render, waitFor } from '@testing-library/react';
 import { SessionList } from './SessionList';
 import { WorkspaceRail } from '@/components/layout/WorkspaceRail';
+import { Layout } from '@/App';
 import { useSessionStore } from '@/stores/sessionStore';
 import { useUIStore } from '@/stores/uiStore';
 import { useWorkspaceStore } from '@/stores/workspaceStore';
 import type { Session, Workspace } from '@/types';
+import { MemoryRouter, Route, Routes } from 'react-router-dom';
 
 const apiMocks = vi.hoisted(() => ({
   createWorkspace: vi.fn(),
@@ -23,6 +25,8 @@ vi.mock('@/services/api', async (importOriginal) => {
     setSessionWorkspaces: apiMocks.setSessionWorkspaces,
   };
 });
+
+vi.mock('@/hooks/useWebSocket', () => ({ useWebSocket: vi.fn() }));
 
 const BASE_WORKSPACE: Workspace = {
   id: 'ws-existing',
@@ -73,7 +77,8 @@ function setupRects() {
     if (this.dataset.workspaceTabId === BASE_WORKSPACE.id) return rect(300, 40, 180, 40);
     if (this.dataset.workspaceTabId === SECOND_WORKSPACE.id) return rect(300, 80, 180, 40);
     if (this.dataset.workspaceTabId === '__create_workspace__') return rect(300, 130, 180, 40);
-    if (this.dataset.testid === 'mobile-workspace-rail-collapsed') return rect(760, 450, 44, 44);
+    if (this.dataset.testid === 'mobile-workspace-rail-collapsed') return rect(260, 200, 44, 600);
+    if (this.dataset.testid === 'mobile-workspace-rail-expanded') return rect(253, 0, 137, 800);
     if (this.querySelector('[data-session-card-id]')) return rect(0, 0, 300, 600);
     return { ...NULL_RECT };
   });
@@ -83,6 +88,17 @@ function startSessionDrag(container: HTMLElement) {
   const handle = container.querySelector('[data-testid="drag-handle"]');
   if (!handle) throw new Error('Session drag handle was not rendered');
   act(() => fireEvent.pointerDown(handle, { button: 0, pointerType: 'mouse', clientX: 10, clientY: 10 }));
+}
+
+function startPointerDown(
+  target: Element,
+  init: { button: number; pointerType: 'mouse' | 'touch'; clientX: number; clientY: number },
+) {
+  const event = new Event('pointerdown', { bubbles: true, cancelable: true });
+  for (const [key, value] of Object.entries(init)) {
+    Object.defineProperty(event, key, { configurable: true, value });
+  }
+  act(() => target.dispatchEvent(event));
 }
 
 function movePointer(clientX: number, clientY: number) {
@@ -114,6 +130,8 @@ describe('Workspace rail drag interactions', () => {
     useWorkspaceStore.setState({ workspaces: [BASE_WORKSPACE], loaded: true, loading: false, error: null });
     useUIStore.setState({
       railExpanded: true,
+      mobileSidebarOpen: false,
+      activeWorkspaceId: 'all',
       groupBy: 'none',
       dragEnabled: true,
       sortBy: 'recent',
@@ -127,7 +145,11 @@ describe('Workspace rail drag interactions', () => {
     setupRects();
   });
 
-  afterEach(() => rectSpy?.mockRestore());
+  afterEach(() => {
+    rectSpy?.mockRestore();
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
 
   it('moves a dragged Session to the Workspace tab using the final pointer target', async () => {
     const { container } = render(<><SessionList /><WorkspaceRail /></>);
@@ -147,7 +169,7 @@ describe('Workspace rail drag interactions', () => {
     const source = container.querySelector('[data-workspace-tab-id="ws-existing"]');
     expect(source).not.toBeNull();
 
-    act(() => fireEvent.pointerDown(source!, { button: 0, pointerType: 'mouse', clientY: 55 }));
+    startPointerDown(source!, { button: 0, pointerType: 'mouse', clientX: 350, clientY: 55 });
     movePointer(350, 112);
     expect(document.body.classList.contains('select-none')).toBe(true);
     releasePointer();
@@ -157,6 +179,78 @@ describe('Workspace rail drag interactions', () => {
     expect(apiMocks.setSessionWorkspaces).not.toHaveBeenCalled();
     expect(useSessionStore.getState().sessions[0]?.workspaceIds).toEqual([]);
     expect(container.querySelector('[data-testid="workspace-count-ws-existing"]')?.textContent).toBe('0');
+  });
+
+  it('uses a short touch tap to select a mobile Workspace', () => {
+    useWorkspaceStore.setState({ workspaces: [BASE_WORKSPACE, SECOND_WORKSPACE] });
+    useUIStore.setState({ activeWorkspaceId: 'all' });
+    const { container } = render(
+      <WorkspaceRail mobileDrawer mobileExpanded onMobileExpandedChange={vi.fn()} />,
+    );
+    const tab = container.querySelector('[data-workspace-tab-id="ws-existing"]');
+    expect(tab).not.toBeNull();
+    expect(tab?.getAttribute('aria-label')).toBe('工作区 Existing，短按切换，长按拖动排序');
+
+    startPointerDown(tab!, { button: 0, pointerType: 'touch', clientX: 350, clientY: 55 });
+    releasePointer();
+    fireEvent.click(tab!);
+
+    expect(useUIStore.getState().activeWorkspaceId).toBe('ws-existing');
+    expect(apiMocks.saveWorkspaceOrder).not.toHaveBeenCalled();
+  });
+
+  it('keeps vertical list scrolling available before the long-press reorder delay', () => {
+    useWorkspaceStore.setState({ workspaces: [BASE_WORKSPACE, SECOND_WORKSPACE] });
+    useUIStore.setState({ activeWorkspaceId: 'all' });
+    const { container } = render(
+      <WorkspaceRail mobileDrawer mobileExpanded onMobileExpandedChange={vi.fn()} />,
+    );
+    const tab = container.querySelector('[data-workspace-tab-id="ws-existing"]');
+    const scroller = container.querySelector<HTMLElement>('[data-testid="workspace-tab-scroll"]');
+    expect(tab).not.toBeNull();
+    expect(scroller).not.toBeNull();
+    let scrollTop = 0;
+    Object.defineProperty(scroller!, 'scrollTop', {
+      configurable: true,
+      get: () => scrollTop,
+      set: (value: number) => { scrollTop = value; },
+    });
+
+    startPointerDown(tab!, { button: 0, pointerType: 'touch', clientX: 350, clientY: 55 });
+    movePointer(350, 30);
+    releasePointer();
+    fireEvent.click(tab!);
+
+    expect(scrollTop).toBe(25);
+    expect(useUIStore.getState().activeWorkspaceId).toBe('all');
+    expect(apiMocks.saveWorkspaceOrder).not.toHaveBeenCalled();
+  });
+
+  it('sorts a mobile Workspace after a long press on any part of its row', async () => {
+    useWorkspaceStore.setState({ workspaces: [BASE_WORKSPACE, SECOND_WORKSPACE] });
+    const { container } = render(
+      <WorkspaceRail mobileDrawer mobileExpanded onMobileExpandedChange={vi.fn()} />,
+    );
+    const tab = container.querySelector('[data-workspace-tab-id="ws-existing"]');
+    expect(tab).not.toBeNull();
+    expect(tab?.className).toContain('touch-none');
+    expect(tab?.className).toContain('gap-1');
+    expect(tab?.querySelector('span')?.className).toContain('min-w-0 flex-1 truncate');
+    expect(container.querySelector('[aria-label^="拖动工作区"]')).toBeNull();
+
+    vi.useFakeTimers();
+    startPointerDown(tab!, { button: 0, pointerType: 'touch', clientX: 350, clientY: 55 });
+    act(() => vi.advanceTimersByTime(400));
+    movePointer(350, 112);
+    releasePointer();
+    fireEvent.click(tab!);
+    act(() => vi.runOnlyPendingTimers());
+    vi.useRealTimers();
+
+    await waitFor(() => expect(apiMocks.saveWorkspaceOrder).toHaveBeenCalledWith(['ws-second', 'ws-existing']));
+    expect(useWorkspaceStore.getState().workspaces.map((workspace) => workspace.id)).toEqual(['ws-second', 'ws-existing']);
+    expect(useUIStore.getState().activeWorkspaceId).toBe('all');
+    expect(apiMocks.setSessionWorkspaces).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -239,15 +333,44 @@ describe('Workspace rail drag interactions', () => {
     expect(useSessionStore.getState().sessions[0]?.workspaceIds).toEqual(['ws-created']);
   });
 
-  it('opens the collapsed mobile rail during a drag and accepts a drop there', async () => {
-    const { container } = render(<><SessionList /><WorkspaceRail mobileOverlay /></>);
-    startSessionDrag(container);
-    movePointer(780, 470);
-    expect(container.querySelector('[data-testid="mobile-workspace-rail-overlay"]')).not.toBeNull();
+  it('opens the Sidebar and attached WorkspaceRail during a touch drop from the mobile chat list', async () => {
+    vi.stubGlobal('matchMedia', vi.fn((query: string) => ({
+      matches: query === '(max-width: 767px)',
+      media: query,
+      onchange: null,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(() => false),
+    })));
+    const { container } = render(
+      <MemoryRouter initialEntries={['/']}>
+        <Routes>
+          <Route element={<Layout />}>
+            <Route path="/" element={<SessionList />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(container.querySelector('[aria-label="打开侧边栏"]')).not.toBeNull());
+    const chatDragHandle = container.querySelector('main [data-testid="drag-handle"]');
+    expect(chatDragHandle).not.toBeNull();
+    act(() => fireEvent.pointerDown(chatDragHandle!, {
+      button: 0,
+      pointerType: 'touch',
+      clientX: 10,
+      clientY: 10,
+    }));
+    movePointer(10, 500); // the left edge opens the attached Sidebar + WorkspaceRail for the drop
+    await waitFor(() => expect(container.querySelector('[data-testid="mobile-workspace-rail-expanded"]')).not.toBeNull());
     movePointer(350, 55);
     releasePointer();
 
     await waitFor(() => expect(apiMocks.setSessionWorkspaces).toHaveBeenCalledWith('session-alpha', ['ws-existing']));
-    await waitFor(() => expect(container.querySelector('[data-testid="mobile-workspace-rail-collapsed"]')).not.toBeNull());
+    await waitFor(() => {
+      expect(useUIStore.getState().mobileSidebarOpen).toBe(false);
+      expect(container.querySelector('[data-testid="mobile-workspace-rail-collapsed"]')).toBeNull();
+    });
   });
 });

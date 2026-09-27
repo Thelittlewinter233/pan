@@ -71,10 +71,10 @@ export function SessionMenu({ session, position, onClose, onManage, onPostbox, o
       }
     };
     // Delay to avoid immediate close from the click that opened it
-    const timer = setTimeout(() => document.addEventListener('click', handler), 0);
+    const timer = setTimeout(() => document.addEventListener('click', handler, true), 0);
     return () => {
       clearTimeout(timer);
-      document.removeEventListener('click', handler);
+      document.removeEventListener('click', handler, true);
     };
   }, [onClose]);
 
@@ -92,9 +92,10 @@ export function SessionMenu({ session, position, onClose, onManage, onPostbox, o
   };
 
   const handleReimport = async () => {
+    const activeWorkspaceId = useUIStore.getState().activeWorkspaceId;
     onClose();
     try {
-      await reimport(session.id);
+      await reimport(session.id, activeWorkspaceId);
       showToast('Session reimported');
     } catch (e) {
       showToast(e instanceof Error ? e.message : 'Reimport failed', 'error');

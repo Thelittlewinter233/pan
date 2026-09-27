@@ -905,13 +905,114 @@ describe('useWebSocket agent-injected message sync', () => {
     ]);
   });
 
+  it('reconciles a late agent queue handoff across DONE, history refresh and A/B/A', async () => {
+    const agentText = '////by agent : S | title | instruct';
+    const canonicalHistory = [
+      msg('user', 'u0'),
+      { ...msg('user', agentText), deliveryKeys: ['task:q-agent-late'] },
+      msg('assistant', 'agent answer'),
+    ];
+    useSessionStore.setState({
+      sessions: [
+        mk('A', 'A', { history: [msg('user', 'u0')], historyTotal: 1 }),
+        mk('B', 'B', { history: [], historyTotal: 0 }),
+      ],
+      currentSessionId: 'A',
+      currentMessages: [msg('user', 'u0')],
+      sessionTranscripts: {},
+      liveStreamBuffers: {},
+      terminalWatermarks: {},
+    });
+    apiMock.fetchSessionHistory.mockResolvedValue({ history: [], total: 0,
+      hasMore: false, start: 0 });
+    apiMock.fetchSessionQueue.mockResolvedValue([]);
+    renderHook(() => useWebSocket());
+
+    // send_session(worker_send) persists an agent task as an ordinary durable
+    // queue item. Its add event identifies the producer; no user row is
+    // projected until the common handoff event below.
+    await flushTrigger('queue.item_added', {
+      type: 'queue.item_added', sessionId: 'A', queueItemId: 'q-agent-late',
+      item: { type: 'task', kind: 'task', id: 'q-agent-late',
+        queueItemId: 'q-agent-late', source: 'agent', text: agentText,
+        deliveryState: 'queued', revision: 1 },
+    });
+    expect(useSessionStore.getState().currentMessages
+      .filter((message) => message.content === agentText)).toHaveLength(0);
+
+    await flushTrigger('worker.result', {
+      type: 'worker.result', sessionId: 'A', workerId: 'w1', generation: 0,
+      taskSeq: 1, status: 'done', result: 'agent answer',
+    });
+    expect(useSessionStore.getState().currentMessages.map((message) => message.content))
+      .toEqual(['u0', 'agent answer', '[DONE] Task completed']);
+
+    // This is the actual useWebSocket queue.item_delivered handler used by
+    // agent tasks and reports. Its queue item arrives after the result marker.
+    await flushTrigger('queue.item_delivered', {
+      type: 'queue.item_delivered', sessionId: 'A', queueItemIds: ['q-agent-late'],
+      messages: [{ role: 'user', content: agentText,
+        queueItemIds: ['q-agent-late'], deliveryKeys: ['task:q-agent-late'] }],
+    });
+    const afterDelivery = useSessionStore.getState().currentMessages;
+    expect(afterDelivery.filter((message) => message.content === agentText)).toHaveLength(1);
+    expect(afterDelivery.map((message) => message.content)).toEqual([
+      'u0', 'agent answer', '[DONE] Task completed', agentText,
+    ]);
+
+    apiMock.fetchSessionHistory.mockResolvedValueOnce({
+      history: canonicalHistory, total: 3, hasMore: false, start: 0,
+      historyEpoch: 'agent-history', historyRevision: 3,
+    });
+    await act(async () => {
+      await useSessionStore.getState().refreshCurrentSessionHistory();
+    });
+    const afterRefresh = useSessionStore.getState().currentMessages;
+    expect(afterRefresh.filter((message) => message.content === agentText)).toHaveLength(1);
+    expect(afterRefresh.map((message) => message.content)).toEqual([
+      'u0', agentText, 'agent answer', '[DONE] Task completed',
+    ]);
+
+    // Both the canonical row and the late handoff carry the same receipt key;
+    // selecting A again must still show exactly one copy at the DONE boundary.
+    apiMock.fetchSessionHistory.mockImplementation(async (sessionId: string) =>
+      sessionId === 'A'
+        ? { history: canonicalHistory, total: 3, hasMore: false, start: 0,
+          historyEpoch: 'agent-history', historyRevision: 3 }
+        : { history: [], total: 0, hasMore: false, start: 0 },
+    );
+    await act(async () => {
+      await useSessionStore.getState().selectSession('B');
+      await useSessionStore.getState().selectSession('A');
+    });
+    const afterSwitch = useSessionStore.getState().currentMessages;
+    expect(afterSwitch.filter((message) => message.content === agentText)).toHaveLength(1);
+    expect(afterSwitch.map((message) => message.content)).toEqual([
+      'u0', agentText, 'agent answer', '[DONE] Task completed',
+    ]);
+
+    await flushTrigger('queue.item_delivered', {
+      type: 'queue.item_delivered', sessionId: 'A', queueItemIds: ['q-agent-late'],
+      messages: [{ role: 'user', content: agentText,
+        queueItemIds: ['q-agent-late'], deliveryKeys: ['task:q-agent-late'] }],
+    });
+    expect(useSessionStore.getState().currentMessages
+      .filter((message) => message.content === agentText)).toHaveLength(1);
+    expect(useSessionStore.getState().currentMessages.map((message) => message.content))
+      .toEqual(['u0', agentText, 'agent answer', '[DONE] Task completed']);
+  });
+
   it('retries when the first history snapshot races the injected message persistence', async () => {
     renderHook(() => useWebSocket());
     apiMock.fetchSessionHistory.mockResolvedValueOnce({
+      // A stale prefix advances total/revision but still lacks the row this
+      // source=report event is expected to inject.
       history: [msg('user', 'u0')],
       total: 1,
       hasMore: false,
       start: 0,
+      historyEpoch: 'a-epoch',
+      historyRevision: 1,
     });
     apiMock.fetchSessionHistory.mockResolvedValueOnce({
       history: [
@@ -921,6 +1022,8 @@ describe('useWebSocket agent-injected message sync', () => {
       total: 2,
       hasMore: false,
       start: 0,
+      historyEpoch: 'a-epoch',
+      historyRevision: 2,
     });
 
     await flushTrigger('worker.status', {
@@ -1061,8 +1164,26 @@ describe('useWebSocket agent-injected message sync', () => {
     ]);
   });
 
-  it('does not sync when the event targets a non-current session', async () => {
+  it('syncs injected report history for a background Session without changing the selected Session', async () => {
+    const injected = '////by agent : B | report\nnew request';
+    useSessionStore.setState({
+      sessions: [
+        mk('A', 'A', { history: [msg('user', 'u0')], historyTotal: 1 }),
+        mk('B', 'B', { history: [msg('user', 'u1')], historyTotal: 1, lastMessage: 'u1' }),
+      ],
+      currentSessionId: 'A',
+      currentMessages: [msg('user', 'u0')],
+      sessionTranscripts: {},
+    });
     renderHook(() => useWebSocket());
+    apiMock.fetchSessionHistory.mockResolvedValueOnce({
+      history: [msg('user', 'u1'), msg('user', injected)],
+      total: 2,
+      hasMore: false,
+      start: 0,
+      historyEpoch: 'b-epoch',
+      historyRevision: 2,
+    });
 
     await flushTrigger('worker.status', {
       type: 'worker.status',
@@ -1072,7 +1193,11 @@ describe('useWebSocket agent-injected message sync', () => {
       source: 'agent',
     });
 
-    expect(apiMock.fetchSessionHistory).not.toHaveBeenCalled();
+    expect(apiMock.fetchSessionHistory).toHaveBeenCalledTimes(1);
+    expect(apiMock.fetchSessionHistory).toHaveBeenCalledWith('B', 0, 50);
+    expect(useSessionStore.getState().sessionTranscripts.B?.window.rows.size).toBe(2);
+    expect(useSessionStore.getState().sessions.find((session) => session.id === 'B')?.lastMessage).toBe(injected);
+    expect(useSessionStore.getState().currentSessionId).toBe('A');
     expect(useSessionStore.getState().currentMessages.map((m) => m.content)).toEqual(['u0']);
   });
 

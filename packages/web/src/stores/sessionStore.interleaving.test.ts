@@ -64,6 +64,51 @@ it('converges a legacy id-less Steer row only within its local history boundary'
   expect(texts()).toEqual(['steer now', 'still streaming']);
 });
 
+it('does not duplicate a queued user row reordered ahead of a live tool', () => {
+  const tool: Message = { role: 'tool', content: 'live tool', nativeItemId: 'tool-1' };
+  store().applyLiveStream('A', [tool], meta);
+  store().appendQueuedMessage('A', { id: 'q-ordered', text: 'sent while streaming' });
+  store().applyHistoryPage('A', {
+    history: [
+      { role: 'user', content: 'sent while streaming' },
+      { role: 'tool', content: 'live tool' },
+    ],
+    start: 0, total: 2, hasMore: false, historyRevision: 2, historyEpoch: 'h',
+  });
+  expect(texts()).toEqual(['sent while streaming', 'live tool']);
+});
+
+it('matches a queued user row to canonical history by its persisted queue item id', () => {
+  const tool: Message = { role: 'tool', content: 'live tool', nativeItemId: 'tool-queue-id' };
+  store().applyLiveStream('A', [tool], meta);
+  store().appendQueuedMessage('A', { id: 'q-persisted', text: 'queued question' });
+  store().applyHistoryPage('A', {
+    history: [
+      { role: 'user', content: 'queued question', queueItemIds: ['q-persisted'] },
+      { role: 'tool', content: 'live tool', nativeItemId: 'tool-queue-id' },
+    ],
+    start: 0, total: 2, hasMore: false, historyRevision: 2, historyEpoch: 'h',
+  });
+  expect(texts()).toEqual(['queued question', 'live tool']);
+});
+
+it('retains queued user identity through delivery before an id-less history refresh', () => {
+  const tool: Message = { role: 'tool', content: 'live tool', nativeItemId: 'tool-2' };
+  store().applyLiveStream('A', [tool], meta);
+  store().appendQueuedMessage('A', { id: 'q-delivered-ordered', text: 'delivered while streaming' });
+  store().appendDeliveredMessages('A', [{
+    role: 'user', content: 'delivered while streaming', queueItemIds: ['q-delivered-ordered'],
+  }]);
+  store().applyHistoryPage('A', {
+    history: [
+      { role: 'user', content: 'delivered while streaming' },
+      { role: 'tool', content: 'live tool' },
+    ],
+    start: 0, total: 2, hasMore: false, historyRevision: 2, historyEpoch: 'h',
+  });
+  expect(texts()).toEqual(['delivered while streaming', 'live tool']);
+});
+
 it('converges an assistant item moved ahead of an interleaved tool by native id', () => {
   const first: Message = { role: 'assistant', content: 'same text', nativeItemId: 'answer-1' };
   const second: Message = { role: 'assistant', content: 'same text', nativeItemId: 'answer-2' };
@@ -116,6 +161,29 @@ it('completed runtime rows remain anchored when history is refreshed repeatedly 
     void store().selectSession('A');
     expect(texts()).toEqual(history.map(m => m.content));
   }
+});
+
+it('moves a delivered queue user from after DONE onto its canonical task boundary across A/B/A', () => {
+  const task = { ...meta, taskSeq: 7 };
+  store().applyLiveStream('A', [row('answer')], task);
+  store().reconcileWorkerResult('A', { result: 'answer', status: 'done' }, task);
+  store().addMessage({ role: 'system', content: '[DONE] Task completed',
+    nativeItemId: 'worker.result:A:7' });
+  // The hand-off WS event can trail worker.result even though the backend
+  // writes the user row before the answer in durable history.
+  store().appendQueuedMessage('A', { id: 'q-done-boundary', text: 'queued prompt' });
+  store().appendDeliveredMessages('A', [{ role: 'user', content: 'queued prompt',
+    queueItemIds: ['q-done-boundary'] }]);
+  expect(texts()).toEqual(['answer', '[DONE] Task completed', 'queued prompt']);
+
+  store().applyHistoryPage('A', { history: [
+    { role: 'user', content: 'queued prompt' }, row('answer'),
+  ], start: 0, total: 2, hasMore: false, historyEpoch: 'h', historyRevision: 2 });
+  expect(texts()).toEqual(['queued prompt', 'answer', '[DONE] Task completed']);
+  void store().selectSession('B');
+  void store().selectSession('A');
+  expect(texts()).toEqual(['queued prompt', 'answer', '[DONE] Task completed']);
+  expect(texts().filter((text) => text === 'queued prompt')).toHaveLength(1);
 });
 
 it('converges a real Codex terminal reorder before the next same-text turn', () => {
@@ -175,6 +243,28 @@ it('converges a real Codex terminal reorder before the next same-text turn', () 
     'first question', 'interim answer', 'reasoning', 'first final', '[DONE] Task completed',
     'same question', 'same reply', '[DONE] Task completed',
   ]);
+});
+
+it('keeps same-body deliveries with distinct delivery keys as two canonical rows', () => {
+  store().appendDeliveredMessages('A', [
+    { role: 'user', content: 'same body', queueItemIds: ['q-one'], deliveryKeys: ['task:q-one'] },
+    { role: 'user', content: 'same body', queueItemIds: ['q-two'], deliveryKeys: ['task:q-two'] },
+  ]);
+  expect(texts().filter((content) => content === 'same body')).toHaveLength(2);
+
+  store().applyHistoryPage('A', { history: [
+    { role: 'user', content: 'same body', deliveryKeys: ['task:q-one'] },
+    { role: 'user', content: 'same body', deliveryKeys: ['task:q-two'] },
+  ], start: 0, total: 2, hasMore: false, historyEpoch: 'h', historyRevision: 2 });
+  expect(texts().filter((content) => content === 'same body')).toHaveLength(2);
+
+  // A delayed/replayed handoff arriving after canonical history is loaded
+  // matches by receipt identity; the two same-body queue items remain distinct.
+  store().appendDeliveredMessages('A', [
+    { role: 'user', content: 'same body', queueItemIds: ['q-one'], deliveryKeys: ['task:q-one'] },
+    { role: 'user', content: 'same body', queueItemIds: ['q-two'], deliveryKeys: ['task:q-two'] },
+  ]);
+  expect(texts().filter((content) => content === 'same body')).toHaveLength(2);
 });
 
 it('a queued second user row keeps its position after the first completed turn', () => {

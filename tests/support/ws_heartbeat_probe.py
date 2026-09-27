@@ -25,7 +25,18 @@ from websockets.sync.client import connect
 def _write_samples(path: Path, samples: list[dict]) -> None:
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_text(json.dumps(samples, ensure_ascii=False), encoding="utf-8")
-    os.replace(temporary, path)
+    # The parent test process reads the current sample file while this child
+    # refreshes it. Windows may deny replacement while that reader has the file
+    # open; keep the last complete snapshot and retry the atomic replace rather
+    # than letting the probe exit with stale heartbeat evidence.
+    for attempt in range(20):
+        try:
+            os.replace(temporary, path)
+            return
+        except PermissionError:
+            if attempt == 19:
+                raise
+            time.sleep(0.005)
 
 
 def main() -> None:
@@ -40,6 +51,7 @@ def main() -> None:
 
     samples: list[dict] = []
     last_pong: float | None = None
+    next_send: float | None = None
     deadline = time.time() + args.timeout
     with connect(args.url, open_timeout=10, close_timeout=2) as ws:
         if args.ready is not None:
@@ -48,21 +60,43 @@ def main() -> None:
             if args.release is not None and args.release.exists():
                 break
             sent = time.perf_counter()
+            sent_at = time.time()
+            probe_lateness_ms = (
+                max(0.0, (sent - next_send) * 1000.0)
+                if next_send is not None else 0.0
+            )
             ws.send(json.dumps({"type": "ping"}))
             while True:
                 raw = ws.recv(timeout=5)
                 if json.loads(raw).get("type") == "pong":
                     break
             now = time.perf_counter()
+            gap_ms = None if last_pong is None else (now - last_pong) * 1000.0
+            server_gap_ms = (
+                None if gap_ms is None
+                else max(0.0, gap_ms - probe_lateness_ms)
+            )
+            next_send = now + args.interval
             samples.append({
                 "at": time.time(),
+                "sentAt": sent_at,
                 "rttMs": round((now - sent) * 1000.0, 3),
-                "gapMs": None if last_pong is None else round(
-                    (now - last_pong) * 1000.0, 3),
+                # gapMs is the raw inter-pong interval. The separate client
+                # lateness measurement identifies time spent unscheduled
+                # before sending this ping; serverGapMs removes only that
+                # directly observed probe-side delay.
+                "gapMs": None if gap_ms is None else round(gap_ms, 3),
+                "probeIntervalMs": round(args.interval * 1000.0, 3),
+                "probeLatenessMs": round(probe_lateness_ms, 3),
+                "serverGapMs": (None if server_gap_ms is None
+                                else round(server_gap_ms, 3)),
+                "excessServerGapMs": (
+                    None if server_gap_ms is None else round(
+                        server_gap_ms - args.interval * 1000.0, 3)),
             })
             last_pong = now
             _write_samples(args.out, samples)
-            time.sleep(args.interval)
+            time.sleep(max(0.0, next_send - time.perf_counter()))
     _write_samples(args.out, samples)
 
 

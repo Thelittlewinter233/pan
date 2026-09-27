@@ -1,8 +1,9 @@
 import { useState, useCallback, useMemo, useEffect, useRef } from 'react';
 import { NavLink, useLocation, useNavigate } from 'react-router-dom';
-import { useSessionStore, useCurrentSession } from '@/stores/sessionStore';
+import { useShallow } from 'zustand/react/shallow';
+import { useSessionStore } from '@/stores/sessionStore';
 import { useUIStore } from '@/stores/uiStore';
-import { useEditorStore } from '@/stores/editorStore';
+import { useWorkspaceStore } from '@/stores/workspaceStore';
 import { useMediaQuery } from '@/hooks/useMediaQuery';
 import { nextSessionDefaultName } from '@/utils/sessionName';
 import { SessionList } from '@/components/session/SessionList';
@@ -16,10 +17,12 @@ import { RenameSessionModal } from '@/components/session/RenameSessionModal';
 import { SessionDeleteModal } from '@/components/session/SessionDeleteModal';
 import { collectDescendantIds, hasManagedChildren } from '@/components/session/sessionDeletePlan';
 import { SPECIAL_FILTERS, getSessionListCandidates } from '@/utils/sessionFilters';
-import { FileTree } from '@/components/editor/FileTree';
+import { EditorDirectoryRoots } from '@/components/editor/EditorDirectoryRoots';
 import { SidebarResizer } from './SidebarResizer';
 import { AppSettingsModal } from './AppSettingsModal';
 import { Button } from '@/components/ui/Button';
+import { WorkspaceManagerChangeConfirmationModal } from './WorkspaceManagerChangeConfirmationModal';
+import type { WorkspaceMoveConfirmationRequest } from '@/utils/workspaceMoveConfirmation';
 import {
   MessageSquare,
   Code,
@@ -28,8 +31,6 @@ import {
   Plus,
   Settings,
   Import,
-  FolderOpen,
-  RefreshCw,
   Search,
   ArrowUpDown,
   Layers,
@@ -38,25 +39,38 @@ import {
   ChevronDown,
   Sun,
   Moon,
-  CalendarClock,
+  ListChecks,
+  Trash2,
+  X,
 } from 'lucide-react';
 
-export function Sidebar() {
+export function Sidebar({ mobileWorkspaceExpanded = false }: { mobileWorkspaceExpanded?: boolean }) {
   const location = useLocation();
   const navigate = useNavigate();
   const isEditorRoute = location.pathname === '/editor';
   const { isMobile } = useMediaQuery();
 
-  // Session store
+  // Session store — 细粒度订阅（useShallow）：只在此切片变化时重渲染。
+  // 不能用 useSessionStore() 整体订阅：inputDrafts（每次敲键）、
+  // liveStreamBuffers/currentMessages（每个流式 chunk）、rendering 等无关字段
+  // 都会让整条侧栏链路重渲染。
   const { multiSelectMode, exitMultiSelect, selectedIds, batchRemoveSessions, removeSessions, removeSession, sessions } =
-    useSessionStore();
-  const currentSession = useCurrentSession();
+    useSessionStore(useShallow((s) => ({
+      multiSelectMode: s.multiSelectMode,
+      exitMultiSelect: s.exitMultiSelect,
+      selectedIds: s.selectedIds,
+      batchRemoveSessions: s.batchRemoveSessions,
+      removeSessions: s.removeSessions,
+      removeSession: s.removeSession,
+      sessions: s.sessions,
+    })));
 
-  // UI store
+  // UI store — 同上：toast 队列、审批/输入/终端交互请求等高频字段不应触发侧栏重渲染。
   const {
     sidebarWidth,
     sidebarCollapsed,
     toggleSidebar,
+    setMobileSidebarOpen,
     showToast,
     groupBy,
     cycleGroupBy,
@@ -71,17 +85,40 @@ export function Sidebar() {
     collapsedGroups,
     collapseAllGroups,
     expandAllGroups,
-    filesCollapsed,
-    toggleFilesCollapsed,
     theme,
     toggleTheme,
     dragEnabled,
     setDragEnabled,
-  } = useUIStore();
-
-  // Editor store
-  const treeLoading = useEditorStore((s) => s.treeLoading);
-  const refreshTree = useEditorStore((s) => s.refreshTree);
+    activeWorkspaceId,
+  } = useUIStore(useShallow((s) => ({
+    sidebarWidth: s.sidebarWidth,
+    sidebarCollapsed: s.sidebarCollapsed,
+    toggleSidebar: s.toggleSidebar,
+    setMobileSidebarOpen: s.setMobileSidebarOpen,
+    showToast: s.showToast,
+    groupBy: s.groupBy,
+    cycleGroupBy: s.cycleGroupBy,
+    searchQuery: s.searchQuery,
+    setSearchQuery: s.setSearchQuery,
+    sortBy: s.sortBy,
+    cycleSortBy: s.cycleSortBy,
+    specialFilters: s.specialFilters,
+    hiddenSessionIds: s.hiddenSessionIds,
+    toggleSpecialFilter: s.toggleSpecialFilter,
+    clearSpecialFilters: s.clearSpecialFilters,
+    collapsedGroups: s.collapsedGroups,
+    collapseAllGroups: s.collapseAllGroups,
+    expandAllGroups: s.expandAllGroups,
+    theme: s.theme,
+    toggleTheme: s.toggleTheme,
+    dragEnabled: s.dragEnabled,
+    setDragEnabled: s.setDragEnabled,
+    activeWorkspaceId: s.activeWorkspaceId,
+  })));
+  // Workspace rail state (batch move menu + scope label).
+  const workspaces = useWorkspaceStore((s) => s.workspaces);
+  const workspacesLoaded = useWorkspaceStore((s) => s.loaded);
+  const loadWorkspaces = useWorkspaceStore((s) => s.loadWorkspaces);
 
   // Local state
   const [showNewModal, setShowNewModal] = useState(false);
@@ -95,6 +132,9 @@ export function Sidebar() {
   const [showAppSettings, setShowAppSettings] = useState(false);
   const [showFilterMenu, setShowFilterMenu] = useState(false);
   const [showDragMenu, setShowDragMenu] = useState(false);
+  const [workspaceMoveConfirmation, setWorkspaceMoveConfirmation] = useState<(
+    WorkspaceMoveConfirmationRequest & { resolve: (confirmed: boolean) => void }
+  ) | null>(null);
   const sortMenuRef = useRef<HTMLDivElement | null>(null);
   const sortPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sortLongPressedRef = useRef(false);
@@ -113,6 +153,15 @@ export function Sidebar() {
   }, []);
 
   useEffect(() => clearSortPress, [clearSortPress]);
+
+  useEffect(() => {
+    const handler = (event: Event) => {
+      const detail = (event as CustomEvent<WorkspaceMoveConfirmationRequest & { resolve: (confirmed: boolean) => void }>).detail;
+      setWorkspaceMoveConfirmation(detail);
+    };
+    window.addEventListener('pan:confirm-workspace-manager-change', handler);
+    return () => window.removeEventListener('pan:confirm-workspace-manager-change', handler);
+  }, []);
 
   useEffect(() => {
     if (!showDragMenu) return;
@@ -185,8 +234,9 @@ export function Sidebar() {
       hiddenSessionIds,
       searchQuery,
       specialFilters,
+      activeWorkspaceId,
     }),
-    [sessions, hiddenSessionIds, searchQuery, specialFilters],
+    [sessions, hiddenSessionIds, searchQuery, specialFilters, activeWorkspaceId],
   );
   const selectableIds = useMemo(
     () => selectableSessions.map((session) => session.id),
@@ -203,6 +253,37 @@ export function Sidebar() {
       for (const id of selectable) next.add(id);
     }
     useSessionStore.setState({ selectedIds: next });
+  };
+
+  /** Batch workspace move (single membership + manager cascade, scoped selection). */
+  const [moveMenuOpen, setMoveMenuOpen] = useState(false);
+  const activeScopeName = activeWorkspaceId === 'all'
+    ? '全部'
+    : workspaces.find((w) => w.id === activeWorkspaceId)?.name ?? '全部';
+
+  // The rail loads workspaces on desktop; the batch menu is reachable on
+  // mobile too, so make sure the list exists before it renders items.
+  useEffect(() => {
+    if (multiSelectMode && !workspacesLoaded) void loadWorkspaces();
+  }, [multiSelectMode, workspacesLoaded, loadWorkspaces]);
+
+  const handleBatchMove = async (workspaceId: string | null) => {
+    setMoveMenuOpen(false);
+    if (selectedIds.size === 0) return;
+    try {
+      const changed = await useWorkspaceStore.getState().moveSessions([...selectedIds], workspaceId);
+      if (changed.length === 0) {
+        showToast(workspaceId ? '所选会话均已在目标工作区' : '所选会话本就没有归属', 'error');
+      } else if (workspaceId) {
+        const name = useWorkspaceStore.getState().workspaces.find((w) => w.id === workspaceId)?.name ?? '工作区';
+        showToast(`已将 ${changed.length} 个会话移入「${name}」`);
+      } else {
+        showToast(`已将 ${changed.length} 个会话移出工作区（未分组）`);
+      }
+      exitMultiSelect();
+    } catch (e) {
+      showToast(e instanceof Error ? e.message : '移动失败', 'error');
+    }
   };
 
   const handleBatchDelete = () => {
@@ -272,6 +353,12 @@ export function Sidebar() {
     setMenuSession(id);
   }, []);
 
+  const handleSessionClick = useCallback(() => {
+    if (location.pathname !== '/jobs') return;
+    navigate('/');
+    if (isMobile) setMobileSidebarOpen(false);
+  }, [isMobile, location.pathname, navigate, setMobileSidebarOpen]);
+
   // ── Nav rail (collapsed mode, desktop only) ──
 
   if (sidebarCollapsed && !isMobile) {
@@ -315,8 +402,8 @@ export function Sidebar() {
         </NavLink>
 
         <NavLink
-          to="/schedules"
-          title="Scheduled tasks"
+          to="/jobs"
+          title="Jobs"
           className={({ isActive }) =>
             `p-1.5 rounded transition-colors ${
               isActive
@@ -325,7 +412,7 @@ export function Sidebar() {
             }`
           }
         >
-          <CalendarClock size={18} />
+          <ListChecks size={18} />
         </NavLink>
 
         <div className="flex-1" />
@@ -357,8 +444,11 @@ export function Sidebar() {
 
   return (
     <aside
-      className="relative flex flex-col h-full border-r border-border-default bg-bg-secondary"
-      style={{ width: sidebarWidth }}
+      className="relative flex min-w-0 flex-col h-full border-r border-border-default bg-bg-secondary"
+      style={{
+        width: isMobile && mobileWorkspaceExpanded ? '50vw' : `min(${sidebarWidth}px, 100vw)`,
+        minWidth: isMobile && mobileWorkspaceExpanded ? 'min(280px, 50vw)' : 'min(280px, 100vw)',
+      }}
     >
       {/* ── Chat route content ── */}
       {!isEditorRoute && (
@@ -383,9 +473,14 @@ export function Sidebar() {
                   {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
                 </button>
                 <button
-                  onClick={toggleSidebar}
+                  onClick={() => {
+                    if (isMobile) setMobileSidebarOpen(false);
+                    else toggleSidebar();
+                  }}
                   className="text-text-tertiary hover:text-text-primary p-0.5 rounded transition-colors"
-                  title="Collapse sidebar"
+                  title={isMobile ? 'Close sidebar' : 'Collapse sidebar'}
+                  aria-label={isMobile ? '收起侧边栏' : 'Collapse sidebar'}
+                  data-testid={isMobile ? 'mobile-sidebar-close' : undefined}
                 >
                   <PanelLeftClose size={16} />
                 </button>
@@ -422,7 +517,7 @@ export function Sidebar() {
                 Editor
               </NavLink>
               <NavLink
-                to="/schedules"
+                to="/jobs"
                 className={({ isActive }) =>
                   `flex-1 flex items-center justify-center gap-1 py-1.5 text-xs rounded transition-colors ${
                     isActive
@@ -431,8 +526,8 @@ export function Sidebar() {
                   }`
                 }
               >
-                <CalendarClock size={12} />
-                Tasks
+                <ListChecks size={12} />
+                Jobs
               </NavLink>
             </div>
 
@@ -519,7 +614,7 @@ export function Sidebar() {
                   <div className="fixed inset-0 z-20" onClick={() => setShowFilterMenu(false)} />
                   <div
                     role="menu"
-                    className="absolute right-0 top-full mt-1 z-30 w-64 rounded border border-border-default bg-bg-primary shadow-lg py-1"
+                    className="absolute left-0 top-full mt-1 z-30 w-64 rounded border border-border-default bg-bg-primary shadow-lg py-1"
                   >
                     {SPECIAL_FILTERS.map((f) => (
                       <label
@@ -631,37 +726,87 @@ export function Sidebar() {
 
           {/* Multi-select bar */}
           {multiSelectMode && (
-            <div className="flex items-center gap-2 px-3 py-2 border-b border-border-muted bg-bg-tertiary">
-              <span className="text-xs text-text-secondary">
+            <div className="sidebar-selection-bar relative flex min-w-0 flex-wrap items-center gap-1.5 px-2 py-2 border-b border-border-muted bg-bg-tertiary">
+              <span className="shrink-0 text-xs text-text-secondary">
                 {selectedIds.size} selected
               </span>
-              <div className="flex-1" />
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={handleToggleSelectAll}
-                disabled={selectableIds.length === 0}
-                aria-label={allSelectableSelected ? 'Deselect all visible sessions' : 'Select all visible sessions'}
-              >
-                {allSelectableSelected ? 'Deselect all' : 'Select all'}
-              </Button>
-              <Button
-                variant="danger"
-                size="sm"
-                onClick={handleBatchDelete}
-                disabled={selectedIds.size === 0}
-              >
-                Delete
-              </Button>
-              <Button variant="ghost" size="sm" onClick={exitMultiSelect}>
-                Cancel
-              </Button>
+              <span className="min-w-0 max-w-full flex-1 text-[10px] text-text-tertiary truncate" title="批量操作的范围（永不跨工作区）">
+                范围：{activeScopeName}
+              </span>
+              <div className="sidebar-selection-actions ml-auto flex max-w-full flex-wrap items-center justify-end gap-1.5">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={handleToggleSelectAll}
+                  disabled={selectableIds.length === 0}
+                  aria-label={allSelectableSelected ? 'Deselect all visible sessions' : 'Select all visible sessions'}
+                >
+                  {allSelectableSelected ? 'Deselect all' : 'Select all'}
+                </Button>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => setMoveMenuOpen((v) => !v)}
+                  disabled={selectedIds.size === 0}
+                  aria-label="Move selected sessions to workspace"
+                  title="Move selected sessions to workspace"
+                >
+                  Workspace
+                </Button>
+              {moveMenuOpen && (
+                <>
+                  <div className="fixed inset-0 z-40" onClick={() => setMoveMenuOpen(false)} />
+                  <div className="absolute right-0 top-full z-50 mt-1 max-h-64 w-44 overflow-y-auto rounded-md border border-border-default bg-bg-tertiary py-1 shadow-xl">
+                    <button
+                      type="button"
+                      className="w-full px-3 py-1.5 text-left text-xs text-text-primary transition-colors hover:bg-accent/20"
+                      onClick={() => void handleBatchMove(null)}
+                    >
+                      未分组（移出工作区）
+                    </button>
+                    {workspaces.map((workspace) => (
+                      <button
+                        key={workspace.id}
+                        type="button"
+                        className="w-full truncate px-3 py-1.5 text-left text-xs text-text-primary transition-colors hover:bg-accent/20"
+                        onClick={() => void handleBatchMove(workspace.id)}
+                      >
+                        {workspace.name}
+                      </button>
+                    ))}
+                  </div>
+                </>
+              )}
+                <Button
+                  variant="danger"
+                  size="sm"
+                  onClick={handleBatchDelete}
+                  disabled={selectedIds.size === 0}
+                  aria-label="Delete selected sessions"
+                  title="Delete selected sessions"
+                  className="sidebar-selection-action-button"
+                >
+                  <span className="sidebar-selection-action-label">Delete</span>
+                  <Trash2 className="sidebar-selection-action-icon" size={16} aria-hidden="true" />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={exitMultiSelect}
+                  aria-label="Cancel selection"
+                  title="Cancel selection"
+                  className="sidebar-selection-action-button"
+                >
+                  <span className="sidebar-selection-action-label">Cancel</span>
+                  <X className="sidebar-selection-action-icon" size={16} aria-hidden="true" />
+                </Button>
+              </div>
             </div>
           )}
 
           {/* Session list */}
           <div className="flex-1 overflow-y-auto">
-            <SessionList onSessionMenu={handleSessionMenu} />
+            <SessionList onSessionClick={handleSessionClick} onSessionMenu={handleSessionMenu} />
           </div>
 
           {/* Session context menu */}
@@ -766,7 +911,7 @@ export function Sidebar() {
                 Editor
               </NavLink>
               <NavLink
-                to="/schedules"
+                to="/jobs"
                 className={({ isActive }) =>
                   `flex-1 flex items-center justify-center gap-1 py-1.5 text-xs rounded transition-colors ${
                     isActive
@@ -775,59 +920,14 @@ export function Sidebar() {
                   }`
                 }
               >
-                <CalendarClock size={12} />
-                Tasks
+                <ListChecks size={12} />
+                Jobs
               </NavLink>
             </div>
           </div>
 
-          {/* Files section — collapsible */}
-          <div className="flex items-center justify-between px-3 py-2 border-b border-border-default min-h-[40px] cursor-pointer select-none hover:bg-bg-hover/30 transition-colors" onClick={toggleFilesCollapsed}>
-            <div className="flex items-center gap-1.5 text-xs font-semibold text-text-tertiary uppercase tracking-wider">
-              <FolderOpen size={13} />
-              Files
-            </div>
-            <div className="flex items-center gap-0.5">
-              {!filesCollapsed && (
-                <button
-                  className="text-text-tertiary hover:text-text-primary p-0.5 rounded transition-colors"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    refreshTree('');
-                  }}
-                  title="Refresh file tree"
-                >
-                  <RefreshCw size={13} className={treeLoading ? 'animate-spin' : ''} />
-                </button>
-              )}
-              {filesCollapsed ? (
-                <ChevronDown size={14} className="text-text-tertiary" />
-              ) : (
-                <ChevronUp size={14} className="text-text-tertiary" />
-              )}
-            </div>
-          </div>
-
-          {/* File tree (collapsible) */}
-          {!filesCollapsed && (
-            currentSession?.workdir ? (
-              <FileTree workdir={currentSession.workdir} />
-            ) : (
-              <div className="flex-1 flex items-center justify-center px-4 text-xs text-text-tertiary text-center">
-                Select a session to browse files
-              </div>
-            )
-          )}
-
-          {/* Workdir footer */}
-          {currentSession?.workdir && (
-            <div
-              className="px-3 py-1.5 text-[10px] text-text-tertiary border-t border-border-default truncate flex-shrink-0"
-              title={currentSession.workdir}
-            >
-              {currentSession.workdir}
-            </div>
-          )}
+          {/* Directory roots: CWD + workspace dirs + temp dirs, each collapsible */}
+          <EditorDirectoryRoots />
         </>
       )}
 
@@ -838,6 +938,17 @@ export function Sidebar() {
       <AppSettingsModal
         open={showAppSettings}
         onClose={() => setShowAppSettings(false)}
+      />
+      <WorkspaceManagerChangeConfirmationModal
+        request={workspaceMoveConfirmation}
+        onClose={() => {
+          workspaceMoveConfirmation?.resolve(false);
+          setWorkspaceMoveConfirmation(null);
+        }}
+        onConfirm={() => {
+          workspaceMoveConfirmation?.resolve(true);
+          setWorkspaceMoveConfirmation(null);
+        }}
       />
       <NewSessionModal
         open={showNewModal}
@@ -851,6 +962,7 @@ export function Sidebar() {
         open={!!manageSessionId}
         onClose={() => setManageSessionId(null)}
         sessionId={manageSessionId}
+        onViewRelationship={setManageSessionId}
       />
       <PostboxModal
         open={!!postboxSessionId}

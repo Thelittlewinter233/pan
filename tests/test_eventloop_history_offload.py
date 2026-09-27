@@ -106,6 +106,128 @@ def test_session_list_cold_read_does_not_block_event_loop():
     assert max(gaps) < 0.05, f"event loop blocked for {max(gaps) * 1000:.1f}ms"
 
 
+def test_cold_tail_page_uses_complete_projection_without_parsing_full_jsonl(
+    monkeypatch,
+):
+    sid = "ses-cold-tail-known-total"
+    rows = _rows(1_000)
+    _seed(sid, rows)
+    # A complete durable projection is the count authority for the optimized
+    # default tail-page path.  Unknown or out-of-sync totals retain the full
+    # compatibility scan.
+    original_loads = json.loads
+    decoded_rows = 0
+
+    def count_row_decodes(value, *args, **kwargs):
+        nonlocal decoded_rows
+        if ((isinstance(value, bytes) and value.startswith(b"{"))
+                or (isinstance(value, str) and value.lstrip().startswith("{"))):
+            decoded_rows += 1
+        return original_loads(value, *args, **kwargs)
+
+    monkeypatch.setattr(_sess.json, "loads", count_row_decodes)
+    page = _sess.history_page(sid, limit=25)
+    assert page["total"] == 1_000
+    assert page["start"] == 975
+    assert [row["content"] for row in page["history"]] == [
+        row["content"] for row in rows[-25:]
+    ]
+    assert decoded_rows == 26  # one metadata file plus the requested 25 rows
+    assert _sess.get(sid, load_history=False)._history_loaded is False
+
+
+def test_cold_tail_page_cache_reuses_unchanged_file_and_invalidates_after_mutation(
+    monkeypatch,
+):
+    sid = "ses-cold-tail-cache"
+    rows = _rows(1_000)
+    nested_original = {
+        "parts": [
+            {
+                "type": "tool",
+                "tool": {"input": {"items": [{"name": "disk-value"}]}},
+            },
+        ],
+    }
+    rows[-1].update(nested_original)
+    _seed(sid, rows)
+    disk_nested_original = json.loads(
+        _sess._history_path(sid).read_text(encoding="utf-8").splitlines()[-1]
+    )["parts"]
+    # The dashboard listing establishes the shallow in-process index before
+    # it fans out into per-session tail-page reads.
+    _sess.list_all(load_history=False)
+    shallow = _sess.get(sid, load_history=False)
+    assert shallow is not None and shallow._history_loaded is False
+
+    original_reader = _sess._history_page_from_jsonl
+    reader_calls = 0
+
+    def count_reads(*args, **kwargs):
+        nonlocal reader_calls
+        reader_calls += 1
+        return original_reader(*args, **kwargs)
+
+    monkeypatch.setattr(_sess, "_history_page_from_jsonl", count_reads)
+    first = _sess.history_page(sid, limit=50)
+    second = _sess.history_page(sid, limit=50)
+    assert reader_calls == 1
+    assert first["history"][-1]["content"] == "msg-000999 " + ROW_SUFFIX
+
+    # Cache-fill and cache-hit results must be detached at every nesting
+    # level, just like rows returned by a fresh JSONL parse.
+    first["history"][-1]["parts"][0]["tool"]["input"]["items"][0]["name"] = (
+        "first-caller-mutation"
+    )
+    first["history"][-1]["parts"].append({"type": "caller-added"})
+    assert second["history"][-1]["parts"] == disk_nested_original
+    second["history"][-1]["content"] = "caller mutation"
+    second["history"][-1]["parts"][0]["tool"]["input"]["items"].append(
+        {"name": "second-caller-mutation"}
+    )
+    third = _sess.history_page(sid, limit=50)
+    assert third["history"][-1]["content"] == "msg-000999 " + ROW_SUFFIX
+    assert third["history"][-1]["parts"] == disk_nested_original
+    assert reader_calls == 1
+
+    appended = {"role": "assistant", "content": "appended-after-cache"}
+    with _sess._history_path(sid).open("ab") as handle:
+        handle.write((json.dumps(appended) + "\n").encode("utf-8"))
+
+    updated = _sess.history_page(sid, limit=50)
+    assert reader_calls == 2
+    assert updated["total"] == 1_001
+    assert updated["start"] == 951
+    assert updated["history"][-1] == appended
+    assert _sess.get(sid, load_history=False)._history_loaded is False
+
+    _sess.history_page(sid, limit=50)
+    assert reader_calls == 2
+
+    replaced_rows = [
+        {
+            "role": "assistant" if index % 2 else "user",
+            "content": f"replacement-{index:06d} {ROW_SUFFIX}",
+        }
+        for index in range(1_001)
+    ]
+    replacement_path = _sess._history_path(sid).with_name(
+        _sess._history_path(sid).name + ".replacement")
+    replacement_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in replaced_rows),
+        encoding="utf-8",
+    )
+    replacement_path.replace(_sess._history_path(sid))
+    replaced = _sess.history_page(sid, limit=50)
+    assert reader_calls == 3
+    assert replaced["total"] == 1_001
+    assert replaced["history"][-1]["content"] == (
+        "replacement-001000 " + ROW_SUFFIX)
+
+    _sess.history_page(sid, limit=50)
+    assert reader_calls == 3
+
+
 def test_summary_projection_120k_history_stays_jsonl_free_and_keeps_heartbeat(
     monkeypatch,
 ):
@@ -229,9 +351,19 @@ def test_session_history_cold_read_does_not_block_event_loop():
     assert max(gaps) < 0.05, f"event loop blocked for {max(gaps) * 1000:.1f}ms"
 
 
-def test_dashboard_broadcast_is_delivered_during_cold_read():
+def test_dashboard_broadcast_is_delivered_during_cold_read(monkeypatch):
     """A dashboard event produced mid-read must reach the client immediately."""
     _seed("ses-cold-broadcast", _rows(60_000))
+    original_history_pages = server._history_pages_for
+    read_started = threading.Event()
+    release_read = threading.Event()
+
+    def blocked_history_pages(session_ids, limit):
+        read_started.set()
+        assert release_read.wait(timeout=5)
+        return original_history_pages(session_ids, limit)
+
+    monkeypatch.setattr(server, "_history_pages_for", blocked_history_pages)
 
     class _FastWS:
         def __init__(self):
@@ -250,8 +382,10 @@ def test_dashboard_broadcast_is_delivered_during_cold_read():
 
     async def scenario():
         read_task = asyncio.create_task(server.api_list_sessions(summary=0))
-        await asyncio.sleep(0.01)
-        assert not read_task.done(), "cold read finished before the event was sent"
+        deadline = time.monotonic() + 5
+        while not read_started.is_set() and time.monotonic() < deadline:
+            await asyncio.sleep(0.001)
+        assert read_started.is_set(), "cold read did not reach the instrumented page read"
         started = time.monotonic()
         await server.broadcast({"type": "worker.stream", "sessionId": "ses-cold-broadcast"})
         deadline = started + 0.05
@@ -259,12 +393,14 @@ def test_dashboard_broadcast_is_delivered_during_cold_read():
             await asyncio.sleep(0.001)
         delivered = time.monotonic() - started
         in_flight = not read_task.done()
+        release_read.set()
         response = await read_task
         return response, delivered, in_flight
 
     try:
         response, delivered, in_flight = asyncio.run(scenario())
     finally:
+        release_read.set()
         for entry in tuple(server._ws_outbound.values()):
             if entry._sender_task is not None:
                 entry._sender_task.cancel()

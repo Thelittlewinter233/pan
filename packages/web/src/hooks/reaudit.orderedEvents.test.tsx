@@ -273,6 +273,65 @@ describe('reaudit · ordered event pipeline', () => {
     ]);
   });
 
+  it('keeps a tool that started before assistant completion ahead of that completed body', () => {
+    renderHook(() => useWebSocket());
+    const turnId = 'turn-tool-started-first';
+    const toolMessage = { content: [{
+      type: 'tool_use', name: 'Command', input: { command: 'echo delayed' },
+    }] };
+    const stream = (event: Record<string, unknown>) => wsMock.trigger('worker.stream', {
+      type: 'worker.stream', sessionId: 'A', workerId: 'w1', generation: 0,
+      taskSeq: 1, event,
+    });
+
+    act(() => {
+      stream({ type: 'content.part', role: 'assistant', delta: true,
+        turn_id: turnId, item_id: 'answer-item', stream_text: 'answer prefix',
+        part: { type: 'text', text: 'answer prefix' } });
+      // Codex emits item/started and output updates as replaceable tool deltas.
+      stream({ type: 'assistant', delta: true, replace: false,
+        turn_id: turnId, item_id: 'tool-item', message: toolMessage });
+      stream({ type: 'assistant', final: true,
+        turn_id: turnId, item_id: 'answer-item',
+        message: { content: [{ type: 'text', text: 'answer complete' }] } });
+      // The tool's completed notification can arrive after the text item.
+      stream({ type: 'assistant', replace: true,
+        turn_id: turnId, item_id: 'tool-item', message: toolMessage });
+    });
+
+    expect(shape()).toEqual([
+      'tool:Command({"command":"echo delayed"})',
+      'assistant:answer complete',
+    ]);
+  });
+
+  it('preserves an assistant completed before a later tool starts', () => {
+    renderHook(() => useWebSocket());
+    const turnId = 'turn-answer-before-tool';
+    const toolMessage = { content: [{
+      type: 'tool_use', name: 'Command', input: { command: 'echo later' },
+    }] };
+    const stream = (event: Record<string, unknown>) => wsMock.trigger('worker.stream', {
+      type: 'worker.stream', sessionId: 'A', workerId: 'w1', generation: 0,
+      taskSeq: 1, event,
+    });
+
+    act(() => {
+      stream({ type: 'assistant', final: true, turn_id: turnId,
+        item_id: 'answer-item',
+        message: { content: [{ type: 'text', text: 'answer first' }] } });
+      stream({ type: 'assistant', delta: true, replace: false,
+        turn_id: turnId, item_id: 'tool-item', message: toolMessage });
+      stream({ type: 'assistant', replace: true,
+        turn_id: turnId, item_id: 'tool-item', message: toolMessage });
+    });
+
+    expect(shape()).toEqual([
+      'assistant:answer first',
+      'tool:Command({"command":"echo later"})',
+    ]);
+  });
+
   it('reconnect snapshot finalizes a partial answer when its terminal frame was lost', () => {
     renderHook(() => useWebSocket());
     act(() => {
@@ -458,6 +517,133 @@ describe('reaudit · ordered event pipeline', () => {
       ]);
   });
 
+  it('background report and delivered user row stay in B transcript across selection and fresh history', async () => {
+    const a = mk('A');
+    const b = mk('B');
+    a.history = [{ role: 'user', content: 'A stays selected', messageId: 'a-1' }];
+    b.history = [{ role: 'user', content: 'B initial', messageId: 'b-1' }];
+    a.historyTotal = b.historyTotal = 1;
+    useSessionStore.setState({ sessions: [a, b], currentSessionId: 'A', currentMessages: a.history });
+    renderHook(() => useWebSocket());
+    apiMock.fetchSessionHistory.mockImplementation(async (sessionId: string) => sessionId === 'B' ? ({
+      history: [
+        { role: 'user', content: 'B initial', messageId: 'b-1' },
+        { role: 'user', content: 'Injected report request', messageId: 'b-injected' },
+      ], total: 2, hasMore: false, start: 0, historyEpoch: 'b-epoch', historyRevision: 2,
+    }) : ({
+      history: [{ role: 'user', content: 'A stays selected', messageId: 'a-1' }],
+      total: 1, hasMore: false, start: 0, historyEpoch: 'a-epoch', historyRevision: 1,
+    }));
+
+    act(() => {
+      wsMock.trigger('worker.status', {
+        type: 'worker.status', sessionId: 'B', workerId: 'w2', generation: 0,
+        taskSeq: 4, taskId: 'b-task-4', status: 'running', source: 'report',
+      });
+      wsMock.trigger('worker.stream', {
+        type: 'worker.stream', sessionId: 'B', workerId: 'w2', generation: 0,
+        taskSeq: 4, taskId: 'b-task-4',
+        event: { type: 'assistant', final: true, replace: true, item_id: 'b-report',
+          message: { content: [{ type: 'text', text: 'B report' }] } },
+      });
+      wsMock.trigger('worker.result', {
+        type: 'worker.result', sessionId: 'B', workerId: 'w2', generation: 0,
+        taskSeq: 4, taskId: 'b-task-4', status: 'done', result: 'B report',
+      });
+      wsMock.trigger('queue.item_delivered', {
+        type: 'queue.item_delivered', sessionId: 'B', messages: [
+          { role: 'user', content: 'B follow-up', messageId: 'b-user-2', queueItemId: 'q-b-2' },
+        ],
+      });
+    });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+
+    const stateAfterBackground = useSessionStore.getState();
+    expect(stateAfterBackground.currentMessages.map((row) => row.content)).toEqual(['A stays selected']);
+    expect(stateAfterBackground.sessions.find((session) => session.id === 'B')?.lastMessage).toBe('B follow-up');
+    expect(stateAfterBackground.sessionTranscripts.B?.runtime.map((row) => row.content)).toEqual(['B report', 'B follow-up']);
+    expect(stateAfterBackground.sessionTranscripts.B?.window.rows.size).toBe(2);
+
+    apiMock.fetchSessionHistory.mockImplementation(async (sessionId: string) => sessionId === 'B' ? ({
+      history: [
+        { role: 'user', content: 'B initial', messageId: 'b-1' },
+        { role: 'user', content: 'Injected report request', messageId: 'b-injected' },
+        { role: 'assistant', content: 'B report', messageId: 'b-report-durable' },
+        { role: 'user', content: 'B follow-up', messageId: 'b-user-2' },
+      ], total: 4, hasMore: false, start: 0, historyEpoch: 'b-epoch', historyRevision: 4,
+    }) : ({
+      history: [{ role: 'user', content: 'A stays selected', messageId: 'a-1' }],
+      total: 1, hasMore: false, start: 0, historyEpoch: 'a-epoch', historyRevision: 1,
+    }));
+    await act(async () => { await useSessionStore.getState().selectSession('B'); });
+    expect(useSessionStore.getState().currentMessages.map((row) => row.content))
+      .toEqual(['B initial', 'Injected report request', 'B report', 'B follow-up']);
+    await act(async () => { await useSessionStore.getState().selectSession('A'); });
+    expect(useSessionStore.getState().currentMessages.map((row) => row.content)).toEqual(['A stays selected']);
+    await act(async () => { await useSessionStore.getState().selectSession('B'); });
+    expect(useSessionStore.getState().currentMessages.map((row) => row.content))
+      .toEqual(['B initial', 'Injected report request', 'B report', 'B follow-up']);
+  });
+
+  it('late history page cannot replace selected result summary with the local DONE marker', () => {
+    const b = mk('B');
+    b.history = [{ role: 'user', content: 'B initial', messageId: 'b-1' }];
+    b.historyTotal = 1;
+    b.lastMessage = 'B initial';
+    useSessionStore.setState({ sessions: [b], currentSessionId: 'B', currentMessages: b.history });
+    renderHook(() => useWebSocket());
+
+    act(() => wsMock.trigger('worker.result', {
+      type: 'worker.result', sessionId: 'B', workerId: 'w2', generation: 0,
+      taskSeq: 7, taskId: 'b-task-7', status: 'done', result: 'Newest result',
+    }));
+
+    const completed = useSessionStore.getState();
+    expect(completed.currentMessages.map((row) => row.content)).toEqual([
+      'B initial', 'Newest result', '[DONE] Task completed',
+    ]);
+    expect(completed.sessions[0]?.lastMessage).toBe('Newest result');
+    expect(completed.sessions[0]?.history?.some((row) => row.content === '[DONE] Task completed')).toBe(false);
+
+    act(() => useSessionStore.getState().applyHistoryPage('B', {
+      history: [{ role: 'user', content: 'B initial', messageId: 'b-1' }],
+      total: 1, hasMore: false, start: 0, historyEpoch: 'b-epoch', historyRevision: 2,
+    }));
+
+    const afterLatePage = useSessionStore.getState();
+    expect(afterLatePage.sessions[0]?.lastMessage).toBe('Newest result');
+    expect(completed.sessions[0]?.historyTotal).toBe(2);
+    expect(afterLatePage.sessions[0]?.historyTotal).toBe(2);
+    expect(afterLatePage.currentMessages.map((row) => row.content)).toEqual([
+      'B initial', 'Newest result', '[DONE] Task completed',
+    ]);
+  });
+
+  it('background history page updates injected-row summary without changing selected messages', () => {
+    const a = mk('A');
+    const b = mk('B');
+    a.history = [{ role: 'user', content: 'A selected', messageId: 'a-1' }];
+    a.historyTotal = 1;
+    b.history = [{ role: 'user', content: 'B initial', messageId: 'b-1' }];
+    b.historyTotal = 1;
+    b.lastMessage = 'B initial';
+    useSessionStore.setState({ sessions: [a, b], currentSessionId: 'A', currentMessages: a.history });
+
+    act(() => useSessionStore.getState().applyHistoryPage('B', {
+      history: [
+        { role: 'user', content: 'B initial', messageId: 'b-1' },
+        { role: 'user', content: 'Injected report request', messageId: 'b-injected' },
+      ],
+      total: 2, hasMore: false, start: 0, historyEpoch: 'b-epoch', historyRevision: 2,
+    }));
+
+    const state = useSessionStore.getState();
+    expect(state.sessions.find((session) => session.id === 'B')?.lastMessage)
+      .toBe('Injected report request');
+    expect(state.sessionTranscripts.B?.window.rows.size).toBe(2);
+    expect(state.currentMessages.map((row) => row.content)).toEqual(['A selected']);
+  });
+
   // DEFECT E2 (F-B). A tool event that arrives before the assistant text is
   // reordered after it once worker.result rebuilds the live projection.
   it('E2 · a tool block streamed before the assistant text keeps its position after result', () => {
@@ -560,5 +746,126 @@ describe('reaudit · ordered event pipeline', () => {
       'assistant:Second answer',
     ]);
     expect(rows).toHaveLength(3);
+  });
+
+  it('E5 · an older DONE stays at its completed task boundary through delivery, later blocks, history, and A/B/A', () => {
+    renderHook(() => useWebSocket());
+    const done1 = 'worker.result:A:1';
+    const done2 = 'worker.result:A:2';
+    const snapshot = () => useSessionStore.getState().currentMessages.map((row) => ({
+      id: row.nativeItemId ?? row.messageId ?? '', role: row.role, content: row.content,
+    }));
+    const history1 = [
+      { role: 'user', content: 'task 1 prompt', messageId: 'u1' },
+      { role: 'tool', content: 'Command({"command":"step-1"})', messageId: 'tool-1' },
+      { role: 'assistant', content: 'answer 1', messageId: 'a1' },
+    ];
+    act(() => {
+      wsMock.trigger('worker.status', { type: 'worker.status', sessionId: 'A', workerId: 'w1', generation: 0, taskSeq: 1, status: 'running' });
+      wsMock.trigger('worker.stream', {
+        type: 'worker.stream', sessionId: 'A', workerId: 'w1', generation: 0, taskSeq: 1,
+        event: { type: 'codex.item.completed', item_id: 'tool-1', item: { id: 'tool-1', type: 'Command', command: 'step-1' } },
+      });
+      wsMock.trigger('worker.stream', assistantDelta('answer 1', 'item-1', 'turn-1', 1));
+      wsMock.trigger('worker.result', { type: 'worker.result', sessionId: 'A', workerId: 'w1', generation: 0, taskSeq: 1, status: 'done', result: 'answer 1' });
+    });
+    expect(snapshot().map((row) => row.id).filter((id) => id === done1)).toHaveLength(1);
+
+    act(() => useSessionStore.getState().applyHistoryPage('A', {
+      history: history1, start: 0, total: history1.length, hasMore: false,
+      historyEpoch: 'h', historyRevision: 3,
+    }));
+    expect(snapshot().map((row) => row.content)).toEqual([
+      'task 1 prompt', 'Command({"command":"step-1"})', 'answer 1', '[DONE] Task completed',
+    ]);
+
+    const expectDone1BeforeTask2 = () => {
+      const rows = snapshot();
+      expect(rows.findIndex((row) => row.id === done1)).toBeLessThan(
+        rows.findIndex((row) => row.content === 'task 2 prompt'),
+      );
+    };
+    act(() => wsMock.trigger('queue.item_delivered', {
+      type: 'queue.item_delivered', sessionId: 'A',
+      messages: [{ role: 'user', content: 'task 2 prompt', queueItemIds: ['q2'] }],
+    }));
+    expectDone1BeforeTask2();
+    act(() => wsMock.trigger('worker.status', {
+      type: 'worker.status', sessionId: 'A', workerId: 'w1', generation: 0, taskSeq: 2, status: 'running',
+    }));
+    expectDone1BeforeTask2();
+    act(() => wsMock.trigger('worker.stream', {
+      type: 'worker.stream', sessionId: 'A', workerId: 'w1', generation: 0, taskSeq: 2,
+      event: { type: 'codex.item.completed', item_id: 'tool-2', item: { id: 'tool-2', type: 'Command', command: 'step-2' } },
+    }));
+    expectDone1BeforeTask2();
+    act(() => wsMock.trigger('worker.stream', assistantDelta('analysis 2', 'item-2a', 'turn-2', 2)));
+    expectDone1BeforeTask2();
+    act(() => wsMock.trigger('worker.stream', assistantDelta('answer 2', 'item-2b', 'turn-2', 2)));
+    expectDone1BeforeTask2();
+    act(() => wsMock.trigger('worker.result', {
+      type: 'worker.result', sessionId: 'A', workerId: 'w1', generation: 0,
+      taskSeq: 2, status: 'done', result: 'answer 2',
+    }));
+    const beforeRefresh = snapshot();
+    expect(beforeRefresh.filter((row) => row.id === done1)).toHaveLength(1);
+    expect(beforeRefresh.filter((row) => row.id === done2)).toHaveLength(1);
+
+    const history2 = [
+      ...history1,
+      { role: 'user', content: 'task 2 prompt', messageId: 'u2', queueItemIds: ['q2'] },
+      { role: 'tool', content: 'Command({"command":"step-2"})', messageId: 'tool-2' },
+      { role: 'assistant', content: 'analysis 2', messageId: 'a2a' },
+      { role: 'assistant', content: 'answer 2', messageId: 'a2b' },
+    ];
+    act(() => useSessionStore.getState().applyHistoryPage('A', {
+      history: history2, start: 0, total: history2.length, hasMore: false,
+      historyEpoch: 'h', historyRevision: 7,
+    }));
+    expect(snapshot().map((row) => row.content)).toEqual([
+      'task 1 prompt', 'Command({"command":"step-1"})', 'answer 1', '[DONE] Task completed',
+      'task 2 prompt', 'Command({"command":"step-2"})', 'analysis 2', 'answer 2', '[DONE] Task completed',
+    ]);
+    expect(snapshot().filter((row) => row.id.startsWith('worker.result:')).map((row) => row.id))
+      .toEqual([done1, done2]);
+    expectDone1BeforeTask2();
+
+    act(() => {
+      wsMock.trigger('queue.item_delivered', {
+        type: 'queue.item_delivered', sessionId: 'A',
+        messages: [{ role: 'user', content: 'task 3 prompt', queueItemIds: ['q3'] }],
+      });
+      wsMock.trigger('worker.status', { type: 'worker.status', sessionId: 'A', workerId: 'w1', generation: 0, taskSeq: 3, status: 'running' });
+      wsMock.trigger('worker.stream', {
+        type: 'worker.stream', sessionId: 'A', workerId: 'w1', generation: 0, taskSeq: 3,
+        event: { type: 'codex.item.completed', item_id: 'tool-3', item: { id: 'tool-3', type: 'Command', command: 'step-3' } },
+      });
+      wsMock.trigger('worker.stream', assistantDelta('answer 3', 'item-3', 'turn-3', 3));
+      wsMock.trigger('worker.result', { type: 'worker.result', sessionId: 'A', workerId: 'w1', generation: 0, taskSeq: 3, status: 'done', result: 'answer 3' });
+    });
+    const history3 = [
+      ...history2,
+      { role: 'user', content: 'task 3 prompt', messageId: 'u3', queueItemIds: ['q3'] },
+      { role: 'tool', content: 'Command({"command":"step-3"})', messageId: 'tool-3' },
+      { role: 'assistant', content: 'answer 3', messageId: 'a3' },
+    ];
+    act(() => useSessionStore.getState().applyHistoryPage('A', {
+      history: history3, start: 0, total: history3.length, hasMore: false,
+      historyEpoch: 'h', historyRevision: 10,
+    }));
+    const afterRefresh = snapshot();
+    expect(afterRefresh.map((row) => row.content)).toEqual([
+      'task 1 prompt', 'Command({"command":"step-1"})', 'answer 1', '[DONE] Task completed',
+      'task 2 prompt', 'Command({"command":"step-2"})', 'analysis 2', 'answer 2', '[DONE] Task completed',
+      'task 3 prompt', 'Command({"command":"step-3"})', 'answer 3', '[DONE] Task completed',
+    ]);
+    expect(afterRefresh.filter((row) => row.id.startsWith('worker.result:')).map((row) => row.id))
+      .toEqual([done1, done2, 'worker.result:A:3']);
+
+    act(() => { void useSessionStore.getState().selectSession('B'); });
+    act(() => { void useSessionStore.getState().selectSession('A'); });
+    expect(snapshot().map((row) => row.content)).toEqual(afterRefresh.map((row) => row.content));
+    expect(snapshot().filter((row) => row.id.startsWith('worker.result:')).map((row) => row.id))
+      .toEqual([done1, done2, 'worker.result:A:3']);
   });
 });

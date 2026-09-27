@@ -22,6 +22,15 @@ CONFIG_FILE = Path(__file__).resolve().parent.parent.parent / "config.json"
 DEFAULT_PLUGIN_MANIFESTS = ["manifest.json", "packages/mcp/manifest.json"]
 
 DEFAULT_CONFIG: dict = {
+    # Data retention is opt-in. A null day count means never clean; there is
+    # deliberately no implicit duration. Jobs settings belong to config.jobs.
+    "data_retention": {
+        "sessions": {"enabled": False, "days": None},
+        "attachments": {"enabled": False, "days": None},
+        "qq_history": {"enabled": False, "days": None},
+        "qq_media": {"enabled": False, "days": None},
+        "pan_logs": {"enabled": False, "days": None},
+    },
     # Pan itself and first-party MCP servers use this interpreter.  Keep the
     # value empty by default so the resolver can fall back to PAN_PYTHON and
     # then the interpreter running the current Pan process.
@@ -64,6 +73,29 @@ DEFAULT_CONFIG: dict = {
         "max_concurrent_dispatch": 5,
         # cron 求值所用的默认时区（任务 schedule 未指定 timezone 时用）
         "default_timezone": "Asia/Shanghai",
+    },
+    # Retention rules for the unified Jobs registry. Disabled by default.
+    "jobs": {
+        "completedRetention": {
+            "enabled": False,
+            "days": None,
+        },
+        "failedRetention": {
+            "enabled": False,
+            "days": None,
+        },
+        "timedOutRetention": {
+            "enabled": False,
+            "days": None,
+        },
+        "cancelledRetention": {
+            "enabled": False,
+            "days": None,
+        },
+        "logFileRetention": {
+            "enabled": False,
+            "days": None,
+        },
     },
     # 本地日志（main.py 启动时配置）：文件大小/天轮转 + console 双输出
     "logging": {
@@ -155,11 +187,20 @@ DEFAULT_CONFIG: dict = {
         # scripts/setup.bat 首次运行时会把探测结果写入此处。
         "python": "",
     },
+    # Session legal-state behavior around Pan service Exit and startup.
+    # Persisted in config.json so all browsers and server-side startup logic
+    # share the same lifecycle policy.
+    "session_lifecycle": {
+        "exitStrategy": "ask",
+        "startupPreference": "ask",
+    },
     # 前端 App 设置（config.json 为单一真源，跨浏览器/会话一致）。
     # 由 GET/PUT /api/settings/ui 读写，前端 appSettingsStore 消费。
     "ui": {
         # 会话列表默认分组方式
         "defaultGroupBy": "none",
+        # 新建 Session 默认归入当前 Workspace
+        "defaultNewSessionToCurrentWorkspace": True,
         # 是否显示 meta-agent（////by agent）消息
         "showMetaAgent": True,
         # 是否显示 task-agent（@@@@by agent）消息
@@ -172,6 +213,72 @@ DEFAULT_CONFIG: dict = {
         },
     },
 }
+
+COMPLETED_JOB_RETENTION_MIN_DAYS = 1
+COMPLETED_JOB_RETENTION_MAX_DAYS = 36500
+COMPLETED_JOB_RETENTION_DEFAULT = {"enabled": False, "days": None}
+JOB_RETENTION_CONFIG_KEYS = {
+    "completed": "completedRetention",
+    "failed": "failedRetention",
+    "timed_out": "timedOutRetention",
+    "cancelled": "cancelledRetention",
+    "logs": "logFileRetention",
+}
+
+
+def parse_retention_settings(section: object) -> tuple[dict, bool]:
+    settings = dict(COMPLETED_JOB_RETENTION_DEFAULT)
+    if not isinstance(section, dict):
+        return settings, False
+    valid = True
+    if "enabled" in section:
+        if type(section["enabled"]) is bool:
+            settings["enabled"] = section["enabled"]
+        else:
+            valid = False
+    if "days" in section:
+        days = section["days"]
+        if days is None:
+            settings["days"] = None
+        elif (type(days) is int
+                and COMPLETED_JOB_RETENTION_MIN_DAYS <= days
+                <= COMPLETED_JOB_RETENTION_MAX_DAYS):
+            settings["days"] = days
+        else:
+            valid = False
+    if not valid:
+        settings["enabled"] = False
+    return settings, valid
+
+
+def job_retention_settings(config: dict | None = None) -> tuple[dict, dict[str, bool]]:
+    """Return safe settings and per-rule validity for all Job/log retention."""
+    if config is None:
+        config = load_config()
+    jobs = config.get("jobs", {}) if isinstance(config, dict) else None
+    rules = {}
+    validity = {}
+    for rule, key in JOB_RETENTION_CONFIG_KEYS.items():
+        section = jobs.get(key, {}) if isinstance(jobs, dict) else None
+        rules[rule], validity[rule] = parse_retention_settings(section)
+    return rules, validity
+
+
+def completed_job_retention_settings(config: dict | None = None) -> tuple[dict, bool]:
+    """Return safe retention settings and whether the persisted values are valid.
+
+    Missing keys use the defaults for old config files. Explicitly malformed
+    values are reported as invalid and resolve to safe defaults; in
+    particular, malformed enable flags can never turn automatic deletion on.
+    """
+    if config is None:
+        config = load_config()
+    if not isinstance(config, dict):
+        return dict(COMPLETED_JOB_RETENTION_DEFAULT), False
+    jobs = config.get("jobs", {})
+    if not isinstance(jobs, dict):
+        return dict(COMPLETED_JOB_RETENTION_DEFAULT), False
+    return parse_retention_settings(jobs.get("completedRetention", {}))
 
 
 def _python_argv_from_value(value, source: str) -> tuple[list[str] | None, str | None]:
@@ -268,6 +375,30 @@ def load_config() -> dict:
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
         user_config = json.load(f)
     return _deep_merge(DEFAULT_CONFIG, user_config)
+
+
+def resolve_pan_api_url() -> str:
+    """Resolve the loopback API URL used by Pan-owned MCP child processes.
+
+    Keep the precedence aligned with Pan startup: an explicit API URL wins,
+    followed by the selected runtime port, then config.json and the default.
+    The launcher pins its resolved port into the main process environment so
+    later worker respawns keep using the instance that is already running.
+    """
+    api_url = os.environ.get("PAN_API_URL")
+    if api_url:
+        return api_url
+
+    port = os.environ.get("PAN_PORT")
+    if port is None or not str(port).strip():
+        port = load_config().get("port", DEFAULT_CONFIG["port"])
+    try:
+        port_number = int(port)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Pan port must be an integer, got {port!r}") from exc
+    if not 1 <= port_number <= 65535:
+        raise ValueError(f"Pan port is outside the valid range: {port_number}")
+    return f"http://127.0.0.1:{port_number}"
 
 
 def _deep_merge(base: dict, override: dict) -> dict:

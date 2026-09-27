@@ -1,12 +1,19 @@
-import { useState } from 'react';
-import { ChevronDown, ChevronUp, CircleCheck, CircleX, Loader2, Wrench } from 'lucide-react';
+import { memo, useState } from 'react';
+import { ChevronDown, ChevronRight, CircleCheck, CircleX, Loader2, Wrench } from 'lucide-react';
 import type { Message } from '@/types';
-import { useSessionStore } from '@/stores/sessionStore';
 import { useDetailStore } from '@/stores/detailStore';
 import { getMessageIdentity } from '@/utils/messageIdentity';
+import { getLatestMessageTs } from '@/utils/messageTimestamp';
+import { isLongBlockContent } from './lazyBlockContent';
+import { MessageTimestamp } from './MessageTimestamp';
 
 interface ToolGroupProps {
   items: Message[];
+  latestTs?: string;
+  timestampsComputed?: boolean;
+  flashKey?: string;
+  flashKeys?: string[];
+  onTimestampFlashConsumed?: (flashKeys: readonly string[]) => void;
 }
 
 interface ToolInfo {
@@ -17,7 +24,7 @@ interface ToolInfo {
   rawContent: string;
 }
 
-function parseTool(content: string): ToolInfo {
+function parseTool(content: string, parseLongArgs = false): ToolInfo {
   if (!content) {
     return { name: '(empty)', status: 'running', args: null, argsPreview: '', rawContent: content };
   }
@@ -55,7 +62,7 @@ function parseTool(content: string): ToolInfo {
   // Parse args JSON and extract first arg for preview
   let args: Record<string, unknown> | null = null;
   let argsPreview = '';
-  if (argsText) {
+  if (argsText && (!isLongBlockContent(content) || parseLongArgs)) {
     try {
       args = JSON.parse(argsText);
       if (args && typeof args === 'object' && !Array.isArray(args)) {
@@ -84,6 +91,8 @@ function parseTool(content: string): ToolInfo {
     } catch {
       argsPreview = argsText.length > 30 ? argsText.slice(0, 30) + '...' : argsText;
     }
+  } else if (argsText) {
+    argsPreview = argsText.length > 40 ? argsText.slice(0, 40) + '...' : argsText;
   }
 
   // Determine status
@@ -136,15 +145,32 @@ function StatusIcon({ status }: { status: ToolInfo['status'] }) {
   }
 }
 
-export function ToolGroup({ items }: ToolGroupProps) {
+export const ToolGroup = memo(function ToolGroup({
+  items,
+  latestTs,
+  timestampsComputed,
+  flashKey,
+  flashKeys,
+  onTimestampFlashConsumed,
+}: ToolGroupProps) {
   const [isOpen, setIsOpen] = useState(false);
   const [expandedTools, setExpandedTools] = useState<Set<string>>(new Set());
-  const unread = useSessionStore((s) => s.getUnread());
 
   if (items.length === 0) return null;
 
-  const tools = items.map((t) => parseTool(t.content));
-  const hasUnread = items.some((t) => unread.has(t.content));
+  // A closed group needs only its count. Avoid parsing every tool payload
+  // until the user opens the group, and defer full JSON parsing of a long
+  // payload until that individual row is expanded.
+  const tools = isOpen
+    ? items.map((item) => {
+        const key = getMessageIdentity(item);
+        return parseTool(item.content, expandedTools.has(key));
+      })
+    : [];
+  const consumeTimestampFlash = () => {
+    const keys = flashKeys?.length ? flashKeys : flashKey ? [flashKey] : [];
+    if (keys.length > 0) onTimestampFlashConsumed?.(keys);
+  };
 
   const handleToolClick = (key: string, tool: ToolInfo) => {
     // Open detail panel for this tool
@@ -165,15 +191,18 @@ export function ToolGroup({ items }: ToolGroupProps) {
       {/* Group Header */}
       <button
         onClick={() => setIsOpen(!isOpen)}
+        aria-expanded={isOpen}
         className="tool-group-header flex items-center gap-2 px-3 py-2 text-xs text-text-secondary hover:text-text-primary hover:bg-bg-hover/30 transition-colors w-full text-left select-none"
       >
         <Wrench size={14} />
         <span>{items.length} tools</span>
-        {hasUnread && !isOpen && (
-          <span className="w-2 h-2 rounded-full bg-accent flex-shrink-0" title="unread" />
-        )}
-        <span className="ml-auto text-text-tertiary">
-          {isOpen ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+        <span className="ml-auto inline-flex items-center gap-2 text-text-tertiary">
+          {isOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+          <MessageTimestamp
+            ts={timestampsComputed ? latestTs : (latestTs ?? getLatestMessageTs(items))}
+            flashKey={flashKey}
+            onFlashConsumed={consumeTimestampFlash}
+          />
         </span>
       </button>
 
@@ -196,17 +225,25 @@ export function ToolGroup({ items }: ToolGroupProps) {
                   {tool.argsPreview && (
                     <span className="text-xs text-text-tertiary truncate">{tool.argsPreview}</span>
                   )}
-                  <span className="ml-auto text-text-tertiary flex-shrink-0">
-                    {expandedTools.has(key) ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+                  <span className="ml-auto inline-flex flex-shrink-0 items-center gap-2 text-text-tertiary">
+                    {expandedTools.has(key) ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                    <MessageTimestamp ts={items[i]!.ts} />
                   </span>
                 </div>
 
                 {/* Expanded content */}
                 {expandedTools.has(key) && (
-                  <div className="bg-bg-tertiary border-t border-border-default p-3 overflow-hidden">
-                    <pre className="text-xs font-mono whitespace-pre-wrap leading-relaxed text-text-secondary">
-                      {tool.args ? formatArgs(tool.args, tool.name) : tool.rawContent}
-                    </pre>
+                  <div className="bg-bg-tertiary border-t border-border-default p-3">
+                    <div
+                      role="region"
+                      tabIndex={0}
+                      aria-label={`${tool.name} content`}
+                      className="max-h-[20rem] overflow-y-auto"
+                    >
+                      <pre className="text-xs font-mono whitespace-pre-wrap break-words leading-relaxed text-text-secondary">
+                        {tool.args ? formatArgs(tool.args, tool.name) : tool.rawContent}
+                      </pre>
+                    </div>
                   </div>
                 )}
               </div>
@@ -216,4 +253,4 @@ export function ToolGroup({ items }: ToolGroupProps) {
       )}
     </div>
   );
-}
+});

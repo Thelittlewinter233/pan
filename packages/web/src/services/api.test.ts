@@ -1,6 +1,17 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { uploadSessionAttachment } from './api';
+import {
+  createSession,
+  importCbcSession,
+  importCodexSession,
+  importKimiSession,
+  importOpencodeSession,
+  reimportSession,
+  steerSessionWorker,
+  uploadSessionAttachment,
+  fetchCompletedJobRetentionSettings,
+  updateCompletedJobRetentionSettings,
+} from './api';
 
 class FakeXMLHttpRequest {
   static instances: FakeXMLHttpRequest[] = [];
@@ -68,5 +79,230 @@ describe('uploadSessionAttachment', () => {
       storageFilename: 'upload_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.md',
     });
     expect(progress.at(-1)).toEqual([file.size, file.size]);
+  });
+});
+
+describe('reimportSession adapter routes', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it.each([
+    ['cbc', '/api/cbc/sessions/import'],
+    ['kimi', '/api/kimi/sessions/import'],
+    ['opencode', '/api/opencode/sessions/import'],
+    ['codex', '/api/adapters/codex/sessions/import'],
+    ['claude', '/api/adapters/claude/sessions/import'],
+  ])('uses the supported %s history-import route', async (adapter, expectedPath) => {
+    let requestUrl = '';
+    let requestBody: Record<string, unknown> = {};
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      requestUrl = String(url);
+      requestBody = JSON.parse(init?.body as string);
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: async () => ({ id: 'ses-existing', workspaceIds: ['ws-original'] }),
+      };
+    }));
+
+    await reimportSession('ses-existing', adapter, 'native-session', 'C:/work');
+
+    expect(requestUrl.endsWith(expectedPath)).toBe(true);
+    expect(requestBody).toEqual({ session_id: 'native-session', cwd: 'C:/work' });
+  });
+});
+
+describe('worker control business errors', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('rejects HTTP 200 responses that carry a worker error body', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      json: async () => ({ error: 'Worker not found' }),
+    })));
+
+    await expect(steerSessionWorker('s1', 'continue')).rejects.toThrow('Worker not found');
+  });
+
+  it('queue mutations reject HTTP 200 responses that carry an error body', async () => {
+    const { enqueueSessionMessage, fetchSessionQueue, updateSessionQueueItem, deleteSessionQueueItem } =
+      await import('./api');
+
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      json: async () => ({ ok: false, error: { message: 'queue rejected' } }),
+    })));
+    await expect(enqueueSessionMessage('s1', 'hi', 'c1')).rejects.toThrow('queue rejected');
+
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      json: async () => ({ error: 'session gone' }),
+    })));
+    await expect(fetchSessionQueue('s1')).rejects.toThrow('session gone');
+
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      json: async () => ({ ok: false, error: 'revision conflict' }),
+    })));
+    await expect(updateSessionQueueItem('s1', 'q1', 'x', 1)).rejects.toThrow('revision conflict');
+    await expect(deleteSessionQueueItem('s1', 'q1')).rejects.toThrow('revision conflict');
+  });
+
+  it('carries one edit token through queue lease, save, and release requests', async () => {
+    const {
+      acquireSessionQueueItemEdit,
+      releaseSessionQueueItemEdit,
+      updateSessionQueueItem,
+    } = await import('./api');
+    const bodies = [
+      { ok: true, expiresAt: 4_000_000_000 },
+      { ok: true, item: { id: 'q1', text: 'edited' }, queueRevision: 3 },
+      { ok: true, released: true },
+    ];
+    const requests: RequestInit[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      requests.push(init ?? {});
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: async () => bodies.shift(),
+      };
+    }));
+
+    const lease = await acquireSessionQueueItemEdit('s1', 'q1', 'edit-token', 2);
+    await updateSessionQueueItem('s1', 'q1', 'edited', 2, 'edit-token');
+    await releaseSessionQueueItemEdit('s1', 'q1', 'edit-token');
+
+    expect(lease.expiresAt).toBe(4_000_000_000);
+    expect(requests.map((request) => request.method)).toEqual(['POST', 'PATCH', 'POST']);
+    expect(JSON.parse(requests[0]?.body as string)).toEqual({
+      editToken: 'edit-token', expectedRevision: 2,
+    });
+    expect(JSON.parse(requests[1]?.body as string)).toEqual({
+      text: 'edited', expectedRevision: 2, editToken: 'edit-token',
+    });
+    expect(JSON.parse(requests[2]?.body as string)).toEqual({ editToken: 'edit-token' });
+  });
+});
+
+describe('canonical Jobs completed-retention API', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('reads and writes the same Jobs API route with the rules payload', async () => {
+    const rules = {
+      completed: { enabled: false, days: null },
+      failed: { enabled: true, days: 14 },
+      timed_out: { enabled: false, days: null },
+      cancelled: { enabled: false, days: null },
+      logs: { enabled: false, days: null },
+    };
+    const configValidity = {
+      completed: true,
+      failed: true,
+      timed_out: true,
+      cancelled: true,
+      logs: true,
+    };
+    const lastRuns = {
+      completed: null,
+      failed: null,
+      timed_out: null,
+      cancelled: null,
+      logs: null,
+    };
+    const requests: Array<{ url: string; method: string; body: unknown }> = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      requests.push({
+        url: String(url),
+        method: init?.method ?? 'GET',
+        body: init?.body ? JSON.parse(init.body as string) : undefined,
+      });
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: async () => ({
+          settings: rules.completed,
+          rules,
+          configValid: true,
+          configValidity,
+          lastRun: null,
+          lastRuns,
+        }),
+      };
+    }));
+
+    await expect(fetchCompletedJobRetentionSettings()).resolves.toMatchObject({ rules });
+    await updateCompletedJobRetentionSettings(rules);
+
+    expect(requests).toEqual([
+      { url: '/api/jobs/settings/completed-retention', method: 'GET', body: undefined },
+      {
+        url: '/api/jobs/settings/completed-retention',
+        method: 'PUT',
+        body: { rules },
+      },
+    ]);
+  });
+});
+
+describe('workspace assignment for Session creation/import requests', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('sends workspaceIds when creating a new Session', async () => {
+    let body: Record<string, unknown> = {};
+    vi.stubGlobal('fetch', vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      body = JSON.parse(init?.body as string);
+      return { ok: true, status: 200, statusText: 'OK', json: async () => ({ id: 'created' }) };
+    }));
+
+    await createSession('New', null, 'cbc', undefined, { workspaceIds: ['ws-active'] });
+
+    expect(body.workspaceIds).toEqual(['ws-active']);
+  });
+
+  it('sends an empty workspaceIds array for all and ungrouped creation scopes', async () => {
+    let body: Record<string, unknown> = {};
+    vi.stubGlobal('fetch', vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      body = JSON.parse(init?.body as string);
+      return { ok: true, status: 200, statusText: 'OK', json: async () => ({ id: 'created' }) };
+    }));
+
+    await createSession('New', null, 'cbc', undefined, { workspaceIds: [] });
+
+    expect(body.workspaceIds).toEqual([]);
+  });
+
+  it.each([
+    ['cbc', (workspaceIds: string[]) => importCbcSession('native-cbc', 'C:/project', workspaceIds), 'project_dir'],
+    ['kimi', (workspaceIds: string[]) => importKimiSession('native-kimi', 'C:/project', workspaceIds), 'cwd'],
+    ['opencode', (workspaceIds: string[]) => importOpencodeSession('native-opencode', 'C:/project', workspaceIds), 'cwd'],
+    ['codex', (workspaceIds: string[]) => importCodexSession('native-codex', 'C:/project', workspaceIds), 'cwd'],
+  ])('includes the selected Workspace in %s import payloads', async (_adapter, invoke, pathKey) => {
+    let body: Record<string, unknown> = {};
+    vi.stubGlobal('fetch', vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      body = JSON.parse(init?.body as string);
+      return { ok: true, status: 200, statusText: 'OK', json: async () => ({ id: 'imported' }) };
+    }));
+
+    await invoke(['ws-active']);
+
+    expect(body.workspaceIds).toEqual(['ws-active']);
+    expect(body[pathKey as string]).toBe('C:/project');
   });
 });

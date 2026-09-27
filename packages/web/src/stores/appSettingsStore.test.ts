@@ -6,6 +6,7 @@ import {
   sanitizeSettings,
 } from '@/stores/appSettingsStore';
 import { fetchUiSettings, updateUiSettings } from '@/services/api';
+import { getCreationWorkspaceIds } from '@/utils/creationWorkspace';
 
 vi.mock('@/services/api', () => ({
   fetchUiSettings: vi.fn(async () => ({})),
@@ -28,11 +29,17 @@ describe('appSettingsStore', () => {
   it('starts with defaults before the backend load completes', () => {
     const s = useAppSettingsStore.getState();
     expect(s.loaded).toBe(false);
+    expect(s.chatViewStyle).toBe('tui');
     expect(s.defaultGroupBy).toBe('none');
+    expect(s.defaultNewSessionToCurrentWorkspace).toBe(true);
     expect(s.showMetaAgent).toBe(true);
     expect(s.showTaskAgent).toBe(true);
     expect(s.showQQ).toBe(true);
     expect(s.showCodexTerminalInput).toBe(false);
+    expect(s.mergeConsecutiveNonBodyBlocks).toBe(false);
+    expect(s.keepScrollOnSessionSwitch).toBe(false);
+    expect(s.showMessageNavigationRail).toBe(false);
+    expect(s.notifications.confirmCrossWorkspaceManagement).toBe(true);
   });
 
   it('applies backend ui settings on load', async () => {
@@ -41,6 +48,11 @@ describe('appSettingsStore', () => {
       showMetaAgent: false,
       showTaskAgent: true,
       showQQ: false,
+      defaultNewSessionToCurrentWorkspace: false,
+      mergeConsecutiveNonBodyBlocks: true,
+      keepScrollOnSessionSwitch: true,
+      showMessageNavigationRail: true,
+      chatViewStyle: 'bubble',
     });
 
     await useAppSettingsStore.getState().loadSettings();
@@ -51,6 +63,11 @@ describe('appSettingsStore', () => {
     expect(s.showMetaAgent).toBe(false);
     expect(s.showTaskAgent).toBe(true);
     expect(s.showQQ).toBe(false);
+    expect(s.defaultNewSessionToCurrentWorkspace).toBe(false);
+    expect(s.mergeConsecutiveNonBodyBlocks).toBe(true);
+    expect(s.keepScrollOnSessionSwitch).toBe(true);
+    expect(s.showMessageNavigationRail).toBe(true);
+    expect(s.chatViewStyle).toBe('bubble');
   });
 
   it('validates server values on load, falling back to defaults', async () => {
@@ -83,6 +100,34 @@ describe('appSettingsStore', () => {
     expect(s.showQQ).toBe(true);
   });
 
+  it('waits for one in-flight settings GET before resolving creation membership', async () => {
+    let resolveLoad!: (v: Record<string, unknown>) => void;
+    mockedFetch.mockReturnValue(new Promise((resolve) => {
+      resolveLoad = resolve;
+    }));
+
+    const startupLoad = useAppSettingsStore.getState().loadSettings();
+    const actionMembership = getCreationWorkspaceIds('ws-at-action-start');
+    await Promise.resolve();
+    expect(mockedFetch).toHaveBeenCalledTimes(1);
+
+    resolveLoad({ defaultNewSessionToCurrentWorkspace: false });
+
+    await expect(actionMembership).resolves.toEqual([]);
+    await startupLoad;
+    expect(useAppSettingsStore.getState().loaded).toBe(true);
+  });
+
+  it('uses DEFAULT_SETTINGS after a failed hydration instead of waiting indefinitely', async () => {
+    mockedFetch.mockRejectedValue(new Error('network down'));
+
+    await expect(getCreationWorkspaceIds('ws-at-action-start'))
+      .resolves.toEqual(['ws-at-action-start']);
+
+    expect(useAppSettingsStore.getState().loaded).toBe(true);
+    expect(useAppSettingsStore.getState().defaultNewSessionToCurrentWorkspace).toBe(true);
+  });
+
   it('writes each change back to the backend (PUT)', () => {
     useAppSettingsStore.getState().setDefaultGroupBy('workdir');
     useAppSettingsStore.getState().setShowMetaAgent(false);
@@ -90,6 +135,8 @@ describe('appSettingsStore', () => {
     useAppSettingsStore.getState().setShowQQ(false);
     useAppSettingsStore.getState().setCodexWarningToast(false);
     useAppSettingsStore.getState().setShowCodexTerminalInput(true);
+    useAppSettingsStore.getState().setMergeConsecutiveNonBodyBlocks(true);
+    useAppSettingsStore.getState().setChatViewStyle('bubble');
 
     expect(useAppSettingsStore.getState().defaultGroupBy).toBe('workdir');
     expect(mockedUpdate).toHaveBeenNthCalledWith(1, { defaultGroupBy: 'workdir' });
@@ -100,21 +147,54 @@ describe('appSettingsStore', () => {
       notifications: { codexWarningToast: false },
     });
     expect(mockedUpdate).toHaveBeenNthCalledWith(6, { showCodexTerminalInput: true });
+    expect(mockedUpdate).toHaveBeenNthCalledWith(7, { mergeConsecutiveNonBodyBlocks: true });
+    expect(mockedUpdate).toHaveBeenNthCalledWith(8, { chatViewStyle: 'bubble' });
+    expect(useAppSettingsStore.getState().chatViewStyle).toBe('bubble');
+    expect(useAppSettingsStore.getState().mergeConsecutiveNonBodyBlocks).toBe(true);
+
+    useAppSettingsStore.getState().setDefaultNewSessionToCurrentWorkspace(false);
+    expect(useAppSettingsStore.getState().defaultNewSessionToCurrentWorkspace).toBe(false);
+    expect(mockedUpdate).toHaveBeenLastCalledWith({
+      defaultNewSessionToCurrentWorkspace: false,
+    });
+
+    // The per-session scroll-memory switch writes through the same ui object.
+    useAppSettingsStore.getState().setKeepScrollOnSessionSwitch(true);
+    expect(useAppSettingsStore.getState().keepScrollOnSessionSwitch).toBe(true);
+    expect(mockedUpdate).toHaveBeenLastCalledWith({ keepScrollOnSessionSwitch: true });
+
+    useAppSettingsStore.getState().setShowMessageNavigationRail(true);
+    expect(useAppSettingsStore.getState().showMessageNavigationRail).toBe(true);
+    expect(mockedUpdate).toHaveBeenLastCalledWith({ showMessageNavigationRail: true });
+  });
+
+  it('persists the cross-workspace management confirmation switch and defaults old settings to enabled', () => {
+    expect(sanitizeSettings({ notifications: { codexWarningToast: false } }).notifications)
+      .toEqual({ codexWarningToast: false, confirmCrossWorkspaceManagement: true });
+    useAppSettingsStore.getState().setConfirmCrossWorkspaceManagement(false);
+    expect(useAppSettingsStore.getState().notifications.confirmCrossWorkspaceManagement).toBe(false);
+    expect(mockedUpdate).toHaveBeenCalledWith({ notifications: { confirmCrossWorkspaceManagement: false } });
   });
 
   it('resets all settings to defaults and writes them back', () => {
     useAppSettingsStore.getState().setDefaultGroupBy('manager');
     useAppSettingsStore.getState().setShowMetaAgent(false);
     useAppSettingsStore.getState().setShowQQ(false);
+    useAppSettingsStore.getState().setDefaultNewSessionToCurrentWorkspace(false);
 
     useAppSettingsStore.getState().resetSettings();
 
     const s = useAppSettingsStore.getState();
     expect(s.defaultGroupBy).toBe(DEFAULT_SETTINGS.defaultGroupBy);
+    expect(s.defaultNewSessionToCurrentWorkspace)
+      .toBe(DEFAULT_SETTINGS.defaultNewSessionToCurrentWorkspace);
     expect(s.showMetaAgent).toBe(DEFAULT_SETTINGS.showMetaAgent);
     expect(s.showTaskAgent).toBe(DEFAULT_SETTINGS.showTaskAgent);
     expect(s.showQQ).toBe(DEFAULT_SETTINGS.showQQ);
     expect(s.showCodexTerminalInput).toBe(DEFAULT_SETTINGS.showCodexTerminalInput);
+    expect(s.mergeConsecutiveNonBodyBlocks).toBe(DEFAULT_SETTINGS.mergeConsecutiveNonBodyBlocks);
+    expect(s.keepScrollOnSessionSwitch).toBe(DEFAULT_SETTINGS.keepScrollOnSessionSwitch);
+    expect(s.showMessageNavigationRail).toBe(DEFAULT_SETTINGS.showMessageNavigationRail);
     expect(mockedUpdate).toHaveBeenLastCalledWith({ ...DEFAULT_SETTINGS });
   });
 
@@ -147,13 +227,35 @@ describe('appSettingsStore', () => {
       ...DEFAULT_SETTINGS,
       showQQ: false,
     });
+    expect(sanitizeSettings({ defaultNewSessionToCurrentWorkspace: false })
+      .defaultNewSessionToCurrentWorkspace).toBe(false);
+    expect(sanitizeSettings({ defaultNewSessionToCurrentWorkspace: 'no' })
+      .defaultNewSessionToCurrentWorkspace).toBe(true);
     expect(
       sanitizeSettings({ notifications: { codexWarningToast: false } }).notifications,
-    ).toEqual({ codexWarningToast: false });
+    ).toEqual({ codexWarningToast: false, confirmCrossWorkspaceManagement: true });
     expect(sanitizeSettings(null)).toEqual({ ...DEFAULT_SETTINGS });
     expect(sanitizeSettings({ showCodexTerminalInput: 'yes' }).showCodexTerminalInput)
       .toBe(false);
     expect(sanitizeSettings({ showCodexTerminalInput: true }).showCodexTerminalInput)
       .toBe(true);
+    expect(sanitizeSettings({ mergeConsecutiveNonBodyBlocks: 'yes' }).mergeConsecutiveNonBodyBlocks)
+      .toBe(false);
+    expect(sanitizeSettings({ mergeConsecutiveNonBodyBlocks: true }).mergeConsecutiveNonBodyBlocks)
+      .toBe(true);
+    expect(sanitizeSettings({ chatViewStyle: 'bubble' }).chatViewStyle).toBe('bubble');
+    expect(sanitizeSettings({ chatViewStyle: 'invalid' }).chatViewStyle).toBe('tui');
+    // Missing / malformed scroll-memory values fall back to "off" (jump to newest).
+    expect(sanitizeSettings({ keepScrollOnSessionSwitch: 'yes' }).keepScrollOnSessionSwitch)
+      .toBe(false);
+    expect(sanitizeSettings({ keepScrollOnSessionSwitch: true }).keepScrollOnSessionSwitch)
+      .toBe(true);
+    expect(sanitizeSettings({}).keepScrollOnSessionSwitch).toBe(false);
+    // Missing / malformed rail visibility falls back to the (off) default.
+    expect(sanitizeSettings({ showMessageNavigationRail: 'no' }).showMessageNavigationRail)
+      .toBe(false);
+    expect(sanitizeSettings({ showMessageNavigationRail: true }).showMessageNavigationRail)
+      .toBe(true);
+    expect(sanitizeSettings({}).showMessageNavigationRail).toBe(false);
   });
 });

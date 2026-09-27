@@ -14,7 +14,7 @@ export function SidebarResizer() {
       const now = Date.now();
       if (now - lastClick.current < 300) {
         lastClick.current = 0;
-        setSidebarWidth(260);
+        setSidebarWidth(280);
         return;
       }
       lastClick.current = now;
@@ -57,7 +57,7 @@ export function SidebarResizer() {
       className="absolute top-0 right-0 h-full w-[4px] cursor-col-resize z-10 hover:bg-accent/30 transition-colors group"
       onMouseDown={handleMouseDown}
     >
-      <div className="absolute top-0 right-0 w-[2px] h-full bg-transparent group-hover:bg-accent/40 transition-colors" />
+      <div className="absolute top-0 right-0 w-[2px] h-full bg-border-default/70 group-hover:bg-accent/40 transition-colors" />
     </div>
   );
 }

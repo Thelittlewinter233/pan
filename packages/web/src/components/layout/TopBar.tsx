@@ -1,7 +1,9 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
+import { useShallow } from 'zustand/react/shallow';
 import { useCurrentSession } from '@/stores/sessionStore';
 import { useWorkerStore } from '@/stores/workerStore';
 import { useUIStore } from '@/stores/uiStore';
+import { useAppSettingsStore } from '@/stores/appSettingsStore';
 import { WorkerDot } from '@/components/worker/WorkerDot';
 import { Button } from '@/components/ui/Button';
 import { useMediaQuery } from '@/hooks/useMediaQuery';
@@ -78,14 +80,29 @@ function cachedQuotaLabel(quota: unknown): string | undefined {
   return available.length > 0 ? `quota ${available.join(' / ')}` : undefined;
 }
 
-export function TopBar() {
+export function TopBar({ rightAction }: { rightAction?: ReactNode }) {
   const currentSession = useCurrentSession();
   const currentWorker = useWorkerStore((s) => s.currentWorker);
   const [codexQuota, setCodexQuota] = useState<CodexQuotaProjection | null>(null);
-  const { showToast, toggleTuiView, tuiViewEnabled } =
-    useUIStore();
+  // 细粒度订阅：toast/审批/交互队列只在 UI store 的分片里；Worker store 只取
+  // 稳定的 action 引用。整体订阅（useUIStore()/useWorkerStore()）会让每次 toast、
+  // 每个交互请求、任意 session 的 worker 更新都重渲染 TopBar。
+  const { showToast } =
+    useUIStore(useShallow((s) => ({
+      showToast: s.showToast,
+    })));
+  const { chatViewStyle, setChatViewStyle } = useAppSettingsStore(useShallow((s) => ({
+    chatViewStyle: s.chatViewStyle,
+    setChatViewStyle: s.setChatViewStyle,
+  })));
+  const tuiViewEnabled = chatViewStyle === 'tui';
   const { restart, killCurrent, interrupt, takeover } =
-    useWorkerStore();
+    useWorkerStore(useShallow((s) => ({
+      restart: s.restart,
+      killCurrent: s.killCurrent,
+      interrupt: s.interrupt,
+      takeover: s.takeover,
+    })));
   const { isMobile } = useMediaQuery();
 
   useEffect(() => {
@@ -108,10 +125,11 @@ export function TopBar() {
 
   if (!currentSession) {
     return (
-      <div className="flex items-center justify-between px-4 py-2 border-b border-border-default bg-bg-primary">
-        <span className="text-sm text-text-tertiary">
+      <div data-testid="topbar" className="flex items-center justify-between px-4 py-1 md:py-2 border-b border-border-default bg-bg-primary gap-1 md:gap-2 max-md:flex-nowrap">
+        <span className="min-w-0 truncate text-sm text-text-tertiary">
           Select a session to start
         </span>
+        {rightAction}
       </div>
     );
   }
@@ -143,19 +161,25 @@ export function TopBar() {
   };
 
   return (
-    <div className="flex items-center justify-between pl-10 pr-3 md:pl-4 md:pr-4 py-2 border-b border-border-default bg-bg-primary gap-2 flex-wrap shrink-0">
-      <div className="flex items-center gap-3 min-w-0">
-        <div className="flex items-center gap-2">
-          <WorkerDot status={status} />
-          <span className="text-sm font-medium text-text-primary truncate max-w-[120px] md:max-w-[200px]">
+    <div data-testid="topbar" className="flex items-center justify-between pl-10 pr-3 md:pl-4 md:pr-4 py-1 md:py-2 border-b border-border-default bg-bg-primary gap-1 md:gap-2 flex-wrap max-md:flex-nowrap shrink-0">
+      <div className="flex items-center gap-1.5 md:gap-3 min-w-0 max-md:flex-1">
+        <div className="flex items-center gap-1 md:gap-2 min-w-0">
+          <WorkerDot status={status} className="shrink-0" />
+          <span
+            className="text-sm font-medium text-text-primary truncate max-w-[120px] md:max-w-[200px] min-w-0"
+            title={currentSession.name || currentSession.id?.slice(0, 12)}
+            aria-label={currentSession.name || currentSession.id?.slice(0, 12)}
+          >
             {currentSession.name || currentSession.id?.slice(0, 12)}
           </span>
-          {/* Deprecated Bubble view: keep the toggle implementation for a
-              future re-enable, but hide this entry from the current UI. */}
+          {/* Toggle between the chat presentations: TUI rows (default) and the
+              Bubble view. */}
           <button
-            hidden
-            onClick={toggleTuiView}
-            className="text-sm text-text-tertiary hover:text-text-primary p-0.5 rounded transition-colors"
+            type="button"
+            onClick={() => setChatViewStyle(tuiViewEnabled ? 'bubble' : 'tui')}
+            aria-label={tuiViewEnabled ? 'Switch to Bubble view' : 'Switch to TUI view'}
+            aria-pressed={!tuiViewEnabled}
+            className="text-sm text-text-tertiary hover:text-text-primary p-0.5 rounded transition-colors max-md:h-8 max-md:w-8 max-md:flex-none max-md:p-0 max-md:justify-center"
             title={tuiViewEnabled ? 'Switch to Bubble view' : 'Switch to TUI view'}
           >
             {tuiViewEnabled ? <Monitor size={16} /> : <MessageSquare size={16} />}
@@ -182,7 +206,7 @@ export function TopBar() {
         </div>
       </div>
 
-      <div className="flex items-center gap-1.5 flex-shrink-0">
+      <div data-testid="topbar-actions" className="flex items-center gap-0.5 md:gap-1.5 flex-shrink-0">
         {nativeUsageLabel && (
           <span
             className="hidden md:inline text-xs text-text-tertiary mr-1"
@@ -204,6 +228,7 @@ export function TopBar() {
             <Button
               variant="ghost"
               size="sm"
+              className="max-md:h-8 max-md:w-8 max-md:flex-none max-md:justify-center max-md:px-0 max-md:py-0"
               onClick={() =>
                 restart(currentSession.id)
                   .then(() => showToast('Restarted worker'))
@@ -216,6 +241,7 @@ export function TopBar() {
             <Button
               variant="ghost"
               size="sm"
+              className="max-md:h-8 max-md:w-8 max-md:flex-none max-md:justify-center max-md:px-0 max-md:py-0"
               onClick={() =>
                 interrupt(currentSession.id)
                   .then(() => showToast('Interrupt sent'))
@@ -229,6 +255,7 @@ export function TopBar() {
               <Button
                 variant="ghost"
                 size="sm"
+                className="max-md:h-8 max-md:w-8 max-md:flex-none max-md:justify-center max-md:px-0 max-md:py-0"
                 onClick={() => {
                   takeover(currentSession.id)
                     .then(() =>
@@ -244,6 +271,7 @@ export function TopBar() {
             <Button
               variant="ghost"
               size="sm"
+              className="max-md:h-8 max-md:w-8 max-md:flex-none max-md:justify-center max-md:px-0 max-md:py-0"
               onClick={() => {
                 if (!confirm(`Kill worker ${effectiveWorkerId}?`)) return;
                 killCurrent(currentSession.id)
@@ -260,6 +288,7 @@ export function TopBar() {
           <Button
             variant="primary"
             size="sm"
+            className="max-md:h-8 max-md:flex-none max-md:px-2 max-md:py-0"
             onClick={() =>
               restart(currentSession.id || '')
                 .then(() => showToast('Worker started'))
@@ -269,6 +298,7 @@ export function TopBar() {
             Start
           </Button>
         )}
+        {rightAction}
       </div>
     </div>
   );

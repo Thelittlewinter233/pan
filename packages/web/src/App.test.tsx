@@ -19,7 +19,7 @@ describe('responsive WorkspaceRail placement', () => {
     localStorage.clear();
     useSessionStore.setState({
       sessions: [
-        { id: 'inside', name: 'Inside workspace', workspaceIds: ['ws-alpha'], alwaysThinkingEnabled: false, effort: '', history: [] },
+        { id: 'inside', name: 'Inside workspace', adapter: 'codex', workspaceIds: ['ws-alpha'], alwaysThinkingEnabled: false, effort: '', history: [] },
         { id: 'outside', name: 'Outside workspace', workspaceIds: [], alwaysThinkingEnabled: false, effort: '', history: [] },
       ],
       currentSessionId: null,
@@ -70,36 +70,54 @@ describe('responsive WorkspaceRail placement', () => {
     );
   }
 
-  it('keeps only a handle when collapsed and opens a full-screen rail without changing the Sidebar drawer state', async () => {
+  it('attaches a touch-sized handle to the mobile Sidebar and expands beside it to fill the viewport', async () => {
     stubViewport(true);
-    renderLayout();
+    const { container } = renderLayout();
 
+    expect(await screen.findByRole('button', { name: '打开侧边栏' })).toBeTruthy();
+    expect(screen.queryByTestId('mobile-workspace-rail-collapsed')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: '打开侧边栏' }));
+
+    const drawer = await screen.findByTestId('mobile-sidebar-workspace-drawer');
     const handle = await screen.findByRole('button', { name: '展开工作区' });
     const collapsedRail = screen.getByTestId('mobile-workspace-rail-collapsed');
-    expect(collapsedRail.className).toContain('fixed');
     expect(collapsedRail.className).toContain('w-11');
-    expect(screen.queryByRole('button', { name: /Alpha/ })).toBeNull();
+    expect(collapsedRail.className).toContain('flex-none');
+    expect(handle.className).toContain('rounded-r-lg');
+    expect(handle.className).toContain('border-l-0');
+    expect(handle.className).not.toContain('rounded-l-lg');
+    expect(drawer.querySelector('aside')?.style.width).toBe('min(280px, 100vw)');
+    expect(container.querySelector('[data-workspace-tab-id="ws-alpha"]')).toBeNull();
 
-    useUIStore.getState().setMobileSidebarOpen(true);
     fireEvent.click(handle);
 
-    const overlay = screen.getByTestId('mobile-workspace-rail-overlay');
-    expect(overlay.className).toContain('inset-0');
-    expect(overlay.className).toContain('w-screen');
-    expect(overlay.className).toContain('h-[100dvh]');
+    const expandedRail = screen.getByTestId('mobile-workspace-rail-expanded');
+    expect(drawer.style.width).toBe('100vw');
+    expect(drawer.querySelector('aside')?.style.width).toBe('50vw');
+    expect(expandedRail.className).toContain('flex-1');
+    expect(expandedRail.className).not.toContain('fixed');
     expect(screen.getByRole('button', { name: '收起工作区面板' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: '展开工作区' })).toBeNull();
 
-    fireEvent.click(screen.getByRole('button', { name: /Alpha/ }));
+    const alphaTab = container.querySelector('[data-workspace-tab-id="ws-alpha"]');
+    expect(alphaTab).not.toBeNull();
+    fireEvent.click(alphaTab!);
     expect(useUIStore.getState().activeWorkspaceId).toBe('ws-alpha');
     expect(useUIStore.getState().railExpanded).toBe(false);
     expect(useUIStore.getState().mobileSidebarOpen).toBe(true);
-    expect(screen.getByTestId('mobile-workspace-rail-overlay')).toBeTruthy();
+    expect(screen.getByTestId('mobile-workspace-rail-expanded')).toBeTruthy();
+    expect(screen.getByText('Inside workspace')).toBeTruthy();
+    expect(screen.queryByText('Outside workspace')).toBeNull();
 
     fireEvent.click(screen.getByRole('button', { name: '收起工作区面板' }));
     await waitFor(() => expect(screen.getByTestId('mobile-workspace-rail-collapsed')).toBeTruthy());
     expect(useUIStore.getState().mobileSidebarOpen).toBe(true);
-    expect(screen.getByText('Inside workspace')).toBeTruthy();
-    expect(screen.queryByText('Outside workspace')).toBeNull();
+
+    fireEvent.click(screen.getByTestId('mobile-sidebar-close'));
+    await waitFor(() => {
+      expect(useUIStore.getState().mobileSidebarOpen).toBe(false);
+      expect(screen.queryByTestId('mobile-workspace-rail-collapsed')).toBeNull();
+    });
   });
 
   it('keeps the desktop rail in the Sidebar layout and does not mount a mobile overlay', async () => {
@@ -108,7 +126,7 @@ describe('responsive WorkspaceRail placement', () => {
 
     await waitFor(() => {
       expect(screen.queryByTestId('mobile-workspace-rail-collapsed')).toBeNull();
-      expect(screen.queryByTestId('mobile-workspace-rail-overlay')).toBeNull();
+      expect(screen.queryByTestId('mobile-workspace-rail-expanded')).toBeNull();
     });
     const desktopHandle = screen.getByRole('button', { name: '全部' });
     const desktopRail = desktopHandle.parentElement;

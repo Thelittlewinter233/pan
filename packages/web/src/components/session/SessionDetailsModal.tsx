@@ -1,15 +1,41 @@
-import { useEffect, useState } from 'react';
-import { ChevronDown, ChevronUp, Copy } from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
+import { ChevronDown, ChevronRight, Copy } from 'lucide-react';
 import { Modal } from '@/components/ui/Modal';
-import { fetchSession, fetchSessionUsage } from '@/services/api';
+import {
+  fetchCodexQuota,
+  fetchSession,
+  fetchSessionUsage,
+  syncSessionLegalWorkerState,
+} from '@/services/api';
 import { useUIStore } from '@/stores/uiStore';
 import type { Session, SessionUsageView } from '@/types';
 import { copyText } from '@/utils/clipboard';
 import { normalizeCodexQuotaProjection, type CodexQuotaWindow } from '@/utils/codexRateLimits';
+import { getSessionUsageCache, setSessionUsageCache } from './sessionUsageCache';
+import { FreshnessSkeleton, FreshnessStatus, type FreshnessState } from './FreshnessStatus';
 
 interface SessionDetailsModalProps {
   session: Session | null;
   onClose: () => void;
+}
+
+// Session Details is mounted across close/open transitions. Keep the last
+// successful projection by Session so a slow provider refresh cannot blank an
+// already-known Usage view on the next open. Every open still starts a fresh
+// request; this cache is a render fast path, not an offline truth source.
+function usageWithQuotaRefreshError(
+  usage: SessionUsageView,
+  message: string,
+): SessionUsageView {
+  if (!usage.codexQuota) return usage;
+  return {
+    ...usage,
+    codexQuota: {
+      ...usage.codexQuota,
+      stale: true,
+      refreshError: message,
+    },
+  };
 }
 
 function displayValue(value: string | null | undefined, empty = '暂无 / 未建立'): string {
@@ -81,53 +107,222 @@ export function SessionDetailsModal({ session, onClose }: SessionDetailsModalPro
   const [usageExpanded, setUsageExpanded] = useState(false);
   const [usage, setUsage] = useState<SessionUsageView | null>(null);
   const [usageLoading, setUsageLoading] = useState(false);
+  const [usageRefreshing, setUsageRefreshing] = useState(false);
+  const [quotaLoading, setQuotaLoading] = useState(false);
   const [usageError, setUsageError] = useState<string | null>(null);
   const [systemPromptExpanded, setSystemPromptExpanded] = useState(false);
   const [detailSession, setDetailSession] = useState<Session | null>(null);
+  const usageRequestId = useRef(0);
+  const detailRequestId = useRef(0);
+  const legalSyncRequestId = useRef(0);
+  const activeSessionIdRef = useRef(sessionId);
+  activeSessionIdRef.current = sessionId;
+  const detailCache = useRef(new Map<string, Session>());
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailRefreshing, setDetailRefreshing] = useState(false);
+  const [detailError, setDetailError] = useState<string | null>(null);
+  const [detailRetrySeq, setDetailRetrySeq] = useState(0);
+  const [usageRetrySeq, setUsageRetrySeq] = useState(0);
+  const [legalSyncBusy, setLegalSyncBusy] = useState(false);
+  const [legalSyncFeedback, setLegalSyncFeedback] = useState<{
+    kind: 'success' | 'error';
+    message: string;
+  } | null>(null);
 
   useEffect(() => {
+    usageRequestId.current += 1;
+    legalSyncRequestId.current += 1;
+    const cached = sessionId ? getSessionUsageCache(sessionId) : undefined;
     setUsageExpanded(false);
-    setUsage(null);
+    setUsage(cached?.usage ?? null);
     setUsageLoading(false);
+    setUsageRefreshing(false);
+    setQuotaLoading(false);
     setUsageError(null);
     setSystemPromptExpanded(false);
-    setDetailSession(null);
+    setDetailSession(sessionId ? detailCache.current.get(sessionId) ?? null : null);
+    setDetailLoading(false);
+    setDetailRefreshing(false);
+    setDetailError(null);
+    setLegalSyncBusy(false);
+    setLegalSyncFeedback(null);
   }, [sessionId]);
 
   useEffect(() => {
     if (!sessionId) return;
+    const requestId = ++detailRequestId.current;
+    const cached = detailCache.current.get(sessionId);
     let active = true;
+    setDetailLoading(!cached);
+    setDetailRefreshing(Boolean(cached));
+    setDetailError(null);
     fetchSession(sessionId)
       .then((full) => {
-        if (active) setDetailSession(full);
+        if (!active || detailRequestId.current !== requestId || full.id !== sessionId) return;
+        detailCache.current.set(sessionId, full);
+        setDetailSession(full);
+        setDetailLoading(false);
+        setDetailRefreshing(false);
       })
-      .catch(() => {
-        // The summary session remains the fallback when the detail request
-        // fails, so opening Details is still useful during a transient error.
+      .catch((error) => {
+        if (!active || detailRequestId.current !== requestId) return;
+        setDetailLoading(false);
+        setDetailRefreshing(false);
+        setDetailError(error instanceof Error ? error.message : 'Session details unavailable');
       });
-    return () => { active = false; };
-  }, [sessionId]);
+    return () => {
+      active = false;
+    };
+  }, [sessionId, detailRetrySeq]);
 
   useEffect(() => {
-    if (!usageExpanded || !sessionId || usage) return;
+    if (!usageExpanded || !sessionId) return;
+    const requestId = ++usageRequestId.current;
+    const cached = getSessionUsageCache(sessionId);
     let active = true;
-    setUsageLoading(true);
+    const isCurrent = () => active && usageRequestId.current === requestId;
+    setUsageLoading(!cached);
+    setUsageRefreshing(Boolean(cached));
+    setQuotaLoading(false);
+    setUsageError(null);
+
     fetchSessionUsage(sessionId)
-      .then((result) => { if (active) setUsage(result); })
-      .catch((error) => {
-        if (active) setUsageError(error instanceof Error ? error.message : 'Usage 加载失败');
+      .then((result) => {
+        if (!isCurrent() || result.sessionId !== sessionId) return;
+        // Do not discard a last-known quota if a cache-only backend read is
+        // temporarily unavailable while the independent refresh is running.
+        const merged = result.codexQuota || !cached?.usage.codexQuota
+          ? result
+          : { ...result, codexQuota: cached.usage.codexQuota };
+        setSessionUsageCache(sessionId, merged);
+        setUsage(merged);
+        setUsageLoading(false);
+        setUsageRefreshing(false);
+
+        if (result.adapter !== 'codex') return;
+        setQuotaLoading(true);
+        fetchCodexQuota(sessionId)
+          .then((quota) => {
+            if (!isCurrent()) return;
+            setUsage((current) => {
+              if (!current || current.sessionId !== sessionId) return current;
+              const refreshed = { ...current, codexQuota: quota };
+              setSessionUsageCache(sessionId, refreshed);
+              return refreshed;
+            });
+          })
+          .catch((error) => {
+            if (!isCurrent()) return;
+            const message = error instanceof Error ? error.message : 'Quota 刷新失败';
+            setUsage((current) => {
+              if (!current || current.sessionId !== sessionId) return current;
+              const stale = usageWithQuotaRefreshError(current, message);
+              setSessionUsageCache(sessionId, stale);
+              return stale;
+            });
+            setUsageError(`Quota 刷新失败：${message}`);
+          })
+          .finally(() => {
+            if (isCurrent()) setQuotaLoading(false);
+          });
       })
-      .finally(() => { if (active) setUsageLoading(false); });
+      .catch((error) => {
+        if (!isCurrent()) return;
+        setUsageError(error instanceof Error ? error.message : 'Usage 加载失败');
+        setUsageLoading(false);
+        setUsageRefreshing(false);
+      })
+      .finally(() => {
+        if (isCurrent()) setUsageLoading(false);
+      });
     return () => { active = false; };
-  }, [sessionId, usageExpanded, usage]);
+  }, [sessionId, usageExpanded, usageRetrySeq]);
 
   if (!session) return null;
 
   // Sidebar sessions come from summary=1 and intentionally omit detail-only
   // fields such as systemPrompt. Render that snapshot immediately, then use
   // the complete session fetched for this open modal once it arrives.
-  const displayedSession = detailSession ?? session;
+  const currentDetailSession = detailSession?.id === sessionId ? detailSession : null;
+  const displayedSession = currentDetailSession ?? session;
   const usageView = usage ?? fallbackUsage(displayedSession);
+  const quotaRefreshError = usageView.codexQuota?.refreshError;
+  const detailFreshness: FreshnessState = detailError
+    ? 'error'
+    : detailLoading
+      ? 'loading'
+      : detailRefreshing
+        ? 'refreshing'
+        : currentDetailSession
+          ? 'updated'
+          : 'cached';
+  const detailSource = currentDetailSession ? 'session metadata' : 'session summary cache';
+  const usageCache = sessionId ? getSessionUsageCache(sessionId) : undefined;
+  const usageFreshness: FreshnessState = usageError
+    ? 'error'
+    : usageLoading
+      ? usageRefreshing
+        ? 'refreshing'
+        : 'loading'
+      : usage
+        ? 'updated'
+        : 'unknown';
+  const usageSource = usage
+    ? typeof usage.source === 'string'
+      ? usage.source
+      : (usage.source as { kind?: string } | null | undefined)?.kind || 'persisted usage projection'
+    : usageCache
+      ? 'session usage cache'
+      : 'unknown';
+  const usageUpdatedAt = usage?.updatedAt ?? usageCache?.cachedAt ?? null;
+  const retryUsage = () => setUsageRetrySeq((value) => value + 1);
+  const syncLegalState = async () => {
+    if (!sessionId || !currentDetailSession || legalSyncBusy) return;
+    const targetSessionId = sessionId;
+    const requestId = ++legalSyncRequestId.current;
+    setLegalSyncBusy(true);
+    setLegalSyncFeedback(null);
+    try {
+      const result = await syncSessionLegalWorkerState(targetSessionId);
+      if (legalSyncRequestId.current !== requestId
+          || activeSessionIdRef.current !== targetSessionId) return;
+      if (result.sessionId !== targetSessionId) {
+        setLegalSyncFeedback({ kind: 'error', message: 'Sync returned a different Session.' });
+      } else if (result.status === 'updated' && result.legalWorkerState) {
+        const latest = detailCache.current.get(targetSessionId) ?? currentDetailSession;
+        const updated = { ...latest, lastLegalWorkerState: result.legalWorkerState };
+        detailCache.current.set(targetSessionId, updated);
+        setDetailSession((current) => current?.id === targetSessionId
+          ? { ...current, lastLegalWorkerState: result.legalWorkerState }
+          : current);
+        // A metadata request that started before the sync must not overwrite
+        // the helper's newer persisted result when it settles later.
+        detailRequestId.current += 1;
+        setLegalSyncFeedback({
+          kind: 'success',
+          message: `Legal state updated to ${result.legalWorkerState}`
+            + (result.runtimeWorkerStatus ? ` (runtime: ${result.runtimeWorkerStatus})` : ''),
+        });
+      } else {
+        setLegalSyncFeedback({
+          kind: 'error',
+          message: result.error || 'Could not synchronize the legal Worker state.',
+        });
+      }
+    } catch (error) {
+      if (legalSyncRequestId.current !== requestId
+          || activeSessionIdRef.current !== targetSessionId) return;
+      setLegalSyncFeedback({
+        kind: 'error',
+        message: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      if (legalSyncRequestId.current === requestId
+          && activeSessionIdRef.current === targetSessionId) {
+        setLegalSyncBusy(false);
+      }
+    }
+  };
   const copyValue = (label: string, value: string | undefined) => {
     if (!value) {
       showToast(`${label} 暂无可复制内容`, 'error');
@@ -172,6 +367,13 @@ export function SessionDetailsModal({ session, onClose }: SessionDetailsModalPro
     // of a centered window (< md breakpoint only). Desktop keeps size="lg".
     <Modal open title="Session Details" onClose={onClose} size="lg" mobileFullscreen>
       <div className="space-y-3">
+        <FreshnessStatus
+          state={detailFreshness}
+          updatedAt={displayedSession.updatedAt}
+          source={detailSource}
+          error={detailError}
+          onRetry={detailError ? () => setDetailRetrySeq((value) => value + 1) : undefined}
+        />
         {rows.map((row) => {
           const copyable = true;
           return (
@@ -199,6 +401,34 @@ export function SessionDetailsModal({ session, onClose }: SessionDetailsModalPro
             </div>
           );
         })}
+        <section aria-label="Legal Worker state" className="rounded border border-border-default px-3 py-2">
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <div className="text-xs text-text-tertiary mb-1">Last legal Worker state</div>
+              <div className="text-sm text-text-primary break-words">
+                {currentDetailSession
+                  ? displayValue(currentDetailSession.lastLegalWorkerState, 'Not recorded')
+                  : detailLoading ? 'Loading Session metadata…' : 'Unavailable'}
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => void syncLegalState()}
+              disabled={!currentDetailSession || detailLoading || legalSyncBusy}
+              className="shrink-0 rounded border border-border-default px-2.5 py-1.5 text-[11px] text-text-secondary hover:bg-bg-hover disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {legalSyncBusy ? 'Updating…' : 'Update to actual state'}
+            </button>
+          </div>
+          {legalSyncFeedback && (
+            <p
+              role={legalSyncFeedback.kind === 'error' ? 'alert' : 'status'}
+              className={`mt-2 text-[11px] ${legalSyncFeedback.kind === 'error' ? 'text-danger' : 'text-success'}`}
+            >
+              {legalSyncFeedback.message}
+            </p>
+          )}
+        </section>
         <section className="rounded border border-border-default overflow-hidden" aria-label="System prompt">
           <button
             type="button"
@@ -210,7 +440,7 @@ export function SessionDetailsModal({ session, onClose }: SessionDetailsModalPro
             <span className="font-medium">System prompt</span>
             <span className="flex items-center gap-1 text-xs text-text-tertiary">
               {systemPromptExpanded ? '收起' : '展开'}
-              {systemPromptExpanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+              {systemPromptExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
             </span>
           </button>
           {systemPromptExpanded && (
@@ -233,13 +463,23 @@ export function SessionDetailsModal({ session, onClose }: SessionDetailsModalPro
           >
             <span className="font-medium">Usage</span>
             <span className="flex items-center gap-1 text-xs text-text-tertiary">
-              {usageLoading ? '加载中…' : usageExpanded ? '收起' : '展开'}
-              {usageExpanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+              {usageLoading ? '加载中…' : usageRefreshing || quotaLoading ? '更新中…' : usageExpanded ? '收起' : '展开'}
+              {usageExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
             </span>
           </button>
           {usageExpanded && (
             <div id="session-usage-details" role="region" aria-label="Usage details" className="space-y-3 border-t border-border-default px-3 py-3">
-              {usageError && <div className="text-xs text-text-tertiary">{usageError}，当前显示已有数据</div>}
+              <FreshnessStatus
+                state={usageFreshness}
+                updatedAt={usageUpdatedAt}
+                source={usageSource}
+                error={null}
+                onRetry={usageError || quotaRefreshError ? retryUsage : undefined}
+              />
+              {usageLoading && !usage && displayedSession.totalUsage == null && (
+                <FreshnessSkeleton label="Loading usage" />
+              )}
+              {usageError && !quotaRefreshError && <div className="text-xs text-text-tertiary">{usageError}，当前显示已有数据</div>}
               {isCodex ? (
                 <div className="space-y-3" role="region" aria-label="Codex quota">
                   <div className="text-xs text-text-tertiary">
@@ -247,7 +487,14 @@ export function SessionDetailsModal({ session, onClose }: SessionDetailsModalPro
                       ? `Quota${usageView.codexQuota?.stale ? '（最近缓存，可能已过期）' : '（最近缓存）'}`
                       : 'Quota'}
                   </div>
-                  {quotaWindows.fiveHour || quotaWindows.weekly || quotaWindows.monthly ? (
+                  {quotaRefreshError && (
+                    <div className="text-xs text-text-tertiary">
+                      Quota 刷新失败：{quotaRefreshError}，当前显示缓存
+                    </div>
+                  )}
+                  {quotaLoading && !quotaIsCached ? (
+                    <div className="text-sm text-text-tertiary">Quota 加载中…</div>
+                  ) : quotaWindows.fiveHour || quotaWindows.weekly || quotaWindows.monthly ? (
                     <>
                       {quotaWindows.fiveHour && renderQuotaWindow('五小时额度', quotaWindows.fiveHour)}
                       {quotaWindows.weekly && renderQuotaWindow('周额度', quotaWindows.weekly)}

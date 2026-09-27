@@ -13,10 +13,10 @@ import type { SpecialFilterId } from '@/utils/sessionFilters';
 function loadSidebarWidth(): number {
   try {
     const v = localStorage.getItem('pan:sidebarWidth');
-    const n = v ? parseInt(v, 10) : 260;
-    return Math.max(200, Math.min(480, n));
+    const n = v ? parseInt(v, 10) : 280;
+    return Math.max(280, Math.min(480, n));
   } catch {
-    return 260;
+    return 280;
   }
 }
 
@@ -175,7 +175,6 @@ interface UIStore {
   userInputRequests: UserInputRequest[];
   elicitationRequests: ElicitationRequest[];
   terminalInteractions: TerminalInteraction[];
-  tuiViewEnabled: boolean;
   sidebarWidth: number;
   sidebarCollapsed: boolean;
   /** Mobile drawer (hamburger) open state — store-backed so route changes /
@@ -196,7 +195,6 @@ interface UIStore {
    *  Persisted to localStorage so hiding survives refreshes/reloads. */
   hiddenSessionIds: Set<string>;
   collapsedGroups: Set<string>;
-  filesCollapsed: boolean;
   theme: Theme;
   /** One-shot requests from the editor to the mounted chat composer. */
   chatAttachmentRequests: ChatAttachmentRequest[];
@@ -215,7 +213,6 @@ interface UIStore {
   addTerminalInteraction: (interaction: TerminalInteraction) => void;
   removeTerminalInteraction: (sessionId: string, itemId: string) => void;
   clearTerminalInteractions: (sessionId: string) => void;
-  toggleTuiView: () => void;
   setSidebarWidth: (w: number) => void;
   toggleSidebar: () => void;
   setMobileSidebarOpen: (open: boolean) => void;
@@ -231,8 +228,7 @@ interface UIStore {
   toggleSpecialFilter: (id: SpecialFilterId) => void;
   clearSpecialFilters: () => void;
   /** Mark a session hidden (Select mode eye button) or shown again. */
-  setSessionHidden: (id: string, hidden: boolean) => void;
-  /** Drop hidden ids that no longer correspond to a live session. */
+  setSessionHidden: (id: string, hidden: boolean) => void;  /** Drop hidden ids that no longer correspond to a live session. */
   pruneHiddenSessions: (validIds: Set<string>) => void;
   toggleGroupCollapse: (key: string) => void;
   collapseAllGroups: (keys: string[]) => void;
@@ -243,7 +239,6 @@ interface UIStore {
    *  (e.g. stale `__pending_*` placeholders or deleted sessions), keeping the
    *  set consistent with the current tree. */
   pruneCollapsedGroups: (validKeys: Set<string>) => void;
-  toggleFilesCollapsed: () => void;
   toggleTheme: () => void;
   requestChatAttachment: (sessionId: string, path: string) => void;
   consumeChatAttachmentRequests: (sessionId: string, paths: string[]) => void;
@@ -257,9 +252,6 @@ export const useUIStore = create<UIStore>((set, get) => ({
   userInputRequests: [],
   elicitationRequests: [],
   terminalInteractions: [],
-  // The old names were reversed: this flag now describes the retained TUI
-  // branch. The Bubble branch remains available for a future re-enable.
-  tuiViewEnabled: true,
   sidebarWidth: loadSidebarWidth(),
   sidebarCollapsed: loadSidebarCollapsed(),
   mobileSidebarOpen: false,
@@ -271,7 +263,6 @@ export const useUIStore = create<UIStore>((set, get) => ({
   specialFilters: new Set<SpecialFilterId>(),
   hiddenSessionIds: loadHiddenSessions(),
   collapsedGroups: new Set<string>(),
-  filesCollapsed: false,
   theme: loadTheme(),
   chatAttachmentRequests: [],
 
@@ -390,12 +381,8 @@ export const useUIStore = create<UIStore>((set, get) => ({
     }));
   },
 
-  toggleTuiView: () => {
-    set((s) => ({ tuiViewEnabled: !s.tuiViewEnabled }));
-  },
-
   setSidebarWidth: (w) => {
-    const clamped = Math.max(200, Math.min(480, Math.round(w)));
+    const clamped = Math.max(280, Math.min(480, Math.round(w)));
     set({ sidebarWidth: clamped });
     persistSidebarWidth(clamped);
   },
@@ -546,10 +533,6 @@ export const useUIStore = create<UIStore>((set, get) => ({
       if (!changed) return {};
       return { collapsedGroups: next };
     });
-  },
-
-  toggleFilesCollapsed: () => {
-    set((s) => ({ filesCollapsed: !s.filesCollapsed }));
   },
 
   toggleTheme: () => {

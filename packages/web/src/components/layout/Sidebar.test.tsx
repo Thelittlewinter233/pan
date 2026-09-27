@@ -1,10 +1,18 @@
 // @vitest-environment jsdom
+import { Profiler } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { Sidebar } from './Sidebar';
 import { useSessionStore } from '@/stores/sessionStore';
 import { useUIStore } from '@/stores/uiStore';
+import { useEditorStore } from '@/stores/editorStore';
+
+function RouteProbe() {
+  const location = useLocation();
+  const currentSessionId = useSessionStore((s) => s.currentSessionId);
+  return <div data-testid="route-probe">{location.pathname}: {currentSessionId ?? 'none'}</div>;
+}
 
 afterEach(() => {
   cleanup();
@@ -42,6 +50,43 @@ describe('Sidebar Session search controls', () => {
       target: { value: 'cli-session' },
     });
     expect(screen.getByRole('button', { name: 'Clear session search' })).toBeTruthy();
+  });
+
+  it('renders the CWD root as a collapsible section labelled CWD', () => {
+    useEditorStore.setState({
+      sessionId: 's1',
+      workdir: 'D:\\project',
+      roots: [{ id: 'cwd:D:/project', kind: 'cwd', path: 'D:/project', label: 'CWD' }],
+      rootTrees: { 'cwd:D:/project': { nodes: [], loading: false } },
+      rootTreeGenerations: {},
+      expanded: new Set(),
+      tempDirs: [],
+      workspaceId: null,
+      workspaceDirs: [],
+    });
+    render(
+      <MemoryRouter initialEntries={['/editor']}>
+        <Sidebar />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText('CWD')).toBeTruthy();
+    expect(screen.getByText('D:/project')).toBeTruthy();
+    const cwdHeader = screen.getByTestId('editor-root-header');
+    expect(cwdHeader.querySelector('svg.lucide-chevron-down')).not.toBeNull();
+
+    fireEvent.click(cwdHeader);
+    expect(cwdHeader.querySelector('svg.lucide-chevron-right')).not.toBeNull();
+  });
+
+  it('opens the special filters menu to the right of its trigger', () => {
+    renderSidebar();
+
+    fireEvent.click(screen.getByTitle('Special filters'));
+
+    const menu = screen.getByRole('menu');
+    expect(menu.className).toContain('left-0');
+    expect(menu.className).not.toContain('right-0');
   });
 
   it('clears the query and restores the unfiltered state', () => {
@@ -111,6 +156,41 @@ describe('Sidebar Session search controls', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Deselect all visible sessions' }));
     expect(useSessionStore.getState().selectedIds).toEqual(new Set());
+  });
+
+  it.each([280, 240])('keeps selection actions within a %ipx-or-narrower viewport', (viewportWidth) => {
+    useSessionStore.setState({
+      sessions: [{ id: 'alpha', name: 'Alpha', alwaysThinkingEnabled: false, effort: '', history: [] }],
+      multiSelectMode: true,
+      selectedIds: new Set(['alpha']),
+    });
+    useUIStore.getState().setSidebarWidth(200);
+    expect(useUIStore.getState().sidebarWidth).toBe(280);
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: viewportWidth });
+    renderSidebar();
+
+    const sidebar = document.querySelector('aside');
+    const selectionBar = document.querySelector('.sidebar-selection-bar');
+    const actions = document.querySelector('.sidebar-selection-actions');
+    expect(sidebar?.style.width).toBe('min(280px, 100vw)');
+    expect(sidebar?.style.minWidth).toBe('min(280px, 100vw)');
+    expect(selectionBar?.className).toContain('flex-wrap');
+    expect(actions?.className).toContain('flex-wrap');
+    expect(screen.getByRole('button', { name: 'Delete selected sessions' }).title).toBe('Delete selected sessions');
+    expect(screen.getByRole('button', { name: 'Cancel selection' }).title).toBe('Cancel selection');
+    expect(screen.getByRole('button', { name: 'Move selected sessions to workspace' }).textContent).toContain('Workspace');
+  });
+
+  it('keeps full action labels and explicit accessible names in the wide selection bar', () => {
+    useSessionStore.setState({ multiSelectMode: true, selectedIds: new Set(['alpha']) });
+    useUIStore.setState({ sidebarWidth: 480 });
+    renderSidebar();
+
+    expect(document.querySelector('aside')?.style.width).toBe('min(480px, 100vw)');
+    expect(screen.getByRole('button', { name: 'Delete selected sessions' }).textContent).toContain('Delete');
+    expect(screen.getByRole('button', { name: 'Cancel selection' }).textContent).toContain('Cancel');
+    expect(screen.getByRole('button', { name: 'Move selected sessions to workspace' }).textContent).toContain('Workspace');
+    expect(document.querySelector('.sidebar-selection-action-icon')).toBeTruthy();
   });
 
   it('uses special filters for the select-all candidate range', () => {
@@ -184,5 +264,179 @@ describe('Sidebar Session search controls', () => {
     fireEvent.pointerUp(sort, { pointerType: 'mouse', button: 0, clientX: 10, clientY: 10 });
     fireEvent.click(sort);
     expect(useUIStore.getState().sortBy).toBe('name');
+  });
+});
+
+describe('Sidebar session navigation from Jobs', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    useSessionStore.setState({
+      sessions: [
+        { id: 'jobs-session', name: 'Jobs session', alwaysThinkingEnabled: false, effort: '', history: [] },
+      ],
+      currentSessionId: null,
+      multiSelectMode: false,
+      selectedIds: new Set(),
+    });
+    useUIStore.setState({
+      sidebarCollapsed: false,
+      mobileSidebarOpen: false,
+      searchQuery: '',
+      specialFilters: new Set(),
+      groupBy: 'none',
+      sortBy: 'recent',
+      dragEnabled: false,
+    });
+  });
+
+  function renderJobsSidebar() {
+    return render(
+      <MemoryRouter initialEntries={['/jobs']}>
+        <Sidebar />
+        <Routes>
+          <Route path="/jobs" element={<div>Jobs view</div>} />
+          <Route path="/" element={<div>Chat view</div>} />
+        </Routes>
+        <RouteProbe />
+      </MemoryRouter>,
+    );
+  }
+
+  it('opens the clicked session in Chat from Jobs, including when it is already selected', () => {
+    const { container } = renderJobsSidebar();
+
+    fireEvent.click(container.querySelector('[data-session-card-id="jobs-session"]')!);
+
+    expect(screen.getByText('Chat view')).toBeTruthy();
+    expect(screen.getByTestId('route-probe').textContent).toContain('/: jobs-session');
+    expect(useSessionStore.getState().currentSessionId).toBe('jobs-session');
+
+    // Repeating the body click while the same session is selected still
+    // navigates from Jobs.
+    fireEvent.click(screen.getByRole('link', { name: /Jobs/ }));
+    expect(screen.getByText('Jobs view')).toBeTruthy();
+    fireEvent.click(container.querySelector('[data-session-card-id="jobs-session"]')!);
+    expect(screen.getByText('Chat view')).toBeTruthy();
+  });
+
+  it('does not navigate when opening the card menu', () => {
+    renderJobsSidebar();
+
+    fireEvent.click(screen.getByTitle('Session actions'));
+
+    expect(screen.getByRole('button', { name: 'Rename' })).toBeTruthy();
+    expect(screen.getByText('Jobs view')).toBeTruthy();
+    expect(useSessionStore.getState().currentSessionId).toBeNull();
+  });
+
+  it('does not navigate when the multi-select checkbox is clicked', () => {
+    useSessionStore.setState({ multiSelectMode: true });
+    renderJobsSidebar();
+
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select Jobs session' }));
+
+    expect(screen.getByText('Jobs view')).toBeTruthy();
+    expect(useSessionStore.getState().selectedIds.has('jobs-session')).toBe(true);
+    expect(useSessionStore.getState().currentSessionId).toBeNull();
+  });
+
+  it('closes an open mobile Sidebar after navigating from Jobs to Chat', () => {
+    vi.stubGlobal('matchMedia', vi.fn(() => ({
+      matches: true,
+      media: '(max-width: 767px)',
+      onchange: null,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(() => false),
+    })));
+    useUIStore.setState({ mobileSidebarOpen: true });
+    const { container } = renderJobsSidebar();
+
+    fireEvent.click(container.querySelector('[data-session-card-id="jobs-session"]')!);
+
+    expect(screen.getByText('Chat view')).toBeTruthy();
+    expect(useUIStore.getState().mobileSidebarOpen).toBe(false);
+    vi.unstubAllGlobals();
+  });
+});
+
+// FE-1: the sidebar chain must only re-render for state it actually reads.
+// Streaming chunks, draft keystrokes, thinking/tool flags, toasts and
+// interactive requests are all irrelevant to the sidebar slice.
+describe('Sidebar render isolation (fine-grained selectors)', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    useSessionStore.setState({
+      sessions: [],
+      currentSessionId: null,
+      multiSelectMode: false,
+      selectedIds: new Set(),
+      inputDrafts: {},
+      currentMessages: [],
+      rendering: false,
+    });
+    useUIStore.setState({
+      sidebarCollapsed: false,
+      searchQuery: '',
+      specialFilters: new Set(),
+      hiddenSessionIds: new Set(),
+      collapsedGroups: new Set(),
+      groupBy: 'none',
+      sortBy: 'recent',
+      dragEnabled: true,
+      toastQueue: [],
+      approvalRequests: [],
+      userInputRequests: [],
+      elicitationRequests: [],
+      terminalInteractions: [],
+    });
+  });
+
+  function renderProfiledSidebar() {
+    const commits: number[] = [];
+    render(
+      <MemoryRouter>
+        <Profiler id="sidebar" onRender={() => commits.push(1)}>
+          <Sidebar />
+        </Profiler>
+      </MemoryRouter>,
+    );
+    return commits;
+  }
+
+  it('ignores streaming/draft/toast updates but re-renders on a session change', () => {
+    const commits = renderProfiledSidebar();
+    const afterMount = commits.length;
+    expect(afterMount).toBeGreaterThan(0);
+
+    act(() => {
+      // Draft keystroke.
+      useSessionStore.setState((s) => ({ inputDrafts: { ...s.inputDrafts, A: 'draft' } }));
+      // A stream chunk landing on the selected session.
+      useSessionStore.setState({ currentMessages: [{ role: 'assistant', content: 'chunk' }] });
+      // Thinking/tool rendering flag.
+      useSessionStore.setState({ rendering: true });
+    });
+    act(() => {
+      // Toast + interactive request (UI store, outside the sidebar slice).
+      useUIStore.setState({ toastQueue: [{ id: 't1', message: 'hi', type: 'info' }] });
+      useUIStore.setState({
+        approvalRequests: [
+          { sessionId: 'A', workerId: 'w1', requestId: 1, method: 'm', params: {} },
+        ],
+      });
+    });
+    expect(commits.length).toBe(afterMount);
+
+    act(() => {
+      useSessionStore.setState({
+        sessions: [
+          { id: 'A', name: 'Alpha', alwaysThinkingEnabled: false, effort: '', history: [], lastMessage: 'hi' },
+        ],
+      });
+    });
+    expect(commits.length).toBeGreaterThan(afterMount);
   });
 });
