@@ -1,11 +1,11 @@
-import React, { createContext, useContext, useRef, useState } from 'react';
+import React, { createContext, memo, useContext, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import ReactMarkdown, { defaultUrlTransform, type ExtraProps } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import rehypeKatex from 'rehype-katex';
 import { Copy, Check, File as FileIcon } from 'lucide-react';
-import { useCurrentSession } from '@/stores/sessionStore';
+import { useSessionStore } from '@/stores/sessionStore';
 import { useEditorStore } from '@/stores/editorStore';
 import { useUIStore } from '@/stores/uiStore';
 import { parseMarkdownFileLink } from '@/utils/markdownFileLinks';
@@ -25,9 +25,20 @@ function transformMarkdownUrl(value: string): string {
   return parseMarkdownFileLink(value) ? value : defaultUrlTransform(value);
 }
 
+const RASTER_IMAGE_MIMES = new Set([
+  'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/bmp', 'image/avif',
+]);
+
+function looksLikeImageLink(href: string, label: React.ReactNode): boolean {
+  const extensionPattern = /\.(?:png|jpe?g|gif|webp|bmp|avif)$/i;
+  return extensionPattern.test(href.split(/[?#]/, 1)[0] || '')
+    || extensionPattern.test(extractLinkText(label));
+}
+
 function MarkdownLink({ href, children, attachmentId, node: _node, ...props }: LinkProps & { attachmentId?: string }) {
   const navigate = useNavigate();
-  const currentSession = useCurrentSession();
+  const sessionId = useSessionStore((s) => s.currentSessionId);
+  const workdir = useSessionStore((s) => s.sessions.find(x => x.id === s.currentSessionId)?.workdir);
   const showToast = useUIStore((s) => s.showToast);
   const draggedRef = useRef(false);
   const dragResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -47,14 +58,58 @@ function MarkdownLink({ href, children, attachmentId, node: _node, ...props }: L
     }
     if (!href) return;
     const fileLink = parseMarkdownFileLink(href);
+
+    // Resolve image identity and MIME through the server-owned attachment
+    // registry. The Markdown href, label, and any path-like text are never
+    // used as permission to read a resource.
+    if (looksLikeImageLink(href, children) && isSafeAttachmentHref(href)) {
+      const attachmentId = fileLink?.serverAttachmentId
+        || extractOpaqueAttachmentId(href)
+        || extractUploadAttachmentId(href);
+      const sourceSessionId = fileLink?.serverSessionId || extractAttachmentSessionId(href) || sessionId;
+      if (!attachmentId || !sourceSessionId) return;
+      event.preventDefault();
+      if (!sessionId || !workdir) {
+        showToast('当前没有可用的 Editor 工作目录，无法预览图片', 'error');
+        return;
+      }
+      try {
+        const response = await fetch(
+          `/api/attachments/editor/${encodeURIComponent(attachmentId)}`
+          + `?session_id=${encodeURIComponent(sourceSessionId)}`,
+        );
+        const metadata = await response.json() as {
+          ok?: boolean; path?: unknown; displayName?: unknown; mimeType?: unknown;
+        };
+        if (!response.ok || metadata.ok === false || typeof metadata.path !== 'string') {
+          throw new Error('图片引用已失效');
+        }
+        if (typeof metadata.mimeType !== 'string' || !RASTER_IMAGE_MIMES.has(metadata.mimeType)) {
+          window.location.assign(href);
+          return;
+        }
+        await useEditorStore.getState().setRoot(sessionId, workdir);
+        const displayName = typeof metadata.displayName === 'string' ? metadata.displayName : 'attachment';
+        const downloadHref = `/api/attachments/ref/${encodeURIComponent(attachmentId)}`
+          + `?session_id=${encodeURIComponent(sourceSessionId)}`;
+        const opened = useEditorStore.getState().openImage(
+          `attachment:${sourceSessionId}:${attachmentId}`,
+          { src: downloadHref, downloadHref, displayName },
+        );
+        if (opened) navigate('/editor');
+      } catch (error) {
+        showToast(`打开图片失败：${error instanceof Error ? error.message : '图片引用已失效'}`, 'error');
+      }
+      return;
+    }
     if (!fileLink) return;
     event.preventDefault();
 
-    if (!currentSession?.id) {
+    if (!sessionId) {
       showToast('当前没有可用的 Session，无法打开文件', 'error');
       return;
     }
-    if (!currentSession.workdir) {
+    if (!workdir) {
       showToast('当前 Session 没有工作目录，无法打开文件', 'error');
       return;
     }
@@ -64,7 +119,7 @@ function MarkdownLink({ href, children, attachmentId, node: _node, ...props }: L
       try {
         const response = await fetch(
           `/api/attachments/editor/${encodeURIComponent(fileLink.serverAttachmentId)}`
-          + `?session_id=${encodeURIComponent(fileLink.serverSessionId || currentSession.id)}`,
+          + `?session_id=${encodeURIComponent(fileLink.serverSessionId || sessionId)}`,
         );
         const metadata = await response.json() as { ok?: boolean; path?: unknown };
         if (!response.ok || metadata.ok === false || typeof metadata.path !== 'string') {
@@ -79,7 +134,7 @@ function MarkdownLink({ href, children, attachmentId, node: _node, ...props }: L
 
     // Keep the existing editor root in sync before opening. This also covers
     // links clicked in Chat/DetailPanel before EditorView has mounted.
-    await useEditorStore.getState().setRoot(currentSession.id, currentSession.workdir);
+    await useEditorStore.getState().setRoot(sessionId, workdir);
     const location = fileLink.location && editorPath
       ? { ...fileLink.location, path: editorPath }
       : fileLink.location;
@@ -94,7 +149,7 @@ function MarkdownLink({ href, children, attachmentId, node: _node, ...props }: L
       || attachmentId
       || extractOpaqueAttachmentId(href)
       || extractUploadAttachmentId(href);
-    const sourceSessionId = fileLink?.serverSessionId || extractAttachmentSessionId(href) || currentSession?.id;
+    const sourceSessionId = fileLink?.serverSessionId || extractAttachmentSessionId(href) || sessionId || undefined;
     const dragHref = dragId && sourceSessionId
       ? serverAttachmentDownloadHref(sourceSessionId, dragId)
       : href;
@@ -173,6 +228,11 @@ interface MarkdownRendererProps {
   className?: string;
   attachmentIds?: string[];
 }
+
+// Keep plugin identity stable so react-markdown does not rebuild its unified
+// pipeline when an unrelated message or sidebar state changes.
+const REMARK_PLUGINS = [remarkGfm];
+const REHYPE_PLUGINS = [rehypeHighlight, rehypeKatex];
 
 /** Recursively extract plain text from React nodes (handles hljs spans). */
 function extractCodeText(node: React.ReactNode): string {
@@ -275,17 +335,19 @@ function PreBlock({ children }: PreProps) {
   return <PreContext.Provider value={true}>{children}</PreContext.Provider>;
 }
 
-export function MarkdownRenderer({ content, className = '', attachmentIds = [] }: MarkdownRendererProps) {
-  const currentSession = useCurrentSession();
+export const MarkdownRenderer = memo(function MarkdownRenderer({ content, className = '', attachmentIds = [] }: MarkdownRendererProps) {
+  // Historical Markdown does not depend on the live session object. Subscribing
+  // to it reparsed every visible history row on every streamed token.
+  const sessionId = useSessionStore((s) => s.currentSessionId);
   if (!content) return null;
-  const renderedContent = normalizeLegacyAttachmentLinks(content, currentSession?.id);
+  const renderedContent = normalizeLegacyAttachmentLinks(content, sessionId ?? undefined);
   let attachmentIndex = 0;
 
   return (
     <div className={`prose-kimi max-w-none break-words ${className}`}>
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        rehypePlugins={[rehypeHighlight, rehypeKatex]}
+        remarkPlugins={REMARK_PLUGINS}
+        rehypePlugins={REHYPE_PLUGINS}
         components={{
           code: CodeBlock,
           pre: PreBlock,
@@ -302,4 +364,4 @@ export function MarkdownRenderer({ content, className = '', attachmentIds = [] }
       </ReactMarkdown>
     </div>
   );
-}
+});

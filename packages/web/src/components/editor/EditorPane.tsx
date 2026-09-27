@@ -2,6 +2,7 @@ import { useEditorStore, languageFromPath } from '@/stores/editorStore';
 import { useCurrentSession } from '@/stores/sessionStore';
 import { EditorTabs } from './EditorTabs';
 import { EditorFileTopBar } from './EditorFileTopBar';
+import { EditorImagePreview } from './EditorImagePreview';
 import { CodeEditor } from './CodeEditor';
 import { MarkdownRenderer } from '@/components/chat/MarkdownRenderer';
 import { Eye, Pencil, Columns2 } from 'lucide-react';
@@ -17,6 +18,8 @@ export function EditorPane() {
   const editorRootMatchesSession = editorSessionId === currentSession?.id;
   const activePath = editorRootMatchesSession ? storedActivePath : null;
   const contents = useEditorStore((s) => s.contents);
+  const imagePreviews = useEditorStore((s) => s.imagePreviews);
+  const imagePreview = activePath ? imagePreviews[activePath] : undefined;
   const mdViewMode = useEditorStore((s) => s.mdViewMode);
   const setMdViewMode = useEditorStore((s) => s.setMdViewMode);
 
@@ -64,9 +67,16 @@ export function EditorPane() {
           </div>
         )}
       </div>
-      {activePath && <EditorFileTopBar operationPath={activePath} />}
+      {activePath && <EditorFileTopBar
+        operationPath={activePath}
+        imagePreview={!!imagePreview}
+        imageDisplayName={imagePreview?.displayName}
+        imageDownloadHref={imagePreview?.downloadHref}
+      />}
 
-      {!activePath ? (
+      {activePath && imagePreview ? (
+        <EditorImagePreview src={imagePreview.src} alt={imagePreview.displayName} />
+      ) : !activePath ? (
         <div className="flex-1 flex items-center justify-center text-text-tertiary text-sm">
           Open a file to start editing
         </div>

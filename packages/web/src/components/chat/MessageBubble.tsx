@@ -3,6 +3,7 @@ import { memo, useMemo, useState } from 'react';
 import { Loader2, Trash2 } from 'lucide-react';
 import { MarkdownRenderer } from './MarkdownRenderer';
 import { ThinkingBlock } from './ThinkingBlock';
+import { ThinkingGroup } from './ThinkingGroup';
 import { ToolGroup } from './ToolGroup';
 import { NonBodyGroup } from './NonBodyGroup';
 import type { GroupDisplayItem } from '@/utils/messageIdentity';
