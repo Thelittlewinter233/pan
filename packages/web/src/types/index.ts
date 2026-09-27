@@ -7,6 +7,8 @@ export type { AttachmentLocation } from './attachment';
 export interface Message {
   role: string;
   content: string;
+  messageId?: string;
+  streaming?: boolean;
   /** Server-canonical parts; content remains the adapter/legacy fallback. */
   parts?: MessagePart[];
   /** 本地 ISO-8601 发送/回复时间（后端写入历史时刻打点）；旧数据缺失则不显示时间。 */

@@ -4,6 +4,10 @@ import { ThinkingBlock } from './ThinkingBlock';
 import { ToolGroup } from './ToolGroup';
 import type { ToolGroupDisplayItem } from '@/utils/messageIdentity';
 import { getQuickJumpKind } from './messageFilter';
+import { useState } from 'react';
+import { Loader2, Trash2 } from 'lucide-react';
+import { useSessionStore } from '@/stores/sessionStore';
+import { useUIStore } from '@/stores/uiStore';
 
 export type GroupedItem = Message | ToolGroupDisplayItem;
 type PrevRole = Message['role'] | 'tool' | null;
@@ -73,6 +77,54 @@ export function MessageBubble({ message, prevRole = null }: MessageBubbleProps) 
   const workerReportLabel = isWorkerReport ? (
     <span className="worker-report-label" aria-label="Worker report">Worker report</span>
   ) : null;
+  const [deleting, setDeleting] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const showToast = useUIStore((s) => s.showToast);
+  const removeMessage = useSessionStore((s) => s.deleteCurrentMessage);
+  const currentMessages = useSessionStore((s) => s.currentMessages);
+  const currentSession = useSessionStore((s) => s.sessions.find((session) => session.id === s.currentSessionId));
+  const sessionBusy = ['running', 'queued'].includes(currentSession?.workerStatus ?? '');
+  const latestIsStreaming = role === 'assistant'
+    && sessionBusy
+    && currentMessages[currentMessages.length - 1] === message;
+  const canDelete = (role === 'user' || role === 'assistant')
+    && !sessionBusy
+    && !message.streaming
+    && !latestIsStreaming;
+  const onDelete = async () => {
+    if (deleting) return;
+    setDeleting(true);
+    try {
+      await removeMessage(message);
+      showToast('消息已删除');
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : '消息删除失败', 'error');
+    } finally {
+      setDeleting(false);
+      setConfirming(false);
+    }
+  };
+  const actions = canDelete ? (
+    <div className="mt-1 flex items-center gap-2">
+      {!confirming ? (
+        <button type="button" onClick={() => setConfirming(true)} disabled={deleting}
+          className="inline-flex items-center gap-1 text-xs text-text-tertiary hover:text-danger disabled:opacity-50"
+          title="删除消息">
+          <Trash2 size={13} /> 删除
+        </button>
+      ) : (
+        <>
+          <span className="text-xs text-text-secondary">确认删除？</span>
+          <button type="button" onClick={() => void onDelete()} disabled={deleting}
+            className="inline-flex items-center gap-1 rounded border border-danger px-2 py-0.5 text-xs text-danger hover:bg-danger/10 disabled:opacity-50">
+            {deleting && <Loader2 size={13} className="animate-spin" />} 确认删除
+          </button>
+          <button type="button" onClick={() => setConfirming(false)} disabled={deleting}
+            className="text-xs text-text-tertiary hover:text-text-primary disabled:opacity-50">取消</button>
+        </>
+      )}
+    </div>
+  ) : null;
 
   // Thinking blocks get their own component
   if (role === 'thinking') {
@@ -113,6 +165,7 @@ export function MessageBubble({ message, prevRole = null }: MessageBubbleProps) 
           />
         </div>
         <MessageTimestamp ts={message.ts} />
+        {actions}
       </div>
     );
   }
@@ -128,6 +181,7 @@ export function MessageBubble({ message, prevRole = null }: MessageBubbleProps) 
         />
       </div>
       <MessageTimestamp ts={message.ts} />
+      {actions}
     </div>
   );
 }

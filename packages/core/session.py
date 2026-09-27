@@ -28,6 +28,7 @@ import os
 import re
 import secrets
 import threading
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -730,6 +731,40 @@ def save_full(s: Session):
     避免增量游标把新 history 的头部误当作已落盘而跳过。
     """
     _save_sync(s, force_full=True)
+
+
+def ensure_history_message_ids(s: Session) -> bool:
+    """Assign durable identities to user/assistant entries for precise UI actions."""
+    changed = False
+    seen: set[str] = set()
+    with _SAVE_LOCK:
+        for message in s.history:
+            if not isinstance(message, dict) or message.get("role") not in {"user", "assistant"}:
+                continue
+            message_id = message.get("_pan_message_id")
+            if not isinstance(message_id, str) or not message_id.startswith("msg_") or message_id in seen:
+                message_id = "msg_" + uuid.uuid4().hex
+                message["_pan_message_id"] = message_id
+                changed = True
+            seen.add(message_id)
+        if changed:
+            _save_sync(s, force_full=True)
+    return changed
+
+
+def delete_history_item(s: Session, message_id: str) -> str | None:
+    """Remove one deletable history entry and rewrite durable history."""
+    with _SAVE_LOCK:
+        index = next((i for i, message in enumerate(s.history)
+                      if isinstance(message, dict)
+                      and message.get("_pan_message_id") == message_id), None)
+        if index is None:
+            return "message_not_found"
+        if s.history[index].get("role") not in {"user", "assistant"}:
+            return "message_not_deletable"
+        del s.history[index]
+        _save_sync(s, force_full=True)
+    return None
 
 
 async def save_async(s: Session):
