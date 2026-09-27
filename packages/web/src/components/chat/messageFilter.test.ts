@@ -1,4 +1,4 @@
-﻿import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import {
   filterVisibleMessages,
   getQuickJumpIndexItems,
@@ -77,8 +77,6 @@ describe('filterVisibleMessages', () => {
     expect(msgs).toEqual(snapshot);
   });
 });
-
-
 describe('quick-location classification', () => {
   it('classifies user messages and task-agent reports separately', () => {
     expect(getQuickJumpKind(mk('plain user', 'user'))).toBe('user');
@@ -141,4 +139,3 @@ describe('quick-location classification', () => {
     expect(targets.map((target) => target.preview)).toEqual(['user message', 'instruction']);
   });
 });
-
