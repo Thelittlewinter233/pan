@@ -7,6 +7,8 @@ export type { AttachmentLocation } from './attachment';
 export interface Message {
   role: string;
   content: string;
+  messageId?: string;
+  streaming?: boolean;
   /** Server-canonical parts; content remains the adapter/legacy fallback. */
   parts?: MessagePart[];
   /** Transient native Codex identity used to merge live Codex messages. */

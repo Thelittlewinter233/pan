@@ -690,6 +690,12 @@ async def no_cache_api(request: Request, call_next):
 def _session_to_api(s: sess.Session):
     """Convert Session to API response dict."""
     w = worker.find_alive_worker_by_session(s.id)
+    history_payload = _api_history(s.id, s.history, include_ids=False)
+    if w and w.status in {"running", "queued"}:
+        for item in reversed(history_payload):
+            if isinstance(item, dict) and item.get("role") == "assistant":
+                item["streaming"] = True
+                break
     a = get_adapter(s.adapter)
     config = load_config().get(s.adapter, {})
     ac = s.adapter_config
@@ -721,7 +727,7 @@ def _session_to_api(s: sess.Session):
         "modelContextWindow": ac.get("model_context_window"),
         "modelAutoCompactTokenLimit": ac.get("model_auto_compact_token_limit"),
         "workdir": s.workdir,
-        "history": _api_history(s.id, s.history),
+        "history": history_payload,
         "lastResult": s.last_result,
         "lastLegalWorkerState": s.last_legal_worker_state,
         "rawUsage": s.raw_usage,
@@ -2524,25 +2530,32 @@ def _normalize_text_attachment_parts(
     return normalized, "".join(fallback), None
 
 
-def _api_history(session_id: str, history: list[dict]) -> list[dict]:
+def _api_history(session_id: str, history: list[dict], *, include_ids: bool = False) -> list[dict]:
     """Serialize history with a compatibility view for old attachment text."""
     normalized: list[dict] = []
     for message in history:
+        if isinstance(message, dict):
+            public_message = {key: value for key, value in message.items()
+                              if key not in {"_pan_message_id", "messageId"}}
+            if include_ids and message.get("role") in {"user", "assistant"} and isinstance(message.get("_pan_message_id"), str):
+                public_message["messageId"] = message["_pan_message_id"]
+        else:
+            public_message = message
         if not isinstance(message, dict) or not isinstance(message.get("content"), str):
             if isinstance(message, dict) and isinstance(message.get("parts"), list):
                 normalized.append({
-                    **message,
+                    **public_message,
                     "parts": [
                         {key: value for key, value in part.items() if key != "__serverPath"}
                         for part in message["parts"] if isinstance(part, dict)
                     ],
                 })
             else:
-                normalized.append(message)
+                normalized.append(public_message)
             continue
         content = _normalize_legacy_attachment_links(session_id, message["content"])
         content = _project_editor_links(session_id, content)
-        safe_message = {**message, "content": content}
+        safe_message = {**public_message, "content": content}
         if isinstance(message.get("parts"), list):
             safe_message["parts"] = [
                 {key: value for key, value in part.items() if key != "__serverPath"}
@@ -3335,17 +3348,44 @@ async def api_session_history(session_id: str, before: int = 0, limit: int = 50)
     s = sess.get(session_id)
     if not s:
         return {"error": "Session not found"}
+    sess.ensure_history_message_ids(s)
     total = len(s.history)
     if before <= 0:
         before = total
     start = max(0, before - limit)
-    page = _api_history(session_id, s.history[start:before])
+    page = _api_history(session_id, s.history[start:before], include_ids=True)
+    if (active_worker := worker.find_alive_worker_by_session(s.id)) and active_worker.status in {"running", "queued"}:
+        for item in reversed(page):
+            if isinstance(item, dict) and item.get("role") == "assistant":
+                item["streaming"] = True
+                break
     return {
         "history": page,
         "total": total,
         "hasMore": start > 0,
         "start": start,
     }
+
+
+@app.delete("/api/sessions/{session_id}/history/{message_id}")
+async def api_delete_session_history(session_id: str, message_id: str):
+    """Delete one user/assistant history entry after idempotent identity checks."""
+    s = sess.get(session_id)
+    if not s:
+        return {"ok": False, "error": {"code": "session_not_found", "message": "Session not found"}}
+    active_worker = worker.find_alive_worker_by_session(s.id)
+    if active_worker and active_worker.status in {"running", "queued"}:
+        return {"ok": False, "error": {
+            "code": "session_busy",
+            "message": "任务运行中，无法删除消息",
+        }}
+    if not isinstance(message_id, str) or not message_id.startswith("msg_"):
+        return {"ok": False, "error": {"code": "invalid_message_id", "message": "Invalid message id"}}
+    error_code = sess.delete_history_item(s, message_id)
+    if error_code:
+        error_message = "This message cannot be deleted" if error_code == "message_not_deletable" else "Message not found"
+        return {"ok": False, "error": {"code": error_code, "message": error_message}}
+    return {"ok": True, "messageId": message_id, "historyTotal": len(s.history)}
 
 
 # ── Agent queue (session.queue_pending, normalized view) ──
