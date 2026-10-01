@@ -416,6 +416,45 @@ export interface StreamEvent {
   workspaceIds?: string[];
   /** workspace.membershipUpdated: the workspace's complete member id snapshot. */
   sessionIds?: string[];
+  /** session.rewind.progress: rewind job identity. */
+  jobId?: string;
+  /** session.rewind.progress: starting/resuming/rewinding-files/truncating/completed/failed. */
+  stage?: string;
+  /** session.rewind.progress: branch session created on completion. */
+  newSessionId?: string;
+  /** session.rewind.progress: failure detail (stage=failed). */
+  error?: string | null;
+  /** session.rewind.progress: capability boundary note from the backend. */
+  limitation?: string;
+}
+
+// ── Rewind ──
+
+/** 1 = code + conversation, 2 = conversation only, 3 = code only. */
+export type RewindScope = 1 | 2 | 3;
+
+export interface ApiRewindResponse {
+  ok?: boolean;
+  error?: string | { code?: string; message?: string };
+  jobId?: string;
+  sessionId?: string;
+  scope?: RewindScope;
+  scopeLabel?: string;
+  status?: string;
+  stage?: string;
+  limitation?: string;
+}
+
+export interface ApiRewindJobStatus {
+  ok?: boolean;
+  error?: string | { code?: string; message?: string } | null;
+  jobId?: string;
+  sessionId?: string;
+  stage?: string;
+  status?: string;
+  scope?: RewindScope;
+  newSessionId?: string | null;
+  limitation?: string;
 }
 
 // ── API response types ──

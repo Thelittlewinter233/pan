@@ -4,6 +4,7 @@ import { MessageNavigationDock, MESSAGE_NAVIGATION_PANEL_ID } from '@/components
 import { useAppSettingsStore } from '@/stores/appSettingsStore';
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { InputRow } from '@/components/chat/InputRow';
+import { RewindStatusBar } from '@/components/chat/RewindStatusBar';
 import { ApprovalBanner } from '@/components/chat/ApprovalBanner';
 import { UserInputBanner } from '@/components/chat/UserInputBanner';
 import { ElicitationBanner } from '@/components/chat/ElicitationBanner';
@@ -329,6 +330,7 @@ export default function ChatView() {
             />
           )}
         </div>
+        <RewindStatusBar />
         <InputRow />
       </div>
     </ChatLayout>

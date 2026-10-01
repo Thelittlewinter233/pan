@@ -1,6 +1,6 @@
 import type { Message } from '@/types';
 import { memo, useMemo, useState } from 'react';
-import { Loader2, Trash2 } from 'lucide-react';
+import { Loader2, Trash2, Undo2 } from 'lucide-react';
 import { MarkdownRenderer } from './MarkdownRenderer';
 import { ThinkingBlock } from './ThinkingBlock';
 import { ThinkingGroup } from './ThinkingGroup';
@@ -64,6 +64,7 @@ export const MessageBubble = memo(function MessageBubble({ message, prevRole = n
   const [confirming, setConfirming] = useState(false);
   const showToast = useUIStore((s) => s.showToast);
   const removeMessage = useSessionStore((s) => s.deleteCurrentMessage);
+  const openRewind = useSessionStore((s) => s.openRewind);
   const currentMessages = useSessionStore((s) => s.currentMessages);
   const currentSession = useSessionStore((s) => s.sessions.find((session) => session.id === s.currentSessionId));
   const sessionBusy = ['running', 'queued'].includes(currentSession?.workerStatus ?? '');
@@ -87,9 +88,20 @@ export const MessageBubble = memo(function MessageBubble({ message, prevRole = n
       setConfirming(false);
     }
   };
-  const actions = canDelete ? (
+  // Rewind anchors are user-role only (worker report messages included, they
+  // land in history as role=user); canDelete also admits assistant messages,
+  // so it cannot be reused here. Busy sessions grey the button out.
+  const showRewind = role === 'user' && !message.streaming;
+  const actions = (canDelete || showRewind) ? (
     <div className="mt-1 flex items-center gap-2">
-      {!confirming ? (
+      {showRewind && (
+        <button type="button" onClick={() => openRewind(message)} disabled={sessionBusy}
+          className="inline-flex items-center gap-1 text-xs text-text-tertiary hover:text-text-primary disabled:opacity-50"
+          title={sessionBusy ? '任务运行中，无法撤回' : '从此消息撤回并分叉'}>
+          <Undo2 size={13} /> 撤回
+        </button>
+      )}
+      {canDelete && (!confirming ? (
         <button type="button" onClick={() => setConfirming(true)} disabled={deleting}
           className="inline-flex items-center gap-1 text-xs text-text-tertiary hover:text-danger disabled:opacity-50"
           title="删除消息">
@@ -105,7 +117,7 @@ export const MessageBubble = memo(function MessageBubble({ message, prevRole = n
           <button type="button" onClick={() => setConfirming(false)} disabled={deleting}
             className="text-xs text-text-tertiary hover:text-text-primary disabled:opacity-50">取消</button>
         </>
-      )}
+      ))}
     </div>
   ) : null;
 
