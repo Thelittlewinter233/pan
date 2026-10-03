@@ -72,7 +72,6 @@ export const MessageBubble = memo(function MessageBubble({ message, prevRole = n
     && sessionBusy
     && currentMessages[currentMessages.length - 1] === message;
   const canDelete = (role === 'user' || role === 'assistant')
-    && !sessionBusy
     && !message.streaming
     && !latestIsStreaming;
   const onDelete = async () => {
@@ -90,7 +89,7 @@ export const MessageBubble = memo(function MessageBubble({ message, prevRole = n
   };
   // Rewind anchors are user-role only (worker report messages included, they
   // land in history as role=user); canDelete also admits assistant messages,
-  // so it cannot be reused here. Busy sessions grey the button out.
+  // so it cannot be reused here. Busy sessions only disable rewind.
   const showRewind = role === 'user' && !message.streaming;
   const actions = (canDelete || showRewind) ? (
     <div className="mt-1 flex items-center gap-2">
