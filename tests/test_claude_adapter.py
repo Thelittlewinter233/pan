@@ -156,6 +156,68 @@ def _patched_mcp_json(path, s):
     return {"pan": {"command": "x"}}
 
 
+def test_ccswitch_settings_args_writes_current_env_and_reloads(tmp_path, monkeypatch):
+    import sqlite3
+    from dataclasses import replace
+
+    config_dir = tmp_path / ".cc-switch"
+    config_dir.mkdir()
+    settings_file = config_dir / "settings.json"
+    db_file = config_dir / "cc-switch.db"
+    provider_id = "jasper-selected"
+    settings_file.write_text(json.dumps({"currentProviderClaude": provider_id}), encoding="utf-8")
+    env = {
+        "ANTHROPIC_BASE_URL": "https://provider.example.invalid",
+        "ANTHROPIC_API_KEY": "redacted-test-secret",
+        "ANTHROPIC_MODEL": "provider-model-a",
+    }
+    with sqlite3.connect(db_file) as db:
+        db.execute("CREATE TABLE providers (id TEXT, app_type TEXT, is_current INTEGER, settings_config TEXT)")
+        db.execute("INSERT INTO providers VALUES (?, 'claude', 1, ?)",
+                   (provider_id, json.dumps({"env": env})))
+    monkeypatch.setattr(claude_adapter.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(_sess, "SESSION_DIR", tmp_path / "data" / "sessions")
+    s = SimpleNamespace(id="session-settings-test", adapter_config={"mcp_servers": []})
+    adapter = ClaudeAdapter()
+
+    args = adapter.ccswitch_settings_args(s)
+    assert args[0] == "--settings"
+    settings_path = Path(args[1])
+    assert settings_path.is_file()
+    assert json.loads(settings_path.read_text(encoding="utf-8")) == {"env": env}
+    assert "redacted-test-secret" not in str(args)
+
+    env["ANTHROPIC_MODEL"] = "provider-model-b"
+    with sqlite3.connect(db_file) as db:
+        db.execute("UPDATE providers SET settings_config = ? WHERE id = ?",
+                   (json.dumps({"env": env}), provider_id))
+    refreshed = adapter.ccswitch_settings_args(s)
+    assert refreshed == args
+    assert json.loads(settings_path.read_text(encoding="utf-8"))["env"]["ANTHROPIC_MODEL"] == "provider-model-b"
+
+
+def test_ccswitch_settings_args_falls_back_without_ccswitch(tmp_path, monkeypatch):
+    monkeypatch.setattr(claude_adapter.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(_sess, "SESSION_DIR", tmp_path / "data" / "sessions")
+    s = SimpleNamespace(id="session-settings-fallback", adapter_config={"mcp_servers": []})
+    assert ClaudeAdapter().ccswitch_settings_args(s) == []
+
+
+def test_ccswitch_settings_args_falls_back_when_provider_missing(tmp_path, monkeypatch):
+    import sqlite3
+
+    config_dir = tmp_path / ".cc-switch"
+    config_dir.mkdir()
+    (config_dir / "settings.json").write_text(
+        json.dumps({"currentProviderClaude": "missing-provider"}), encoding="utf-8")
+    with sqlite3.connect(config_dir / "cc-switch.db") as db:
+        db.execute("CREATE TABLE providers (id TEXT, app_type TEXT, is_current INTEGER, settings_config TEXT)")
+    monkeypatch.setattr(claude_adapter.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(_sess, "SESSION_DIR", tmp_path / "data" / "sessions")
+    s = SimpleNamespace(id="session-settings-missing", adapter_config={"mcp_servers": []})
+    assert ClaudeAdapter().ccswitch_settings_args(s) == []
+
+
 def test_oneshot_args_basic():
     a = ClaudeAdapter()
     s = _make_session()

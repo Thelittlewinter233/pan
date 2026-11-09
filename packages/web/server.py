@@ -7524,6 +7524,18 @@ def _retention_cleanup_auxiliary(session_id: str) -> list[str]:
                 except OSError as exc:
                     skipped.append("mcp_session_config_cleanup_failed")
                     _log(f"[retention] MCP Session config cleanup skipped: {type(exc).__name__}")
+        for suffix in (".claude-settings.json", ".claude-settings.json.tmp"):
+            settings_path = mcp_root / f"{session_id}{suffix}"
+            if settings_path.exists() or settings_path.is_symlink():
+                safe_settings = _retention_safe_session_file(safe_mcp_root, settings_path)
+                if safe_settings is None:
+                    skipped.append("claude_settings_config_unsafe")
+                else:
+                    try:
+                        safe_settings.unlink()
+                    except OSError as exc:
+                        skipped.append("claude_settings_config_cleanup_failed")
+                        _log(f"[retention] Claude settings cleanup skipped: {type(exc).__name__}")
     elif mcp_root.exists() or mcp_root.is_symlink():
         skipped.append("mcp_config_root_unsafe")
     kimi_root = DATA_DIR / "kimi-homes"

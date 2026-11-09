@@ -29,6 +29,7 @@ import logging
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -312,6 +313,7 @@ class ClaudeAdapter:
                          extra_args: list[str] | None = None) -> list[str]:
         """stream 模式 argv 构建（oneshot 模式下 worker 实际不调用，仅防御/测试）。"""
         args = self.base_args()
+        args.extend(self.ccswitch_settings_args(s))
         args.extend(self.model_args(s))
         args.extend(self.permission_mode_args(s))
         args.extend(self.effort_args(s))
@@ -330,6 +332,7 @@ class ClaudeAdapter:
         prompt 末参。
         """
         args = list(self.base_args_stream())
+        args.extend(self.ccswitch_settings_args(s))
         args.extend(self.model_args(s))
         args.extend(self.permission_mode_args(s))
         args.extend(self.effort_args(s))
@@ -343,6 +346,64 @@ class ClaudeAdapter:
         args.append(text)
         args.extend(self.mcp_args(s))
         return args
+
+    def ccswitch_settings_args(self, s: Session) -> list[str]:
+        """Write the active cc-switch provider env to a session-local settings file.
+
+        The global Claude settings file belongs to cc-switch's live proxy mode.
+        Mirror cc-switch's terminal launch behavior with ``--settings`` instead
+        of modifying that shared file or injecting process env (which Claude
+        settings can override). The DB is opened read-only and re-read on every
+        spawn so a worker respawn follows the provider's latest configuration.
+        """
+        root = Path.home() / ".cc-switch"
+        settings_path = root / "settings.json"
+        database_path = root / "cc-switch.db"
+        try:
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            if not isinstance(settings, dict):
+                return []
+            provider_id = settings.get("currentProviderClaude")
+            if not isinstance(provider_id, str) or not provider_id:
+                return []
+            db_uri = database_path.resolve().as_uri() + "?mode=ro"
+            with sqlite3.connect(db_uri, uri=True, timeout=2) as conn:
+                row = conn.execute(
+                    "SELECT settings_config FROM providers "
+                    "WHERE id = ? AND app_type = 'claude' AND is_current = 1",
+                    (provider_id,),
+                ).fetchone()
+            if row is None:
+                return []
+            provider_config = json.loads(row[0])
+            provider_env = provider_config.get("env") if isinstance(provider_config, dict) else None
+            if not isinstance(provider_env, dict):
+                return []
+            env = {
+                key: value for key, value in provider_env.items()
+                if isinstance(key, str) and isinstance(value, (str, int, float, bool))
+            }
+            if not env.get("ANTHROPIC_BASE_URL") or not env.get("ANTHROPIC_API_KEY"):
+                return []
+
+            from ...session import SESSION_DIR
+            config_dir = SESSION_DIR.parent / "mcp-configs"
+            config_dir.mkdir(parents=True, exist_ok=True)
+            config_path = config_dir / f"{s.id}.claude-settings.json"
+            temporary_path = config_path.with_suffix(config_path.suffix + ".tmp")
+            temporary_path.write_text(
+                json.dumps({"env": env}, ensure_ascii=False), encoding="utf-8"
+            )
+            try:
+                os.chmod(temporary_path, 0o600)
+            except OSError:
+                pass  # Windows ACLs inherit from the protected Pan data directory.
+            os.replace(temporary_path, config_path)
+            return ["--settings", str(config_path)]
+        except (OSError, sqlite3.Error, json.JSONDecodeError, TypeError, ValueError):
+            # cc-switch is optional: preserve the existing Claude launch path
+            # when its configuration is absent, incomplete, or unreadable.
+            return []
 
     def mcp_args(self, s: Session) -> list[str]:
         """写 data/mcp-configs/<session_id>.mcp.json 并返回 --mcp-config <path>。
