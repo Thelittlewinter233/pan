@@ -5,26 +5,72 @@ import type { AttachmentLocation } from './attachment';
 export type { AttachmentLocation } from './attachment';
 
 export interface Message {
+  /** Verbatim provider/history body before display link projection. */
+  rawContent?: string;
+  terminal?: HistoryTerminal;
   role: string;
   content: string;
   /** Stable canonical history identity. Absent on legacy rows. */
   messageId?: string;
-  /** True while this is the newest assistant entry and the worker is streaming. */
+  /** Client receipt identity used to reconcile an optimistic row to Pan history. */
+  clientMessageId?: string;
+  /** True while this (last) assistant entry is still being streamed by a
+   *  running worker; actions that would fork or mutate history guard on it. */
   streaming?: boolean;
   /** Stable provider block identity for compound messages. */
   blockId?: string;
   /** Stable provider turn identity when the adapter exposes one. */
   turnId?: string;
+  /** True when this row is bookmarked (backend history/navigation projection). */
+  bookmarked?: boolean;
   /** Server-canonical parts; content remains the adapter/legacy fallback. */
   parts?: MessagePart[];
   /** 本地 ISO-8601 发送/回复时间（后端写入历史时刻打点）；旧数据缺失则不显示时间。 */
   ts?: string;
   /** Transient native Codex identity used to merge live Codex messages. */
   nativeItemId?: string;
+  /** Original native input parts, including image/path metadata. */
+  nativeContent?: unknown[];
+  /** Live-only Codex turn summary; expires at its own execution's terminal. */
+  nativeAggregate?: 'plan' | 'diff';
   /** Queue item(s) whose local CLI hand-off produced this user message. */
   queueItemIds?: string[];
   /** Stable server receipt keys shared by queue delivery events and history. */
   deliveryKeys?: string[];
+  /**
+   * Durable row origin written by the worker history receipt
+   * (backend `worker.SOURCE_TYPES`): `user` = 前端发送、`agent` = MCP 编排注入、
+   * `report` = 报告/通知通道、`system_prompt` = 系统提示词注入、
+   * `automation` = 定时/后台 Job。旧数据缺失该字段。
+   */
+  source?: string;
+  /** 派发方的 Session id（`agent` 来源行的调用方身份）；旧数据缺失。 */
+  sourceSessionId?: string;
+  /** 任务行携带的 taskId（正式派发或继承的活动任务号）；旧数据缺失。 */
+  taskId?: string;
+  /** `assign` = 正式派发幂等键；`active` = 仅继承活动 taskId 的后续消息。 */
+  taskIdSource?: 'assign' | 'active';
+  /** Original Pan queue envelopes; provider role never replaces their origins. */
+  queueEnvelopes?: Array<Record<string, unknown>>;
+  kind?: string;
+  envelope?: Record<string, unknown>;
+  eventId?: string;
+  channel?: string;
+}
+
+export interface HistoryTerminal {
+  eventId: string;
+  terminalKey: string;
+  status: 'done' | 'error';
+  occurredAt: string;
+  order: number;
+  anchorMessageId: string | null;
+  taskSeq: number | null;
+  taskId: string | null;
+  executionSeq: number | null;
+  workerId: string;
+  generation: number;
+  error?: { source?: string; code: string | number | null; message: string; truncated?: boolean };
 }
 
 export type MessagePart =
@@ -64,7 +110,30 @@ export interface PanAccess {
   autoClaimCreated?: boolean;
 }
 
+/**
+ * One durable terminal identity from a Session's bounded per-task index
+ * (backend `terminal_results`). Identity only — never a result body.
+ */
+export interface TerminalIdentity {
+  /** Formal assign taskId, or null for a non-assign turn. */
+  taskId?: string | null;
+  taskSeq?: number | null;
+  /** Ordered cursor within the durable terminal window. */
+  resultCursor?: number;
+  /** Stable identity of the terminal event (survives replay/reconnect). */
+  terminalKey?: string;
+  status?: string;
+  /** History epoch this run committed at (absent on legacy rows). */
+  historyEpoch?: string | null;
+  /** History revision at that commit; with the epoch it proves the run's tail
+   *  block boundary. Absent/zero means the relation cannot be proven. */
+  historyRevision?: number;
+}
+
 export interface Session {
+  nativeControl?: boolean;
+  /** Adapter declares a Terminal TUI transport (capability bit from the API). */
+  nativeControlCapable?: boolean;
   id: string;
   name: string;
   adapter?: string;
@@ -86,8 +155,46 @@ export interface Session {
   workerGeneration?: number | null;
   workerTaskId?: string | null;
   workerTaskSeq?: number | null;
+  workerExecutionSeq?: number | null;
+  /**
+   * Unread done count for this Session: materialized ``generation - read``
+   * (backend `_persist_terminal_state` increments the generation after the
+   * existing terminal dedup; error/cancelled/zombie and child report arrivals
+   * do not count). 0/undefined renders no badge. Display/filter only — acks
+   * always carry {@link unreadDoneGeneration}, never this count.
+   */
+  unreadDoneCount?: number;
+  /** Monotonic count of real done terminal states (ack request boundary). */
+  unreadDoneGeneration?: number;
+  /** Highest done generation acknowledged as read (server-side monotonic). */
+  unreadDoneReadGeneration?: number;
+  /**
+   * Whether this Session currently records done unread — the global
+   * unread-recording policy or its per-Session override decides. Drives the
+   * Session menu's "Enable unread tracking" entry.
+   */
+  unreadTracking?: boolean;
+  /** Persisted per-Session recording override ("record"); null = global policy. */
+  unreadRecordingOverride?: 'record' | null;
+  /** Pending queue rows per the queue panel's public projection (0 hides). */
+  queuePendingCount?: number;
+  /** True only when the queue is non-empty and every pending row is locked. */
+  queueAllLocked?: boolean;
+  /** Durable queue revision matching the queue events/snapshot. */
+  queueRevision?: number;
+  /** Independent durable pause for this Session's entire queue. */
+  queuePaused?: boolean;
   /** Last Worker state confirmed through an explicit Pan lifecycle action. */
   lastLegalWorkerState?: string | null;
+  /** Durable execution safety; False alone is not an Illegal condition. */
+  legalOffline?: boolean;
+  illegalOffline?: boolean;
+  legalityDiagnostics?: {
+    coverage: string;
+    revision: number;
+    migrationUncertainty?: string | null;
+    outstanding: Array<{ operationId: string; kind?: string; state?: string; reason?: string | null }>;
+  };
   /** Id of the managing (parent) session; absent/null means unmanaged. */
   managedBy?: string | null;
   /** True when the managing session has blocked outbound operations to this session. */
@@ -100,11 +207,24 @@ export interface Session {
    * omit the field entirely.
    */
   workspaceIds?: string[];
+  /** Existing custom Session order; pin state uses its own storage. */
+  order?: number | null;
+  /** Shared pin state, independent of the user-defined Session order. */
+  pinned?: boolean;
+  /** Position among all pinned Sessions, or null when unpinned. */
+  pinOrder?: number | null;
+  /** Monotonic revision for the shared pin-state snapshot. */
+  pinRevision?: number;
   /** Managed-session report subscriptions (ids this session gets reports from). */
   reportSubscriptions?: string[];
+  /** Whether the direct manager subscribes to this Session's completion reports. */
+  reportsToManager?: boolean | null;
   /** QQ inbox subscriptions, each formatted "user:<uin>" or "group:<uin>". */
   qqSubscriptions?: string[];
+  qqReportTargets?: string[];
   notificationSettings?: { browser: boolean; system: boolean };
+  /** QQ, system, or browser msgBridge is enabled for this Session. */
+  msgBridgeEnabled?: boolean;
   /** MCP capability flags; only present on the full (non-summary) endpoint. */
   panAccess?: PanAccess;
   /** Whether MCP was ever enabled for this session (mcp_servers non-empty). */
@@ -115,6 +235,11 @@ export interface Session {
   mcpLockReason?: 'always' | 'never' | null;
   /** Names of MCP servers currently enabled for this session. */
   mcpServers?: string[];
+  pluginBindings?: PluginBinding[];
+  pluginSelectionRevision?: number;
+  pluginApplyStatus?: 'pending' | 'next_start' | 'applied' | 'failed';
+  restartError?: string;
+  pluginRestart?: DelayedRestartState | null;
   history: Message[];
   /** Frontend demo sidecar; the real backend stores this outside Session JSON. */
   hiddenMessageIds?: string[];
@@ -133,12 +258,20 @@ export interface Session {
   lastMessage?: string;
   /** Monotonic backend summary projection version. */
   summaryRevision?: number;
+  /** Client summary cursor, independent of the loaded transcript window. */
+  summaryHistoryRevision?: number;
   lastUserPreview?: string;
   lastAssistantPreview?: string;
   lastDisplayPreview?: string;
   /** Explicit worker execution mode for this session: "stream" / "oneshot" / null(unset). */
   outputMode?: string | null;
   lastResult?: Record<string, unknown> | null;
+  /**
+   * Bounded identity view of the durable per-task terminal index (newest last,
+   * no result bodies).  A completed task stays listed here after newer tasks
+   * finish, so an explicit per-task action can bind to it on a cold load.
+   */
+  terminalResults?: TerminalIdentity[] | null;
   totalUsage?: Record<string, number> | null;
   createdAt?: string;
   updatedAt?: string;
@@ -228,6 +361,7 @@ export interface WorkerEventContent {
 }
 
 export interface WorkerEvent {
+  rawEvent?: WorkerEvent;
   type: string;
   /** 本地 ISO-8601 完成时刻（最终 assistant 消息一次性携带，delta 不带）。 */
   ts?: string;
@@ -271,6 +405,7 @@ export interface WorkerEvent {
   error?: unknown;
   error_text?: string;
   result?: string;
+  rawResult?: string;
   cliSessionId?: string;
   /** Durable acknowledgement correlation for browser send-queue items. */
   clientMessageId?: string;
@@ -343,6 +478,8 @@ export interface TerminalInteraction {
 
 export interface StreamEvent {
   type: string;
+  notificationId?: string;
+  delayedRestart?: DelayedRestartState;
   /** Legacy/source cursor; new clients prefer sourceCursorStart/End. */
   eventEpoch?: string;
   eventSeq?: number;
@@ -357,6 +494,7 @@ export interface StreamEvent {
   historyEpoch?: string;
   historyRevision?: number;
   /** Durable result/history coverage boundary. */
+  historyTerminalId?: string;
   terminalCoverage?: {
     historyEpoch?: string;
     historyRevision?: number;
@@ -372,6 +510,9 @@ export interface StreamEvent {
   resultCursors?: Record<string, number>;
   resultsAvailableFrom?: Record<string, number>;
   sessionId?: string;
+  queueRevision?: number;
+  agentReportsPaused?: boolean;
+  queuePaused?: boolean;
   workerId?: string;
   /** Monotonic runtime generation, used to ignore late lifecycle events. */
   generation?: number;
@@ -383,6 +524,8 @@ export interface StreamEvent {
   event?: WorkerEvent;
   message?: string;
   status?: string;
+  result?: string;
+  rawResult?: string;
   notification?: {
     title?: string;
     body?: string;
@@ -391,8 +534,13 @@ export interface StreamEvent {
   };
   cancelled?: boolean;
   taskSeq?: number;
+  executionSeq?: number;
   /** Durable task identity carried by worker.stream for late-frame isolation. */
   taskId?: string | null;
+  /** Stable backend identity for this terminal task result. */
+  terminalKey?: string;
+  /** Monotonic per-Session cursor for terminal result replay and ordering. */
+  resultCursor?: number;
   name?: string;
   newName?: string;
   /** Safe session fields included by session lifecycle events when available. */
@@ -418,6 +566,8 @@ export interface StreamEvent {
   workspaceIds?: string[];
   /** workspace.membershipUpdated: the workspace's complete member id snapshot. */
   sessionIds?: string[];
+  /** Shared Session pin snapshot revision. */
+  pinRevision?: number;
   /** session.rewind.progress: rewind job identity. */
   jobId?: string;
   /** session.rewind.progress: starting/resuming/rewinding-files/truncating/completed/failed. */
@@ -484,6 +634,8 @@ export interface ApiCodexRefreshOfficialModelsResponse {
 
 export interface ApiGenericResponse {
   error?: string;
+  outcome?: 'accepted' | 'rejected' | 'unknown';
+  consumption?: 'unconfirmed';
   workerId?: string;
   sessionId?: string;
   status?: string;
@@ -520,6 +672,49 @@ export interface ApiSessionOrderResponse {
   error?: { code?: string; message?: string };
 }
 
+export interface ApiSessionPinResponse {
+  ok?: boolean;
+  pinned?: boolean;
+  pinOrder?: number | null;
+  pinRevision?: number;
+  sessionIds?: string[];
+  error?: { code?: string; message?: string };
+}
+
+/** POST /api/sessions/{id}/unread-action — Session-menu unread action. */
+export interface ApiSessionUnreadActionResponse {
+  ok?: boolean;
+  unreadTracking?: boolean;
+  unreadRecordingOverride?: 'record' | null;
+  unreadDoneCount?: number;
+  unreadDoneGeneration?: number;
+  unreadDoneReadGeneration?: number;
+  error?: { code?: string; message?: string };
+}
+
+/** POST /api/settings/unread-recording/reapply — global apply of the policy. */
+export interface ApiReapplyUnreadRecordingResponse {
+  ok?: boolean;
+  unreadRecording?: string[];
+  alignedSessionCount?: number;
+  failedSessions?: string[];
+  /** True when a newer global apply superseded this one mid-scan. */
+  superseded?: boolean;
+  error?: { code?: string; message?: string };
+}
+
+/** POST /api/sessions/{id}/unread-done/ack — generation-cursor acknowledgement. */
+export interface ApiSessionUnreadAckResponse {
+  ok?: boolean;
+  /** Remaining unread done count after this acknowledgement (authoritative). */
+  unreadDoneCount?: number;
+  /** Done generation known to the server when the ack was applied. */
+  unreadDoneGeneration?: number;
+  /** Read cursor after the ack (monotonic; idempotent for equal cursors). */
+  unreadDoneReadGeneration?: number;
+  error?: { code?: string; message?: string };
+}
+
 export interface ApiReportSubscribeResponse {
   managerId?: string;
   sessionId?: string;
@@ -533,6 +728,37 @@ export interface ApiReadonlyResponse {
   managerId?: string;
   sessionId?: string;
   readonlySession?: boolean;
+  error?: ApiErrorInfo;
+}
+
+export interface ApiSessionReportToManagerResponse {
+  ok?: boolean;
+  sessionId?: string;
+  managerId?: string;
+  reportsToManager?: boolean;
+  error?: ApiErrorInfo;
+}
+
+/** POST /api/sessions/{id}/manual-report — explicit browser task report. */
+export interface ApiSessionManualReportResponse {
+  ok?: boolean;
+  sessionId?: string;
+  managerId?: string;
+  queueItemId?: string;
+  /** True when this exact (session, task, message) report was already delivered. */
+  alreadyReported?: boolean;
+  /** Present on definite failures; a retry is only safe when retryable. */
+  retryable?: boolean;
+  error?: ApiErrorInfo;
+}
+
+export interface ApiSessionMsgBridgeResponse {
+  ok?: boolean;
+  sessionId?: string;
+  msgBridgeEnabled?: boolean;
+  qqSubscriptions?: string[];
+  qqReportTargets?: string[];
+  notificationSettings?: { browser: boolean; system: boolean };
   error?: ApiErrorInfo;
 }
 
@@ -569,6 +795,7 @@ export interface ApiQqSubscribeResponse {
   qqTarget?: string;
   subscribed?: boolean;
   qqSubscriptions?: string[];
+  qqReportTargets?: string[];
   error?: string;
 }
 
@@ -582,19 +809,42 @@ export interface ApiSessionHistoryResponse {
   error?: string;
 }
 
-export interface ApiSessionSearchResult {
-  message: Message;
-  index: number;
-  fromEnd: number;
-  matchCount: number;
-  firstMatch: number;
+export interface ApiHistorySearchVersion {
+  sessionId: string;
+  historyEpoch: string;
+  historyRevision: number;
+  historyTotal: number;
 }
 
-export interface ApiSessionSearchResponse {
-  matches: ApiSessionSearchResult[];
-  totalMatches: number;
-  total: number;
-  error?: string;
+export type HistorySearchRole = 'user' | 'assistant' | 'tool' | 'thinking';
+
+export interface ApiHistorySearchHit {
+  sessionId: string;
+  messageId: string;
+  messageIndex: number;
+  role: HistorySearchRole;
+  snippet: string;
+  historyEpoch: string;
+  historyRevision: number;
+  historyTotal: number;
+  matchCount?: number;
+  matchStart?: number;
+  firstMatch?: number;
+}
+
+export interface ApiHistorySearchResponse {
+  /** Optional nearest visible-window hit; ordinary page ordering is unchanged. */
+  viewportHit?: ApiHistorySearchHit | null;
+  matchingSessionIds?: string[];
+  preparedIdentities?: number;
+  hits: ApiHistorySearchHit[];
+  versions: ApiHistorySearchVersion[];
+  limit: number;
+  hasMore: boolean;
+  nextCursor: string | null;
+  totalMatches?: number;
+  totalMessages?: number;
+  roles?: HistorySearchRole[];
 }
 
 // ── Session template types ──
@@ -603,7 +853,10 @@ export interface SessionTemplate {
   name: string;
   adapter?: string;
   model?: string | null;
+  mcpMode?: 'always' | 'optional' | 'never';
   mcpServers?: string[];
+  pluginBindings?: PluginBinding[] | null;
+  panAccess?: PanAccess;
   /** Absolute path of the plugin dir whose manifest.json defined this template. */
   sourceManifest?: string;
   /** Short readable manifest label, e.g. "packages/mcp/manifest.json". */
@@ -611,10 +864,49 @@ export interface SessionTemplate {
   system_prompt_preview?: string;
 }
 
+export interface SessionTemplateManifestTarget {
+  id: string;
+  label: string;
+  writable: boolean;
+  reason?: string | null;
+}
+
+export interface ApiSessionTemplateTargetsResponse {
+  manifestTargets?: SessionTemplateManifestTarget[];
+  loaded?: boolean;
+  total?: number;
+  error?: string;
+}
+
+export interface SessionTemplateSaveInput {
+  manifestId: string;
+  baseTemplate?: string;
+  name: string;
+  adapter?: string | null;
+  model?: string | null;
+  permission_mode?: string | null;
+  system_prompt?: string | string[];
+  mcp_mode?: 'always' | 'optional' | 'never';
+  mcp_servers?: string[];
+  plugin_bindings?: PluginBinding[];
+  pan_access?: {
+    restrict_to_managed?: boolean;
+    can_claim_unmanaged?: boolean;
+    auto_claim_created?: boolean;
+  };
+}
+
 export interface ApiSessionTemplatesResponse {
   sessionTemplates?: SessionTemplate[];
   total?: number;
   error?: string;
+}
+
+export interface ApiSessionTemplateSaveResponse {
+  ok?: boolean;
+  error?: string;
+  name?: string;
+  manifestId?: string;
 }
 
 export interface ApiMcpServersResponse {
@@ -636,6 +928,9 @@ export interface AdapterConfig {
   effortValues: string[];
   /** Per-model reasoning effort values when the adapter exposes them. */
   modelEfforts?: Record<string, string[]>;
+  /** Per-model credit consumption multipliers (e.g. 0.08) when the adapter
+   *  exposes them (cbc). Display-only: the submitted model stays the raw ID. */
+  modelCreditMultipliers?: Record<string, number>;
   permissionModes: PermissionMode[];
   defaultPermissionMode: string;
   supportedSettings: string[];
@@ -649,6 +944,7 @@ export interface ApiConfigResponse {
   defaultModel: string;
   effortValues: string[];
   modelEfforts?: Record<string, string[]>;
+  modelCreditMultipliers?: Record<string, number>;
   permissionModes: PermissionMode[];
   defaultPermissionMode?: string;
   supportedSettings?: string[];
@@ -689,7 +985,7 @@ export interface ApiDataCatalogResponse {
   };
 }
 
-export type DataRetentionPolicyId = 'sessions' | 'attachments' | 'qq_history' | 'qq_media' | 'pan_logs';
+export type DataRetentionPolicyId = 'sessions' | 'attachments' | 'qq_history' | 'qq_media' | 'pan_logs' | 'workdirs';
 
 export interface ApiDataRetentionPolicy {
   enabled: boolean;
@@ -717,6 +1013,7 @@ export interface AdapterInfo {
   defaultModel: string;
   supportsResume: boolean;
   supportsFork: boolean;
+  supportsSteer?: boolean;
 }
 
 export interface ApiAdaptersResponse {
@@ -816,7 +1113,8 @@ export interface ApiMainRestartStatusResponse {
   reason?: string;
   requestId?: string;
   jobId?: string;
-  phase?: 'requested' | 'stopping' | 'stopped' | 'starting' | 'ready' | 'failed' | 'timed_out';
+  operation?: 'restart' | 'exit';
+  phase?: 'requested' | 'stopping_workers' | 'stopping' | 'stopped' | 'starting' | 'ready' | 'failed' | 'timed_out';
   jobStatus?: string;
   root?: string;
   oldPid?: number | null;
@@ -875,22 +1173,26 @@ export interface ApiMainExitResponse {
 }
 
 export type ApiSessionExitStrategy = 'ask' | 'offline' | 'preserve-running';
-export type ApiStartupPreference = 'ask' | 'wake-running' | 'sync-actual' | 'preserve-running';
+export type ApiStartupPreference = 'ask' | 'wake-running' | 'clear-illegal' | 'preserve-running';
 
 export interface ApiSessionLifecyclePreferences {
   exitStrategy: ApiSessionExitStrategy;
   startupPreference: ApiStartupPreference;
+  wakeMessage?: string;
 }
 
 export interface ApiSessionLegalStateSyncResult {
   sessionId: string;
   status: 'updated' | 'error';
-  legalWorkerState?: string;
+  legalWorkerState?: string; // deprecated compatibility
+  legalOffline?: boolean;
+  illegalOffline?: boolean;
+  legalityDiagnostics?: Session["legalityDiagnostics"];
   runtimeWorkerStatus?: string;
   error?: string;
 }
 
-export type ApiStartupRecoveryChoice = 'restart' | 'preserve-running' | 'sync-actual';
+export type ApiStartupRecoveryChoice = 'restart' | 'preserve-running' | 'sync-actual' | 'clear-illegal';
 
 export interface ApiStartupRecoveryCandidate {
   id: string;
@@ -898,7 +1200,7 @@ export interface ApiStartupRecoveryCandidate {
   adapter: string;
   workdir?: string;
   updatedAt?: string;
-  lastLegalWorkerState: 'running';
+  lastLegalWorkerState?: 'running';
 }
 
 export interface ApiStartupRecoveryRecord {
@@ -1013,6 +1315,23 @@ export interface ApiOpencodeSessionsResponse {
 
 // ── Worker types ──
 
+export interface DelayedRestartState {
+  sessionId: string;
+  workerId: string | null;
+  generation: number | null;
+  revision: number;
+  action: 'start' | 'restart';
+  status: 'pending' | 'restarting' | 'completed' | 'failed' | 'cancelled';
+  error: string | null;
+  replacementWorkerId?: string;
+  replacementGeneration?: number;
+}
+
+export interface ApiDelayedRestartResponse {
+  delayedRestart: DelayedRestartState | null;
+  error?: string;
+}
+
 export interface WorkerItem {
   workerId: string;
   sessionId: string;
@@ -1042,8 +1361,9 @@ export interface QueuedMessage {
 
 /** Edit overlay for one queued item; the server lease keeps Worker hand-off paused. */
 export interface QueuedEdit {
+  composerValue?: import('@/components/chat/RichTextComposer').ComposerValue;
   id: string;
-  /** Draft shown over the same pending queue row while its server lease is held. */
+  /** Draft shown in the main composer while its server lease is held. */
   text: string;
   /** 编辑前的原文（Esc 取消 / 保存为空时恢复）。 */
   originalText: string;
@@ -1060,11 +1380,46 @@ export interface QueuedEdit {
   releasing?: boolean;
   cancelRequested?: boolean;
   leaseExpiresAt?: number;
+  /** Body/revision captured under the edit lease, independent of the row preview. */
+  revision?: number;
+  bodyFormat?: 'text' | 'json' | 'parts';
+  /** Keep the draft available for copying when the lease or item is invalid. */
+  error?: string;
+  /** Item kind captured at startEdit; gates attachment editing (task only). */
+  kind?: 'task' | 'report' | 'qq' | 'wechat';
+  /** Attachment parts already on the item (server-authoritative order/metadata;
+   *  shown read-only, they are preserved server-side on save). */
+  originalAttachments?: Array<{ attachmentId: string; displayName: string }>;
+  /** Isolated attachment occurrences for this edit, including restored nodes. */
+  attachments?: QueuedEditAttachment[];
+}
+
+/** One newly added queued-edit attachment; mirrors PendingAttachment shape. */
+export interface QueuedEditAttachment {
+  /** Local composer occurrence identity; never sent to the server. */
+  occurrenceId: string;
+  /** Compatibility alias used by chip selectors. */
+  id: string;
+  /** Opaque server attachment id once uploaded/registered. */
+  attachmentId?: string;
+  displayName: string;
+  href?: string;
+  path?: string;
+  mimeType?: string;
+  source?: 'upload' | 'server_file';
+  status: 'uploading' | 'registering' | 'ready' | 'error';
+  loadedBytes?: number;
+  totalBytes?: number;
+  error?: string;
+  /** Client File kept for upload/retry; never serialized. */
+  file?: File;
+  /** Dedupe key for repeated picks of the same client file. */
+  fileKey?: string;
 }
 
 // ── Agent queue (backend session.queue_pending, normalized) ──
 
-export type AgentQueueKind = 'task' | 'report' | 'qq';
+export type AgentQueueKind = 'task' | 'report' | 'qq' | 'wechat';
 export type QueueDispatchState =
   | 'queued'
   | 'reserved'
@@ -1096,13 +1451,27 @@ export interface AgentQueueItem {
     /** queued=仍待本地 CLI 交接；reserved/writing 只在恢复事件中短暂存在。 */
     dispatchState?: QueueDispatchState;
     revision?: number;
+    locked?: boolean;
+    steerPending?: boolean;
+    steerError?: string;
+    lockManual?: boolean;
+    lockAutoReport?: boolean;
+    lockSource?: 'manual' | 'illegal' | null;
+    illegalBatchId?: string | null;
+    /**
+     * 结构化来源身份：服务端写入的 sourceSessionId（agent 发送方的 Session）。
+     * 只做展示与跳转，来源身份绝不从正文前缀推导。
+     */
+    sourceSessionId?: string | null;
   };
 }
 
 export interface ApiSessionQueueResponse {
   items: AgentQueueItem[];
   queueRevision?: number;
-  error?: string;
+  agentReportsPaused?: boolean;
+  queuePaused?: boolean;
+  error?: string | { code?: string; message?: string };
   ok?: boolean;
 }
 
@@ -1122,6 +1491,7 @@ export interface SyncedSettings {
 }
 
 export interface SettingsBody {
+  nativeControl?: boolean;
   model?: string;
   permissionMode?: string;
   alwaysThinkingEnabled?: boolean;
@@ -1130,6 +1500,8 @@ export interface SettingsBody {
   panAccess?: PanAccess;
   /** Names of MCP servers to enable (empty array clears them). */
   mcpServers?: string[];
+  pluginBindings?: PluginBinding[];
+  expectedPluginRevision?: number;
   /** Force past the session template's always/never MCP lock (user confirmed). */
   forceMcp?: boolean;
   /** Worker execution mode; empty string clears (→ adapter default). */
@@ -1146,6 +1518,19 @@ export interface McpServerInfo {
   name: string;
   command?: string | null;
   cwd?: string | null;
+  displayName?: string;
+  aliases?: string[];
+  supportedModes?: PluginMode[];
+  defaultMode?: PluginMode;
+  sourceKind?: 'mcp' | 'pan_api';
+}
+
+export type PluginMode = 'standalone' | 'pan_native' | 'gateway';
+
+export interface PluginBinding {
+  plugin_id: string;
+  enabled: boolean;
+  mode: PluginMode;
 }
 
 // ── File-system types ──

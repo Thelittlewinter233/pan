@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import { useCurrentSession } from '@/stores/sessionStore';
 import { useWorkerStore } from '@/stores/workerStore';
@@ -7,18 +7,51 @@ import { useAppSettingsStore } from '@/stores/appSettingsStore';
 import { WorkerDot } from '@/components/worker/WorkerDot';
 import { Button } from '@/components/ui/Button';
 import { useMediaQuery } from '@/hooks/useMediaQuery';
+import { useTerminalTuiEntry, terminalTuiTitle } from '@/hooks/useTerminalTuiEntry';
+import { useTopBarUsageFit } from '@/hooks/useTopBarUsageFit';
+import { useTakeoverReadiness } from '@/hooks/useTakeoverReadiness';
 import { fetchSessionUsage } from '@/services/api';
 import { normalizeCodexQuotaProjection, type CodexQuotaWindow } from '@/utils/codexRateLimits';
 import type { CodexQuotaProjection } from '@/types';
+import { copyText } from '@/utils/clipboard';
+import { useNativeControlStore } from '@/stores/nativeControlStore';
+import { usePlatformStore } from '@/stores/platformStore';
+import { platformLabel } from '@/utils/platformCapabilities';
 import {
   MessageSquare,
   Monitor,
+  Code,
   Copy,
   RotateCw,
+  Clock,
   Ban,
   Download,
   X,
+  TerminalSquare,
+  ArrowUp,
+  Loader2,
 } from 'lucide-react';
+
+/**
+ * Chat presentations available from the TopBar. Kept here (rather than in the
+ * store) because the accessible names are this button's concern; the store only
+ * owns the persisted value. The three modes are:
+ *   tui    — full-width role-bar rows with rendered Markdown (default)
+ *   bubble — shrink-to-fit bubbles with rendered Markdown
+ *   raw    — TUI rows, but each body shows the original text, unrendered
+ *
+ * Desktop (md+) shows all three as a segmented selector. On mobile the bar is
+ * too narrow for that, so the control collapses back to a single button that
+ * cycles through the same three modes on click.
+ */
+const CHAT_VIEW_OPTIONS = [
+  { value: 'tui', short: 'TUI', label: 'Switch to TUI view', Icon: Monitor },
+  { value: 'bubble', short: 'Bubble', label: 'Switch to Bubble view', Icon: MessageSquare },
+  { value: 'raw', short: 'Raw', label: 'Switch to Raw view', Icon: Code },
+] as const;
+
+/** Mobile click cycle: TUI → Bubble → Raw → TUI. */
+const CHAT_VIEW_CYCLE = { tui: 'bubble', bubble: 'raw', raw: 'tui' } as const;
 
 function tokenCount(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
@@ -82,7 +115,14 @@ function cachedQuotaLabel(quota: unknown): string | undefined {
 
 export function TopBar({ rightAction }: { rightAction?: ReactNode }) {
   const currentSession = useCurrentSession();
+  const takeoverReadiness = useTakeoverReadiness(currentSession);
   const currentWorker = useWorkerStore((s) => s.currentWorker);
+  // TopBar is the always-mounted poller driving the shared Terminal TUI
+  // contract (including the auto-enter after a "pending idle" upgrade that
+  // was scheduled from the Session Settings entry — see useTerminalTuiEntry).
+  const terminalEntry = useTerminalTuiEntry(currentSession, { poll: true });
+  const nativeActive = terminalEntry.active;
+  const platform = usePlatformStore((s) => s.platform);
   const [codexQuota, setCodexQuota] = useState<CodexQuotaProjection | null>(null);
   // 细粒度订阅：toast/审批/交互队列只在 UI store 的分片里；Worker store 只取
   // 稳定的 action 引用。整体订阅（useUIStore()/useWorkerStore()）会让每次 toast、
@@ -90,12 +130,12 @@ export function TopBar({ rightAction }: { rightAction?: ReactNode }) {
   const { showToast } =
     useUIStore(useShallow((s) => ({
       showToast: s.showToast,
-    })));
-  const { chatViewStyle, setChatViewStyle } = useAppSettingsStore(useShallow((s) => ({
+      })));
+  const { chatViewStyle, setChatViewStyle, showChatViewSwitcher } = useAppSettingsStore(useShallow((s) => ({
     chatViewStyle: s.chatViewStyle,
     setChatViewStyle: s.setChatViewStyle,
+    showChatViewSwitcher: s.showChatViewSwitcher,
   })));
-  const tuiViewEnabled = chatViewStyle === 'tui';
   const { restart, killCurrent, interrupt, takeover } =
     useWorkerStore(useShallow((s) => ({
       restart: s.restart,
@@ -104,6 +144,27 @@ export function TopBar({ rightAction }: { rightAction?: ReactNode }) {
       takeover: s.takeover,
     })));
   const { isMobile } = useMediaQuery();
+  const nativeState = useNativeControlStore((s) => currentSession?.id ? s.sessions[currentSession.id] : undefined);
+  const chooseView = async (value: 'tui' | 'bubble' | 'raw') => {
+    terminalEntry.cancelAutoEnter();
+    setChatViewStyle(value);
+    if (currentSession) useNativeControlStore.getState().showTerminal(currentSession.id, false);
+    try {
+      if (currentSession && nativeState && nativeState.mode !== 'pan') {
+        await useNativeControlStore.getState().switchMode(currentSession.id, 'pan');
+      }
+    } catch { showToast('History view opened; control ownership is unconfirmed and input remains suspended', 'error'); }
+  };
+  const delayedRestartState = useWorkerStore((s) =>
+    currentSession?.id ? s.delayedRestarts[currentSession.id] : undefined,
+  );
+  useEffect(() => {
+    if (!currentSession?.id) return;
+    // Reconnect refreshes the selected Session only. A different Session may
+    // have completed its restart while disconnected; do not keep its cached
+    // pending intent disabling this entry when the user returns to it.
+    void useWorkerStore.getState().refreshDelayedRestart(currentSession.id).catch(() => {});
+  }, [currentSession?.id]);
 
   useEffect(() => {
     const sessionId = currentSession?.id;
@@ -123,6 +184,48 @@ export function TopBar({ rightAction }: { rightAction?: ReactNode }) {
     return () => { active = false; };
   }, [currentSession?.id, currentSession?.adapter]);
 
+  const status = currentSession?.workerStatus || 'offline';
+  const nativeUsageLabel = currentWorker && currentWorker.sessionId === currentSession?.id
+    ? liveUsageLabel(currentWorker.nativeUsage)
+    : undefined;
+  const cachedQuotaText = currentSession?.adapter === 'codex' ? cachedQuotaLabel(codexQuota) : undefined;
+
+  // Whole-item hiding order for the optional usage labels (context first,
+  // then quota). Widths are measured from the live DOM, so the fit follows the
+  // real TopBar space — long names, a wider Sidebar, or changed controls — not
+  // a viewport breakpoint.
+  const barRef = useRef<HTMLDivElement | null>(null);
+  const leftRef = useRef<HTMLDivElement | null>(null);
+  const nameRef = useRef<HTMLElement | null>(null);
+  const actionsRef = useRef<HTMLDivElement | null>(null);
+  const contextRef = useRef<HTMLSpanElement | null>(null);
+  const quotaRef = useRef<HTMLSpanElement | null>(null);
+  const usageLabelRefs = useMemo(() => {
+    const labels: Array<RefObject<HTMLElement | null>> = [];
+    if (nativeUsageLabel) labels.push(contextRef);
+    if (cachedQuotaText) labels.push(quotaRef);
+    return labels;
+  }, [nativeUsageLabel, cachedQuotaText]);
+  const fitRevision = [
+    currentSession?.id ?? '',
+    currentSession?.name ?? '',
+    nativeUsageLabel ?? '',
+    cachedQuotaText ?? '',
+    String(showChatViewSwitcher),
+    String(isMobile),
+  ].join('|');
+  const fitRefs = useMemo(() => ({
+    bar: barRef,
+    left: leftRef,
+    name: nameRef,
+    actions: actionsRef,
+    labels: usageLabelRefs,
+  }), [usageLabelRefs]);
+  const hiddenUsageCount = useTopBarUsageFit(fitRefs, !isMobile, fitRevision);
+  const contextHidden = Boolean(nativeUsageLabel) && hiddenUsageCount > 0;
+  const quotaHidden = Boolean(cachedQuotaText)
+    && hiddenUsageCount > (nativeUsageLabel ? 1 : 0);
+
   if (!currentSession) {
     return (
       <div data-testid="topbar" className="flex items-center justify-between px-4 py-1 md:py-2 border-b border-border-default bg-bg-primary gap-1 md:gap-2 max-md:flex-nowrap">
@@ -134,12 +237,6 @@ export function TopBar({ rightAction }: { rightAction?: ReactNode }) {
     );
   }
 
-  const status = currentSession.workerStatus || 'offline';
-  const nativeUsageLabel = currentWorker?.sessionId === currentSession.id
-    ? liveUsageLabel(currentWorker.nativeUsage)
-    : undefined;
-  const cachedQuotaText = currentSession.adapter === 'codex' ? cachedQuotaLabel(codexQuota) : undefined;
-
   // Effective worker for the CURRENT session. Prefer the server-reported
   // session.workerId (authoritative after page load); fall back to the live
   // WS-tracked worker (workerStore keeps currentWorkerId synced per-session
@@ -150,8 +247,16 @@ export function TopBar({ rightAction }: { rightAction?: ReactNode }) {
     currentWorker.sessionId === currentSession.id &&
     currentWorker.status !== 'offline'
       ? currentWorker.id
-      : null);
+      : null) || nativeState?.workerId;
   const hasWorker = Boolean(effectiveWorkerId);
+
+  // Values for the collapsed mobile click-cycle control. Both lookups are total
+  // by construction (the union has exactly these three members).
+  const currentView = CHAT_VIEW_OPTIONS.find((option) => option.value === chatViewStyle)!;
+  const nextView = CHAT_VIEW_OPTIONS.find(
+    (option) => option.value === CHAT_VIEW_CYCLE[chatViewStyle],
+  )!;
+  const CurrentViewIcon = currentView.Icon;
 
   const handleCopy = (text: string) => {
     navigator.clipboard
@@ -160,30 +265,116 @@ export function TopBar({ rightAction }: { rightAction?: ReactNode }) {
       .catch(() => showToast('Copy failed', 'error'));
   };
 
+  // Copy the Session's full display name (never the id, never the truncated
+  // text). The button is a plain type="button": it never navigates or renames.
+  const sessionName = currentSession.name?.trim() ?? '';
+  const sessionTitle = sessionName || currentSession.id?.slice(0, 12) || '';
+  const handleCopySessionName = () => {
+    if (!sessionName) return;
+    copyText(sessionName)
+      .then(() => showToast(`Copied session name: ${sessionName}`))
+      .catch(() => showToast('Copy session name failed', 'error'));
+  };
+
   return (
-    <div data-testid="topbar" className="flex items-center justify-between pl-10 pr-3 md:pl-4 md:pr-4 py-1 md:py-2 border-b border-border-default bg-bg-primary gap-1 md:gap-2 flex-wrap max-md:flex-nowrap shrink-0">
-      <div className="flex items-center gap-1.5 md:gap-3 min-w-0 max-md:flex-1">
-        <div className="flex items-center gap-1 md:gap-2 min-w-0">
-          <WorkerDot status={status} className="shrink-0" />
-          <span
-            className="text-sm font-medium text-text-primary truncate max-w-[120px] md:max-w-[200px] min-w-0"
-            title={currentSession.name || currentSession.id?.slice(0, 12)}
-            aria-label={currentSession.name || currentSession.id?.slice(0, 12)}
-          >
-            {currentSession.name || currentSession.id?.slice(0, 12)}
-          </span>
-          {/* Toggle between the chat presentations: TUI rows (default) and the
-              Bubble view. */}
-          <button
-            type="button"
-            onClick={() => setChatViewStyle(tuiViewEnabled ? 'bubble' : 'tui')}
-            aria-label={tuiViewEnabled ? 'Switch to Bubble view' : 'Switch to TUI view'}
-            aria-pressed={!tuiViewEnabled}
-            className="text-sm text-text-tertiary hover:text-text-primary p-0.5 rounded transition-colors max-md:h-8 max-md:w-8 max-md:flex-none max-md:p-0 max-md:justify-center"
-            title={tuiViewEnabled ? 'Switch to Bubble view' : 'Switch to TUI view'}
-          >
-            {tuiViewEnabled ? <Monitor size={16} /> : <MessageSquare size={16} />}
-          </button>
+    <div
+      ref={barRef}
+      data-testid="topbar"
+      data-usage-fit={hiddenUsageCount}
+      className="flex items-center justify-between pl-9 pr-1 md:pl-4 md:pr-4 py-1 md:py-2 border-b border-border-default bg-bg-primary gap-0.5 md:gap-2 flex-wrap max-md:flex-nowrap shrink-0"
+    >
+      <div ref={leftRef} className="flex items-center gap-1 md:gap-3 min-w-0 max-md:flex-1">
+        <div className="flex items-center gap-0.5 md:gap-2 min-w-0 max-md:flex-1">
+          <WorkerDot status={status} illegalOffline={currentSession.illegalOffline} className="shrink-0" />
+          {/* Mobile: the name region is the top bar's only flexible item, so
+              it takes every px left of the fixed-size controls — ≥ half of
+              the bar's usable width even at 320px. Truncation keeps overflow
+              away while `title`/`aria-label` expose the full name. Clicking
+              (or Enter/Space on) the name copies that full name. */}
+          {sessionName ? (
+            <button
+              ref={(el) => { nameRef.current = el; }}
+              type="button"
+              data-testid="topbar-session-name"
+              onClick={handleCopySessionName}
+              title={sessionName}
+              aria-label={`Copy session name: ${sessionName}`}
+              className="cursor-pointer border-0 bg-transparent px-0 py-0.5 text-left text-sm font-medium text-text-primary truncate min-w-0 max-md:flex-1 md:max-w-[200px] hover:text-accent focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+            >
+              {sessionName}
+            </button>
+          ) : (
+            <span
+              ref={(el) => { nameRef.current = el; }}
+              data-testid="topbar-session-name"
+              className="text-sm font-medium text-text-primary truncate min-w-0 max-md:flex-1 md:max-w-[200px]"
+              title={sessionTitle}
+              aria-label={sessionTitle}
+            >
+              {sessionTitle}
+            </span>
+          )}
+          {/* Chat presentation. Desktop exposes an explicit three-mode
+              selector; mobile keeps the compact single button that cycles
+              TUI → Bubble → Raw. The active mode is never inferred from a
+              `!tui` check (ChatMessages keys `.bubble-mode` on `=== 'bubble'`),
+              so Raw is never confused with Bubble. Appearance can hide this
+              switcher only; the Terminal TUI / Upgrades entry below stays. */}
+          {showChatViewSwitcher && (isMobile ? (
+            <button
+              type="button"
+              onClick={() => void chooseView(nextView.value)}
+              aria-pressed={!nativeActive}
+              aria-label={nextView.label}
+              title={`Chat view: ${currentView.short} — click to switch to ${nextView.short}`}
+              className="text-text-tertiary hover:text-text-primary p-0.5 rounded transition-colors max-md:h-6 max-md:w-6 max-md:flex max-md:flex-none max-md:items-center max-md:justify-center max-md:p-0"
+            >
+              <CurrentViewIcon size={16} />
+            </button>
+          ) : (
+            <div
+              role="group"
+              aria-label="Chat view"
+              className="flex items-center gap-0.5 rounded border border-border-default bg-bg-tertiary p-0.5"
+            >
+              {CHAT_VIEW_OPTIONS.map(({ value, label, Icon }) => (
+                <button
+                  key={value}
+                  type="button"
+                  onClick={() => void chooseView(value)}
+                  aria-label={label}
+                  aria-pressed={!nativeActive && chatViewStyle === value}
+                  title={label}
+                  className={`rounded p-0.5 transition-colors max-md:h-8 max-md:w-8 max-md:flex max-md:flex-none max-md:items-center max-md:justify-center max-md:p-0 ${
+                    !nativeActive && chatViewStyle === value
+                      ? 'bg-bg-primary text-text-primary'
+                      : 'text-text-tertiary hover:text-text-primary'
+                  }`}
+                >
+                  <Icon size={16} />
+                </button>
+              ))}
+            </div>
+          ))}
+          {/* Desktop-only entry: on mobile the same contract (upgrade,
+              pending idle, enter TUI, error retry) lives in Session Settings
+              → More (SettingsPopover). */}
+          {!isMobile && (currentSession.nativeControlCapable
+            ?? (currentSession.adapter === 'codex' || currentSession.adapter === 'cbc')) && <button type="button"
+            className="terminal-tui-entry ml-1 flex shrink-0 items-center justify-center gap-1 rounded border px-2 py-1 text-xs transition-colors md:min-h-0"
+            data-terminal-status={terminalEntry.status}
+            aria-label="Terminal TUI" aria-pressed={terminalEntry.active} disabled={terminalEntry.busy}
+            title={terminalEntry.status === 'unsupported'
+              ? `Terminal TUI is not available on this platform (${platformLabel(platform)})`
+              : terminalTuiTitle(terminalEntry.status)}
+            onClick={() => void terminalEntry.enterNative()}>
+            <span className="relative inline-flex shrink-0" aria-hidden="true">
+              <TerminalSquare size={16} />
+              {terminalEntry.status === 'upgrade' && <ArrowUp size={10} className="terminal-tui-entry__upgrade-arrow absolute -right-1 -top-1 rounded-sm bg-bg-primary" />}
+              {terminalEntry.status === 'upgrading' && <Loader2 size={10} className="absolute -right-1 -top-1 animate-spin rounded-sm bg-bg-primary" />}
+            </span>
+            <span>{terminalEntry.label}{terminalEntry.pendingIdle ? ' · pending idle' : ''}</span>
+          </button>}
         </div>
         <div className="hidden md:flex items-center gap-1 text-xs text-text-secondary">
           <span
@@ -206,10 +397,18 @@ export function TopBar({ rightAction }: { rightAction?: ReactNode }) {
         </div>
       </div>
 
-      <div data-testid="topbar-actions" className="flex items-center gap-0.5 md:gap-1.5 flex-shrink-0">
+      <div
+        ref={actionsRef}
+        data-testid="topbar-actions"
+        className="relative flex items-center gap-0.5 md:gap-1.5 flex-shrink-0"
+      >
         {nativeUsageLabel && (
           <span
-            className="hidden md:inline text-xs text-text-tertiary mr-1"
+            ref={contextRef}
+            data-testid="topbar-context-usage"
+            data-usage-hidden={contextHidden ? 'true' : 'false'}
+            aria-hidden={contextHidden || undefined}
+            className={`hidden md:inline text-xs text-text-tertiary mr-1${contextHidden ? ' invisible absolute pointer-events-none' : ''}`}
             title="Live Codex token usage for the current turn"
           >
             {nativeUsageLabel}
@@ -217,7 +416,11 @@ export function TopBar({ rightAction }: { rightAction?: ReactNode }) {
         )}
         {cachedQuotaText && (
           <span
-            className="hidden md:inline text-xs text-text-tertiary mr-1"
+            ref={quotaRef}
+            data-testid="topbar-quota-usage"
+            data-usage-hidden={quotaHidden ? 'true' : 'false'}
+            aria-hidden={quotaHidden || undefined}
+            className={`hidden md:inline text-xs text-text-tertiary mr-1${quotaHidden ? ' invisible absolute pointer-events-none' : ''}`}
             title="Codex account rate-limit usage (persisted profile cache)"
           >
             {cachedQuotaText}
@@ -228,7 +431,7 @@ export function TopBar({ rightAction }: { rightAction?: ReactNode }) {
             <Button
               variant="ghost"
               size="sm"
-              className="max-md:h-8 max-md:w-8 max-md:flex-none max-md:justify-center max-md:px-0 max-md:py-0"
+              className="max-md:h-6 max-md:w-6 max-md:flex-none max-md:justify-center max-md:px-0 max-md:py-0"
               onClick={() =>
                 restart(currentSession.id)
                   .then(() => showToast('Restarted worker'))
@@ -238,32 +441,54 @@ export function TopBar({ rightAction }: { rightAction?: ReactNode }) {
             >
               <RotateCw size={14} />
             </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              className="max-md:h-8 max-md:w-8 max-md:flex-none max-md:justify-center max-md:px-0 max-md:py-0"
-              onClick={() =>
-                interrupt(currentSession.id)
-                  .then(() => showToast('Interrupt sent'))
-                  .catch((e) => showToast(e.message, 'error'))
-              }
-              title="Interrupt"
-            >
-              <Ban size={14} />
-            </Button>
+            {/* Delayed restart / Interrupt stay reachable on mobile via
+                Session Settings → Worker; the mobile top bar keeps only the
+                high-frequency Restart and Kill controls. */}
+            {!isMobile && (
+              <>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  disabled={delayedRestartState?.status === 'pending'
+                    || delayedRestartState?.status === 'restarting'}
+                  onClick={() => useWorkerStore.getState().delayedRestart(currentSession.id)
+                    .then(() => showToast('Worker will restart after the current task completes'))
+                    .catch((e: Error) => showToast(e.message, 'error'))}
+                  title={delayedRestartState?.status === 'pending' ? 'Delayed restart pending: waiting for task completion'
+                    : delayedRestartState?.status === 'restarting' ? 'Restarting worker'
+                    : delayedRestartState?.status === 'failed' ? `Delayed restart failed: ${delayedRestartState.error}`
+                    : 'Delayed restart: after task completion, before queued work'}
+                >
+                  <Clock size={14} />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() =>
+                    interrupt(currentSession.id)
+                      .then(() => showToast('Interrupt sent'))
+                      .catch((e) => showToast(e.message, 'error'))
+                  }
+                  title="Interrupt"
+                >
+                  <Ban size={14} />
+                </Button>
+              </>
+            )}
             {!isMobile && (
               <Button
                 variant="ghost"
                 size="sm"
-                className="max-md:h-8 max-md:w-8 max-md:flex-none max-md:justify-center max-md:px-0 max-md:py-0"
                 onClick={() => {
+                  if (nativeActive && !confirm('Takeover stops the current Worker and opens an external PowerShell session. This is not a seamless TUI/Pan control switch. Continue?')) return;
                   takeover(currentSession.id)
                     .then(() =>
                       showToast('PowerShell opened for takeover'),
                     )
                     .catch((e) => showToast(e.message, 'error'));
                 }}
-                title="Takeover"
+                disabled={!takeoverReadiness.ready}
+                title={takeoverReadiness.reason || 'Takeover'}
               >
                 <Download size={14} />
               </Button>
@@ -271,11 +496,11 @@ export function TopBar({ rightAction }: { rightAction?: ReactNode }) {
             <Button
               variant="ghost"
               size="sm"
-              className="max-md:h-8 max-md:w-8 max-md:flex-none max-md:justify-center max-md:px-0 max-md:py-0"
+              className="max-md:h-6 max-md:w-6 max-md:flex-none max-md:justify-center max-md:px-0 max-md:py-0"
               onClick={() => {
                 if (!confirm(`Kill worker ${effectiveWorkerId}?`)) return;
                 killCurrent(currentSession.id)
-                  .then(() => showToast('Kill sent'))
+                  .then(() => showToast('Worker stopped'))
                   .catch((e) => showToast(e.message, 'error'));
               }}
               title="Kill worker"
@@ -288,7 +513,7 @@ export function TopBar({ rightAction }: { rightAction?: ReactNode }) {
           <Button
             variant="primary"
             size="sm"
-            className="max-md:h-8 max-md:flex-none max-md:px-2 max-md:py-0"
+            className="max-md:h-7 max-md:flex-none max-md:px-2 max-md:py-0"
             onClick={() =>
               restart(currentSession.id || '')
                 .then(() => showToast('Worker started'))

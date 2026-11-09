@@ -3,11 +3,114 @@ name: pan-http-api
 description: Pan HTTP API 速查（技术细节引用文档，配合 docs/skills/pan/SKILL.md 使用）。覆盖冷启动常用端点请求体、字段命名映射、Windows curl 中文编码坑、轮询兜底策略。MCP 能覆盖的编排操作一律走 MCP 工具，本文件仅用于直调（rename/branch 等无 MCP 工具）与排查。
 ---
 
+Locker 用户接口复用 `POST /api/automation/login` 的内存 Bearer。单用户 profile
+验证成功固定映射 recipient `user`；创建 Card 时使用 `recipient_id="user"`，
+不得通过 response body 指定身份。旧其他 recipient 不自动合并，未授权仍 401、
+非本人 Card 404。choice 指向已启用 Trigger 时经真实 Event Store 定向持久接纳，
+receipt 不代表 Action 执行完成。submit/reject 只将固定摘要前 200 字符通知来源
+Session Queue，delete 不新增通知；unknown 只查原回执。完整契约见
+[User Inbox](../../../design/User-Inbox-Interaction-Card-Contract.md)。
+
+终态 error 的 TA→MA report 保留兼容 `result`，并分别保存 `errorText`、
+`errorCode`、`errorSource`、`errorTextTruncated` 与 `lastMessage` 上下文。
+诊断从同次 terminal CLI 事件提取，在终态提交前冻结为 `reportDiagnostic`，
+随 `lastResult`/有界 terminal records 落盘；自动与手动报告均复用该运行记录。
+`errorSource` 复用日志的显式 wrapper error_source（如 codex_error_payload），
+无该字段时为 `cli.error` 或 `cli.error_text`；code 仅来自原生 `error.code`
+或字符串 `codexErrorInfo`，不按正文猜 capacity/quota。原生诊断缺失为 null，
+status 仍为 error；不能用助手正文替代诊断或改成 done。done/cancelled 与旧报告
+渲染保留原行为。批量、Force、Steer 共用 report formatter；普通 Queue 列表
+仍为既有摘要投影，不额外暴露完整报告。errorText 经现有日志脱敏后最多 1200
+字符，code 最多 128 字符，保留截断标记；不复制 raw/error 对象或读取 JSONL。
+历史记录不回填前次错误。此修复不改变 MA 恢复策略、投递/未知回执或权限门禁。
+
+## 来源分类与自动回答汇报
+
+`/api/assign`、`/api/send`（含 force）及 `/api/task` 根据验证后的 `sourceSessionId` 和管理祖先链将上行 agent 消息标为 `source=report`，保留原 task 投递事务。设置不影响手动上行投递。
+
+全局 `GET/PUT /api/settings/ui` 的 `autoReport` 值为 `{system:false, ma:true, user:false, plugins:{}, summary:{system:false, ma:false, user:false, plugins:{}}}`。PUT 提供完整该值，`plugins` 是按插件 ID 的显式覆盖；`summary` 是独立的 prompt 摘要策略（默认全关，插件覆盖不继承 `auto_report_default`）；重置传默认值及空覆盖。`GET /api/plugins/message-sources` 返回消息能力插件及声明的 `defaultEnabled`/有效 `effectiveEnabled`，另附 `effectiveSummaryEnabled`（无用户覆盖时恒为 false）。插件以可选 `message_source` 对象声明消息能力，`auto_report_default` 可省略，省略为 false；没有消息能力对象的普通注册插件不出现在此列表。
+
+`POST /api/plugins/{plugin_id}/messages` 接受 `{sessionId, text, clientMessageId?}`；要求该插件声明消息能力，持久化 `source=plugin`/`sourcePluginId`，使用原有队列 gate。它与 `/api/send` 同属本地信任边界，不授予额外访问能力。详细快照、旧 QQ 兼容、Stop reports 和防循环规则见 [设计契约](../../../source-aware-auto-report.md)。
+
 # Pan HTTP API 速查（引用文档）
+
+## 主服务 CLI 身份与控制台
+
+- `GET /api/main/identity`：当前进程 `pid`、`createdAt`、`root`、运行 `version` 与 `console={state, hwnd, managed, pid, interactive}`；非 Windows console 为 unsupported。
+- `POST /api/main/console`：`{action:"show"|"hide", pid, createdAt}`，目标身份不符或共享/不可控窗口返回 409。只控制 Pan 自己的交互 console，不控制 Worker/Job 终端，不写启动配置。返回 `{ok:true, console:{...}}`；无法核验可见状态时拒绝。
+- 用户 CLI 对 `POST /api/main/exit|restart` 附带 `X-Pan-Expected-Pid` / `X-Pan-Expected-Created-At`，服务端拒绝查询后已更换的实例；未附 header 的现有 UI/console 调用契约不变。CLI 等持久 Job 终态及进程事实，不将 scheduled/accepted 当作完成。日常命令和注册详见 [Pan CLI](../../../PAN_CLI.md)。
+
+Action/Group 创建：`POST /api/actions/actions` 或 `/api/actions/groups`，body 为
+`{item: {...}, expectedRevision?: number}`。省略 `item.id` 时由服务端生成，返回 registry
+及 `item`（含权威 ID）；显式合法 ID 兼容，但创建不覆盖已有 ID。原 PUT 更新路径仍要求
+URL 与 item 的原 ID 一致。`action_drafts` put 同样支持省略 ID 并返回 item，Action
+仍强制 disabled。创建响应不明时先 list 核对，不盲目重放。完整字段见
+[Actions](../../../plugins/ACTIONS.md)。
 
 > 供 `docs/skills/pan/SKILL.md` 引用。**MA 编排一律走 MCP 工具**（见 SKILL.md §5）；本文件是 HTTP 直调与排查用的技术细节，含 MCP 覆盖不到的端点（rename / branch）、以及直调/排查所需的请求体与字段约定。
 
 Pan 的 HTTP API 在 `packages/web/server.py`，基址 `http://127.0.0.1:<port>`（代码默认 **8768**；main/test 测试或隔离运行使用 8767 或 8765；由 `config.json` 的 `port` 字段或 `PAN_PORT` 环境变量覆盖）。全部返回 JSON；错误通常返回 `{"error": "..."}`。**API 无鉴权、绑 loopback（127.0.0.1）**——不要在非本机环境暴露端口。
+
+## 执行合法性与主服务退出（2026-10-18）
+
+Session 摘要/详情返回 `legalOffline`、`illegalOffline` 和 `legalityDiagnostics`。**Illegal 就是待恢复，没有独立的恢复意图字段。** `legalOffline=false, illegalOffline=false` 仅表示正常执行尚未安全结束，不属于待恢复。旧 `lastLegalWorkerState` 仅为只读兼容元数据。历史 `recovery_requested` / `recoveryRequested` 加载时清理，不据其布尔值制造事故。
+
+`PUT /api/settings/session-lifecycle` 的 `startupPreference=clear-illegal` 会在下次启动将已有 Illegal 改为安全 offline，并解除仍归属对应事故的自动锁；保留 Manual 和独立安全 gate。旧设置值 sync-actual 按 ask 读取；询问弹窗里的“标记安全下线”现在也会取消 Illegal，而不是只改一个恢复意图字段。自动恢复及 resume Job 只选择 Illegal Session。
+
+- `POST /api/sessions/{id}/legality/mark-illegal` 显式标记 Illegal / 待恢复，并按现有 queued 范围建立一次事故自动锁；Manual 不覆盖，重复不扩大。没有未结束 provider run 时记录独立 administrative operation，明确不是观测到 provider 执行。不会启动 Worker。
+- `POST /api/sessions/{id}/legality/mark-safe-offline` 显式取消 Illegal / 待恢复，将旧责任安全退休并解除其精确自动锁，保留 Manual。活/未知 owner 拒绝手动状态转换，不以 UI Idle 猜进程已停止。
+- `/legality/reconcile`、`/legal-state/sync` 为 mark-safe-offline 的 deprecated 别名；`/legality/request-recovery`、`/legal-state/running` 为 mark-illegal 的 deprecated 别名，不保留旧恢复意图行为。
+- `POST /api/main/exit` 与既有 `/api/main/restart` 使用保存的 `session_lifecycle.exitStrategy`；ask 时传 `{"options":{"markRunningSessionsOffline":true}}` 安全退休，False 保留未收尾执行为 Illegal。`{"options":{"preserveRunningIllegal":true}}` 可覆盖保存的安全策略。只有可核验 runtime 退休及必要落盘成功才算安全。
+- Pan 主服务 SIGINT/Ctrl+C、SIGTERM、服务管理停止/强杀不构成安全退出授权；已安全 Idle 不因此 Illegal。可交互主控制台 q 后回车使用同一 Exit API；ask 显示 1/2/3 菜单，2 秒内三次 q 或 qqq 回车强制保留未收尾执行。Worker/Job/原生终端内部 Ctrl+C 语义不变。
+
+验证必须使用自己拥有的临时数据根、进程及动态非保护端口；运行目录不是数据隔离。执行合法性迁移与受控原生 operation 边界见设计及交付报告。
+
+## Agent taskId / send 继承（T-040）
+
+`POST /api/assign` 的 `taskId` 是正式任务幂等键。成功入队后，它成为目标
+Session 的持久 `active_task_id`；同一 `taskId` 的 assign 重试仍按原有幂等语义
+返回 pending/receipt，不重复执行。
+
+`POST /api/send`（普通 send 和 `agent_send_force` 的统一入口）不生成新的
+业务编号。对来源为 Pan agent 的消息，入队时复制目标 Session 当时的
+`active_task_id`；没有活动任务就是 `taskId: null`。普通消息的 inherited taskId
+只用于完成 report 配对，不参加 assign 去重，所以连续 send 不会互相去重。正式
+任务完成/终止后，新的普通 send 不继承旧 taskId；已入队消息仍使用自己入队时的
+快照。Session 重启/恢复只从持久 queue 中的未完成正式 task 恢复活动上下文，绝不
+从 `lastResult` 或 history 猜测。
+
+### 即时 force / 原生 Steer
+
+`agent_send_force` 与兼容 `worker_send_force` 都向 `/api/send` 传
+`{"sessionId":"...","text":"...","source":"agent","force":true}`。
+可选 `clientMessageId` 是事务去重键；调用者身份由 MCP 附加为
+`sourceSessionId`。MCP 不先调用 restart，也不自行选择底层协议。
+
+- 支持 Steer 的 active stream 即时尝试原生 admission；idle/queued 使用普通
+  consumer handoff；无 Steer 能力才 restart+send；无 Worker 保留持久队列语义。
+- `status/outcome: accepted` 是 CLI 接受，`consumption: unconfirmed` 不是已消费。
+  `queued` 只表示等待交接；`rejected` 可显式重试；`unknown` 禁止自动重发或
+  降级 restart。原生拒绝后重试复用原 item，未知结果保留原事务并阻止投递。
+- Pause everything、手动/报告锁、编辑租约、owner/runtime/generation 与
+  delayed restart 优先级仍有效。force 不承诺绕过这些门禁；不要把 queued
+  告诉用户为已 Steer。已有 delayed intent 不被 force 或 self-consume 取消。
+- CBC stream 使用 `control_request.request.subtype=steer`，绑定 CLI session
+  和 `expected_request_id`。`steered:true` 仅为 admission。迟到回执只结算原
+  run/item，history 保留原归属，最终 result 仍属于原任务。
+- UI direct：`POST /api/sessions/{id}/worker/steer`，body 为 `text/messageId`；
+  queue：`POST /api/sessions/{id}/queue/{itemId}/steer`，只接受
+  `{"expectedRevision":N}`，正文/来源从原队列读取。保持 10 秒队列请求与
+  30 秒 provider receipt 边界。self_queue 复用同一能力路由；其 consumed
+  仅指 Pan 队列项，嵌套 `steer.consumption` 仍为 unconfirmed。
+
+CBC native TUI 与 Oneshot 不因此获得 stream 控制协议能力，不能盲发键盘
+或以 restart/resume 冒充同 run Steer。协议不识别/缺少 run 时明确拒绝或未知，
+不静默回退普通 prompt。
+
+单 Session/单 Worker/FIFO 下，新的 assign 入队即切换活动上下文；旧任务及其已经
+入队的普通消息仍按 FIFO 处理。`queueItemId` 只是内部技术 ID，不是业务 taskId；
+本规则不引入 `sourceQueueItemId`、`deliveryUnitId` 或事件模型。既有进程内
+`_task_status` 仍保持全局 taskId 注册作用域，本次未修改其作用域。
 
 ## 端点清单
 
@@ -19,29 +122,38 @@ Pan 的 HTTP API 在 `packages/web/server.py`，基址 `http://127.0.0.1:<port>`
 | `PATCH` | `/api/sessions/{id}` | `{"model": "...", "permissionMode": "...", "alwaysThinkingEnabled": true, "effort": "high", "maxThinkingTokens": 8192, "modelContextWindow": 262144, "modelAutoCompactTokenLimit": 200000, "mcpServers": ["pan"], "forceMcp"?: true, "outputMode": "stream", "gameId": "..."}` | 更新后 session（设置**即时持久化**，worker 下次 (re)spawn 生效；**可中途更新 `mcpServers`**，中途换 adapter 才需 handoff）。`modelContextWindow`/`modelAutoCompactTokenLimit` 是可选正整数 Codex 覆盖值；传 `null` 可清除。`mcpServers` 传 manifest 中声明的**服务名列表**（服务端解析为完整配置）：非空即启用、`[]` 清空/禁用、**省略该字段 = 保持不变**（部分更新；`mcpEnabled` 仅是响应字段，请求体里传了会被忽略）；未知或不可用的 MCP server 返回 `error`，不会生成无效配置；模板 `mcp_mode=always/never` 锁死增删，body 带 `forceMcp: true` 跳过锁（UI 确认后使用）。改上下文覆盖值、`mcpServers`/`outputMode`（或有活 worker 时改其他进程相关字段：model/permission/effort/thinking/MCP/outputMode）时带 `requireRestart: true`，重启自动完成：**idle worker 自动 respawn 生效、running worker 回 idle 时自动 respawn、无 worker 下次 spawn 生效**——想立即切换仍可手动 agent_kill + agent_spawn（别名 worker_*）。**MCP 等价工具：`session_update`** |
 | `POST` | `/api/sessions/{id}/rename` | `{"name": "new-name"}` | `{"sessionId","name","status":"renamed"}`。**无 MCP 工具，需 HTTP 直调** |
 | `POST` | `/api/sessions/{id}/branch` | `{"name": "fork-name"}` | 复制 adapter transcript 新建 session（保留 workdir/character/MCP 绑定）。**无 MCP 工具，需 HTTP 直调** |
-| `POST` | `/api/sessions/{id}/handoff` | `{"handoffPrompt": "...", "copySettings": true, "adapter"?: "...", "model"?: "...", "permissionMode"?: "..."}` | **替身交接**：创建孪生 session B 接替 A（见 SKILL.md §2.7）。等价 MCP 工具 `session_handoff`；`handoffPrompt` 必填，`copySettings=false` 时 `adapter` 必填 |
+| `POST` | `/api/sessions/{id}/handoff` | `{"handoffPrompt":"...", "targetSessionId"?:"ses_B", "copySettings"?:bool, "overrideOriginalPrompt"?:false, "originalPrompt"?:"...", "adapter"?:"...", "model"?:"...", "permissionMode"?:"..."}` | URL id=来源 A；省略 target 才新建 B，旧 copy 默认true（false 时 adapter 必填）。指定 target 必须为已有 B：copy 省略/false 保留 B 设置，true/adapter覆写拒绝；model/permissionMode 仅无活/native Worker 可显式改。original 元数据默认覆盖为 A.original，override=true 用本次字符串（允许空串），false 忽略残留文本。已有 B 的有效 systemPrompt 逐字冻结，任何当前/后续 spawn 均不从新元数据合成；简报唯一普通入队，返回 briefDelivery.queueItemId，与 A.handoffReceipt 可核对，queued 不代表已读，未知不得自动重投。B history/CLI ID/name/绑定保留；关系合并与冲突零修改拒绝见 [完整字段表](handoff.md)。新建模式才合成本次简报+original |
 | `POST` | `/api/readonly` | `{"managerId": "...", "sessionId": "...", "readonlySession": true}` | 设置或清除已由 `managerId` 管理的 session 的持久只读状态；不能借此认领 session。只读目标拒绝其他 session 的任务/消息/通知，返回 `readonly_session` |
-| `POST` | `/api/notify` | `{"targetSessionId": "...", "text": "...", "source"?: "..."}` | 持久化后台任务完成/状态通知到目标 `queue_pending`；无活 worker 时自动唤醒/spawn。该路由供 MCP `agent_notify` 使用，权限隔离由 MCP 层执行，不是普通任务派发 |
+| `POST` | `/api/notify` | `{"targetSessionId": "...", "text": "...", "source"?: "...", "sourceSessionId"?: "..."}` | 持久化 Agent 主动通知到目标 `queue_pending`；无活 worker 时自动唤醒/spawn。该路由供 MCP `agent_notify` 使用，权限隔离由 MCP 层执行，不是普通任务派发；调度器/后台 Job 终态通知另带结构化 `noticeKind=background_job_terminal`、`jobId`、`status`、`targetSessionId(s)` 和可选 `creatorSessionId`，并渲染为 `////by pan system` |
 | `POST` | `/api/notifications/send` | `{"sessionId":"...", "title":"...", "body":"...", "sourceSessionId":"..."}` | 发送 best-effort Pan 系统通知；MCP `notification_send` 使用，调用者身份和 managed 隔离由 MCP 层执行 |
 | `POST` | `/api/sessions/{id}/reminders` | `{"dueAt":"<absolute ISO-8601>", "title":"...", "body":"..."}` | 注册一次性持久提醒；MCP `reminder_register` 使用 |
 | `GET` | `/api/sessions/{id}/reminders` | — | 列出该 session 的待处理提醒；MCP `reminder_list` 使用 |
 | `DELETE` | `/api/sessions/{id}/reminders/{reminderId}` | — | 取消该 session 的待处理提醒；MCP `reminder_cancel` 使用 |
-| `POST` | `/api/background-jobs` | `{"targetSessionId":"...", "argv":[...], "cwd":"...", "label"?:"..."}` | 创建脱离 Worker 生命周期的持久后台 Job；argv 不经 shell，MVP 的 cwd 仅允许 Pan 项目目录内 |
+| `POST` | `/api/background-jobs` | `{"targetSessionId":"...", "argv":[...], "cwd":"...", "name":"Meaningful task name", "label"?:"...", "creatorSessionId"?:"...", "hideWindow"?:true}` | 创建脱离 Worker 生命周期的持久后台 Job；argv 不经 shell，cwd 可为任意已存在目录（建议绝对路径）；creator 与接收 target 分开持久化；Windows 默认隐藏命令窗口，显式 `hideWindow:false` 显示，必须是真布尔值 |
 | `GET` | `/api/background-jobs[?targetSessionId=...]` | — | 列出 Job Registry 记录 |
 | `GET` | `/api/background-jobs/{jobId}` | — | 查询 Job 事实、PID、日志和通知状态 |
+| `POST` | `/api/session-message-jobs` | `{"targetSessionId":"...", "creatorSessionId"?:"..."}` 或 `{"targetSessionIds":["..."], "text":"...", "schedule":{...}, "description"?:"...", "sourceSessionId"?:"...", "creatorSessionId"?:"..."}` | 创建单目标 Session 时间消息或定时群发 Job；creator 与接收 target 分开持久化，群发目标去重且保持输入顺序；单目标消息沿用 agent send 语义，保留 `sourceSessionId` 与 `////by agent : <creatorSessionId> | <title>`；`text` 只作为消息发送，不执行 shell |
+| `PATCH` | `/api/background-jobs/{jobId}` | `{"schedule"?:{...}, "text"?:"...", "description"?:"...", "targetSessionIds"?:[...]}` | 编辑未终态 Session 消息/定时群发 Job；重排或改目标后回到 `pending` |
 | `POST` | `/api/background-jobs/{jobId}/cancel` | — | 取消并杀完整进程树（PID 创建时间必须匹配；无法安全确认时返回 `cancel_unsafe`） |
 | `POST` | `/api/background-jobs/{jobId}/retry` | — | 用新 jobId 重试原命令 |
+| `POST` | `/api/sessions/broadcast` | `{"sessionIds":["..."], "text":"...", "source"?:"agent", "sourceSessionId"?:"..."}` | 对选定 Session 逐个复用普通 send 入队；返回每个目标结果 |
 | `GET` | `/api/main/restart/status` | — | 读取当前 checkout/port 的持久化 main-lifecycle Job；`pending` 只表示 requested/stopping/stopped/starting，终态含 `ready`/`failed`/`timed_out` 与 PID/错误字段 |
 | `POST` | `/api/main/restart` | — | 原子登记 service lifecycle Job 后返回 `status:"scheduled"`, `accepted:true`, `phase:"requested"`；重复请求返回 `busy` 与已有 `requestId`/`jobId`，不会绑定 Session 或进入 `queue_pending` |
 | `POST` | `/api/report-subscribe` | `{"managerId": "<MA session id>", "sessionId": "<managed session id>"}` | `{"subscribed": true, "reportSubscriptions": [...]}`。**等价 MCP 工具：`report_subscribe`（编排首选）** |
 | `POST` | `/api/report-unsubscribe` | 同上 | `{"subscribed": false, ...}`。等价 MCP 工具：`report_unsubscribe` |
 | `POST` | `/api/claim` | `{"managerId": "...", "sessionId": "..."}` | 认领会话建立 managed 关系（带 `_check_access(claim=True)` 隔离检查；目标已被他人管理则拒绝）。等价 MCP 工具：`session_claim`（claim 自动 report_subscribe） |
 | `POST` | `/api/unclaim` | `{"managerId": "...", "sessionId": "..."}` | 解除 managed 关系（同时退订该 session 报告）。等价 MCP 工具：`session_unclaim` |
-| `POST` | `/api/worker/{worker_id}/restart` | — | 终止并重新 spawn worker 进程。`agent_send_force`（MCP，别名 worker_send_force）内部走此端点 |
-| `POST` | `/api/worker/{worker_id}/steer` | `{"text": "补充指令"}` | 将补充指令注入正在运行的 Codex 原生回合，并在写入成功后落盘到 Pan history |
+| `POST` | `/api/worker/{worker_id}/restart` | — | 终止并重新 spawn worker 进程。force-send 经 `/api/send` 按能力路由，不直接调用此端点 |
+| `POST` | `/api/sessions/{id}/worker/delayed-restart` | — | 返回 `delayedRestart`：`sessionId`、捕获的 `workerId/generation`、单调 `revision`、`action:start/restart`、`status:pending/restarting/completed/failed/cancelled`、`error`。running 时等待当前任务的终态持久化、结果/报告与队列清理全部完成；有效 idle 边界先同步封住旧 Worker，再按既有配置 respawn，优先于队列续派。已 idle（含尚未交接的 queued）立即调度；无 Worker 与 Restart 一致，调度 start。重复请求/settings 自动重启合并为一个意图。held/takeover 拒绝，立即 kill/restart 取消旧代意图；force/self-consume 保留已有 delayed intent。意图仅在本次 Pan 进程内有效，不跨服务重启恢复。MCP `agent_restart_delayed(session_id)` 使用 `?existing_worker_only=true`：服务端同步拒绝无活 Worker 或 Illegal Session（已接受 restart 的退役间隙只返回原回执），不启动离线 Worker、不授权恢复；原 HTTP 默认 start 语义不变。不是按秒定时重启。 |
+| `GET` | `/api/sessions/{id}/worker/delayed-restart` | — | 返回当前 `delayedRestart` 或 `null`，旧 Worker 被移除后仍可读取失败/完成状态；Session 不存在返回 `error`。MCP `agent_restart_delayed_status(session_id)` 只读查证，返回相同状态并附 `ok`；两工具复用 self/managed 权限，不 claim、不改 model/settings。状态变化通过 `worker.delayed_restart` WS 事件发布；客户端按 revision 拒绝陈旧事件/响应。 |
+| `POST` | `/api/worker/{worker_id}/steer` | `{"text": "补充指令"}` | 将补充指令注入支持 native Steer 的 running Worker；CBC stream 等待 control_response admission（accepted 不代表已消费），Codex 等待实际 `turn/steer` RPC 回执，Claude 使用 streaming stdin/drain 交接边界。确认后记录 history；结果不明不能自动重发 |
 | `POST` | `/api/worker/{worker_id}/control` | `{"control": {"type": "terminal_input", "process_id": "...", "text": "..."}}` | 向运行中的 Codex 发送终端输入；`terminal_terminate` 可终止对应进程。也支持审批、用户输入、权限和 elicitation 控制 |
+| `PUT` | `/api/sessions/{id}/qq-report` | `{"target":"user:123@456", "enabled":true, "expectedEnabled":false}` | 独立 QQ 完成报告对象；支持 user/group、可选 @bot，返回 qqReportTargets/msgBridgeEnabled。readonly/CAS 拒绝，存盘后才成功；done 发本任务最后 assistant 正文，error 发与 TA→MA 相同的本次 result，一次发送无重试 |
+| `PUT` | `/api/sessions/{id}/msg-bridge` | `{"enabled":false, "expectedEnabled":true}` | 灭钟清空 QQ subscribe/report 与 system/browser；亮钟按 ui.notifications.completionBridge 多选默认开启（旧配置为 system-only）；QQ 默认联系人必须非空且点亮时校验可用性，失败不部分开启。任一 QQ subscribe/report 或 system/browser 开启时 summary.msgBridgeEnabled=true；WeChat/TA→MA 关系独立 |
 | `POST` | `/api/qq/subscribe` | `{"sessionId": "...", "target_type": "user"/"group", "target_id": "..."}` | Pan session 订阅某 QQ 会话 inbox 提醒（`@@@@by qq` 推送到 queue_pending）；等价 MCP 工具 `session_qq_subscribe`（pan server） |
 | `POST` | `/api/qq/unsubscribe` | 同上 | 退订（等价 `session_qq_unsubscribe`） |
+
+> **OS 进程后台 Job 使用政策**（仅 `agent_background_*` 对应的 OS 命令 Job；不适用 Session 消息/群发 Job、Scheduler 与普通派发）：**MA/TA 均适用，执行前自主判断、不需 MA 提醒或另行授权**（命令本身仍遵守既有权限）；一般预计**超过 3 分钟**的命令才用（一般门槛，非运行 timeout、非硬性禁止短任务）；启动后**不轮询**——不循环 GET `/api/background-jobs*`、不 tail 日志、不 sleep/watch/PID 等待，确认启动成功后结束回合进入 idle，等终态通知（`noticeKind=background_job_terminal`）唤醒再核验 status/exitcode 与日志；需要实时观察进度或命令需交互式 stdin 请改前台执行。GET/cancel/retry 保留用于终态后核验与用户明确要求的一次性诊断。详见 SKILL.md §5「持久后台 Job、通知与报告订阅」。
 
 ### 查询
 
@@ -78,12 +190,29 @@ Codex 的 live 增量游标仍由 adapter 的 `codex_prev_usage` 负责；本查
 | `POST` | `/api/sessions/order` | `{"sessionIds": ["ses_a", "ses_b", ...]}`（期望显示顺序；部分重排允许——未列出的 session 按原相对顺序排在列出的后面） | `{"ok": true, "order": [全量 session id 顺序]}`；广播 `session.orderUpdated`。**Dashboard 同层拖拽排序**即此端点 |
 | `GET` | `/api/sessions/{id}/queue` | — | `{"items": [...], "queueRevision": N}`——只含仍 `queued` 的项（`reserved`/`writing`/`sent_to_cli` 不在 pending 视图中） |
 | `POST` | `/api/sessions/{id}/queue` | `{"text": "...", "clientMessageId"?: "browser-uuid"}` | 用户消息**持久化入队**（`source`/`kind` 由服务端强制为 `user`/`task`）；返回 `{"ok": true, "item": {...queueItemId...}, "queueRevision": N, "duplicate": bool}` |
+| `POST` | `/api/sessions/{id}/queue/{item_id}/steer` | `{"expectedRevision": N}` | 服务端取原条目全文及来源，经真实 native Steer 交接后消费原条目一次；要求 running、adapter `supportsSteer`、非 readonly、无编辑 lease/条目锁，且 Pause everything 未开启。拒绝/冲突保留条目；回执不明保留并标记 `steerPending`，禁止自动重发。前端不得提交重造正文或来源 |
 | `PATCH` | `/api/sessions/{id}/queue/order` | `{"orderedIds": [...], "expectedQueueRevision"?: N}` | 重排全部来源（user/agent/report/qq/system）的 queued 项 |
 | `PATCH` | `/api/sessions/{id}/queue/{item_id}` | `{"text": "...", "expectedRevision"?: N}` | 编辑队列项：**仅 user 源 + queued** 可编辑；否则 `queue_item_readonly` / `queue_item_not_editable`；revision 冲突 `queue_revision_conflict` |
 | `DELETE` | `/api/sessions/{id}/queue/{item_id}` | — | 删除仍 queued 的项；已被 Worker claim（reserved/writing/sent）返回 `queue_item_not_deletable` |
 | `POST` | `/api/sessions/{id}/queue/{item_id}/retry` | — | 重试原 `queueItemId`（清除 backoff，不创建副本） |
 
 > Dashboard 拖拽的管理变更（把卡片拖到另一 manager 卡片正中）复用既有端点，不需要新排序端点：`POST /api/claim`（`managerId`=被拖入的 manager，`sessionId`=被拖动的 session），随后 `POST /api/unclaim` 解除旧 manager 关系。`GET /api/sessions?summary=1` 返回的精简字段含 `order`。
+
+### Workspace（会话分组，2026-10-02 补录）
+
+> Workspace 是命名容器。**成员关系只持久化在 management-tree 根 session 的 `workspaceIds`（0 或 1 个）**，被管理后代通过 managedBy 链继承（`effective_workspace_ids`）；同一管理树整体落在同一个 Workspace。`[]` = ungrouped，没有 "default" 分区。MCP 等价工具：`workspace_list` / `workspace_create` / `workspace_delete`，移动成员用 `session_update(workspace_ids=[...])`（复用下表 `PUT /api/sessions/{id}/workspaces`）。
+
+| 方法 | URL | Body / 参数 | 返回 |
+|------|-----|------------|------|
+| `GET` | `/api/workspaces` | — | `{"workspaces":[view]}`；view 含 `id/name/order/dirs/createdAt/updatedAt/sessionCount/sessionIds`（MCP `workspace_list` 去掉成员 id 列表，仅保留 `sessionCount`）。等价 MCP：`workspace_list` |
+| `POST` | `/api/workspaces` | `{"name":"Inbox"}` | `{"ok":true,"workspace":view}`；name 必填/trim/≤128/唯一，否则 `invalid_name` / `name_taken`。广播 `workspace.created`。等价 MCP：`workspace_create` |
+| `GET` | `/api/workspaces/{id}` | — | `{"ok":true,"workspace":view}` 或 `workspace_not_found` |
+| `PATCH` | `/api/workspaces/{id}` | `{"name"?:"...", "dirs"?:[...]}` | 改名 / 改共享目录（`dirs` 必须是已存在的绝对目录，仅元数据不落盘）。广播 `workspace.updated` |
+| `POST` | `/api/workspaces/order` | `{"workspaceIds":[...]}` | 重排 Workspace 显示顺序（部分重排允许）；广播 `workspace.orderUpdated` |
+| `DELETE` | `/api/workspaces/{id}` | — | 从各根 session 清除该 id（后代跟随→变 ungrouped）后删除元数据，**不删 session**；无 dangling id / 跨 Workspace managed 关系。广播 `workspace.deleted`。等价 MCP：`workspace_delete` |
+| `PUT` | `/api/workspaces/{id}/sessions` | `{"sessionIds":[...], "actorSessionId"?:"..."}` | 设置该 Workspace 的成员集合（**move 语义**：成员被移入、移出的根变 ungrouped）；被管理的 session 返回 `managed_session`，须先分离；可选 `actorSessionId` 触发 managed 写权限校验。广播 `workspace.membershipUpdated` |
+| `PUT` | `/api/sessions/{id}/workspaces` | `{"workspaceIds":[...], "actorSessionId"?:"..."}` | 移动单个 session 到至多一个 Workspace（`[]` = ungrouped）。`workspaceIds` 必须唯一且都存在（`invalid_workspace_ids` / `workspace_not_found`）；**`managed_by` 非空的 session 返回 `managed_session`**（硬约束：先 `POST /api/unclaim` 分离，与 Dashboard 拖拽一致）。广播 `session.workspaceUpdated`。**MCP：`session_update(session_id, workspace_ids=[...])`** |
+
 
 ### 导入 / 设置 / Manifest（排查 / 维护用，2026-08-27 补录）
 
@@ -100,6 +229,14 @@ Codex 的 live 增量游标仍由 adapter 的 `codex_prev_usage` 负责；本查
 | `GET` | `/api/manifest/command-routes` | QQ 前缀命令路由列表 |
 | `GET` | `/api/worker/{id}/takeover-command` | 生成终端接管命令 |
 | `POST` | `/api/qq/notify` / `GET /api/qq/contacts` | QQ 插件上报 inbox 更新 / 最近 QQ 联系人（QQ 通道内部使用） |
+
+### Reimport 来源冲突确认
+
+普通 `POST /api/adapters/{adapter}/sessions/import` 使用 `session_id`（native Session ID）及可选 `cwd`。无法无损匹配 Pan queue origins 时不写历史，返回 `errorCode: reimport_origin_conflict` 和 `conflict`：`sessionId`、`historyRevision`、`count`、`items`、`omittedCount`、`confirmationToken`、`stale`。每个 item 含从 1 开始的 Pan 历史 `position`、`messageId`、`source`、`reason`、`preview`；最多 20 项，每个预览最多 160 字符。原因包括缺失身份、原生同身份正文变化、歧义匹配、缺失或变化。
+
+前端复用确认 Modal 展示摘要。取消不发覆盖请求；用户明确确认后，原请求加 `force: true`、`panSessionId` 和此次 `confirmationToken`。覆盖以 native 顺序和内容为准，保留可证明匹配的 Pan 元数据；无法匹配的 Pan 消息及其 task/source/envelope/parts 信息可能丢失，弹窗明确提示。
+
+确认绑定 Session、当前 Pan 历史 revision/完整内容及 native 历史、usage 和可取得的 rollout 文件快照。过期返回 `reimport_stale`，须重新检查并再次确认；不可复用旧确认覆盖新消息。进程重启也会使 token 失效。`readonly_session`、并发变化、保存失败仍受原保护，force 只允许绕过来源匹配冲突；保存异常仍失败并回滚。MCP `session_import` 不会隐式强制覆盖。
 
 ## 核心编排端点请求体（直调 / 排查用）
 
@@ -132,7 +269,9 @@ HTTP JSON body 用 **camelCase**，MCP 工具参数用 **snake_case**——同�
 | 思考开关 | `alwaysThinkingEnabled` | `alwaysThinkingEnabled` | `always_thinking_enabled` |
 | 最大思考 tokens | `maxThinkingTokens` | `maxThinkingTokens` | `max_thinking_tokens` |
 | MCP 开关 | `mcpEnabled` | `mcpEnabled` | `mcp_enabled` |
-| MCP servers | — | `mcpServers` | `mcp_servers` |
+| MCP servers (legacy) | — | `mcpServers` | `mcp_servers` (v2 derived physical connections) |
+| Plugin selection | `plugin_bindings` | `pluginBindings` | `plugin_bindings` |
+| Plugin revision guard | `expected_plugin_revision` | `expectedPluginRevision` | `plugin_selection_revision` |
 | 工作目录 | `workdir` | `workdir` | `workdir`（两边一致） |
 
 **要点**：`POST /api/sessions` 返回的 `id` 与后续所有请求体的 `sessionId` 是**同一个值**（`ses_...`）。响应字段叫 `id`，但 spawn/assign/task 的 body 一律用 `sessionId`（MCP 里是 `session_id`）——不要照抄响应字段名传请求。
@@ -155,3 +294,362 @@ Windows 下 `curl -d '{"text":"中文…"}'` 内联中文 body 会报 `{"detail"
 - **结束条件**：`lastResult.status` 变为 `done`（读 `result`）或 `error`（读 `result` 排查）→ 停止轮询。
 - **放弃条件一（worker 已死）**：轮询中发现 `workerStatus` 变 `null` 且 `lastResult.status` 仍是 `queued`/`running` → watchdog 已回收或进程已死，任务不会继续 → 停止本轮，`agent_spawn` 后重新 assign。
 - **放弃条件二（超时预算）**：为每轮任务设总预算。stream running 卡死判定基于**任务运行时长**（`worker.task_timeout_sec` 默认 1800s，见 SKILL.md §7.3），queued 静默超时 300s（`config.example.json`）、运行环境 config.json 实测 1200s——**轮询超过任务时长上限没有意义**：worker 要么已产出结果，要么已被 watchdog 判定卡死 kill。简单任务预算 60–120s；复杂任务预算取 `worker.task_timeout_sec` + 余量。到点仍无结果且 worker 存活 → 停止盲目轮询，先查卡死原因再决定重发。
+
+## 插件面板（pan-plugin/v1 扩展）
+
+`GET /api/plugins/panels` 返回注册的全局 View Entry；`POST /api/plugins/{plugin}/panels/{panel}/actions/{action}` 调用该面板声明的 capability，body 为 `arguments` 与可选 `requestId`。`write_external` 必须使用稳定 requestId，结果未知时先核对状态，不能自动重放。面板与 Session 的 MCP 勾选互相独立，不为面板启动 Worker。数据目录、版本与 Agent 能力白名单见 [面板协议](../../../design/Pan-Plugin-Panels-v1.md)。
+
+
+### Orphan workdir retention
+
+- `GET/PUT /api/settings/data-retention`: includes `policies.workdirs` (`enabled: false`, `days: null` by default). Days must be null or an integer 1–36500. Enabled with null days does not clean. Jobs policies remain separate.
+- `POST /api/settings/workdir-retention/preview`: exactly `{"days": 30}`. Runs in a background thread and returns `candidates: [{name, path, modifiedAt, entries}]`, `scanned`, `deleted`, `skipped`, `skipReasons`, `error`, `completedAt`, `results`.
+- `POST /api/settings/workdir-retention/delete`: exactly `{"days": 30, "names": ["orphan-name"]}` (1–2000 names). Only single direct-child names are accepted, never paths. Returns individual `results: [{name, deleted, reason?}]` plus counters/errors. All safety checks repeat; preview is not an authorization token. Deletion never removes Sessions. Partial failures are reported per item.
+- Default-root-only, recursive newest mtime; all archived/offline Session and Workspace overlapping paths protect directories. Unsafe links/reparse points and unknown references fail closed. Traversal is bounded (2,000 root entries, 100,000 tree entries, 2,048 directories per tree, 20-second traversal budget); reference stores are capped at 10,000 entries and 8 MiB per metadata file and 32 MiB total per reference store. Errors/skip reasons are observable. Session retention preserves workdirs unconditionally.
+
+- Concurrency: a stable reference snapshot is loaded once for preflight, then re-read for each claimed deletion. Claims are admitted only when no reference transaction is active and its generation still matches preflight. The short coordinator mutex never covers filesystem IO or store/ticket waits. Under an active claim, new overlapping Session/Workspace references fail immediately; unrelated writes proceed. Failed cleanup releases its claim; only successful deletion is retained in a bounded 256-entry completion cache. Missing paths in registered cleanup roots stay rejected after completion-cache eviction; root scopes are capped at 32 (excess scopes fail closed). Snapshot/claim conflicts fail closed and can be retried. Workspace `dirs` reads return copies; changes must use the update operation.
+
+### Explicit Wake and persistent Illegal message admission (2026-10-20)
+
+`POST /api/sessions/wake` accepts `{ "sessionIds": ["ses_..."], "clientMessageId": "stable-per-action-id" }`, with existing optional `source` and `sourceSessionId` access metadata. Per-Session results distinguish queued and error; queued means durable acceptance, not CLI delivery. It atomically enqueues the Behavior `wakeMessage`, releases only that new message's Illegal lock and places it first. It respects Pause, Manual/report locks, leases and native ownership, and does not interrupt handed-off execution. Reusing the same id never unlocks or reorders the original again.
+
+The shared `GET/PUT /api/settings/session-lifecycle` now includes `wakeMessage` (nonblank, maximum 32000 characters, default `继续`). Scheduled recovery resolves it at fire time. Ordinary broadcast/send/notify/assign remain ordinary messages: while Illegal they acquire Illegal locks, including plugin and Job notices, and cannot recover the Session by themselves. Manual Start or an explicitly unlocked message permits a ready successor to restore the incident; startup failure never clears it. An empty Illegal Session also remains dormant.
+
+
+### Filtered Session history reads (2026-10-21)
+
+- `GET /api/sessions/{session_id}?historyRoles=user,assistant,tool&toolOutput=command_only&historyLimit=50&before=0` activates the MCP body projection. Omitting `historyRoles` preserves the existing Dashboard/full API. An empty `historyRoles=` selects no bodies. Valid roles: user, assistant, tool, thinking. Valid tool modes: command_only, include_output.
+- `GET /api/sessions/{session_id}/messages/{message_id}?roles=user,assistant,tool&toolOutput=command_only` reads one unique existing durable Pan ID in that Session with the same projection. Legacy/native/positional IDs are not promoted. No persistence or ID backfill occurs.
+- Positive limits apply after filtering and cap at 200; 0 preserves full selected history compatibility. Prefer 50 for bounded JSONL reads. Retained page references are O(limit); scans remain O(history rows), and a legacy embedded JSON file must be parsed in full. `historyTotal` is canonical total; `historyFilteredTotal` is selected total. `historyStart`/`nextBefore` are canonical exclusive pagination positions, never message identities. Continue with unchanged options until nextBefore is null. Restart after epoch/revision changes; appends preserve older positions, replacements may not. A concurrent disk mutation yields history_changed.
+- Body rows expose role/content/messageIndex, existing canonical messageId with identityKind=persistent, or identityKind=legacy_unaddressable without a fabricated ID. No parts/rawContent/output passthrough. command_only exposes a canonical tool name and explicit command/cmd strings only; opaque/truncated calls omit arguments. include_output returns stored content only. Result metadata omits body previews and provider extras; lastResult.result is present only when assistant is selected.
+- Errors are explicit `{ok:false,error:{code,message}}`: invalid_params, invalid_message_id, session_not_found, message_not_found (including cross-Session and ambiguous IDs), message_filtered, history_changed, history_unavailable. HTTP remains a trusted local admin interface. MCP session_get/session_message_get enforce existing managed access before any target read; do not invent an HTTP manager parameter as authentication.
+
+
+### Agent Session history search (2026-10-21)
+
+`session_history_search(session_id, query, limit=50, cursor=None, roles=None, tool_output="command_only")` wraps the existing `GET /api/history/search` with `sessionId`, `q`, `limit`, `cursor`, `roles`, `countMode=messages` and `toolOutput`. Session scope is required; MCP checks managed read permission before every request. It never passes prepareLegacy or launches indexing jobs.
+
+The existing HTTP default remains `toolOutput=include_output` for compatibility. The new optional `toolOutput=command_only` works in indexed messages mode and selects an internal lazy command projection partition in the same disposable SQLite index. It reuses history_read.command_content: only canonical tool names and explicit command/cmd strings are searchable/excerpted; arbitrary tool arguments, outputs and parts are excluded before matching, limiting and cursor advancement. Public hit roles remain tool, with the original Pan messageId and canonical index. The raw and projected partitions have distinct query cache keys. Internal tool_command is not a public selectable role. Content occurrence-count mode rejects command_only with 422; its existing behavior is unchanged.
+
+MCP defaults to roles user/assistant/tool; thinking and full stored tool content require explicit options. Queries are trimmed case-insensitive literal substrings up to 512 characters; limits clamp to 1..100 (default 50). Snippets use the existing 42-character context radius around the query. Only existing durable Pan IDs are returned; legacy rows without one are skipped without writes/backfill. Empty query/roles return an empty page. Hit bodies/parts are not included. Use session_message_get to read a selected hit with matching options.
+
+Reuse nextCursor with the same scope/query/limit/roles/tool mode until null. The existing signed, 15-minute cursor now also binds tool projection; old cursors without a mode retain include_output semantics. History changes, projection changes, index rebuild/signing-key changes, or invalid cursors produce 409 detail.code=history_search_cursor_expired. Other existing HTTP errors pass through (including error="Session not found", 422 validation and 503 history_search_unavailable). HTTP itself remains a trusted local admin interface, not a manager-authenticated endpoint.
+
+Schema 4 adds an internal tool_command FTS partition and permits raw/projected rows for the same persisted ID. It rebuilds only the disposable search index through the existing lazy schema path. Canonical history, Session persistence, verified append proofs, query reference bounds and existing FTS/short-literal matching engine remain authoritative/unchanged. No new database file, background indexing task or polling is introduced. Initial/rebuild indexing can load full Session history; result output alone is bounded.
+
+
+### Model catalog (2026-10-21)
+
+`model_catalog(adapter=None, session_id=None)` wraps `GET /api/model-catalog?adapter=<registered-name>`. Omit adapter for separate directories of all registered adapters. MCP checks the explicit Session or bound PAN_AGENT_SESSION_ID with existing managed-access logic before requesting metadata; HTTP remains trusted local admin. An unknown adapter returns unknown_adapter; blank explicit MCP adapter returns invalid_params. The original model_list, /api/models and /api/adapter/config interfaces are unchanged.
+
+The response has `ok`, `adapters`, and `availability="metadata_only_not_provider_verified"`. Each directory exposes model IDs with per-model effort and creditMultiplier states, modelList provenance/cache freshness, defaultModel, adapterEffortValues, supportedSettings, executionModes and declared adapter capabilities. Value states contain value/status/source/scope. Missing booleans are null/unknown; literal false, explicit empty lists and zero multipliers are preserved. Adapter-wide values never establish per-model support.
+
+Only already populated process `_cached_models` or literal supported_models are read. Dynamic discovery/default/effort/multiplier properties are not implicitly invoked. A cold dynamic list is unknown with an empty result, not known unavailable. Cached model names retain their existing selection scope; catalog performs no account scan. The optional adapter model_catalog_metadata hook must be credential-free and only return non-secret model declarations. The Codex implementation reuses its existing per-model models_cache.json effort parser; arbitrary fields and hidden models are not exposed.
+
+modelList.source names the projected adapter cache/declaration; modelList.origin is unknown when the cache did not retain original provenance. `freshness.status` is fresh/stale only when an existing monotonic cache timestamp and TTL are available; ageSeconds/ttlSeconds describe the process cache, and sourceUpdatedAt remains null rather than inventing an upstream timestamp. Other freshness is unknown. Dynamic CBC credit multiplier refresh reads credentials to bind current-account data; this endpoint never calls it or exposes its unbound warm cache. Its multiplier value/source/freshness therefore remain unknown, without a default x1. Existing literal multiplier maps may be projected with unknown freshness. These are metadata declarations rather than live availability or pricing guarantees.
+
+The read runs off the event loop, does not mutate/invalidate caches, does not launch CLI/provider/model requests, and introduces no new polling or database. Unsafe/missing sources and safe hook errors degrade to unknown without raw exception strings. A whole adapter projection failure returns that adapter with status=unknown and empty models, preserving other directories.
+
+
+### Own report status and consumption (A8, 2026-10-21)
+
+MCP `report_status()` wraps `POST /api/self-queue/report-status` with exactly `{}`. `report_consume(item_id=None)` wraps `/api/self-queue/report-consume`: `{}` selects/forces a batch, `{"itemId":"original-ID"}` only queries its receipt and never retries. Other arguments (including Session overrides) are rejected. Bound stdio supplies `X-Pan-Queue-Caller`; existing loopback/local-process, no Origin/Fetch and resolvable own Session gates apply. Remote/SSE cannot lend local identity. This is the existing local-process assertion, not a new remote authentication system.
+
+Status returns `{ok:true,sessionId,reportSubscriptions,agentReportsPaused}` from persisted configuration without liveness/relationship repair or queue counts. `report_next` and its HTTP operation are removed; `report_ack` is not implemented. User spelling report_comsume maps to report_consume, with no alias.
+
+Consume uses the existing TA report classifier (not Job/notice/channel). It skips unprocessable or missing-ID rows without exposing IDs/counts. Existing Illegal/manual/Stop-report row locks, Pause, readonly, edit leases, native ownership and uncertain/reserved/retry gates are authoritative. Future report pause configuration is not an extra row lock. An active edit lease prevents aggregation/Steer. No gate is unlocked. A frozen batch whose member becomes unavailable is not split.
+
+Selection/reordering and `reportConsumeIds`/self-consume intent on the ORIGINAL rows are persisted in one ordered writer ticket with rollback before delivery on failure. Eligible reports move to the front in original order; other rows retain relative order. `reportConsumeIds` are the existing member IDs, not a new identity/inbox. Both ordinary queue selection and native Steer resolve this exact unit; one native control message and one normal formatted history row preserve all original `queueItemIds`, delivery keys, per-row sources/task identity and envelopes. Automatic Force skips frozen batch rows to avoid independent reordering. Actual ordinary and batch Steer handoff share the Action Session/Group reservation with unbuild/settings/startup. Steer acquires it in spawn-then-Session order, rechecks loaded pins after waiting, and keeps it until the write/drain/receipt owner retires, including cancellation. Spawn/queue locks are released before waiting on provider I/O. Normal reservation rechecks the exact unit and revisions; final write rechecks gates. Settings changes may block delivery after queuing, without deleting the batch.
+
+A no-argument call shares a server-owned attempt with simultaneous callers. An unfinished batch takes precedence over creating another batch. Running/capable routes to batch Steer; running/non-Steer uses existing Force restart; idle/queued uses ordinary wakeup independent of Steer capability; absent Worker uses existing creation/recovery. Lifecycle/delayed restart priority remains. The request can be interrupted by its own handoff, so retain returned original itemId or inspect identity-only own queue and query it. There is no new report copy or enqueue operation.
+
+Metadata-only receipt: `{ok,status,itemId,queueItemIds,retryable:false}`. accepted means durable CLI admission, not MA processing/model completion. queued/pending/unknown/unconfirmed are not success. Query using any original member ID resolves the same frozen unit and never writes to CLI. Actual policy/edit locks still hide receipt identity with item_unavailable. Missing/expired/non-batch IDs are unavailable; receipts use existing bounded ledger retention (TTL/count), with membership preserved in metadata compaction. After expiry, queries cannot establish prior acceptance and never recreate an item.
+
+Native rejected receipts retain the original queued batch; a subsequent ordinary handoff can use it safely. Unknown controls retain each member's queueSteerPending; ordinary writes persist selfConsumeAttempted before the write and recover ambiguous writes as selfConsumeUncertain. Neither can be automatically retried or regrouped. An original-ID query is observational, not an explicit retry command: it never writes CLI or saves Session state. For accepted memory state it reads the existing durable ledger to verify each member; insufficient persisted proof yields unconfirmed. The original persistence owner, not the query, repairs failed writes. Before-write persistence failures retain/roll back queued rows without creating history. Successful provider handoff alone appends body/history and records each member sent_to_cli, removing originals; receipt persistence uncertainty is reported unconfirmed, not falsely accepted.
+
+Consumption can hydrate the existing own Session history before taking row references, because native runtime validation and the Worker lifecycle use the full canonical Session. This is not a bounded-memory history read operation; responses remain metadata-only. Structured report parts that the native Steer contract cannot preserve are skipped on that route.
+
+No response contains report result/body/snippet/parts/attachment text. `self_queue_read` now projects TA reports as identity/type/source only; non-report messages retain existing read behavior. Use consume first, then real handoff/history to determine when report text entered agent context. No ack, parallel inbox, polling, queue deletion/unlock or history rewrite is added.
+
+
+### Session Operation query template
+
+`GET /api/actions/session-operation-template` 返回 disabled 普通 Action 模板、
+`queryFields/queryPredicateSchema/limits`，不读取 Session 或执行操作。
+现有 Action draft/source 接口接受 `execution:{kind:"session_operation",
+operation:"pause_everything",selector:{mode:"query",query:Predicate}}`。
+Predicate 使用 and/or/not 或 field/op/value；七字段、类型约束与 8/64/2048/256
+深度/节点/候选/结果限制见 `docs/design/Event-Trigger-Action-v0.1-core-contract.md`。
+Agent 草稿强制关闭、Trigger token 管理与 Group/provider 安全门禁不变。
+
+
+## Durable Automation Events
+
+- `GET /api/automation` adds `storage.events` and `storage.runs`: usage, caps,
+  warning/full, pending/overduePending and default retentionSeconds=604800.
+- `GET /api/automation/events?after=0&limit=20`: ascending sequence cursor,
+  limit 1..100, returns `{events,nextAfter,storage}`. Each entry includes the
+  original event, frozen Trigger revisions, pending/delivered, deliveryCount and
+  lastError. It does not execute anything or grant publication rights.
+- `POST /api/automation/events/replay`, user Bearer and exactly `{eventIds:[...]}`:
+  1..100 unique retained IDs, returns `{scheduled,automaticRunRetry:false}`.
+  Missing/expired or uncertain-associated events ->409. No new Event or Run attempt
+  is created; existing failed/succeeded/cancelled Runs stay deduplicated.
+- `POST /api/automation/events/maintenance`, user Bearer: fixed seven-day policy,
+  returns `deletedEvents/deletedRuns`. No caller-controlled delete range.
+
+There is no public event publisher. Production plugin publication commits before
+acknowledgement; at-least-once covers Event-to-Trigger matching, with retained
+Event+Trigger dedup. Live plugin subscriptions remain best effort. Capacity blocks
+new admission rather than dropping pending facts/uncertain Runs. Details and
+migration risks: `docs/design/Event-Trigger-Action-v0.2-event-store.md`.
+
+
+## Automation scheduling and uncertainty recovery
+
+Complete Job Template backend routes are distinct from schedule presets:
+`GET /api/jobs/action-jobs/schema?actionId=...`, `GET/POST /api/jobs/action-jobs`,
+`PUT/DELETE /api/jobs/action-jobs/{id}`, revision-checked user `run-now`/`cancel`,
+`GET/POST /api/jobs/job-templates`, `PUT/DELETE /api/jobs/job-templates/{id}` and
+user-only `POST /api/jobs/job-templates/{id}/instantiate`. Instantiate accepts only
+`{expectedRevision,idempotencyKey,overrides?:{name?,description?}}`. Agent writes
+disabled complete drafts only; no arbitrary Action fields or API dispatch escape.
+Persist the idempotency key across an unknown response;503 pending includes jobId.
+GET `/api/jobs/action-references/{actionId}` gives deletion reference locations.
+Generic legacy mutations reject these protected Jobs. Full body/schema/default,
+snapshot cleanup and migration rules are in
+[`Event-Trigger-Action-v0.4-job-templates.md`](../../../design/Event-Trigger-Action-v0.4-job-templates.md).
+
+Unified Job policies are part of the complete `config`, not extra Action fields:
+`trigger:{kind:immediate|once|interval|cron|event|schedule,query?,eventTypes?}`,
+`completion:{kind:ordinary|monitoring,signalType?}`, `recovery:{enabled,monitoring,
+maxAttempts,backoffSec:[5,15,60],stableResetSec:300}`,
+`overlap:{mode:forbid|queue|parallel,parallelLimit:3}`,
+`notification:{target:job,on:[completed,failed,cancelled,unknown,uncertain,cleaning],sessionIds?:[...]}`.
+Immediate/event use empty schedule; event query is the existing fail-closed
+seven-field Session predicate. Policy defaults are no recovery/ordinary/forbid.
+Monitoring requires Action capability; parallel monitoring is rejected.
+`GET /api/jobs/action-jobs/{id}/runs` returns Attempt history and lastExecution.
+`POST /api/jobs/action-jobs/{id}/retry` (failed) or `/confirm-recovery`
+(unknown/uncertain) requires user Bearer and exactly
+`{expectedRevision,confirm:true}`. They preserve Run ID, allocate a new Attempt,
+never silently retry unknown process identity, and return409 when state changed.
+All Job edits use returned `configRevision`; terminal status is withheld while
+`snapshotCleanup:pending`/`status:cleaning`. Notification recipients are separate
+from business arguments; existing durable notice gates remain in force.
+
+Agent MCP `job_config_drafts(operation:list|schema|put|runs,...)` exposes the same
+backend schema and disabled Job/complete Template draft path. It rejects enabled
+configs and offers no instantiate/run/recovery or privileged lifecycle capability.
+Old Job MCP/HTTP entry points remain compatibility adapters and report `unified`
+with product System Action references; unknown historical kinds never gain recovery.
+
+`GET /api/automation/schema` supplies the strict scheduling fragment and limits.
+Trigger writes accept `executionMode` (serial default/parallel), `maxConcurrency`
+(serial1; parallel default3/range1..32), `retry:{enabled:false,maxAttempts:3}`
+(total attempts1..10, including first). Unknown fields/types reject. Omitted additive
+fields preserve an existing policy for old clients. Changing concurrency requires
+user Bearer/revision even on disabled drafts; reducing below running count ->409.
+Action `idempotent` defaults false; Agent drafts remain disabled.
+
+Failed automatic retry requires frozen idempotent eligibility and original/current
+retry opt-in, persists retry_wait/nextAttemptAt, with1s exponential backoff capped60s.
+Run attempt IDs/history remain separate under one logical Run ID. Disable cancels
+queued/retry_wait, never replays history on reenable. Cancel API accepts retry_wait.
+
+`POST /api/automation/runs/{id}/confirm-recovery` requires user Bearer and exactly
+`{expectedRevision:N,confirm:true}`. Current uncertain revision only; returns `{run}`
+queued with same ID and a new attempt at claim. Authentication401, malformed400,
+missing404, stale/non-uncertain/disabled/capacity/budget409. Explicit confirmation
+accepts potential repetition of unknown effects even with automatic retry disabled;
+it never promotes eligibility. This is not an Agent tool. Query IDs and confirmed
+successful target results are reused. Token expiry/logout after admission does
+not revoke execution or bypass business gates. Full contract and migration caveats:
+`docs/design/Event-Trigger-Action-v0.3-retry-scheduling.md`.
+
+`GET /api/diagnostics/runtime-issues/schema` returns the v0.3 RuntimeIssue/Event
+contract. Native/provider samples keep observation, classification and delivery
+outcomes separate. Codex quota exhausted, Codex capacity and CBC rate limiting are
+distinct; generic 429 and tool failures remain unknown. Mapping is diagnostic only
+and does not change retry, account, restart or recovery behavior.
+
+The v0.3 quota policy foundation provides user-Bearer management at
+`GET/PUT /api/automation/quota-policy` and protected query Job creation at
+`POST /api/automation/quota-policy/query-jobs`. PUT requires exactly
+`{mode:"manual"|"automatic",maSessionId,expectedRevision}`; query Job creation
+requires exactly `{kind:"monitor95"|"once",expectedRevision}`. Default mode is
+manual and the production adapter is unavailable. Unknown/stale account windows
+never trigger switching. No issue injection or arbitrary command endpoint exists.
+See `docs/design/quota-policy-v0.3.md` for the ledger/Job/receipt contract and
+remaining managed-account/provider integration boundary.
+### Quota policy safety revision
+
+`PUT /api/automation/quota-policy/disabled-accounts` requires user Bearer and exactly
+`{disabledAccountIds: string[], expectedRevision: integer}`. IDs are unique, <=128,
+nonempty <=256 chars; unknown account IDs may be disabled before inventory can see
+them. Invalid input400/auth401/stale409/persistence503. GET the existing policy
+endpoint for `disabledAccountIds` and `accountConfigRevision`; these are separate
+from capacity `excluded`. No reset/recovery can clear user-disabled accounts.
+Changed lists increment epoch and fence pending recovery commands/Jobs. Product
+defaults contain no user IDs. Adapter/Worker command contract is v2; missing owner,
+process birth or unfinished-task evidence blocks recovery rather than guessing.
+See [quota policy safety](../../../design/quota-policy-v0.3-safety.md) for the exact
+inventory/receipt contract and production wiring boundary.
+
+### Default-off quota host projection
+
+`PUT /api/automation/quota-policy/host` requires user Bearer and exactly
+`{enabled:boolean,sessionRoles:{sessionId:"ma"|"ta"},expectedRevision:integer}`.
+At most256 explicit roles; no inference from Session names. Defaults are disabled
+and empty roles. Invalid400/auth401/stale409/persistence503. Changing this config
+increments policy epoch and fences old recovery plans; it does not enable effects.
+GET policy includes `host`, adapter `unavailable` (disabled) / `host-readonly`, and
+the last `hostObservation`. Provider, managed default and native profile/windows
+are separate identity domains. Policy quota now uses official provider IDs and
+`identityDomain:"cc-switch-provider:codex"`; compatibility currentAccountId and
+accounts[].id refer to provider IDs, never auth status IDs. Unverified Worker
+provider identity remains unknown independently. Native status requires fresh observedAt AND receivedAt and both valid
+fiveHour/week windows with future reset. GET does not run a new query; use the
+existing once/monitor95 query Job API after opt-in. No CLI args, credentials,
+account binding, mutation port or effects-enable flag can be provided by clients.
+Production switch/model/restart/send effects remain unbound. See the exact
+[host adapter contract and remaining wiring](../../../design/quota-host-v0.3.md).
+The [provider source contract](../../../design/quota-provider-identity-v0.3.md)
+defines bounded all-official sampling, disabled exclusions, strict window/time
+validation, provider before/after checks and the pending explicit launch binding.
+
+Trusted fixed new-Worker binding is an internal opt-in lifecycle path, not an HTTP
+verified flag. See [launch binding](../../../design/provider-launch-binding-v0.3.md).
+Existing Session execution-operation persistence may include a completed safe
+provider-launch operation with providerLaunchBinding (domain/ID, digests, epoch,
+Worker/generation, process birth and thread receipt); no config body/capability.
+Host inventory consumes only its matching live owner. A copied historical record
+does not grant startup identity or unfinished-task eligibility. No new effect or
+launch-export endpoint is exposed in this batch.
+
+
+## Agent Inbox / Router / Locker v1
+
+Unified Job compatibility keeps these containers separate: `/api/jobs/action-jobs`
+and `/job-templates` retain user-Bearer enable/instantiate/recovery; Agent Template
+drafts require both outer `enabled:false` and `config.enabled:false`. Inbox MCP
+self/managed access does not grant these operations. Job result notices use their
+existing per-Attempt queue event ID, never Locker shared consume/subscribe APIs.
+Legacy Job `unified.config` is a disabled review projection, with typed schedule
+and `compatibility:{reviewRequired:true,migrationIssues:[...]}`; top-level legacy
+Job fields remain actual execution state. Unknown/ambiguous schedule fields report
+diagnostics rather than recalculating a date or starting a migrated Job.
+
+共享 Agent Inbox 与 Session Queue 是不同容器。HTTP `/api/agent-inbox` 列出
+Locker；`POST /api/agent-inbox/{list|read|consume|subscriptions|subscribe|mode|backlog|recover}`
+提供共享读取、原子消费与订阅。`POST /api/plugins/{plugin_id}/route` 提供固定内部
+目标 agent_inbox / session_queue；user_inbox 尚未实现，明确拒绝。
+MCP `agent_inbox` 复用 caller self/managed 权限，不提供用户审批或任意执行目标。
+
+全文入目标 Queue 落盘即完成目标接纳，全部固定目标接纳才完成共享消费，不等待 CLI。
+Notification 不携正文、不消费；开订阅及变更模式默认只收新消息，backlog 是显式转发
+操作。逐目标 unknown 必须核对原 QueueID，不得盲目重投。QQ 旧订阅保留并映射全文，
+历史积压不自动回放，QQ history 独立保留。
+
+参数、响应、迁移及恢复边界见
+[Agent Inbox API 与冻结设计](../../../design/Agent-Inbox-Router-Locker.md)，前端结构见
+[JSON Schema](../../../design/Agent-Inbox-Router-Locker.schema.json)。
+
+## User Inbox / Interaction Card 后端契约
+
+基于 Agent Inbox 候选的后续后端批次新增 `/api/interaction-cards` 生产者请求与
+`/api/user-inbox` 用户读取/一次性答复接口。用户端在未注入受信登录验证器时明确503关闭；
+MCP `interaction_card` 导出 create/get/receipt/list_pending/no_answer_needed，不导出用户答复。可选answerInput、可选choice
+triggerRef、通知元数据、幂等与Job/Trigger接纳边界见
+[Interaction Card契约](../../../design/User-Inbox-Interaction-Card-Contract.md)，
+[完整Schema](../../../../packages/interactions/schema.json)。此接口不会自动继续/完成Job，
+也不改变QQ/Agent Inbox/Locker消费状态。
+
+
+### 用户 Locker / Interaction Card 增量（2026-10-23）
+
+`GET /api/user-inbox` 的 cards、`GET /api/user-locker-messages` 的 messages 及对应单条/producer 回执均返回 `relatedMessageId: string | null`。新字段由可信本地 `/api/interaction-card-tools/create`、`/api/locker-message-tools/create` 自动确定，客户端不能传入。卡片 owner 可以是 caller 的受管 Session，定位读取 owner 而非 producer；普通 message 沿用自身 caller owner。普通 HTTP/Router/Job/internal 非 agent 创建保持 null。原 requestKey / messageId+签名命中返回原行，字段不参与签名，不追溯更新。SQLite cards 与 locker_messages 分别 ALTER TABLE 新增可空 related_message_id，既有行保持 NULL。
+
+
+User Inbox 是独立 `/react/locker` panel，页面只称 Locker；不与 Session Chat History 或 Agent Inbox 的消费语义混用。
+`GET /api/user-lockers` 返回 recipient 的真实来源容器和当前 Workspace IDs；聚合 Locker 只是前端按 Workspace 合并原消息的视图。
+`GET /api/locker-unread-summary` 是同源、只读、无需 Bearer 的轻量导航提示接口，返回
+`{"unread": integer, "sessions": {"<sessionId>": integer}}`。`unread` 是聚合总数，`sessions`
+只给出有未读的来源 Session 计数（无未读的 Session 不出现，不补 0）。服务端用 SQLite
+`COUNT(*)` 汇总 cards、locker messages 和已回答且未读的 user reminding cards；未回答的
+reminding card 不计入。它不返回正文、标题、卡片 ID、Locker 名称或 owner 名称，唯一标识是
+Session 列表本身已公开的 Session ID。这个有意的 tradeoff 是：同机同源页面可以在登录握手前
+显示聚合数字与逐 Session 计数，但所有 Locker 内容、read/delete 和逐项读取仍必须经过现有
+User Bearer 认证接口。
+`PUT /api/user-inbox/{id}/read {read:boolean}` 修改原消息 read/unread；没有消费游标。
+`POST .../submit`（Respond 请求）与 `POST .../reject`（仅 requestId/expectedRevision）原子竞争一次性 response，之后只读。
+拒收保留卡片，内部 outbox 使用稳定 QueueID 向来源 Session 发 summaryBody 前 200 字符；返回 Card.rejectionDelivery 显示通知接纳状态，unknown 不盲目重投。
+`DELETE /api/user-inbox/{id}` 仅删除终态用户记录，不通知，留最小 tombstone；内部未确认投递和生产者回应回执保留。
+`GET /api/interaction-cards/{id}/receipt?ownerSessionId=...` 与 MCP `interaction_card(operation=receipt)` 为来源归属读回执，用户删除后仍可核对。
+全部用户入口复用运行中 Automation UserAuth（或受信宿主 principal verifier）；缺认证宿主=503，错/缺 Bearer=401，其他 recipient=404，绝不借用 MCP/Session 身份代答。schema/API/迁移/UI/运行时边界见 `docs/design/User-Inbox-Interaction-Card-Contract.md`。
+
+带 choice trigger 的创建由服务端产生不可变 `Card.trustedChoices[choiceId]`：固定 Trigger revision、Action digest、arguments、targetIds、authorization 和可信 operation 摘要。生产者不得提供该字段。范围外目标403；动态/不可证明目标或旧未绑定 choice 409 incomplete；定义变化409 stale。当前绑定只支持能证明 Session 范围的 explicit Session Operation；无 trigger 的普通卡片不受影响。前端显示可信摘要、目标和参数映射。提交通知 CLI JSON 包含 cardId、responseKind、可选 answer/choiceId、最多200字符 summaryBody；完整正文/附件不转发。unknown 只核对原回执，不能重新 submit。
+
+### Profile-wide Agent authorization (four objects)
+
+User Bearer management is independent of the profile-wide Agent grant matrix.
+`GET /api/automation/authorization` returns `authorizationRevision`/`permissions`;
+`PUT /api/automation/authorization/permissions` requires user Bearer and
+`{expectedRevision,permissions}`. Defaults are all false. The four objects are
+Trigger, Action, passive Job Template and Action-reference Job only.
+
+Core MCP `authorization_objects` and existing four-object draft tools use the
+existing private plugin IPC transport, never the user's password/Bearer or a
+self-reported HTTP identity header. Operation mappings, CAS, system immutability,
+revocation and fixture contracts are documented in
+[`Authorization-Profile-Agent-Matrix.md`](../../../design/Authorization-Profile-Agent-Matrix.md).
+
+### Ordinary Locker Message producer (2026-10-24)
+
+MCP `locker_message(operation="create", message={messageId,role,content,ts,...})`
+uses only its bound local stdio caller as source, defaults to this profile user,
+and never copies into Chat or Session Queue. Get by the original source message
+identity: `locker_message(operation="get", message_id="...")`. Same ID/document
+is idempotent; changed contents conflict. Unknown outcomes require lookup, never
+automatic resend. The existing schema endpoint declares LockerMessageProducer.
+The same-user loopback bridge rejects remote/SSE/browser callers and source or
+recipient overrides. See [ordinary Locker contract](../../../design/user-locker-messages-internal-v1.md).
+
+
+### Interaction Card 生产者待答清理
+
+本地 stdio `interaction_card(operation="create")` 走 `POST /api/interaction-card-tools/create`，从既有本地 caller 桥接身份记录可信 producer。相同身份重试不补绑创建者。旧 `/api/interaction-cards` 创建仍兼容，但 payload 的 producerSessionId/ownerSessionId 不赋予新清理权限；历史无可信 producer 的卡片保持可读、可回答，不猜测创建者。
+
+- `POST /api/interaction-card-tools/list_pending {limit?:1..500,after?:cardId}`：只返回 caller 自己创建、未终态且无执行意图的 cards 与 nextAfter；每项有稳定 id/revision/status。禁止 owner/managed/recipient override。游标沿用原卡片 ID，已被删除的游标返回 not_found。
+- `POST /api/interaction-card-tools/no_answer_needed {cardId,expectedRevision}`：原子 CAS 进入持久 `status=no_answer_needed`；重复同一标记幂等。拒绝已答复/拒绝/执行中/unknown 的卡片，不能取消 Action。请求没有用户答复、choice 或通知副作用。
+- 以上是沿用 Locker stdio 的 same-user loopback caller assertion，拒绝浏览器 Origin/Sec-Fetch、非 loopback 或无有效 Session caller；MCP SSE/远端不能转借身份。不是远程登录或用户 Bearer。
+- 无需回答卡片留在原混排列表，明显标示终态，只允许用户 Bearer 删除。submit/respond/reject/read/dispatch 均 409，无恢复操作，Agent 不获得删除权限。GUI 延续刷新/focus 机制，并在旧回答得到 409 conflict 后读回原卡片状态。
+# User-created cards (user → owner Session)
+
+These APIs are separate from `interaction_card` and its response/Trigger flow.
+User endpoints require the existing profile User Bearer.
+
+| Method / path | Body / result |
+|---|---|
+| POST `/api/reminding-cards` | `{ownerSessionId,requestKey,kind:"question"|"task",body,attachments:[{id,name,mimeType?,size?}]}` → `{card}`. Owner must exist; attachments/links use the existing Session registry ownership checks. Stable ID derives from user+owner+requestKey; identical retry returns original, changed content/deleted identity conflicts. Body or attachments required. |
+| GET `/api/reminding-cards` | `{cards:[...]}` for the authenticated profile, bounded to 1000 stored cards; one bulk request, no per-card reads. |
+| DELETE `/api/reminding-cards/{id}` | Delete unanswered or completed record; tombstone retained. Final pending deletion stops future reminders. |
+| PUT `/api/reminding-cards/{id}/read` | `{read:boolean}` → `{card}`; only answered cards. |
+| GET `/api/reminding-cards/{id}/attachments/{attachmentId}` | User-authorized registered attachment belonging to this card and owner. |
+| GET / PUT `/api/reminding-cards/settings` | `{minutes:integer}`; default 10, range 1–1440; persisted reminder setting exposed under Behavior. |
+| POST `/api/reminding-card-tools/list_pending` | `{}` → `{cards:[...]}`; trusted local stdio caller only, owner fixed to caller Session; no managed override. |
+| POST `/api/reminding-card-tools/answer` | `{cardId,body,expectedRevision}` → `{card}`; same own-only identity. Nonblank question / possibly empty task; revision CAS, first answer terminal, repeat 409. |
+
+MCP exposes only `reminding_card(operation="list_pending"|"answer",card_id?,body?,expected_revision?)`.
+Card fields include `id,direction:"user",kind,ownerSessionId,lockerId,body,attachments,revision,
+status:"pending"|"answered",answer,read,createdAt,answeredAt`. `createdAt` never changes;
+`answeredAt` is null until first answer and then immutable. Pending cards have no user read control;
+first answer marks unread. Locker counts distinct stored cards; answered UI projects the same record
+at both creation and answer times, with unique position keys and shared card-id actions.
+
+Immediate creation Notification includes the fixed reminder text, body and card id; periodic notices
+contain only “你还有未回答的用户卡片，如果目前仍无法回答，请忽略这条消息并朝着能回答的方向工作，但不要为了回答而随意回答”.
+Reminder admission persists the queue row and invokes normal queue wake/auto-spawn; it never releases
+Illegal or bypasses Pause/locks/leases. A process-owned scheduler waits without polling
+when no pending cards remain; persisted last reminder and stable outbox IDs coalesce missed periods
+after restart. Neither reminder nor answer authorizes or invokes an interaction response or Trigger.

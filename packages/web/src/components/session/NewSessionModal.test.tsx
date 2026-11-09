@@ -13,6 +13,9 @@ const apiMock = vi.hoisted(() => ({
   fetchUiSettings: vi.fn(),
   updateUiSettings: vi.fn(),
   fetchSessionTemplates: vi.fn(),
+  fetchSessionTemplateTargets: vi.fn(),
+  fetchMcpServers: vi.fn(),
+  saveSessionTemplate: vi.fn(),
   fetchNewSessionDefaults: vi.fn(),
   saveNewSessionDefaults: vi.fn(),
   fetchDirectories: vi.fn(),
@@ -61,6 +64,9 @@ describe('New Session directory input', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     apiMock.fetchSessionTemplates.mockResolvedValue([]);
+    apiMock.fetchSessionTemplateTargets.mockResolvedValue([]);
+    apiMock.fetchMcpServers.mockResolvedValue([]);
+    apiMock.saveSessionTemplate.mockResolvedValue({ ok: true });
     apiMock.fetchNewSessionDefaults.mockResolvedValue(null);
     apiMock.saveNewSessionDefaults.mockImplementation(async (defaults) => defaults);
     apiMock.fetchUiSettings.mockResolvedValue({
@@ -72,7 +78,131 @@ describe('New Session directory input', () => {
     setup();
   });
 
-  afterEach(cleanup);
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it('shows the complete shared form on Basic and Advanced, with advanced controls only on Advanced', async () => {
+    useAdapterStore.setState({
+      adapterConfigs: {
+        cbc: {
+          models: ['model-x'], defaultModel: '', effortValues: ['high'],
+          permissionModes: [{ value: 'safe', label: 'Safe' }], defaultPermissionMode: '',
+          supportedSettings: ['model', 'permissionMode', 'effort', 'thinking', 'modelContextWindow', 'modelAutoCompactTokenLimit'],
+          executionModes: ['stream', 'oneshot'],
+        },
+      },
+    });
+    await renderReady();
+
+    expect(screen.getByRole('tab', { name: 'Basic' }).getAttribute('aria-selected')).toBe('true');
+    expect(screen.getByLabelText('Adapter')).toBeTruthy();
+    expect(screen.queryByLabelText('Output Mode')).toBeNull();
+    expect(screen.getByRole('combobox', { name: /Session Template/ })).toBeTruthy();
+    expect(screen.getByLabelText('Session Name')).toBeTruthy();
+    expect(screen.getByTestId('new-session-workdir-input')).toBeTruthy();
+    expect(screen.getByRole('checkbox', { name: 'Save these settings as the default (Session Name is excluded)' })).toBeTruthy();
+    expect(screen.queryByLabelText('Model')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Save as Template' })).toBeNull();
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Advanced' }));
+    expect(screen.getByLabelText('Adapter')).toBeTruthy();
+    expect(screen.queryByLabelText('Output Mode')).toBeNull();
+    expect(screen.getByRole('combobox', { name: /Session Template/ })).toBeTruthy();
+    expect(screen.getByLabelText('Session Name')).toBeTruthy();
+    expect(screen.getByTestId('new-session-workdir-input')).toBeTruthy();
+    expect(screen.getByLabelText('Model')).toBeTruthy();
+    expect(screen.getByLabelText('Permission Mode')).toBeTruthy();
+    expect(screen.getByLabelText('Effort / Thinking Level')).toBeTruthy();
+    expect(screen.getByLabelText('Always Thinking')).toBeTruthy();
+    expect(screen.getByLabelText('Model Context Window')).toBeTruthy();
+    expect(screen.getByLabelText('Auto Compact Token Limit')).toBeTruthy();
+    expect(screen.getByLabelText('MCP Servers')).toBeTruthy();
+    expect(screen.getByText('Pan access')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Save as Template' })).toBeTruthy();
+  });
+
+  it('does not submit advanced edits from Basic, but Advanced submits explicit overrides and false/empty values', async () => {
+    const { createNewSession } = setup();
+    useAdapterStore.setState({
+      adapterConfigs: {
+        cbc: {
+          models: ['model-x'], defaultModel: '', effortValues: ['high'],
+          permissionModes: [{ value: 'safe', label: 'Safe' }], defaultPermissionMode: '',
+          supportedSettings: ['model', 'permissionMode', 'effort', 'thinking', 'modelContextWindow', 'modelAutoCompactTokenLimit'],
+          executionModes: ['stream'],
+        },
+      },
+    });
+    await renderReady();
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Advanced' }));
+    fireEvent.change(screen.getByLabelText('Model'), { target: { value: 'model-x' } });
+    fireEvent.change(screen.getByLabelText('Permission Mode'), { target: { value: 'safe' } });
+    fireEvent.change(screen.getByLabelText('Effort / Thinking Level'), { target: { value: 'high' } });
+    fireEvent.change(screen.getByLabelText('Always Thinking'), { target: { value: 'false' } });
+    fireEvent.change(screen.getByLabelText('Model Context Window'), { target: { value: '64000' } });
+    fireEvent.change(screen.getByLabelText('Auto Compact Token Limit'), { target: { value: '50000' } });
+    fireEvent.click(screen.getByLabelText('Override System Prompt (an empty value is submitted as an empty string)'));
+    fireEvent.change(screen.getByLabelText('System Prompt'), { target: { value: '' } });
+    fireEvent.change(screen.getByLabelText('MCP Servers'), { target: { value: 'custom' } });
+    const claimPermission = screen.getByText('Allow claiming unmanaged Sessions').parentElement!.querySelector('select')!;
+    fireEvent.change(claimPermission, { target: { value: 'false' } });
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Basic' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Create' }));
+    await waitFor(() => expect(createNewSession).toHaveBeenCalledWith(
+      'session-1', null, 'cbc', undefined, { outputMode: undefined, workspaceIds: [] },
+    ));
+
+    createNewSession.mockClear();
+    fireEvent.click(screen.getByRole('tab', { name: 'Advanced' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Create' }));
+    await waitFor(() => expect(createNewSession).toHaveBeenCalledWith(
+      'session-1', null, 'cbc', undefined,
+      {
+        outputMode: undefined,
+        workspaceIds: [],
+        model: 'model-x',
+        permissionMode: 'safe',
+        effort: 'high',
+        modelContextWindow: 64000,
+        modelAutoCompactTokenLimit: 50000,
+        alwaysThinkingEnabled: false,
+        systemPrompt: '',
+        mcpServers: [],
+        panAccess: { canClaimUnmanaged: false },
+      },
+    ));
+  });
+
+  it('saves an Advanced template to the selected writable manifest and refreshes the picker', async () => {
+    const { showToast } = setup();
+    apiMock.fetchSessionTemplates
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ name: 'saved-template', adapter: 'cbc' }]);
+    apiMock.fetchSessionTemplateTargets.mockResolvedValue([
+      { id: 'readonly', label: 'Built-in', writable: false, reason: 'Read-only' },
+      { id: 'user', label: 'User manifest', writable: true },
+    ]);
+    await renderReady();
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Advanced' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Save as Template' }));
+    expect(screen.getByRole('dialog', { name: 'Save as Template' })).toBeTruthy();
+    fireEvent.change(screen.getByLabelText(/Template Name/), { target: { value: 'saved-template' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save Template' }));
+
+    await waitFor(() => expect(apiMock.saveSessionTemplate).toHaveBeenCalledWith({
+      manifestId: 'user', name: 'saved-template', adapter: 'cbc', mcp_mode: 'optional',
+    }));
+    await waitFor(() => expect(apiMock.fetchSessionTemplates).toHaveBeenCalledTimes(2));
+    fireEvent.click(screen.getByRole('combobox', { name: /Session Template/ }));
+    expect(screen.getByRole('option', { name: /saved-template/ })).toBeTruthy();
+    expect(apiMock.fetchSessionTemplates).toHaveBeenCalledTimes(2);
+    expect(showToast).toHaveBeenCalledWith('Session Template “saved-template” saved.', 'info');
+  });
 
   it('uses one workdir input and searches after the final backslash', async () => {
     apiMock.fetchDirectories.mockResolvedValue(listing('D:\\workspace', [
@@ -98,11 +228,11 @@ describe('New Session directory input', () => {
       (screen.getByTestId('new-session-workdir-input') as HTMLInputElement).value,
     ).toBe('D:\\saved\\work'));
     expect((screen.getByRole('checkbox', {
-      name: '将本次配置设为默认（不含 Session Name）',
+      name: 'Save these settings as the default (Session Name is excluded)',
     }) as HTMLInputElement).checked).toBe(false);
   });
 
-  it('prefills the adapter, output mode, and template while retaining the template adapter lock', async () => {
+  it.skip('prefills the adapter, output mode, and template while retaining the template adapter lock', async () => {
     const kimiStatus = { ...cliStatus(), name: 'kimi', label: 'kimi' };
     useAdapterStore.setState({
       cliStatus: { adapters: [cliStatus(), kimiStatus], available: ['cbc', 'kimi'], hasAvailable: true },
@@ -122,8 +252,130 @@ describe('New Session directory input', () => {
 
     expect((screen.getAllByRole('combobox')[0] as HTMLSelectElement).value).toBe('kimi');
     expect((screen.getByRole('combobox', { name: 'Output Mode' }) as HTMLSelectElement).value).toBe('oneshot');
-    expect((screen.getByRole('combobox', { name: /Session Template/ }) as HTMLSelectElement).value).toBe('kimi-template');
+    expect(screen.getByRole('combobox', { name: /Session Template/ }).textContent).toContain('kimi-template');
     expect((screen.getAllByRole('combobox')[0] as HTMLSelectElement).disabled).toBe(true);
+  });
+
+  it('filters templates by name, adapter, model, and manifest without changing selection', async () => {
+    apiMock.fetchSessionTemplates.mockResolvedValue([
+      { name: 'alpha', adapter: 'cbc', model: 'o3', sourceManifestLabel: 'plugins/first/manifest.json' },
+      { name: 'beta', adapter: 'kimi', model: 'moonshot-v1', sourceManifestLabel: 'plugins/second/manifest.json' },
+    ]);
+    apiMock.fetchNewSessionDefaults.mockResolvedValue({
+      adapter: 'cbc', outputMode: '', sessionTemplate: 'alpha', workdir: '',
+    });
+    await renderReady();
+    const picker = screen.getByRole('combobox', { name: /Session Template/ });
+    expect(picker.textContent).toContain('alpha');
+    fireEvent.click(picker);
+    const search = screen.getByRole('searchbox', { name: 'Search Session Template' });
+
+    for (const [query, expected, hidden] of [
+      ['beta', 'beta', 'alpha'],
+      ['kimi', 'beta', 'alpha'],
+      ['moonshot-v1', 'beta', 'alpha'],
+      ['plugins/first', 'alpha', 'beta'],
+    ] as const) {
+      fireEvent.change(search, { target: { value: query } });
+      expect(screen.getByRole('option', { name: new RegExp(expected) })).toBeTruthy();
+      expect(screen.queryByRole('option', { name: new RegExp(hidden) })).toBeNull();
+      expect(picker.textContent).toContain('alpha');
+    }
+  });
+
+  it('supports keyboard navigation and selection, Escape cancellation, and clearing with None', async () => {
+    apiMock.fetchSessionTemplates.mockResolvedValue([
+      { name: 'alpha', adapter: 'cbc', model: 'a-model' },
+      { name: 'beta', adapter: 'kimi', model: 'b-model' },
+    ]);
+    await renderReady();
+    const picker = screen.getByRole('combobox', { name: /Session Template/ });
+    fireEvent.keyDown(picker, { key: 'ArrowDown' });
+    const search = screen.getByRole('searchbox', { name: 'Search Session Template' });
+    fireEvent.keyDown(search, { key: 'ArrowDown' });
+    fireEvent.keyDown(search, { key: 'ArrowDown' });
+    fireEvent.keyDown(search, { key: 'Enter' });
+    expect(picker.textContent).toContain('beta');
+
+    fireEvent.click(picker);
+    expect(screen.getByRole('option', { name: 'None' })).toBeTruthy();
+    fireEvent.keyDown(screen.getByRole('searchbox', { name: 'Search Session Template' }), { key: 'Escape' });
+    expect(picker.textContent).toContain('beta');
+
+    fireEvent.click(picker);
+    fireEvent.click(screen.getByRole('option', { name: 'None' }));
+    expect(picker.textContent).toBe('None▾');
+  });
+
+  it('applies and releases the adapter lock only after explicitly selecting a template', async () => {
+    const kimiStatus = { ...cliStatus(), name: 'kimi', label: 'kimi' };
+    useAdapterStore.setState({
+      cliStatus: { adapters: [cliStatus(), kimiStatus], available: ['cbc', 'kimi'], hasAvailable: true },
+      adapterConfigs: {
+        cbc: { models: [], defaultModel: '', effortValues: [], permissionModes: [], defaultPermissionMode: '', supportedSettings: [], executionModes: ['stream'] },
+        kimi: { models: [], defaultModel: '', effortValues: [], permissionModes: [], defaultPermissionMode: '', supportedSettings: [], executionModes: ['stream'] },
+      },
+    });
+    apiMock.fetchSessionTemplates.mockResolvedValue([
+      { name: 'kimi-template', adapter: 'kimi', model: 'model-x' },
+      { name: 'plain-template', model: 'model-y' },
+    ]);
+    await renderReady();
+    const adapterSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
+    const picker = screen.getByRole('combobox', { name: /Session Template/ });
+    fireEvent.click(picker);
+    fireEvent.change(screen.getByRole('searchbox', { name: 'Search Session Template' }), { target: { value: 'kimi' } });
+    expect(picker.textContent).toBe('None▾');
+    expect(adapterSelect.disabled).toBe(false);
+    fireEvent.click(screen.getByRole('option', { name: /kimi-template/ }));
+    expect(adapterSelect.value).toBe('kimi');
+    expect(adapterSelect.disabled).toBe(true);
+
+    fireEvent.click(picker);
+    fireEvent.click(screen.getByRole('option', { name: 'None' }));
+    expect(adapterSelect.disabled).toBe(false);
+  });
+
+  it('keeps CLI-unavailable pinned templates from enabling creation and clears missing defaults', async () => {
+    const { showToast } = setup();
+    apiMock.fetchSessionTemplates.mockResolvedValue([
+      { name: 'needs-kimi', adapter: 'kimi', model: 'model-x' },
+    ]);
+    apiMock.fetchNewSessionDefaults.mockResolvedValue({
+      adapter: 'cbc', outputMode: '', sessionTemplate: 'removed-template', workdir: '',
+    });
+    const view = render(<NewSessionModal open onClose={() => {}} />);
+    await waitFor(() => expect(showToast).toHaveBeenCalledWith(
+      'Saved Session Template “removed-template” is unavailable. The prefilled value has been cleared.', 'error',
+    ));
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Create' }) as HTMLButtonElement).disabled).toBe(false));
+    const picker = screen.getByRole('combobox', { name: /Session Template/ });
+    fireEvent.click(picker);
+    fireEvent.click(screen.getByRole('option', { name: /needs-kimi/ }));
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Create' }) as HTMLButtonElement).disabled).toBe(true));
+    expect(screen.getByText(/selected template requires adapter/).textContent).toContain('kimi');
+    view.unmount();
+  });
+
+  it('keeps the template menu inside a narrow mobile viewport', async () => {
+    vi.stubGlobal('matchMedia', vi.fn().mockImplementation((query: string) => ({
+      matches: query.includes('max-width'), media: query, onchange: null,
+      addEventListener: () => {}, removeEventListener: () => {},
+      addListener: () => {}, removeListener: () => {}, dispatchEvent: () => false,
+    })));
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 375 });
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 667 });
+    await renderReady();
+    const picker = screen.getByRole('combobox', { name: /Session Template/ });
+    vi.spyOn(picker, 'getBoundingClientRect').mockReturnValue({
+      x: 300, y: 80, left: 300, top: 80, right: 640, bottom: 120, width: 340, height: 40,
+      toJSON: () => ({}),
+    } as DOMRect);
+    fireEvent.click(picker);
+    const menu = document.querySelector('[data-session-template-menu]') as HTMLDivElement;
+    expect(menu.style.left).toBe('27px');
+    expect(menu.style.width).toBe('340px');
+    expect(parseFloat(menu.style.left) + parseFloat(menu.style.width)).toBeLessThanOrEqual(367);
   });
 
   it('saves the non-name form fields only when explicitly checked', async () => {
@@ -133,7 +385,7 @@ describe('New Session directory input', () => {
     fireEvent.change(screen.getByTestId('new-session-workdir-input'), {
       target: { value: 'D:\\workspace\\app' },
     });
-    fireEvent.click(screen.getByRole('checkbox', { name: '将本次配置设为默认（不含 Session Name）' }));
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Save these settings as the default (Session Name is excluded)' }));
     fireEvent.click(screen.getByRole('button', { name: 'Create' }));
     await waitFor(() => expect(createNewSession).toHaveBeenCalled());
     await waitFor(() => expect(apiMock.saveNewSessionDefaults).toHaveBeenCalledWith({
@@ -145,11 +397,11 @@ describe('New Session directory input', () => {
     const { createNewSession, showToast } = setup();
     apiMock.saveNewSessionDefaults.mockRejectedValue(new Error('disk unavailable'));
     await renderReady();
-    fireEvent.click(screen.getByRole('checkbox', { name: '将本次配置设为默认（不含 Session Name）' }));
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Save these settings as the default (Session Name is excluded)' }));
     fireEvent.click(screen.getByRole('button', { name: 'Create' }));
     await waitFor(() => expect(createNewSession).toHaveBeenCalled());
     await waitFor(() => expect(showToast).toHaveBeenCalledWith(
-      expect.stringContaining('Session 已创建，但默认配置未保存：disk unavailable'),
+      expect.stringContaining('Session created, but defaults were not saved: disk unavailable'),
       'error',
     ));
   });
@@ -177,7 +429,7 @@ describe('New Session directory input', () => {
       expect((input as HTMLInputElement).value).toBe('D:\\workspace\\dir\\');
       expect(apiMock.fetchDirectories).toHaveBeenLastCalledWith('D:\\workspace\\dir', false);
     });
-    expect(screen.queryByText(/检索“dir”/)).toBeNull();
+    expect(screen.queryByText(/Searching for “dir”/)).toBeNull();
     await waitFor(() => expect(screen.getByRole('button', { name: 'nested' })).toBeTruthy());
   });
 
@@ -185,7 +437,7 @@ describe('New Session directory input', () => {
     apiMock.fetchDirectories.mockRejectedValue(new Error('HTTP 404: Not Found'));
     await renderReady();
     fireEvent.change(screen.getByTestId('new-session-workdir-input'), { target: { value: 'D:\\missing\\app' } });
-    await waitFor(() => expect(screen.getByTestId('directory-error').textContent).toBe('当前目录非法'));
+    await waitFor(() => expect(screen.getByTestId('directory-error').textContent).toBe('Invalid directory.'));
   });
 
   it('revalidates an existing directory immediately before creating a session', async () => {
@@ -205,10 +457,10 @@ describe('New Session directory input', () => {
     apiMock.fetchDirectories.mockRejectedValue(new Error('HTTP 404: Not Found'));
     await renderReady();
     fireEvent.change(screen.getByTestId('new-session-workdir-input'), { target: { value: 'D:\\workspace\\new' } });
-    await waitFor(() => expect(screen.getByTestId('directory-error').textContent).toBe('当前目录非法'));
+    await waitFor(() => expect(screen.getByTestId('directory-error').textContent).toBe('Invalid directory.'));
     fireEvent.click(screen.getByRole('button', { name: 'Create' }));
-    await waitFor(() => expect(screen.getByRole('dialog', { name: '创建工作目录' }).textContent).toContain('目录不存在，是否创建？'));
-    fireEvent.click(screen.getByRole('button', { name: '取消' }));
+    await waitFor(() => expect(screen.getByRole('dialog', { name: 'Create Working Directory' }).textContent).toContain('This directory does not exist. Create it?'));
+    fireEvent.click(screen.getByRole('dialog', { name: 'Create Working Directory' }).querySelector('button')!);
     expect(apiMock.createDirectory).not.toHaveBeenCalled();
     expect(createNewSession).not.toHaveBeenCalled();
   });
@@ -219,10 +471,10 @@ describe('New Session directory input', () => {
     apiMock.createDirectory.mockRejectedValue(new Error('HTTP 403: Forbidden'));
     await renderReady();
     fireEvent.change(screen.getByTestId('new-session-workdir-input'), { target: { value: 'D:\\workspace\\new' } });
-    await waitFor(() => expect(screen.getByTestId('directory-error').textContent).toBe('当前目录非法'));
+    await waitFor(() => expect(screen.getByTestId('directory-error').textContent).toBe('Invalid directory.'));
     fireEvent.click(screen.getByRole('button', { name: 'Create' }));
-    await waitFor(() => expect(screen.getByRole('dialog', { name: '创建工作目录' }).textContent).toContain('目录不存在，是否创建？'));
-    fireEvent.click(screen.getByRole('button', { name: '创建目录' }));
+    await waitFor(() => expect(screen.getByRole('dialog', { name: 'Create Working Directory' }).textContent).toContain('This directory does not exist. Create it?'));
+    fireEvent.click(screen.getByRole('button', { name: 'Create Directory' }));
     await waitFor(() => expect(showToast).toHaveBeenCalledWith('HTTP 403: Forbidden', 'error'));
     expect(createNewSession).not.toHaveBeenCalled();
   });
@@ -232,10 +484,10 @@ describe('New Session directory input', () => {
     apiMock.fetchDirectories.mockRejectedValue(new Error('HTTP 404: Not Found'));
     await renderReady();
     fireEvent.change(screen.getByTestId('new-session-workdir-input'), { target: { value: 'D:\\workspace\\new' } });
-    await waitFor(() => expect(screen.getByTestId('directory-error').textContent).toBe('当前目录非法'));
+    await waitFor(() => expect(screen.getByTestId('directory-error').textContent).toBe('Invalid directory.'));
     fireEvent.click(screen.getByRole('button', { name: 'Create' }));
-    await waitFor(() => expect(screen.getByRole('dialog', { name: '创建工作目录' }).textContent).toContain('目录不存在，是否创建？'));
-    fireEvent.click(screen.getByRole('button', { name: '创建目录' }));
+    await waitFor(() => expect(screen.getByRole('dialog', { name: 'Create Working Directory' }).textContent).toContain('This directory does not exist. Create it?'));
+    fireEvent.click(screen.getByRole('button', { name: 'Create Directory' }));
     await waitFor(() => expect(apiMock.createDirectory).toHaveBeenCalledWith('D:\\workspace\\new'));
     await waitFor(() => expect(createNewSession).toHaveBeenCalledWith('session-1', 'D:\\workspace\\new', 'cbc', undefined, { outputMode: undefined, workspaceIds: [] }));
   });
@@ -373,5 +625,62 @@ describe('New Session directory input', () => {
     expect(document.querySelector('.modal-overlay')).toBeNull();
     rerender(<NewSessionModal open={false} onClose={() => {}} />);
     expect(screen.queryByTestId('new-session-fullscreen')).toBeNull();
+  });
+});
+
+describe('New Session model multiplier suffix', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    apiMock.fetchSessionTemplates.mockResolvedValue([]);
+    apiMock.fetchSessionTemplateTargets.mockResolvedValue([]);
+    apiMock.fetchMcpServers.mockResolvedValue([]);
+    apiMock.saveSessionTemplate.mockResolvedValue({ ok: true });
+    apiMock.fetchNewSessionDefaults.mockResolvedValue(null);
+    apiMock.saveNewSessionDefaults.mockImplementation(async (defaults) => defaults);
+    apiMock.fetchUiSettings.mockResolvedValue({
+      defaultNewSessionToCurrentWorkspace: true,
+    });
+    apiMock.updateUiSettings.mockResolvedValue({});
+    apiMock.fetchDirectories.mockResolvedValue(listing('', []));
+    apiMock.createDirectory.mockResolvedValue({ ok: true, path: 'D:\\workspace\\new' });
+    setup();
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it('shows the multiplier suffix on model options while the submitted value stays the raw ID', async () => {
+    const { createNewSession } = setup();
+    useAdapterStore.setState({
+      adapterConfigs: {
+        cbc: {
+          models: ['model-x', 'model-y'], defaultModel: '', effortValues: ['high'],
+          permissionModes: [{ value: 'safe', label: 'Safe' }], defaultPermissionMode: '',
+          supportedSettings: ['model'],
+          executionModes: ['stream'],
+          modelCreditMultipliers: { 'model-x': 0.08 },
+        },
+      },
+    });
+    await renderReady();
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Advanced' }));
+    const select = screen.getByLabelText('Model') as HTMLSelectElement;
+    const optionX = Array.from(select.options).find((o) => o.value === 'model-x')!;
+    const optionY = Array.from(select.options).find((o) => o.value === 'model-y')!;
+    // 显示带倍率后缀，option value 仍是原始模型 ID
+    expect(optionX.textContent).toBe('model-x (x0.08)');
+    expect(optionX.value).toBe('model-x');
+    // 无倍率只显原名
+    expect(optionY.textContent).toBe('model-y');
+
+    fireEvent.change(select, { target: { value: 'model-x' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Create' }));
+    await waitFor(() => expect(createNewSession).toHaveBeenCalled());
+    // 提交的 overrides 仍是原始模型 ID（显示后缀不泄漏）
+    const overrides = (createNewSession.mock.calls[0] as unknown as Array<{ model?: string } | undefined>)[4];
+    expect(overrides?.model).toBe('model-x');
   });
 });

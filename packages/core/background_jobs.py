@@ -35,6 +35,7 @@ _lock = threading.RLock()
 _recovery_task: asyncio.Task | None = None
 _stop_recovery = asyncio.Event()
 COMPLETED_RETENTION_SCAN_INTERVAL_SEC = 24 * 60 * 60
+JOB_DELETE_PROCESS_TIMEOUT_SEC = 2.0
 _completed_retention_hooks: dict[str, Any] = {"on_deleted": None}
 
 # The registry is shared by the generic background-process Jobs and the small
@@ -86,6 +87,26 @@ def _atomic_write(path: Path, value: dict) -> None:
                     pass
                 raise
             time.sleep(0.01 * (attempt + 1))
+
+
+def _write_job(path: Path, job: dict, *, created: bool = False) -> None:
+    """Publish a full public snapshot only after the registry commit succeeds.
+
+    Message/scheduler state machines and agent-facing APIs share this boundary.
+    Detached runners have no event callback; their terminal recovery remains
+    responsible for broadcasting after Pan observes the durable result.
+    """
+    from packages.jobs.system_actions import sync
+    sync(job, created)
+    _atomic_write(path, job)
+    if (not job.get("scheduledParentJobId")
+            and not (job.get("kind") == BACKGROUND_PROCESS_KIND
+                     and job.get("status") in {"completed", "failed", "cancelled"})):
+        # Process terminal delivery retains the strict retry/ack recovery path.
+        # Freeze nested schedule/target fields before an async broadcaster runs.
+        snapshot = json.loads(json.dumps(job_public_view(job)))
+        _scheduled_task_emit({"type": "job.created" if created else "job.updated",
+                              "jobId": job["jobId"], "job": snapshot})
 
 
 @contextmanager
@@ -230,7 +251,7 @@ def _normalize_job(job: dict | None) -> dict | None:
 
 def _save(job: dict, registry_root: str | Path | None = None) -> dict:
     with _lock, _job_lock(job["jobId"], registry_root):
-        _atomic_write(_job_path(job["jobId"], registry_root), job)
+        _write_job(_job_path(job["jobId"], registry_root), job)
     return job
 
 
@@ -240,7 +261,7 @@ def _create(job: dict, registry_root: str | Path | None = None) -> dict:
         path = _job_path(job["jobId"], registry_root)
         if path.exists():
             raise ValueError("job id already exists")
-        _atomic_write(path, job)
+        _write_job(path, job, created=True)
     return job
 
 
@@ -253,20 +274,26 @@ def _update(job_id: str, changes: dict[str, Any], *, replace: dict | None = None
         if not current:
             raise ValueError("job not found")
         current.update(changes)
-        _atomic_write(path, current)
+        _write_job(path, current)
         return current
 
 
 def get(job_id: str, registry_root: str | Path | None = None) -> dict | None:
     try:
-        return _normalize_job(_load_path(_job_path(job_id, registry_root)))
+        local = _normalize_job(_load_path(_job_path(job_id, registry_root)))
     except ValueError:
         return None
+    if local is not None or registry_root is not None:
+        return local
+    from packages.jobs import pan_bridge
+    remote = pan_bridge.request("get", job_id)
+    return pan_bridge.public_job(remote) if remote is not None else None
 
 
 # ── name / description 规范（所有 kind 统一；2026-09-25 用户拍板）──
 #
-# - name 必填：strip 后为空（含 None/纯空白）→ 默认名 `job-N`，绝不拒绝创建；
+# - OS process start requires explicit name (1-200 trimmed characters).
+# - Web /api/jobs and schedule/message creation retain optional automatic `job-N` names;
 # - 默认名 = **存量最小空缺**序号（删了 job-3 → 新建可复用 job-3）；
 #   允许极端条件（并发创建）下重名——name 纯展示，唯一标识是 jobId；
 # - name 是普通可编辑字段，无 nameIsAuto 标记位；
@@ -311,7 +338,43 @@ def default_job_name(registry_root: str | Path | None = None) -> str:
 def list_jobs(registry_root: str | Path | None = None) -> list[dict]:
     root = _root(registry_root) / "jobs"
     jobs = [_normalize_job(_load_path(p)) for p in root.glob("job_*.json")]
-    return sorted((j for j in jobs if j), key=lambda j: j.get("createdAt", ""), reverse=True)
+    jobs = [j for j in jobs if j]
+    if registry_root is None:
+        from packages.jobs import pan_bridge
+        remote = pan_bridge.request("list")
+        if remote is not None:
+            if not isinstance(remote, dict) or not isinstance(remote.get("jobs"), list):
+                raise pan_bridge.JobServiceUnavailable("invalid independent Job service response")
+            local_ids = {job["jobId"] for job in jobs}
+            for item in remote["jobs"]:
+                job = pan_bridge.public_job(item)
+                if job["jobId"] not in local_ids:
+                    jobs.append(job)
+    return sorted(jobs, key=_job_creation_sort_key, reverse=True)
+
+
+def _job_creation_sort_key(job: dict) -> tuple[float, str]:
+    """Legacy/malformed timestamps must not take down the whole Jobs GUI.
+
+    Use a numeric read-time key; preserve the original record on disk and in
+    its public view. Missing, bool, nonfinite and invalid values sort oldest.
+    """
+    value = job.get("createdAt")
+    timestamp = 0.0
+    try:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            timestamp = float(value)
+        elif isinstance(value, str):
+            try:
+                timestamp = float(value)
+            except ValueError:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                timestamp = parsed.replace(tzinfo=timezone.utc).timestamp() if parsed.tzinfo is None else parsed.timestamp()
+    except (ValueError, TypeError, OverflowError, OSError):
+        timestamp = 0.0
+    if not math.isfinite(timestamp):
+        timestamp = 0.0
+    return timestamp, str(job.get("jobId") or "")
 
 
 # ── 结构化 source / target（PLAN §1/§3；2026-09-25 定形）──
@@ -396,11 +459,16 @@ def job_public_view(job: dict | None) -> dict | None:
     if not isinstance(job, dict):
         return job
     view = dict(job)
+    view.pop('attemptSnapshot', None)
     identity = _structured_identity(job)
     view["source"] = identity["source"]
     view["target"] = identity["target"]
     view.pop("sourceStruct", None)
     view.pop("targetStruct", None)
+    if isinstance(view.get('config'), dict) and view.get('action', {}).get('api') == 'action_reference':
+        from packages.jobs.unified import project
+        view.pop('unified', None)
+        view['unified'] = project(view)
     return view
 
 
@@ -584,7 +652,7 @@ def retarget_session_jobs(old_session_id: str, new_session_id: str,
                     if not _retarget_job_record(current, old_session_id, new_session_id):
                         summary["unchanged"] += 1
                         continue
-                    _atomic_write(path, current)
+                    _write_job(path, current)
                     summary["updated"] += 1
             except Exception as exc:
                 summary["errors"].append({
@@ -635,7 +703,7 @@ def update_job_field(job_id: str, changes: dict[str, Any],
             patch.pop("status", None)  # 循环/状态机按 nextFireAt 自行归类
         patch["updatedAt"] = time.time()
         current.update(patch)
-        _atomic_write(path, current)
+        _write_job(path, current)
         return current
 
 
@@ -651,9 +719,9 @@ def _validate_cwd(cwd: Any) -> Path:
     if not isinstance(cwd, str) or not cwd:
         raise ValueError("cwd is required")
     path = Path(cwd).expanduser().resolve()
-    allowed = PROJECT_ROOT.resolve()
-    if not (path == allowed or allowed in path.parents):
-        raise ValueError("cwd must be inside the Pan project directory")
+    # Jobs execute agent work in arbitrary existing directories, including
+    # sibling Git worktrees. The command and notification permissions are
+    # separate from cwd validation; cwd is not a project-containment boundary.
     if not path.is_dir():
         raise ValueError("cwd does not exist or is not a directory")
     return path
@@ -675,6 +743,14 @@ def _runner_command(job_id: str) -> list[str]:
 
 
 def _spawn_background_runner(job: dict, registry_root: str | Path | None = None) -> dict:
+    with _registry_lock("spawn-" + job["jobId"], registry_root):
+        current = get(job["jobId"], registry_root)
+        if not current or current.get("status") not in {"starting", "running"}:
+            raise ValueError("Job no longer admitted for runner spawn")
+        return _spawn_background_runner_unlocked(job, registry_root)
+
+
+def _spawn_background_runner_unlocked(job: dict, registry_root: str | Path | None = None) -> dict:
     job_id = job["jobId"]
     log_path = Path(job["logPath"])
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -689,7 +765,11 @@ def _spawn_background_runner(job: dict, registry_root: str | Path | None = None)
         },
     }
     if os.name == "nt":
-        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | getattr(subprocess, "DETACHED_PROCESS", 0)
+        # A venv redirector starts the real Python with flags=0. DETACHED_PROCESS
+        # is not inherited and would let that child allocate a Terminal window.
+        # NO_WINDOW creates a windowless console that the redirector child inherits.
+        # This runner is always headless; the task's hideWindow policy is separate.
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
     else:
         kwargs["start_new_session"] = True
     try:
@@ -711,27 +791,49 @@ def _spawn_background_runner(job: dict, registry_root: str | Path | None = None)
         if current.get("status") == "starting":
             current["status"] = "running"
         current["updatedAt"] = time.time()
-        _atomic_write(path, current)
+        _write_job(path, current)
         return _normalize_job(current)
 
 
 def start(target_session_id: str, argv: list[str], cwd: str, *,
+          hide_window: bool = True,
           label: str | None = None,
           name: str | None = None,
           description: str | None = None,
           creator_session_id: str | None = None,
           registry_root: str | Path | None = None) -> dict:
+    from packages.jobs.window import validate_hide_window
+    validate_hide_window(hide_window)
+    name = normalize_name(name)
+    if name is None:
+        raise ValueError("name is required")
+    if len(name) > 200:
+        raise ValueError("name must be at most 200 characters")
     if not _sessions.get(target_session_id):
         raise ValueError("target session does not exist")
     creator_sid, creator_error = _worker._normalize_source_session_id(creator_session_id)
     if creator_error:
         raise ValueError(creator_error)
     argv, cwd_path = _validate_command(argv, cwd)
+    if registry_root is None:
+        from packages.jobs import pan_bridge
+        remote = pan_bridge.request("start", {
+            "targetSessionId": target_session_id, "creatorSessionId": creator_sid,
+            "argv": argv, "cwd": str(cwd_path), "label": label,
+            "hideWindow": hide_window,
+            "name": name, "description": description,
+        })
+        if remote is not None:
+            public = pan_bridge.public_job(remote)
+            _scheduled_task_emit({"type": "job.created", "jobId": public["jobId"],
+                                  "job": job_public_view(public)})
+            return public
     job_id = "job_" + secrets.token_hex(12)
     now = time.time()
     log_path = _root(registry_root) / "logs" / f"{job_id}.log"
     job = {
         "jobId": job_id, "targetSessionId": target_session_id, "argv": argv,
+        "hideWindow": hide_window,
         "kind": BACKGROUND_PROCESS_KIND, "operation": "run",
         "creatorSessionId": creator_sid,
         "sourceStruct": normalize_source({"type": "agent",
@@ -751,7 +853,8 @@ def start(target_session_id: str, argv: list[str], cwd: str, *,
 def start_scheduled_process(parent_job: dict, dispatch_key: str, *,
                             fire_at: str | None = None,
                             entry_id: str | None = None,
-                            registry_root: str | Path | None = None) -> dict:
+                            registry_root: str | Path | None = None,
+                            admitted_execution: str | None = None) -> dict:
     """Start or recover the one process run for a scheduled shell dispatch key.
 
     The stable child ID makes scheduler stale-claim recovery at-most-once: after
@@ -771,15 +874,25 @@ def start_scheduled_process(parent_job: dict, dispatch_key: str, *,
     # delete that would orphan an active shell run.
     with _lock, _job_lock(parent_id, registry_root):
         parent = _load_path(_job_path(parent_id, registry_root))
-        if not parent or parent.get("kind") != SCHEDULED_TASK_KIND:
+        if (not parent or parent.get("kind") != SCHEDULED_TASK_KIND
+                or parent.get("status") in {"cleanup_pending", "deleting"}):
             raise ValueError("scheduled parent Job not found")
         action = parent.get("action")
-        if parent_job.get("action") != action:
+        if admitted_execution is not None:
+            admission = parent.get('activeExecutions', {}).get(admitted_execution, parent.get('execution', {}))
+            if (admission.get('id') != admitted_execution or dispatch_key != admitted_execution
+                    or admission.get('actionId') != 'system_scheduled_task'
+                    or parent.get('status') != 'running'):
+                raise ValueError('System Action admission no longer current')
+            action = parent_job.get('action')
+        elif parent_job.get("action") != action:
             raise ValueError("scheduled shell action changed before the dispatch started")
         args = action.get("args") if isinstance(action, dict) else None
         if not isinstance(action, dict) or action.get("api") != "shell" or not isinstance(args, dict):
             raise ValueError("scheduled parent Job no longer has a shell action")
         command, cwd_path = validate_shell_action(args.get("command"), args.get("cwd"))
+        from packages.jobs.window import validate_hide_window
+        hide_window = validate_hide_window(args.get("hideWindow", True))
         target = parent.get("targetSessionId")
         if target is not None and (not isinstance(target, str) or not _sessions.get(target)):
             raise ValueError("notification target session does not exist")
@@ -797,6 +910,7 @@ def start_scheduled_process(parent_job: dict, dispatch_key: str, *,
             "kind": BACKGROUND_PROCESS_KIND,
             "operation": "run",
             "shellCommand": command,
+            "hideWindow": hide_window,
             "argv": [],
             "cwd": str(cwd_path),
             "scheduledParentJobId": parent_id,
@@ -1111,7 +1225,7 @@ def update_message(job_id: str, *, text: str | None = None,
         if current.get("status") in MESSAGE_JOB_TERMINAL:
             raise ValueError("terminal message Jobs cannot be edited")
         current.update(changes)
-        _atomic_write(path, current)
+        _write_job(path, current)
         return current
 
 
@@ -1144,6 +1258,12 @@ async def run_due_message_jobs(now: float | None = None,
                 path = _job_path(candidate["jobId"], registry_root)
                 current = _load_path(path)
                 if current and current.get("status") == "running":
+                    if current.get('attemptSnapshot'):
+                        from packages.jobs.system_actions import finish
+                        finish(current, 'uncertain')
+                        current.update(status='uncertain', nextRunAt=None, lastError='Unconfirmed system Action delivery; explicit investigation required')
+                        _write_job(path, current)
+                        continue
                     current.update(status=("scheduled" if current.get("schedule", {}).get("type")
                                    in {"interval", "weekly"} else "pending"),
                                    # Keep the recovered occurrence due even
@@ -1151,7 +1271,7 @@ async def run_due_message_jobs(now: float | None = None,
                                    nextRunAt=_iso_utc(current_time - 0.001),
                                    lastError="recovered after scheduler restart",
                                    updatedAt=current_time)
-                    _atomic_write(path, current)
+                    _write_job(path, current)
     claimed: list[dict] = []
     for candidate in list_jobs(registry_root):
         if candidate.get("kind") not in {SESSION_MESSAGE_KIND, SESSION_BROADCAST_KIND}:
@@ -1177,7 +1297,7 @@ async def run_due_message_jobs(now: float | None = None,
                 continue
             job.update(status="running", runStartedAt=current_time,
                        updatedAt=current_time)
-            _atomic_write(path, job)
+            _write_job(path, job)
             claimed.append(job)
     delivered = 0
     for job in claimed:
@@ -1186,6 +1306,19 @@ async def run_due_message_jobs(now: float | None = None,
         latest = get(job["jobId"], registry_root=registry_root)
         if not latest or latest.get("status") != "running":
             continue
+        # Freeze the current target at the same reservation boundary as legacy
+        # retarget semantics. Admission must persist before any queue handoff.
+        from packages.jobs.system_actions import prepare, finish
+        with _lock, _job_lock(job['jobId'], registry_root):
+            latest = _load_path(_job_path(job['jobId'], registry_root))
+            if not latest or latest.get('status') != 'running':
+                continue
+            snapshot = prepare(latest, job['jobId'] + ':' + str(job.get('nextRunAt')))
+            _write_job(_job_path(job['jobId'], registry_root), latest)
+            params = snapshot['arguments']
+            latest = {**latest, 'text': params['text']}
+            if 'sessionId' in params: latest['targetSessionId'] = params['sessionId']
+            if 'sessionIds' in params: latest['targetSessionIds'] = params['sessionIds']
         # Claiming an occurrence establishes that it is in flight, but
         # handoff may retarget it before this send boundary.  Read the target
         # from the current registry snapshot immediately before send_session;
@@ -1205,7 +1338,7 @@ async def run_due_message_jobs(now: float | None = None,
                 if not isinstance(result, dict):
                     result = {"status": "error", "result": "send returned an invalid result"}
             except Exception as exc:  # isolate one target and keep the fan-out alive
-                result = {"status": "error", "result": str(exc)}
+                result = {"status": "unknown", "result": str(exc)}
             item = dict(result)
             item["sessionId"] = target_id
             target_results.append(item)
@@ -1226,6 +1359,7 @@ async def run_due_message_jobs(now: float | None = None,
                     for item in failures
                 ]
         finished = time.time()
+        unknown=any(item.get('status') in {'unknown','uncertain','unconfirmed'} for item in target_results)
         recurring = job.get("schedule", {}).get("type") in {"interval", "weekly"}
         ok = isinstance(result, dict) and result.get("status") != "error"
         # 部分失败：即时 toast 事件（第八轮定论——completed + toast + runs 可查）。
@@ -1242,7 +1376,10 @@ async def run_due_message_jobs(now: float | None = None,
             "lastDelivery": result if isinstance(result, dict) else {"status": "error"},
             "updatedAt": finished,
         }
-        if ok:
+        if unknown:
+            changes.update(status='uncertain',nextRunAt=None,lastError='Unconfirmed message delivery; automatic replay blocked')
+            ok=False
+        elif ok:
             if recurring:
                 changes.update(status="scheduled",
                                nextRunAt=_iso_utc(_message_next_run(job["schedule"], finished)),
@@ -1270,7 +1407,8 @@ async def run_due_message_jobs(now: float | None = None,
             latest = _load_path(path)
             if latest and latest.get("status") == "running":
                 latest.update(changes)
-                _atomic_write(path, latest)
+                finish(latest, 'uncertain' if unknown else 'completed' if ok else 'failed', {'status': result.get('status')})
+                _write_job(path, latest)
     return delivered
 
 
@@ -1294,15 +1432,20 @@ _scheduled_task_hooks: dict[str, Any] = {
     "root_resolver": None,
     "config_resolver": None,
     "on_event": None,
+    "on_event_strict": None,
+    "qq_send": None,
 }
 _scheduled_task_stats: dict[str, Any] = {"dueScanned": 0, "lastTickAt": None}
 
 
 def register_scheduled_tasks(*, root_resolver=None, config_resolver=None,
-                             on_event=None) -> None:
+                             on_event=None, on_event_strict=None, qq_send=None) -> None:
     """Register the scheduler plugin's registry root / config / event callback.
 
-    幂等：仅覆盖显式给出的可调用项，重复注册安全。
+    幂等：仅覆盖显式给出的可调用项，重复注册安全。on_event_strict 是带成功
+    契约的发射（scheduler emit_strict）：返回是否已成功递交广播，供终态补发
+    的重试语义使用；未注册时 _scheduled_task_emit_strict 退回 on_event 的
+    尽力而为语义。
     """
     if callable(root_resolver):
         _scheduled_task_hooks["root_resolver"] = root_resolver
@@ -1310,6 +1453,10 @@ def register_scheduled_tasks(*, root_resolver=None, config_resolver=None,
         _scheduled_task_hooks["config_resolver"] = config_resolver
     if on_event is not None:
         _scheduled_task_hooks["on_event"] = on_event
+    if on_event_strict is not None:
+        _scheduled_task_hooks["on_event_strict"] = on_event_strict
+    if callable(qq_send):
+        _scheduled_task_hooks["qq_send"] = qq_send
 
 
 def scheduled_task_stats() -> dict:
@@ -1322,26 +1469,72 @@ def is_recovery_running() -> bool:
 
 
 def delete_job(job_id: str, registry_root: str | Path | None = None) -> bool:
-    """Remove one job record under its cross-process lock."""
-    with _lock, _job_lock(job_id, registry_root):
-        path = _job_path(job_id, registry_root)
-        current = _load_path(path)
-        if not current:
-            return False
-        action = current.get("action")
-        if (current.get("kind") == SCHEDULED_TASK_KIND
-                and isinstance(action, dict) and action.get("api") == "shell"):
-            if current.get("status") == "running":
-                raise ValueError("cannot delete a scheduled shell Job while its dispatch is being claimed")
-            if any(child.get("scheduledParentJobId") == job_id
-                   and child.get("status") in {"starting", "running"}
-                   for child in list_jobs(registry_root)):
-                raise ValueError("cannot delete a scheduled shell Job while its process is active")
+    """Serialize explicit delete/recheck; never unlink unconfirmed process owners.
+
+    Only the per-delete mutex spans OS waits. Registry/global locks are released
+    before cleanup, so unrelated Jobs and runner facts can continue to commit.
+    """
+    with (_registry_lock("delete-" + job_id, registry_root),
+          _registry_lock("spawn-" + job_id, registry_root),
+          _registry_lock("task-spawn-" + job_id, registry_root)):
+        with _lock, _job_lock(job_id, registry_root):
+            path = _job_path(job_id, registry_root)
+            current = _load_path(path)
+            if not current:
+                return False
+            if current.get("executionOwner") == "independent-job-service":
+                raise ValueError("independent Job deletion is unsupported")
+            action = current.get("action")
+            if (current.get("kind") == SCHEDULED_TASK_KIND
+                    and isinstance(action, dict) and action.get("api") == "shell"):
+                if current.get("status") in {"running", "starting"} or any(
+                        child.get("scheduledParentJobId") == job_id
+                        and child.get("status") not in {"completed", "failed", "cancelled"}
+                        for child in list_jobs(registry_root)):
+                    raise ValueError("cannot delete scheduled shell Job with an active dispatch/child")
+            active = current.get("status") in {"starting", "running", "cleanup_pending", "deleting"}
+            if current.get("kind", BACKGROUND_PROCESS_KIND) == BACKGROUND_PROCESS_KIND:
+                active = active or str(current.get("status", "")).lower() in {"unknown", "uncertain"}
+            if active:
+                current.setdefault("cleanupOriginalStatus", current.get("status"))
+                current.update(status="cleanup_pending", cleanupAttemptAt=time.time(),
+                               updatedAt=time.time(), cleanupError="process cleanup in progress")
+                _write_job(path, current)
+            else:
+                path.unlink()
+                return True
+
+        def persist_proof(proof):
+            with _lock, _job_lock(job_id, registry_root):
+                latest = _load_path(path)
+                if not latest or latest.get("status") != "cleanup_pending":
+                    raise ValueError("Job cleanup admission changed")
+                latest.update(proof, updatedAt=time.time())
+                _write_job(path, latest)
+
         try:
+            frozen = dict(current)
+            frozen["_cleanupPersist"] = persist_proof
+            receipt = _terminate_job_processes([frozen])
+            if not isinstance(receipt, dict) or receipt.get("confirmed") is not True:
+                raise ValueError((receipt or {}).get("reason") or "process cleanup receipt unknown")
+        except Exception as exc:
+            persist_proof({"cleanupError": str(exc)[:500]})
+            raise ValueError(f"cannot safely delete: {exc}") from exc
+        with _lock, _job_lock(job_id, registry_root):
+            latest = _load_path(path)
+            if not latest:
+                return False
+            if latest.get("status") != "cleanup_pending":
+                raise ValueError("Job cleanup state changed; record retained")
             path.unlink()
-        except OSError:
-            return False
-        return True
+            return True
+
+
+def _terminate_job_processes(jobs: list[dict], *, timeout: float | None = None) -> dict:
+    from packages.jobs.process_cleanup import terminate_owned_jobs
+    return terminate_owned_jobs(jobs, timeout=(JOB_DELETE_PROCESS_TIMEOUT_SEC
+                                               if timeout is None else timeout))
 
 
 def register_completed_job_retention(*, on_deleted=None) -> None:
@@ -1992,22 +2185,88 @@ async def _run_job_action(job: dict, target: str | None,
                           fire_at: str | None = None,
                           entry_id: str | None = None,
                           registry_root: str | Path | None = None) -> dict:
+    from packages.jobs.system_actions import invoke
+    async def effect(frozen):
+        return await _execute_job_action(frozen, frozen.get('targetSessionId', target), dispatch_key,
+                                         fire_at, entry_id, registry_root)
+    return await invoke(job, dispatch_key, effect, registry_root)
+
+
+async def _execute_job_action(job: dict, target: str | None, dispatch_key: str,
+                              fire_at: str | None = None, entry_id: str | None = None,
+                              registry_root: str | Path | None = None,
+                              admitted_execution: str | None = None) -> dict:
     """执行 job 的 action 模板（PLAN §1/§2：动作 = API 调用模板）。
 
     Scheduled-task actions:
     - ``assign``（默认）：task 文本入目标 session 队列，worker 幂等索引兜底；
     - ``send_session``：发人可读消息（走 message 语义，无 task_id 幂等）。
     - ``resume_legal_running``：fire 时重新筛选并按 Session 收据幂等发送固定消息。
+    - ``send_qq``：通过 Web 层注册的 QQ 插件回调发送到选定的联系人和 bot。
 
     未知 action.api / 兼容层旧记录（无 action 字段）一律回落 assign。
     """
     action = job.get("action")
     api = str(action.get("api") or "assign") if isinstance(action, dict) else "assign"
+    if api == 'action_reference':
+        return {'status':'error','error':'Use protected Action Job runtime; no legacy assign fallback'}
     text = job.get("text") or ""
+    if api == "send_qq":
+        from packages.jobs.actions import normalize_scheduled_qq_action
+
+        normalized, validation_error = normalize_scheduled_qq_action(action)
+        if validation_error:
+            error = f"invalid send_qq action: {validation_error}"
+            return {"status": "error", "error": error, "result": error,
+                    "dispatchKey": dispatch_key}
+        args = normalized["args"]
+        sender = _scheduled_task_hooks.get("qq_send")
+        if not callable(sender):
+            error = "QQ sender is unavailable"
+            return {"status": "error", "error": error, "result": error,
+                    "dispatchKey": dispatch_key}
+        target_type = args.get("targetType")
+        target_id = args.get("targetId")
+        bot_uin = args.get("botUin")
+        try:
+            response = await sender(
+                target_type="private" if target_type == "user" else "group",
+                target_id=target_id,
+                text=text,
+                bot_uin=bot_uin,
+            )
+        except Exception as exc:
+            error = f"QQ send failed: {exc}"
+            return {"status": "error", "error": error, "result": error,
+                    "dispatchKey": dispatch_key}
+        if not isinstance(response, dict):
+            response = {"ok": False, "error": {
+                "code": "invalid_response",
+                "message": "QQ send callback returned an invalid response"}}
+        if response.get("ok") is True:
+            return {
+                "status": "completed",
+                "dispatchKey": dispatch_key,
+                "targetType": target_type,
+                "targetId": target_id,
+                "botUin": bot_uin,
+                **({"messageId": response.get("message_id")}
+                   if response.get("message_id") is not None else {}),
+            }
+        raw_error = response.get("error")
+        if isinstance(raw_error, dict):
+            error = str(raw_error.get("message") or raw_error.get("code") or "QQ send failed")
+            error_code = raw_error.get("code")
+        else:
+            error = str(raw_error or response.get("message") or "QQ send failed")
+            error_code = None
+        return {"status": "error", "error": error, "result": error,
+                "dispatchKey": dispatch_key,
+                **({"qqErrorCode": error_code} if error_code is not None else {})}
     if api == "shell":
         child = start_scheduled_process(
             job, dispatch_key, fire_at=fire_at, entry_id=entry_id,
-            registry_root=registry_root)
+            registry_root=registry_root, **({'admitted_execution': admitted_execution} if admitted_execution else {}))
         child_status = child.get("status")
         if child_status in {"failed", "cancelled"}:
             result_status = "error"
@@ -2029,12 +2288,13 @@ async def _run_job_action(job: dict, target: str | None,
     if api == "send_session":
         return await _worker.send_session(target, text, source="automation")
     if api == RESUME_LEGAL_RUNNING_ACTION:
+        from . import legal_offline as _legality
         # Resolve candidates at fire time. Session identity is persistent, while
         # Worker liveness is a separate, transient runtime fact.
         candidates = sorted(
             (
                 session for session in _sessions.list_all(load_history=False)
-                if (getattr(session, "last_legal_worker_state", None) == "running"
+                if (_legality.is_illegal(session)
                     and isinstance(getattr(session, "id", None), str)
                     and _worker.find_alive_worker_by_session(session.id) is None)
             ),
@@ -2051,9 +2311,8 @@ async def _run_job_action(job: dict, target: str | None,
             ).hexdigest()
             client_message_id = f"job-resume:{digest}"
             try:
-                result = await _worker.send_session(
-                    session.id, RESUME_LEGAL_RUNNING_TEXT,
-                    source="automation", client_message_id=client_message_id)
+                result = await _worker.wake_session(
+                    session.id, source="automation", client_message_id=client_message_id)
                 if not isinstance(result, dict):
                     result = {"status": "error",
                               "result": "send_session returned an invalid result"}
@@ -2098,6 +2357,8 @@ def _iso_local(value: datetime | None) -> str | None:
 
 
 def _scheduled_task_emit(event: dict) -> None:
+    from packages.jobs.system_actions import notify
+    notify(event)
     callback = _scheduled_task_hooks.get("on_event")
     if callback is None:
         return
@@ -2112,6 +2373,10 @@ def _scheduled_task_emit(event: dict) -> None:
             loop = None
         if loop is not None:
             loop.create_task(_consume_emitted(result))
+        else:
+            close = getattr(result, "close", None)
+            if callable(close):
+                close()
 
 
 async def _consume_emitted(awaitable) -> None:
@@ -2172,7 +2437,7 @@ def _apply_entry_change(job_id: str, entry_id: str, entry_patch: dict,
         current.update(job_patch)
         current["nextFireAt"] = _job_next_fire(current)
         current["updatedAt"] = time.time()
-        _atomic_write(path, current)
+        _write_job(path, current)
         return current
 
 
@@ -2270,7 +2535,11 @@ def _reconcile_scheduled_processes(registry_root: str | Path) -> int:
                         current["lastError"] = (
                             str(error) if delivery["status"] == "error" else None)
                     current["updatedAt"] = time.time()
-                    _atomic_write(path, current)
+                    if current.get('attemptSnapshot', {}).get('dispatchKey') == dispatch_key:
+                        from packages.jobs.system_actions import finish
+                        finish(current, 'completed' if delivery['status'] == 'completed' else 'cancelled' if delivery['status'] == 'cancelled' else 'failed',
+                               {'status': delivery['status'], 'processJobId': child['jobId']})
+                    _write_job(path, current)
                     _scheduled_task_emit({
                         "type": "job.updated",
                         "jobId": parent_id,
@@ -2321,7 +2590,8 @@ async def _redeliver_undelivered(job: dict, registry_root: str | Path | None) ->
             return left_key == right_key
         return left == right
 
-    delivered: list[tuple[dict, dict]] = []
+    delivered: list[tuple[dict, dict, dict]] = []
+    qq_attempts: list[tuple[dict, dict, dict]] = []
     for stale_note in notes:
         # tick_scheduled_tasks iterates a list snapshot.  A concurrent process
         # can retarget, edit, pause, disable, or cancel the Job after that
@@ -2352,7 +2622,7 @@ async def _redeliver_undelivered(job: dict, registry_root: str | Path | None) ->
         target = current.get("targetSessionId")
         action_api = action.get("api", "assign") if isinstance(action, dict) else "assign"
         target_required = action_api not in {
-            "shell", RESUME_LEGAL_RUNNING_ACTION,
+            "shell", RESUME_LEGAL_RUNNING_ACTION, "send_qq",
         }
         if target_required and not target:
             # target 仍缺失（可能被清空）：便条原样保留。
@@ -2366,11 +2636,13 @@ async def _redeliver_undelivered(job: dict, registry_root: str | Path | None) ->
                 registry_root=registry_root)
         except Exception as exc:
             result = {"status": "error", "result": str(exc)}
+        if action_api == "send_qq":
+            qq_attempts.append((dict(note), current, result))
         if (isinstance(result, dict)
                 and str(result.get("status")) not in {"error", "failed", "cancelled"}):
-            delivered.append((dict(note), current))
+            delivered.append((dict(note), current, result))
 
-    if delivered:
+    if delivered or qq_attempts:
         # Remove only the notes this pass actually delivered from the latest
         # record; preserve fires concurrently appended by another scheduler.
         with _lock, _job_lock(job_id, registry_root):
@@ -2379,22 +2651,53 @@ async def _redeliver_undelivered(job: dict, registry_root: str | Path | None) ->
             if not latest:
                 return 0
             remaining = list(latest.get("undeliveredFires") or [])
-            for delivered_note, _ in delivered:
+            for delivered_note, _, _ in delivered:
                 for index, current_note in enumerate(remaining):
                     if isinstance(current_note, dict) and same_note(
                             current_note, delivered_note):
                         remaining.pop(index)
                         break
-            latest.update(undeliveredFires=remaining,
-                          lastStatus="dispatched", lastError=None,
-                          updatedAt=time.time())
-            _atomic_write(path, latest)
-        for note, delivered_job in delivered:
+            if delivered:
+                latest["undeliveredFires"] = remaining
+            if qq_attempts:
+                _, _, last_result = qq_attempts[-1]
+                last_error = (None if str(last_result.get("status"))
+                              not in {"error", "failed", "cancelled"}
+                              else str(last_result.get("error")
+                                       or last_result.get("result")
+                                       or "QQ send failed"))
+                latest.update(lastStatus="error" if last_error else "completed",
+                              lastError=last_error, lastDelivery=last_result,
+                              updatedAt=time.time())
+            elif delivered:
+                latest.update(lastStatus="dispatched", lastError=None,
+                              updatedAt=time.time())
+            _write_job(path, latest)
+        for note, delivered_job, result in delivered:
             fire_dt = _job_cron.parse_datetime(note.get("fireAt")) or datetime.now()
-            _append_task_run(delivered_job,
-                             delivered_job.get("taskId") or job_id, fire_dt,
-                             note.get("dispatchKey") or "", "dispatched", None,
-                             registry_root, entry_id=note.get("entryId"))
+            is_qq = (isinstance(delivered_job.get("action"), dict)
+                     and delivered_job["action"].get("api") == "send_qq")
+            if is_qq:
+                _append_task_run(delivered_job,
+                                 delivered_job.get("taskId") or job_id, fire_dt,
+                                 note.get("dispatchKey") or "", "completed", None,
+                                 registry_root, entry_id=note.get("entryId"),
+                                 result=result)
+            else:
+                _append_task_run(delivered_job,
+                                 delivered_job.get("taskId") or job_id, fire_dt,
+                                 note.get("dispatchKey") or "", "dispatched", None,
+                                 registry_root, entry_id=note.get("entryId"))
+        for note, attempted_job, result in qq_attempts:
+            if str(result.get("status")) not in {"error", "failed", "cancelled"}:
+                continue  # successful QQ sends were recorded with delivered notes above
+            fire_dt = _job_cron.parse_datetime(note.get("fireAt")) or datetime.now()
+            error = str(result.get("error") or result.get("result") or "QQ send failed")
+            _append_task_run(attempted_job,
+                             attempted_job.get("taskId") or job_id, fire_dt,
+                             note.get("dispatchKey") or "", "error", error,
+                             registry_root, entry_id=note.get("entryId"),
+                             result=result)
     return len(delivered)
 
 
@@ -2528,7 +2831,7 @@ async def _fire_scheduled_entry(job: dict, entry: dict, now_dt: datetime,
                           "error": None})
 
     target_required = action_api not in {
-        "shell", RESUME_LEGAL_RUNNING_ACTION,
+        "shell", RESUME_LEGAL_RUNNING_ACTION, "send_qq",
     }
     if not target and target_required:
         return _backlog_undelivered_fire(
@@ -2559,7 +2862,7 @@ async def _fire_scheduled_entry(job: dict, entry: dict, now_dt: datetime,
     max_runs = job.get("maxRuns")
     result_status = str(result.get("status") or "error")
     pending_process = result_status == "running"
-    succeeded = result_status not in {"error", "failed", "cancelled"}
+    succeeded = result_status not in {"error", "failed", "cancelled", "unknown", "uncertain", "unconfirmed"}
     run_status = "running" if pending_process else (
         "completed" if result_status == "completed" else
         "dispatched" if succeeded else "error"
@@ -2604,6 +2907,10 @@ async def run_due_scheduled_tasks(now: float | None = None) -> int:
     root = _scheduled_task_root()
     if root is None:
         return 0
+    from packages.jobs.action_runtime import for_root, is_protected_job as is_action_job
+    runtime = for_root(root)
+    if runtime is not None:
+        await runtime.tick(cfg)
     _reconcile_scheduled_processes(root)
     if not cfg.get("enabled", True):
         return 0
@@ -2615,6 +2922,8 @@ async def run_due_scheduled_tasks(now: float | None = None) -> int:
     #    放回 scheduled。entry 触发点不动，错过点重新走 grace 判定；
     #    重投由 dispatch_key 幂等保证不双跑。
     for job in list_jobs(root):
+        if is_action_job(job):
+            continue
         if job.get("kind") != SCHEDULED_TASK_KIND or job.get("status") != "running":
             continue
         started = job.get("runStartedAt")
@@ -2622,6 +2931,10 @@ async def run_due_scheduled_tasks(now: float | None = None) -> int:
                 and now_ts - float(started) < _scheduled_task_requeue_after(job)):
             continue
         try:
+            if job.get('attemptSnapshot'):
+                _update(job['jobId'], {'status': 'uncertain', 'enabled': False,
+                                      'lastError': 'Unconfirmed system Action; automatic replay blocked'}, registry_root=root)
+                continue
             _update(job["jobId"], {"status": "scheduled", "runStartedAt": None,
                                    "updatedAt": now_ts}, registry_root=root)
         except ValueError:
@@ -2630,13 +2943,22 @@ async def run_due_scheduled_tasks(now: float | None = None) -> int:
     # 2) 维护 + 认领
     claimed: list[dict] = []
     for job in list_jobs(root):
+        if is_action_job(job):
+            continue
         if job.get("kind") != SCHEDULED_TASK_KIND:
             continue
         if job.get("status") not in {"pending", "scheduled"}:
             continue
         if not job.get("enabled"):
             continue
-        if job.get("undeliveredFires") and _sessions.get(job.get("targetSessionId")) is not None:
+        action = job.get("action")
+        action_api = action.get("api", "assign") if isinstance(action, dict) else "assign"
+        target_required = action_api not in {
+            "shell", RESUME_LEGAL_RUNNING_ACTION, "send_qq",
+        }
+        if (job.get("undeliveredFires")
+                and (not target_required
+                     or _sessions.get(job.get("targetSessionId")) is not None)):
             try:
                 handled += await _redeliver_undelivered(job, root)
             except Exception:
@@ -2658,7 +2980,7 @@ async def run_due_scheduled_tasks(now: float | None = None) -> int:
                 continue
             current.update(status="running", runStartedAt=now_ts,
                             updatedAt=now_ts)
-            _atomic_write(path, current)
+            _write_job(path, current)
             claimed.append(current)
 
     # 3) 执行被认领的到期 entries（认领即「落盘先于派发」）。每个 entry 前重载
@@ -2676,6 +2998,8 @@ async def run_due_scheduled_tasks(now: float | None = None) -> int:
         closing = {"status": "scheduled", "runStartedAt": None,
                    "updatedAt": time.time()}
         closing_job = get(job["jobId"], registry_root=root) or latest
+        if closing_job.get('status') in {'unknown','uncertain','cancelled','cleaning'}:
+            continue
         if not closing_job.get("enabled"):
             closing["status"] = "completed"
         try:
@@ -2712,12 +3036,17 @@ def _owns_process(job: dict) -> Any:
         return None
 
 
-def cancel(job_id: str) -> dict:
-    job = get(job_id)
+def cancel(job_id: str, registry_root: str | Path | None = None) -> dict:
+    job = get(job_id, registry_root)
     if not job:
         raise ValueError("job not found")
+    if job.get("executionOwner") == "independent-job-service":
+        from packages.jobs import pan_bridge
+        return pan_bridge.public_job(pan_bridge.request("cancel", job_id))
     if job.get("kind") in {SESSION_MESSAGE_KIND, SESSION_BROADCAST_KIND}:
-        return cancel_message(job_id)
+        return cancel_message(job_id, registry_root)
+    if job.get("status") in {"cleanup_pending", "deleting"}:
+        raise ValueError("cannot safely cancel: deletion cleanup pending; use explicit DELETE to recheck")
     if job.get("status") in {"completed", "failed", "cancelled"}:
         return job
     proc = _owns_process(job)
@@ -2727,37 +3056,57 @@ def cancel(job_id: str) -> dict:
         raise ValueError("cannot safely cancel: task PID identity is unavailable or reused")
     if not proc and not runner:
         raise ValueError("cannot safely cancel: Runner PID identity is unavailable")
+    # Publish accepted cancellation before killing. The runner can otherwise
+    # observe the termination exit code and commit failed before cancel commits.
+    with _lock, _job_lock(job_id, registry_root):
+        current = _load_path(_job_path(job_id, registry_root))
+        if not current: raise ValueError("job not found")
+        if current.get("status") in {"cleanup_pending", "deleting"}:
+            raise ValueError("cannot safely cancel: deletion cleanup pending")
+        if current.get("status") in {"completed", "failed", "cancelled"}: return current
+        current["cancelRequestedAt"] = time.time()
+        _write_job(_job_path(job_id, registry_root), current)
     if proc:
         _kill_tree(proc)
     if runner and getattr(runner, "pid", None) != getattr(proc, "pid", None):
         _kill_tree(runner)
-    with _lock, _job_lock(job_id):
-        current = _load_path(_job_path(job_id))
+    with _lock, _job_lock(job_id, registry_root):
+        current = _load_path(_job_path(job_id, registry_root))
         if not current:
             raise ValueError("job not found")
+        if current.get("status") in {"cleanup_pending", "deleting"}:
+            raise ValueError("cannot safely cancel: deletion cleanup pending")
         if current.get("status") in {"completed", "failed", "cancelled"}:
             return current
         current.update(status="cancelled", exitCode=None, updatedAt=time.time(),
                        terminalEventId=f"{job_id}:terminal", notificationState="pending")
-        _atomic_write(_job_path(job_id), current)
+        _write_job(_job_path(job_id, registry_root), current)
         return current
 
 
 def _kill_tree(proc: Any) -> None:
     """Best-effort descendant-first termination for an owned process."""
+    import psutil
+
     try:
         children = proc.children(recursive=True)
-        for child in reversed(children):
-            child.kill()
-        proc.kill()
-    except (OSError, AttributeError):
-        pass
+    except (OSError, AttributeError, psutil.NoSuchProcess):
+        children = []
+    for owned in [*reversed(children), proc]:
+        try:
+            owned.kill()
+        except (OSError, AttributeError, psutil.NoSuchProcess):
+            # Exit races are expected; still attempt every other owned member.
+            pass
 
 
 def retry(job_id: str) -> dict:
     old = get(job_id)
     if not old:
         raise ValueError("job not found")
+    if old.get("executionOwner") == "independent-job-service":
+        from packages.jobs import pan_bridge
+        return pan_bridge.public_job(pan_bridge.request("retry", job_id))
     if old.get("scheduledParentJobId"):
         raise ValueError("scheduled shell runs are managed by the parent Job and cannot be retried")
     if old.get("kind") in {SESSION_MESSAGE_KIND, SESSION_BROADCAST_KIND}:
@@ -2768,6 +3117,8 @@ def retry(job_id: str) -> dict:
         raise ValueError("job is not retryable")
     new_job = start(
         old["targetSessionId"], old["argv"], old["cwd"], label=old.get("label"),
+        name=(normalize_name(old.get("name")) or "Retry background process")[:200],
+        hide_window=old.get("hideWindow", True),
         creator_session_id=old.get("creatorSessionId"),
     )
     new_job["retryOf"] = job_id
@@ -2792,6 +3143,8 @@ def get_active_service_job(root: str, port: int,
     """Return the persisted in-flight lifecycle Job for one checkout/port."""
     root_value = str(Path(root).expanduser().resolve())
     for job in list_jobs(registry_root):
+        if job.get("executionOwner") == "independent-job-service":
+            continue
         if (job.get("kind") == SERVICE_LIFECYCLE_KIND
                 and str(Path(str(job.get("root", ""))).expanduser().resolve()) == root_value
                 and int(job.get("port", -1)) == int(port)
@@ -2832,7 +3185,7 @@ def create_service_job(*, request_id: str, operation: str, root: str, port: int,
     registry_path = str(_root(registry_root))
     job = {
         "jobId": job_id, "kind": SERVICE_LIFECYCLE_KIND, "operation": operation,
-        "name": default_job_name(registry_path),
+        "name": f"{operation} Pan service on port {port}",
         "description": "",
         "options": frozen_options,
         "requestId": request_id, "phase": "requested", "status": "pending",
@@ -2870,7 +3223,8 @@ def transition_service_job(job_id: str, phase: str, *, registry_root: str | Path
             }
         else:
             allowed = {
-                "requested": {"stopping", "failed", "timed_out"},
+                "requested": {"stopping_workers", "stopping", "failed", "timed_out"},
+                "stopping_workers": {"stopping", "failed", "timed_out"},
                 "stopping": {"stopped", "failed", "timed_out"},
                 "stopped": {"starting", "failed", "timed_out"},
                 "starting": {"ready", "failed", "timed_out"},
@@ -2904,7 +3258,7 @@ def transition_service_job(job_id: str, phase: str, *, registry_root: str | Path
         } else (
             phase if phase in {"failed", "timed_out"} else "running")
         current.update(phase=phase, status=status, updatedAt=time.time())
-        _atomic_write(path, current)
+        _write_job(path, current)
         return _normalize_job(current)
 
 
@@ -2916,6 +3270,76 @@ def find_service_job(request_id: str, registry_root: str | Path | None = None) -
     return None
 
 
+def claim_hidden_runner(job_id: str) -> bool:
+    """Publish the real Python owner before hidden task creation, exactly once.
+
+    The spawning controller can die before persisting Popen's redirector PID.
+    The runner therefore owns this claim; recovery never starts a replacement.
+    """
+    from packages.core.terminal.identity import probe_process, ProcessStatus
+    pid = os.getpid()
+    probe = probe_process(pid)
+    if probe.status is not ProcessStatus.ALIVE or probe.identity is None:
+        raise OSError("hidden runner creation identity unavailable")
+    filetime = probe.identity.created_at_filetime
+    with _lock, _job_lock(job_id):
+        path = _job_path(job_id)
+        current = _load_path(path)
+        if (not current or current.get("status") not in {"starting", "running"}
+                or current.get("runnerClaim")):
+            return False
+        if current.get("cancelRequestedAt"):
+            current.update(status="cancelled", exitCode=None,
+                           terminalEventId=f"{job_id}:terminal", notificationState="pending")
+            current["updatedAt"] = time.time()
+            _write_job(path, current)
+            return False
+        current.update(runnerPid=pid, runnerFiletime=str(filetime),
+                       runnerProcessCreatedAt=filetime / 10_000_000 - 11644473600,
+                       runnerClaim=secrets.token_hex(16), updatedAt=time.time())
+        _write_job(path, current)
+        return True
+
+
+def runner_spawn(job_id: str, factory):
+    """Serialize task spawn/publication without holding the global registry gate."""
+    with _registry_lock("task-spawn-" + job_id):
+        with _lock, _job_lock(job_id):
+            path = _job_path(job_id)
+            current = _load_path(path)
+            if (not current or current.get("status") not in {"starting", "running"}
+                    or current.get("cancelRequestedAt")):
+                raise ValueError("Job no longer admitted for task spawn")
+        proc = factory()
+        try:
+            facts = dict(status="running", pid=proc.pid,
+                         processCreatedAt=_process_create_time(proc.pid), updatedAt=time.time())
+            if os.name == "nt":
+                from packages.core.terminal.identity import probe_process
+                probe = probe_process(proc.pid)
+                if probe.identity is None:
+                    raise ValueError("spawned task identity unavailable")
+                facts["processFiletime"] = str(probe.identity.created_at_filetime)
+                guard = getattr(proc, "job_guard", None)
+                if guard is not None:
+                    facts["processJobHandle"] = str(guard.raw_handle)
+            with _lock, _job_lock(job_id):
+                current = _load_path(path)
+                if (not current or current.get("status") not in {"starting", "running"}
+                        or current.get("cancelRequestedAt")):
+                    raise ValueError("Job no longer admitted after task spawn")
+                current.update(facts)
+                _write_job(path, current)
+            return proc
+        except BaseException:
+            if getattr(proc, "job_guard", None) is not None:
+                proc.close()
+            else:
+                proc.kill()
+                proc.wait(timeout=2)
+            raise
+
+
 def runner_update(job_id: str, **changes: Any) -> dict:
     job = get(job_id)
     if not job:
@@ -2925,7 +3349,29 @@ def runner_update(job_id: str, **changes: Any) -> dict:
         changes.setdefault("terminalEventId", f"{job_id}:terminal")
         changes["notificationState"] = "pending"
     changes["updatedAt"] = time.time()
-    return _update(job_id, changes)
+    with _lock, _job_lock(job_id):
+        current = _load_path(_job_path(job_id))
+        if not current: raise ValueError("job not found")
+        if current.get("cancelRequestedAt") and changes.get("status") in {"completed", "failed"}:
+            # The runner may finish before the cancelling caller commits (or
+            # that caller may disappear). Do not leave an active pending record.
+            changes.update(status="cancelled", exitCode=None)
+        if current.get("status") in {"cleanup_pending", "deleting"}:
+            if changes.get("status") in {"completed", "failed", "cancelled"}:
+                # This is an observation, not an admitted terminal transition.
+                # Keep the executable Attempt snapshot until deletion has its
+                # own complete exit proof; do not publish a terminal outbox ID.
+                changes["cleanupRunnerOutcome"] = {
+                    key: changes.pop(key) for key in
+                    ("status", "exitCode", "error", "processTreeEnded") if key in changes}
+                changes.pop("terminalEventId", None)
+                changes.pop("notificationState", None)
+            changes.pop("status", None)
+        if current.get("status") == "cancelled":
+            changes.pop("status", None)
+        current.update(changes)
+        _write_job(_job_path(job_id), current)
+        return current
 
 
 def reconcile_running(registry_root: str | Path | None = None) -> int:
@@ -2937,6 +3383,8 @@ def reconcile_running(registry_root: str | Path | None = None) -> int:
     """
     changed = 0
     for job in list_jobs(registry_root):
+        if job.get("executionOwner") == "independent-job-service":
+            continue
         if job.get("kind") in {
             SERVICE_LIFECYCLE_KIND, SESSION_MESSAGE_KIND, SESSION_BROADCAST_KIND,
             SCHEDULED_TASK_KIND}:
@@ -2948,28 +3396,188 @@ def reconcile_running(registry_root: str | Path | None = None) -> int:
         runner = _owns_process({"pid": runner_pid, "processCreatedAt": runner_created})
         if runner is not None:
             continue
-        reason = "runner identity missing, unavailable, dead, or PID reused"
-        if job.get("scheduledParentJobId"):
-            task_process = _owns_process({
-                "pid": job.get("pid"),
-                "processCreatedAt": job.get("processCreatedAt"),
-            })
-            if task_process is not None:
-                _kill_tree(task_process)
-                try:
-                    task_process.wait(timeout=2.0)
-                except Exception:
-                    pass
-                reason = "Runner disappeared; terminated the verified scheduled shell process"
-        _update(job["jobId"], {"status": "failed", "error": "orphaned: " + reason,
-                                "terminalEventId": f"{job['jobId']}:terminal",
-                                "notificationState": "pending", "updatedAt": time.time()},
-                registry_root=registry_root)
-        changed += 1
+        with _lock, _job_lock(job["jobId"], registry_root):
+            path = _job_path(job["jobId"], registry_root)
+            current = _load_path(path)
+            if (not current or current.get("status") not in {"starting", "running"}
+                    or current.get("runnerPid") != runner_pid
+                    or current.get("runnerProcessCreatedAt") != runner_created):
+                # A runner may commit its terminal fact during the liveness probe.
+                # Do not replace that fact (or a different owner generation).
+                continue
+            reason = "runner identity missing, unavailable, dead, or PID reused"
+            if job.get("scheduledParentJobId"):
+                task_process = _owns_process({
+                    "pid": job.get("pid"),
+                    "processCreatedAt": job.get("processCreatedAt"),
+                })
+                if task_process is not None:
+                    _kill_tree(task_process)
+                    try:
+                        task_process.wait(timeout=2.0)
+                    except Exception:
+                        pass
+                    reason = "Runner disappeared; terminated the verified scheduled shell process"
+            current.update(status="failed", error="orphaned: " + reason,
+                           terminalEventId=f"{job['jobId']}:terminal",
+                           notificationState="pending", updatedAt=time.time())
+            _write_job(path, current)
+            changed += 1
     return changed
 
 
+async def _scheduled_task_emit_strict(event: dict) -> bool:
+    """可靠发射：返回事件是否已成功入队广播通道（失败由调用方保持可重试）。
+
+    on_event_strict（scheduler emit_strict）优先；未注册时退回 on_event 的
+    尽力而为语义（回调异常 = 失败）。入队成功即算数：每连接 socket 发送
+    按 broadcast 的隔离契约不 await，断线客户端由重连 REST 水合收敛。
+    job.updated 是状态 upsert，客户端对重复事件幂等：成功后、标记持久化
+    前崩溃导致的重发是允许的收敛路径，因此这里绝不以牺牲送达换取严格一次。
+    """
+    from packages.jobs.system_actions import notify
+    notify(event)
+    strict = _scheduled_task_hooks.get("on_event_strict")
+    callback = strict if callable(strict) else _scheduled_task_hooks.get("on_event")
+    if not callable(callback):
+        return False
+    try:
+        result = callback(event)
+        if inspect.isawaitable(result):
+            result = await result
+        return result is not False
+    except Exception:
+        return False
+
+
+def _terminal_broadcast_candidate(job: dict, root: str | Path) -> dict | None:
+    """（legacy 路径）读取待补发终态的当前视图；只读，不做任何写入。
+
+    分离 runner 只把终态落盘（自身没有 WS 通道，独立进程所有权不变）；
+    恢复循环在此观测到未广播的终态后，由调用方以严格契约发布，成功后才
+    通过 _mark_terminal_broadcast 持久化幂等标记。发布前崩溃只会让下一
+    tick 重发同一状态（客户端幂等 upsert）；先标记后发布则可能因一次
+    广播失败而永久卡住旧状态，故顺序必须是发布成功 → 标记。
+    scheduled 子任务不在 /api/jobs 列表内且由父任务 finalize 负责广播，
+    这里跳过，避免 GUI upsert 引入列表外作业。
+    """
+    if job.get("scheduledParentJobId"):
+        return None
+    event_id = job.get("terminalEventId") or f"{job['jobId']}:terminal"
+    if job.get("terminalEventEmittedFor") == event_id:
+        return None
+    with _lock, _job_lock(job["jobId"], root):
+        current = _load_path(_job_path(job["jobId"], root))
+        if not current:
+            return None
+        current_event_id = (current.get("terminalEventId")
+                            or f"{current['jobId']}:terminal")
+        if (current.get("status") not in {"completed", "failed", "cancelled"}
+                or current.get("terminalEventEmittedFor") == current_event_id):
+            return None
+        return job_public_view(current)
+
+
+def _mark_terminal_broadcast(job_id: str, root: str | Path) -> None:
+    """成功发布后持久化幂等标记；纯簿记，不触碰 updatedAt（否则会把
+    retention 的完成年龄刷新，让本应清理的终态记录逃过清理）。"""
+    with _lock, _job_lock(job_id, root):
+        current = _load_path(_job_path(job_id, root))
+        if not current:
+            return
+        current_event_id = (current.get("terminalEventId")
+                            or f"{current['jobId']}:terminal")
+        if current.get("terminalEventEmittedFor") == current_event_id:
+            return
+        current["terminalEventEmittedFor"] = current_event_id
+        _write_job(_job_path(job_id, root), current)
+
+
+def _terminal_broadcast_ledger_path() -> Path:
+    return _root() / "jobs" / ".terminal-broadcast-ledger.json"
+
+
+def _load_terminal_broadcast_ledger() -> dict:
+    try:
+        data = json.loads(_terminal_broadcast_ledger_path().read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if isinstance(data, dict) and isinstance(data.get("jobs"), dict):
+        return data["jobs"]
+    return data if isinstance(data, dict) else {}
+
+
+def _save_terminal_broadcast_ledger(ledger: dict) -> None:
+    path = _terminal_broadcast_ledger_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write(path, {"jobs": ledger})
+
+
+async def _broadcast_independent_terminals() -> None:
+    """（独立 Job 服务路径）远程注册表里的终态补发 job.updated。
+
+    独立服务的 runner 把终态写进服务自己的 SQLite 注册表并与 outbox 同
+    事务持久化（服务无 WS 通道，进程所有权不变）；GUI 列表由 /api/jobs 的
+    pan_bridge 远程合并提供，因此远程终态必须在此补发。幂等标记持久化在
+    本地 ledger（键 jobId，值 status:terminalEventId）——绝不写服务注册表。
+    发布失败不记 ledger，下一 tick 重试；成功后崩溃导致的重复 upsert 是
+    允许的收敛路径。ledger 只保留仍在远程列表中的作业：服务 retention
+    删除的作业不会重现，其项在当轮清掉，防止文件无限增长。scheduled
+    子任务被 /api/jobs 过滤且由父任务 finalize 广播，跳过。
+    """
+    from packages.jobs import pan_bridge
+    if pan_bridge.configured_client() is None:
+        return
+    try:
+        remote = await asyncio.to_thread(pan_bridge.request, "list")
+    except Exception:
+        return  # 服务不可用：本轮跳过，下一 tick 重试。
+    if not isinstance(remote, dict) or not isinstance(remote.get("jobs"), list):
+        return
+    ledger = _load_terminal_broadcast_ledger()
+    ledger_dirty = False
+    live: set[str] = set()
+    for item in remote["jobs"]:
+        # 畸形项只跳过：public_job 的 JobServiceUnavailable 不得冒泡——
+        # 那会连坐本轮 retention（恢复循环的其余部分不依赖这一项）。
+        if not isinstance(item, dict) or not isinstance(item.get("jobId"), str):
+            continue
+        job = pan_bridge.public_job(item)
+        live.add(job["jobId"])
+        if job.get("scheduledParentJobId"):
+            continue
+        if job.get("status") not in {"completed", "failed", "cancelled"}:
+            continue
+        job_id = job["jobId"]
+        fingerprint = (f"{job.get('status')}:"
+                       f"{job.get('terminalEventId') or f'{job_id}:terminal'}")
+        if ledger.get(job_id) == fingerprint:
+            continue
+        if await _scheduled_task_emit_strict({
+                "type": "job.updated",
+                "jobId": job_id,
+                "job": job_public_view(job)}):
+            ledger[job_id] = fingerprint
+            ledger_dirty = True
+    # 已被服务 retention 删除的作业不会再次出现：清掉其 ledger 项，
+    # 否则文件随终态作业数无限增长。误删的最坏结果是一次重复 upsert
+    # （客户端幂等），正是本设计已允许的收敛路径。
+    stale = [key for key in ledger if key not in live]
+    if stale:
+        for key in stale:
+            ledger.pop(key, None)
+        ledger_dirty = True
+    if ledger_dirty:
+        _save_terminal_broadcast_ledger(ledger)
+
+
 async def recover_notifications() -> int:
+    from packages.jobs import pan_bridge
+    try:
+        independent_delivered = await pan_bridge.recover_events(_worker.enqueue_notice)
+    except pan_bridge.JobServiceUnavailable:
+        # An independent-service outage must not starve legacy/scheduled jobs.
+        independent_delivered = 0
     roots = {_root()}
     scheduled_root = _scheduled_task_root()
     if scheduled_root is not None:
@@ -2981,15 +3589,22 @@ async def recover_notifications() -> int:
         await run_due_scheduled_tasks()
     except Exception:
         pass  # scheduler pass 不得饿死 message job / 终态通知恢复
-    delivered = 0
+    delivered = independent_delivered
     for root in roots:
         reconcile_running(root)
         for job in list_jobs(root):
             if job.get("kind") in {SERVICE_LIFECYCLE_KIND, SESSION_MESSAGE_KIND,
                                     SESSION_BROADCAST_KIND, SCHEDULED_TASK_KIND}:
                 continue
-            if (job.get("status") not in {"completed", "failed", "cancelled"}
-                    or job.get("notificationState") in {"delivered", "not_applicable"}):
+            if job.get("status") not in {"completed", "failed", "cancelled"}:
+                continue
+            broadcast = _terminal_broadcast_candidate(job, root)
+            if broadcast is not None and await _scheduled_task_emit_strict({
+                    "type": "job.updated",
+                    "jobId": broadcast["jobId"],
+                    "job": broadcast}):
+                _mark_terminal_broadcast(broadcast["jobId"], root)
+            if (job.get("notificationState") in {"delivered", "not_applicable"}):
                 continue
             # Hold the cross-process job lock through projection and terminal
             # notification marking; enqueue_notice is idempotent after a crash.
@@ -3003,7 +3618,7 @@ async def recover_notifications() -> int:
                 if not target:
                     current["notificationState"] = "not_applicable"
                     current["updatedAt"] = time.time()
-                    _atomic_write(_job_path(current["jobId"], root), current)
+                    _write_job(_job_path(current["jobId"], root), current)
                     continue
                 event_id = current.get("terminalEventId") or f"{current['jobId']}:terminal"
                 text = json.dumps({
@@ -3024,8 +3639,10 @@ async def recover_notifications() -> int:
                     current["notificationState"] = "delivered"
                     current["terminalEventId"] = event_id
                     current["updatedAt"] = time.time()
-                    _atomic_write(_job_path(current["jobId"], root), current)
+                    _write_job(_job_path(current["jobId"], root), current)
                     delivered += 1
+    # 独立 Job 服务路径：远程注册表的终态补发（与 legacy 循环同一严格契约）。
+    await _broadcast_independent_terminals()
     try:
         retention_result = await asyncio.to_thread(
             run_completed_job_retention, emit_events=False)

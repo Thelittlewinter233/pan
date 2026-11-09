@@ -201,7 +201,11 @@ def test_mcp_args_url_server():
     }]})
     joined = " ".join(a.mcp_args(s))
     assert 'mcp_servers.remote.url="http://127.0.0.1:9000/mcp"' in joined
-    assert 'mcp_servers.remote.transport="http"' in joined
+    # 不注入 transport/type：codex 由「是否存在 url」推断传输方式（实测 cli 0.162
+    # 可调通 http MCP）；显式传这两个键会被判为未识别设置，每次启动报
+    # `mcp_servers.<name>.transport is ignored` 警告。
+    assert "mcp_servers.remote.transport" not in joined
+    assert "mcp_servers.remote.type" not in joined
     print("PASS: mcp_args url server")
 
 
@@ -297,7 +301,9 @@ def test_parse_user_message_block():
         "id": "i5", "type": "userMessage",
         "content": [{"type": "text", "text": "hello"}],
     }}
-    assert a.extract_assistant_blocks(event) == [{"role": "user", "content": "hello"}]
+    assert a.extract_assistant_blocks(event) == [{
+        "role": "user", "content": "hello", "nativeItemId": "i5",
+    }]
     print("PASS: parse user_message block")
 
 
@@ -496,6 +502,87 @@ def test_app_server_turn_error_with_failed_status_stays_an_error(monkeypatch):
     assert emitted[-1]["is_error"] is True
     assert emitted[-1]["turn_status"] == "failed"
     print("PASS: failed turn still reports error")
+
+
+def test_app_server_failed_turn_preserves_raw_error_beside_assistant_text(monkeypatch):
+    """A failed turn can still carry partial assistant text.
+
+    Pan must receive the provider error object as well, otherwise the Worker
+    only sees ``result=<assistant text>`` and the real failure is lost.
+    """
+    app = app_server_wrapper.AppServer("node", "codex.js", "C:/work", [])
+    app.thread_id = "thread-1"
+    emitted: list[dict] = []
+    monkeypatch.setattr(app_server_wrapper, "_write_stdout", emitted.append)
+    raw_error = {
+        "message": "stream disconnected before completion",
+        "code": "rate_limit",
+        "codexErrorInfo": {
+            "responseStreamDisconnected": {"httpStatusCode": 429},
+        },
+        "additionalDetails": "retry after 12s",
+    }
+
+    def request(method: str, params: dict) -> int:
+        assert method == "turn/start"
+        app.incoming.put({"id": 1, "result": {"turn": {"id": "turn-1"}}})
+        app.incoming.put({
+            "method": "turn/completed",
+            "params": {"turn": {
+                "id": "turn-1", "status": "failed", "error": raw_error,
+                "items": [{"type": "agentMessage", "text": "partial answer"}],
+            }},
+        })
+        return 1
+
+    monkeypatch.setattr(app, "_request", request)
+    app.run_turn("hello")
+
+    result = emitted[-1]
+    assert result["type"] == "result"
+    assert result["is_error"] is True
+    assert result["result"] == "partial answer"
+    assert result["error"] == raw_error
+    print("PASS: failed turn keeps raw error beside assistant text")
+
+
+def test_app_server_completed_turn_emits_recovered_transient_error(monkeypatch):
+    """A reconnect notice followed by a completed turn is a recovered,
+    non-terminal CLI error, not a task failure and not silence."""
+    app = app_server_wrapper.AppServer("node", "codex.js", "C:/work", [])
+    app.thread_id = "thread-1"
+    emitted: list[dict] = []
+    monkeypatch.setattr(app_server_wrapper, "_write_stdout", emitted.append)
+    raw_error = {
+        "message": "Reconnecting... 2/5",
+        "codexErrorInfo": {"responseStreamDisconnected": {"httpStatusCode": None}},
+    }
+
+    def request(method: str, params: dict) -> int:
+        assert method == "turn/start"
+        app.incoming.put({"id": 1, "result": {"turn": {"id": "turn-1"}}})
+        app.incoming.put({
+            "method": "error",
+            "params": {"threadId": "thread-1", "turnId": "turn-1", "error": raw_error},
+        })
+        app.incoming.put({
+            "method": "turn/completed",
+            "params": {"turn": {"id": "turn-1", "status": "completed",
+                                  "items": [{"type": "agentMessage", "text": "391"}]}},
+        })
+        return 1
+
+    monkeypatch.setattr(app, "_request", request)
+    app.run_turn("17*23?")
+
+    recovered = [event for event in emitted
+                 if event.get("type") == "codex.transient_error_recovered"]
+    assert len(recovered) == 1
+    assert recovered[0]["error"] == raw_error
+    assert recovered[0]["turn_status"] == "completed"
+    assert emitted[-1]["is_error"] is False
+    assert emitted[-1]["result"] == "391"
+    print("PASS: completed turn reports recovered transient error")
 
 
 def test_app_server_error_is_normalized_for_pan(monkeypatch):
@@ -1251,6 +1338,13 @@ def test_app_server_native_items_are_displayable():
 def test_item_to_block_mapping():
     assert codex_sessions._item_to_block({"type": "userMessage", "content": [{"type": "text", "text": "u"}]}) == {"role": "user", "content": "u"}
     assert codex_sessions._item_to_block({"type": "agentMessage", "text": "a"}) == {"role": "assistant", "content": "a"}
+    assert codex_sessions._item_to_block({
+        "id": "native-user", "type": "userMessage",
+        "content": [{"type": "text", "text": "u"}],
+    }) == {"role": "user", "content": "u", "nativeItemId": "native-user"}
+    assert codex_sessions._item_to_block({
+        "id": "native-assistant", "type": "agentMessage", "text": "a",
+    }) == {"role": "assistant", "content": "a", "nativeItemId": "native-assistant"}
     assert codex_sessions._item_to_block({"type": "reasoning", "summary": ["r"]}) == {"role": "thinking", "content": "r"}
     assert codex_sessions._item_to_block({"type": "plan", "text": "inspect"}) == {"role": "thinking", "content": "inspect"}
     assert codex_sessions._item_to_block({"type": "commandExecution", "command": "cmd", "aggregated_output": "out"}) == {"role": "tool", "content": "cmd\n→ out"}
@@ -1284,15 +1378,27 @@ def test_norm_path():
 
 
 def test_cwd_matches_repository_root():
+    """_cwd_matches 的双向包含契约（``5ca5d70a``include directory descendants）。
+
+    Codex 常持久化 git 仓库根，而 Pan 可能从其子目录启动，因此线程记录的根
+    是所选目录的祖先时必须匹配；反过来，所选目录是线程cwd 的子目录（线程实际
+    跑在其内部）也必须匹配——否则按子目录过滤会静默漏掉会话。分隔符边界仍然
+    生效：``repo`` 不得匹配 ``repo-other``。
+    """
     original = codex_sessions._IS_WINDOWS
     try:
         codex_sessions._IS_WINDOWS = True
+        # 线程记录的仓库根是所选目录的祖先 → 匹配。
         assert codex_sessions._cwd_matches(r"C:\repo", r"C:\repo\nested") is True
+        # 仅共享前缀但不是祖先 → 不匹配（分隔符边界）。
         assert codex_sessions._cwd_matches(r"C:\repo", r"C:\repo-other") is False
-        assert codex_sessions._cwd_matches(r"C:\repo\nested", r"C:\repo") is False
+        # 所选目录是线程 cwd 的子目录（线程实际在其内部）→ 同样匹配。
+        assert codex_sessions._cwd_matches(r"C:\repo\nested", r"C:\repo") is True
+        # 真正的无关目录 → 不匹配。
+        assert codex_sessions._cwd_matches(r"C:\repo", r"C:\elsewhere") is False
     finally:
         codex_sessions._IS_WINDOWS = original
-    print("PASS: _cwd_matches ancestor boundary")
+    print("PASS: _cwd_matches ancestor/descendant boundary")
 
 
 # ── sessions：临时 ~/.codex 端到端（hermetic）──
@@ -1374,14 +1480,15 @@ def _build_fake_codex_dir(tmp: Path) -> tuple[Path, Path, Path]:
     return state, hist, tmp / "sessions"
 
 
-def test_sessions_provider_e2e():
+def test_sessions_provider_e2e(monkeypatch):
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         state, hist, sess_dir = _build_fake_codex_dir(tmp)
         # monkeypatch 模块级路径到 fake ~/.codex
-        codex_sessions._STATE_DB = state
-        codex_sessions._HISTORY_DB = hist
-        codex_sessions._SESSIONS_DIR = sess_dir
+        monkeypatch.setattr(codex_sessions, "_CODEX_DIR", tmp)
+        monkeypatch.setattr(codex_sessions, "_STATE_DB", state)
+        monkeypatch.setattr(codex_sessions, "_HISTORY_DB", hist)
+        monkeypatch.setattr(codex_sessions, "_SESSIONS_DIR", sess_dir)
 
         # list_sessions + cwd 过滤
         all_sessions = codex_sessions.list_sessions()
@@ -1436,8 +1543,8 @@ def test_sessions_provider_e2e():
         assert Path(rp).is_file(), "fork must materialize a rollout file"
         meta = json.loads(Path(rp).read_text(encoding="utf-8").splitlines()[0])
         assert meta["payload"]["id"] == new_id
-        assert meta["payload"]["session_id"] == new_id
-        assert Path(rp).read_text(encoding="utf-8").find("thread_abc") == -1
+        assert meta["payload"]["session_id"] == "thread_abc"  # native session-tree root
+        assert meta["payload"]["context_window"]["window_id"] == "thread_abc-ctx"
         print("PASS: sessions provider e2e (fake ~/.codex)")
 
 
@@ -1650,5 +1757,7 @@ if __name__ == "__main__":
     test_item_to_block_mapping()
     test_norm_path()
     test_cwd_matches_repository_root()
-    test_sessions_provider_e2e()
+    import pytest
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        test_sessions_provider_e2e(monkeypatch)
     print("\n=== ALL CODEX ADAPTER TESTS PASSED ===")

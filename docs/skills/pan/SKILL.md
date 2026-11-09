@@ -1,11 +1,50 @@
 ---
 name: pan
-description: Pan CLI Agent 编排中间层——冷启动操作手册。通过 MCP 工具管理 Session（持久编排对象，承载 meta-agent/MA 或 task-agent/TA 身份）及其 Worker 进程（cbc/kimi/opencode/claude/codex 等多 CLI adapter）。当需要创建会话、并行派发任务（agent_assign）、订阅完成通知（report_subscribe → queue_pending）、读取结果、清理 session 或了解 Pan 编排坑与约定时使用。
+description: Pan CLI Agent 编排中间层——冷启动操作手册。通过 MCP 工具管理 Session（持久编排对象，承载 meta-agent/MA 或 task-agent/TA 身份）及其 Worker 进程（cbc/kimi/opencode/claude/codex 等多 CLI adapter）。当需要创建会话、并行派发任务（agent_assign）、订阅完成通知（report_subscribe → queue_pending）、读取结果、清理 session 或了解 Pan 编排坑与约定时使用。收到未答卡片提醒（user card reminder）需要查询或回答用户卡片时同样适用。执行预计超过 3 分钟的长命令（全量测试、build、长脚本等）前自主判断是否改用持久后台 Job（agent_background_start）并核验终态通知时同样适用。
 ---
 
 # Pan — CLI Agent 编排中间层（冷启动操作手册）
 
-Pan 是 Supervisor/Worker 架构的 CLI Agent 编排器。你（meta-agent，MA）通过 Pan MCP 工具调度多个 task-agent（TA）会话（cbc / kimi / opencode / claude / codex 等多 adapter，持续增加中），每个会话拥有独立的记忆（workdir）；Worker 是实际运行这些会话的临时 CLI 进程实例。
+## 用户创建的提问卡 / 任务卡
+
+SendQueuePanel 展开后的动作行提供 `create reminding card`；移动端入口位于展开的“队列操作”网格。
+点击后收起队列面板并进入卡片态，选择 Question / Task，使用当前输入区的正文和附件；发送行按钮为 `create`，旁边有 `cancel`。
+Esc / 再点入口退出并保留草稿；切换 Session 清空卡片态草稿。卡片归创建时的 Session。
+
+Agent 仅使用一个本地可信 stdio 工具 `reminding_card`：
+`reminding_card(operation="list_pending")` 返回自己 Session 的所有未答卡（id、kind、body、
+attachments、createdAt、revision）；`reminding_card(operation="answer", card_id=..., body=...,
+expected_revision=...)` 首答即终态。question 要求非空白答案，task 允许空串；重复回答或
+revision 竞争返回冲突，不覆盖答案。MA / managed 关系不能跨 Session 代答。不提供 reject。
+
+有未答卡时默认每 10 分钟向 owner 队列投递 Notification；Behavior 中可改为 1–1440 分钟。
+创建时立即提示并附正文/card id，此后只发固定提示；最后一张回答/删除后停止定时提醒。
+提醒入队不解除 Illegal，不绕过 Pause、锁或 lease；后续积压 wake / Worker 恢复沿用正常队列机制。
+提醒不是用户答复或授权。重启按持久化的提醒时间恢复，错过的周期合并为一条。
+
+Locker 与现有卡片同列表，用 Reminding · Question / Reminding · Task 标方向。未答只展示创建位置且无
+已读状态；已答只读，首次标未读，用户可切换。底层始终一张卡，返回不变的 `createdAt`
+和首次设置的 `answeredAt`；已答卡在创建时间和回答时间各投影一行，两行内容与状态相同，
+操作共用 card id，任一行已读/删除同步作用两行。计数按卡片去重；每个位置按自己的时间排序，
+同时间原位置先于投影，React key 区分位置。产品层称为 reminding card；HTTP/MCP 对外使用
+reminding-cards/reminding_card，代码模块、表和内部字段仍保留 user_cards/user_card_*，不迁移数据。
+此流程独立存储，不进入 interaction_card 的
+open/responded、回应/拒绝通知或 Trigger 路径，原 agent→user 契约保持不变。
+
+Pan 是 Supervisor/Worker 架构的 CLI Agent 编排器。本入口只维护各角色共用的概念、工具契约和操作说明；角色行为由专门文档维护。
+
+## 必读：先识别自己的角色
+
+**已被明确声明为 MA 或 TA 的 Agent，必须进一步阅读对应行为文档。未声明角色的 Agent 只需阅读本入口及当前操作所需参考，不必阅读 MA/TA 手册，也不必为此先要求指定角色。**
+
+- **MA（meta-agent）**：负责澄清需求、拆解派发、跟进、独立验收与整合。必须阅读 [MA 行为准则](references/ma.md)。
+- **TA（task-agent）**：负责已派发任务的实施、验证和交付。必须阅读 [TA 行为准则](references/ta.md)。
+- 一个 Session 可以在不同任务中承担不同角色，也可以暂不承担 MA/TA 角色；以用户或当前任务的明确声明为准，不根据 adapter、模型、Session 名称或是否拥有子 Session 猜测。明确兼任两种角色时两份都读；未声明时不自动套用任一角色准则。
+- 角色文档不扩大用户授权。用户当前指令及任务边界优先于本 skill；只读讨论不能自动变成实现，TA 完成不等于 MA 验收通过。
+
+角色文档中的共用操作均引用本入口，避免复制工具参数与回执语义。以后调整 MA 的需求澄清、派发、等待、验收行为，直接修改 `references/ma.md`；调整 TA 的执行和交付行为，修改 `references/ta.md`。
+
+Dashboard 队列的入队回执只证明持久化，不证明已交给 Worker；聊天正文由服务端交接事件或确认 history 生成。队列 Steer 使用原 `queueItemId` 与 `expectedRevision`，由服务端读取全文和来源，遵守 Pause everything、readonly、锁及编辑 lease；仅支持 native Steer 的 adapter 提供按钮。回执不明的条目保持 `steerPending`，不得自动重发。接口与 provider 回执边界见 [HTTP API](references/http-api.md)。
 
 > **术语分层（MA / TA / Session / Worker，全文统一）**：
 > - **角色（职责）**：**meta-agent（MA）** 负责编排元任务——任务拆解、派发、监督、验收、合并；**task-agent（TA）** 执行具体开发、测试、调查或文档任务。MA/TA 是职责角色，不是进程类型或程序形态。
@@ -13,23 +52,82 @@ Pan 是 Supervisor/Worker 架构的 CLI Agent 编排器。你（meta-agent，MA�
 > - **进程（物理执行体）**：**Worker** 是临时 CLI 子进程，实际运行某个 MA 或 TA 的 Session——**既有 MA Worker 也有 TA Worker**；Worker 不承载身份（身份在 Session），可 kill / 回收 / 随时重建。
 > - **推荐关系**：用户 ↔ MA(Session/Worker) → `agent_assign` → TA(Session/Worker)；TA 完成报告经 `report_subscribe` → 落盘队列 `queue_pending` → MA 验收（§2 / §3）。
 
-> **这份 SKILL.md 是 Pan 编排知识的单一事实源**（立项 `docs/archive/Pan冷启动Agent编排skill立项.md`）。**主源**：`docs/skills/pan/SKILL.md`（git 版本控制）；`.codebuddy/skills/pan/SKILL.md` 是**同步副本**（CodeBuddy 编辑器加载 skill 用，不进 git）——改内容先改主源，再复制到副本保持同步。MCP 工具 / HTTP API / workdir 约定变化时必须同步更新本文件。
+> **`docs/skills/pan/` 是 Pan skill 的版本控制主源目录**（立项 `docs/archive/Pan冷启动Agent编排skill立项.md`）。**主源**：`docs/skills/pan/SKILL.md`（git 版本控制）；`.codebuddy/skills/pan/SKILL.md` 是**同步副本**（CodeBuddy 编辑器加载 skill 用，不进 git）——先改主源；角色拆分后同步必须覆盖 SKILL.md 及其引用文件，不能只复制入口。用户要求暂缓同步时仅修改仓库主源。MCP 工具 / HTTP API / workdir 约定变化时更新对应共用说明。
 >
-> **技术细节引用子文档**：HTTP API 清单与字段映射 → [`references/http-api.md`](references/http-api.md)；/ws/agent 订阅协议与 monitor_workers.py 盯梢模板（测试/排障用）→ [`references/ws-protocol.md`](references/ws-protocol.md)。本文件保留编排流程主线，细节见子文档。
+> **技术细节引用子文档**：HTTP API 清单与字段映射 → [`references/http-api.md`](references/http-api.md)；/ws/agent 订阅协议与 monitor_workers.py 盯梢模板（测试/排障用）→ [`references/ws-protocol.md`](references/ws-protocol.md)。本文件保留共用操作，角色行为见 `references/ma.md` 与 `references/ta.md`。
+
+### Illegal 与显式唤醒（2026-10-20）
+
+Illegal / 待恢复 Session 会自动 Illegal 锁定所有后续新入队消息，包括 agent、assign、插件、报告与 Job 通知。普通发送、群发及正文“继续”不自动恢复。手动解锁至少一条消息或手动 Start/Restart 才允许有效继任恢复；Manual、Pause、lease 与 native owner 等 gate 保持独立。
+
+显式 Wake 使用 `POST /api/sessions/wake`，同次持久化“发送 Behavior 配置的消息、解除其 Illegal 锁、置于队首”，再调度。UI 多选 Wake、启动恢复、定时恢复统一此操作，不能用普通 send/broadcast 模拟。相同去重 ID 不重发、重排或重新解锁。Oneshot Worker 模式已停用入口，历史配置解析为 stream；实现保留，Job 的 one-shot 调度不受影响。
+
+## 未获回答的用户问题：使用交互卡保留待办
+
+Agent 向用户提出需要回答的问题后，先在对话中正常提问，不必首次就建卡。若用户下一条消息转向其它内容、或任务被其它事件打断后重新进入时仍未回答该问题，视为用户错过，此时应自动使用 `interaction_card(operation="create", ...)` 将问题保留到 User Locker，不再在对话里重复追问。尤其适用于设计取舍、API 接入信息、Token 配置、许可，以及阻塞任务推进的决定。只有问题明确阻塞且不会再有机会等到下一轮时，才在首次提问时建卡；无需为了等下一轮而主动轮询。
+
+- 按可信来源判断答复，不以 provider 的 `role=user` 或下一轮有输入为依据。Notification、Report、MA/其他 Agent 消息不是用户答复；除非用户明确授予其代答权限，不能替用户选择、授权或补齐凭据。用户回答了别的问题时，原问题仍未解决。
+- 卡片写清所需信息、为什么需要、影响哪一步、可选项及推荐项；收拢相关问题，让用户能够直接作答，不必翻找旧聊天。API/Token 等敏感信息优先请求用户在指定配置入口填写，卡片只收集非敏感说明或“已配置”确认；避免把秘密复制进卡片正文、摘要、通知或报告。
+- 同一待决事项复用原卡片身份，保存 `cardId`/`requestKey`；创建结果 unknown 时先按原身份查询，不重复投递。后续通知、报告或继续工作不应反复新建同一问题的卡片。
+- 创建成功只证明问题已持久接纳，不等于用户已看见、回答或批准。按原卡片查询回应并核对回答的范围；超时、拒收、无关消息或普通“继续”不补齐缺失答案或许可。用户已在聊天中明确回答时直接采用，不强迫其再答卡片。
+- 用户已在聊天中明确回答，或原问题已不再需要时，使用 `interaction_card(operation="list_pending", limit=100, after=...)` 查看自己可信 stdio 身份创建的待答卡片，按返回的 `id`/`revision` 调用 `interaction_card(operation="no_answer_needed", card_id=..., expected_revision=...)` 关闭原卡片，避免长期留待答。同一标记重复调用幂等；unknown 先查询原卡片，不重复创建或伪造终态。旧数据不能证明创建者时不会列入，也不能借 owner/managed 权限关闭。
+- “无需回答”是持久终态，不等于用户同意或拒绝，不提供任何缺失的授权；不执行 choice、不制造用户答复或来源通知。Locker 明显显示“无需回答”并保留只读原卡片；用户只能删除，不能再提交、拒绝、编辑、切换已读或恢复。
+- 卡片等待期间继续推进不依赖该答复的工作；依赖项保持待答并保留恢复条件。交互卡工具不可用时，明确保留待答问题及下一步，通过现有对话询问，不伪造用户回应。
+
+可信本地 MCP `interaction_card(create)` 与 `locker_message(create)` 会在新条目上保存只读 `relatedMessageId`：取 **owner Session** 创建时的上一条导航 user 消息（MA 代建取被创建者历史）。无可靠目标、旧数据与非 agent producer 为 null；重试返回原值，不补绑、不参与签名。Locker 的“跳转到相关上下文”复用聊天导航分页/滚动高亮；列表渲染不解析导航；点击时才解析，Session 已知不可用或目标已知被显示设置隐藏时禁用，其他不可达情况留在 Locker 显示原因并允许再次点击重试。Agent 无需也不能自报此字段。
+
+MA 与 TA 均适用；TA 对需由 MA 决策的问题仍先遵守任务汇报关系，不能把 MA 的实现意见等同用户授权。工具参数见 `interaction_card` 当前 schema；卡片回应不是 Trigger/Job 执行成功的证明。
 
 ## 0. 快速开始（30 秒冷启动）
 
+**主服务用户 CLI（Windows）**：Windows setup.bat / start_pan.bat 自动注册 `pan`（单纯 clone 不触发；任意分支或无 Git 可用；冲突警告不阻断启动），支持 start / exit / restart / debug / status / logs [-f] / doctor / show console / hide console / --help / --version。start 按 console_hidden 独立启动并等待 ready；exit/restart 走显式合法 API 与持久 Job 终态，ask 策略需 `--running offline|preserve`。debug 是前台 main.py，不改永久配置；doctor 只读。show/hide 只控制 Pan 独占交互窗口；logs 跟随退出不停止服务。status 区分 stopped/unknown 并显示运行版本。步骤见 [Pan CLI](../../PAN_CLI.md)。稳定安装的 PATH 不应指向临时 TA 树；注册与同步由任务授权决定。
+
+Action/Group：核心 **Actions** Panel 管理 `data/actions` 中的共享定义。Agent 使用
+`action_drafts(operation="list"|"put"|"delete", kind="actions"|"groups", item=..., item_id=...,
+expected_revision=...)` CRUD 草稿；Agent put 强制 Action disabled。
+新建 Action/Group 或 Agent 新建草稿均可省略 `item.id`，服务端生成稳定唯一 ID，
+返回 `item` 含已分配 ID。更新传原 `item.id`，重命名不改 ID；显式合法 ID 兼容。
+创建结果不明时先 list 核对，禁止盲目重发省略 ID 的创建。
+Panel 使用 Actions / New Action / Groups 导航；Groups 中 Use in Session 配置绑定。用户
+启用并 build Group 后才注册 `action-group-<id>` MCP 插件，Session 通过已有
+`plugin_bindings` 选择三模式。运行 Worker 固定 release；rebuild 沿用 idle/deferred
+restart，unbuild 只被启用该 Group 的 live running Session 阻塞，错误列出名字/ID，
+idle 允许并清理 bindings。API 首批只允许固定的三个内部 GET 路由，命令用固定
+executable + argv，输入只替换整个 scalar 参数；high-risk build 拒绝。不得自动
+重试结果不明的副作用。字段与完整范围见 `docs/plugins/ACTIONS.md`。
+Session Operation 后端支持 explicit/event/query。query 为七字段白名单、有界
+and/or/not 与 typed eq/ne/in/contains；name.contains 为区分大小写字面子串，
+workspaceIds.contains 为精确元素。深度/节点/候选/结果上限 8/64/2048/256，
+执行开始一次查询、固定目标后落盘；不提供脚本/SQL/正则或 Agent 权限旁路。
+`GET /api/actions/session-operation-template` 返回 disabled 模板、谓词 schema
+及限制；`action_drafts` 可保存但不能启用/执行，旧 Group/provider 不接受该类型。
+参数完整定义见 `docs/design/Event-Trigger-Action-v0.1-core-contract.md`。
+持久事件阶段：生产插件 await `bus.publish_async`，成功回执 `persisted:true`
+只证明 Event 已落盘，不证明 Action 成功。默认保留7天，Event+Trigger 在保留期内
+去重；pending/uncertain 不自动丢弃，failed/uncertain Action 不自动重试。
+有界查询、Bearer 重放与容量状态见 [HTTP API](references/http-api.md) 和
+`docs/design/Event-Trigger-Action-v0.2-event-store.md`。
+有限重试/调度后端：Trigger 默认 serial；parallel 默认3、上限32，修改并发需用户
+Bearer/revision。Action 显式 idempotent 与 Trigger retry 显式开启才允许 failed
+自动有限重试（默认总3次，退避落盘）；uncertain 不自动重试，独立用户确认入口
+`confirm-recovery` 需 Bearer、expectedRevision、confirm:true。Agent仍仅关闭草稿。
+后端 schema/字段及恢复风险见 `docs/design/Event-Trigger-Action-v0.3-retry-scheduling.md`。
+
 1. MCP 工具接线（命名空间 `mcp__pan__`，G2 实测 2026-08-17）：
    - **`--mcp-config` 路径（MA 常态）**：由 Pan adapter 自动注入 `data/mcp-configs/<session_id>.mcp.json`，工具 **direct connected，直接调用即可，无需 ToolSearch**。"工具列表里没看到"≠未连接，先直接试调一次。
-   - 无本地 `config.json` 时默认加载根 `manifest.json` 与 `packages/mcp/manifest.json`；后者注册 `pan` 与 `pan-qq`。stdio MCP command 使用 `${PAN_PYTHON}`（优先环境变量，否则使用运行 Pan 的 Python 解释器），git worktree 不需要私有 `.venv`。选择未知或不可用 server 时，session 配置 API 返回明确错误。
+   - 无本地 `config.json` 时默认加载根 `manifest.json` 与 `packages/mcp/manifest.json`；后者注册 `pan` 与 `qq`（旧名 `pan-qq` 兼容）。stdio MCP command 使用 `${PAN_PYTHON}`（优先环境变量，否则使用运行 Pan 的 Python 解释器），git worktree 不需要私有 `.venv`。选择未知或不可用 server 时，session 配置 API 返回明确错误。
+   - Session 插件通过 `pluginBindings` 选择 `standalone` / `pan_native` / `gateway`；`session_create` / `session_update` 的 MCP 参数名为 `plugin_bindings`。旧 `mcpServers` 仍可用，但不能与新字段同时提交。`qq` 并入 `pan` 时工具名为 `pan_qq_*`，不会自动启用 Pan 核心管理工具；gateway 生成单个 stdio `pan-tools`，固定提供 `api_discover` / `api_call`。新增内部链路走本地 IPC，不增加 Pan 鉴权。原生/独立接入变化等待空闲 restart；已有 gateway 内的目录变化即时生效。关闭 QQ 工具不停止既有 Job、订阅或通知。协议见 `docs/design/Pan-Plugin-Capability-v1.md`。
    - **项目级 `.mcp.json` 发现路径**：工具是 deferred 的 → `ToolSearch`（查询词 `pan`/`mcp`）→ `DeferExecuteTool` 调用。
    - **拿手册**：MCP 工具 `pan_handbook()` 直接返回本文件全文（§5「其他」）——接线完成后若不清楚编排流程，先调它再动手。
    - 前置三对齐：MCP server 目标端口（`PAN_API_URL`，默认 8768）**必须**与 `PAN_AGENT_SESSION_ID` 所在服务同实例，否则 `report_subscribe` 失效（§3 / §10.2 G9）。
-2. 编排主链路：`session_create → report_subscribe（订阅）→ agent_assign → queue_pending 收完成报告 → session_get 查结果 → session_delete 收尾`。
-3. **完成通知只有一条编排路径**：MCP `report_subscribe` → 报告落到自己的**落盘队列 `queue_pending`**（MA 内部订阅，§3）。外部 WS 盯梢（`/ws/agent` / `monitor_workers.py`）仅**测试/排障/外部协调者**用，不是编排路径（§4）。
+2. MA 的任务派发、依赖与收尾流程见 [MA 行为准则](references/ma.md)。
+3. 完成报告经 `report_subscribe` 落入订阅者的持久队列 `queue_pending`（§3）；MA 如何等待与接收见角色文档。外部 WS 是测试/排障/外部协调者接口。
 4. 端口约定：代码默认/应用端口保持 **8768**；main/test 的测试或隔离运行使用 **8767 或 8765**，按运行实例配置。MCP server 默认连 `PAN_API_URL`（8768）。**关键**：MCP server 目标端口必须与 `PAN_AGENT_SESSION_ID` 所在服务**同实例**（§3 三对齐），否则 `report_subscribe` / `qq_bind` 失效（§10.2 G9）。端口不符时用 `PAN_API_URL` 覆盖。
+5. **长命令先判后台 Job（MA/TA 均适用，执行前自主判断）**：准备执行 OS 命令时，若**预计超过 3 分钟**（全量测试、build、长脚本等典型场景），默认直接用 `agent_background_start` 起持久后台 Job——这是执行者自己的判断，**不需要 MA 提醒，也不需要 MA 另行授权**（命令本身仍遵守既有权限/审批/安全/managed 隔离）。要点：`target_session_id` 用自己；`cwd` 与 argv（可执行文件/文件参数）用绝对路径；Windows 默认 `hide_window=True` 隐藏控制台；stdout/stderr 落持久日志，Registry 记终态。启动成功且无其它可独立推进的工作 → **立刻 final 结束回合进入 idle**；终态通知（`noticeKind=background_job_terminal` 入 `queue_pending`）唤醒后再核验状态/日志/exitcode，**不轮询**。例外：交互式命令（需 stdin/TTY）、或用户明确要实时观察 → 不走后台 Job。完整政策见 §5「持久后台 Job、通知与报告订阅」。
 
 ## 0.5 面向最终用户：怎么回复「怎么玩转 Pan」
+
+主服务退出与执行合法性：SIGINT/Ctrl+C、SIGTERM、服务管理停止不构成安全退出授权；需要安全退出时使用显式 Exit API，控制台 q 也调用该 API。恢复/退出决策使用新的执行账本：Illegal 即待恢复，没有独立恢复意图字段，旧 `lastLegalWorkerState` 只读兼容；具体端点与信号/Worker 边界见 [HTTP API](references/http-api.md)。
 
 > **触发**：最终用户（非 agent、不写代码的人）问「怎么使用 / 玩转 Pan」「你能干什么」时，**不要**向用户抛 MCP 工具名、API、session_id 等开发者 / agent 术语——本文件其余章节都是编排视角，直接照讲用户听不懂。
 >
@@ -37,9 +135,18 @@ Pan 是 Supervisor/Worker 架构的 CLI Agent 编排器。你（meta-agent，MA�
 
 ## 1. 核心概念
 
+### 读取和提前消费自己的队列
+
+- `self_queue_read()` 返回自己的可消费队列项。TA 报告只返回原 ID/type/source，不返回正文、result、snippet、parts、附件文本或任意 envelope；其他非 report 消息的既有正文/元数据读取不变。读取本身不消费。报告推荐先用 `report_consume()`，由真实 CLI 交接/history 表明正文进入 context 的时点。
+- `self_queue_consume(item_id)` 按读取所得的原 ID 提前消费，可打断当前任务。接口不接受 Session 参数；身份来自 Pan 为本地 stdio MCP 注入的可信调用者上下文，远程无绑定身份的调用不可用。
+- 带逐项锁、全体锁、Stop reports 实际自动锁、编辑租约，以及 Pause everything 阻止的项不可见、不可消费；不会返回隐藏项的正文、ID、数量、队列位置或整体 revision。Stop reports 只隐藏实际锁定的 Agent 报告，通道提醒和显式通知沿用原规则；UI 显式解锁后可恢复可见。消费会复检当前限制并遵守最终交接 gate。
+- 只有 `ok=true, status=consumed` 证明原消息已实际交给 CLI；这不是任务完成报告。`pending`、`unconfirmed` 不表示成功。调用可能因为打断当前任务而失去响应；再次使用**同一原 ID**只查已有意图或持久回执，不重新发送正文或伪造新消息。不确定交接不会自动重投；待确认项继续受阻，需由用户调查处置。
+- `status=rejected, retryable=true` 表示本次可证明未写入或被明确拒绝，保留原 item，允许显式按同一原 ID 重试；真正未知结果禁止自动重投。拒绝/未知由控制写入边界与结构化回执判断，不按错误文字猜测。空闲且具备原生消费能力的 Worker 复用正常队列交接，不额外重启。
+- 此接口只读和消费自己的队列，不提供编辑、删除或别的 Session 队列控制。原 source/taskId/channel/envelope/parts/message 身份由原 item 与既有交接回执保留。
+
 | 概念 | 说明 |
 |------|------|
-| **MA（meta-agent）** | 编排角色：负责 Pan 编排元任务（拆解、派发、监督、验收、合并），不亲自承担可派发的执行工作。MA 以 Session 身份存在（如 `SMA` 模板创建的会话），实际运行在 Worker 进程中（MA Worker） |
+| **MA（meta-agent）** | 编排角色：对用户目标的闭环负责，亲自理解需求、判断依赖、独立验收和决定下一步；按需委派实施。MA 以 Session 身份存在（如 `SMA` 模板创建的会话），实际运行在 Worker 进程中（MA Worker） |
 | **TA（task-agent）** | 执行角色：承接具体开发、测试、调查或文档任务。TA 同样以 Session 身份存在、运行在 Worker 进程中（TA Worker）；由 MA 经 `agent_assign` 派发任务 |
 | **Session** | 持久编排对象（身份层）：承载 MA 或 TA 身份，持久身份（`ses_<16hex>`），拥有收件箱（`queue_pending`）、agentLevel、managedBy 链。投递/编排语义（`agent_assign` / `agent_send` / 报告投递）都以 session_id 寻址；独立于 Worker 生命周期 |
 | **Worker** | 物理执行体（进程层）：临时的 cbc/kimi/opencode/claude/codex CLI 子进程，实际运行某个 MA 或 TA 的 Session。可被 kill、回收、随时重建（进程是顺带的）；**MA 与 TA 都运行在 Worker 中，不要把 Worker 与 TA 划等号** |
@@ -53,45 +160,24 @@ Pan 是 Supervisor/Worker 架构的 CLI Agent 编排器。你（meta-agent，MA�
 关键规则：
 - **角色 = MA/TA，身份 = Session（编排对象），进程 = Worker（物理执行体）**：`agent_*` 工具以 session_id 寻址 Session（承载 MA 或 TA 身份）；无活进程也容忍（send 入队待投、kill 无害 no-op）。
 - Session 是持久化的——kill/回收 Worker（无论 MA Worker 还是 TA Worker）不会删除 Session 数据。
+- Worker 的 **Delayed restart**（Settings 的 Worker 区及顶栏时钟按钮）会等待当前任务完整结束，再在有效 idle 边界优先于队列续派执行；与 settings 自动重启合并，重复点击幂等。无 Worker 时按 Restart 的 start 语义处理；pending/执行中/失败/取消状态可观察。它不抢占运行、终态保存/报告或立即 kill/restart/force，只在本次 Pan 服务进程内有效。HTTP 字段与状态见 references/http-api.md。
+- Agent 独立入口：`agent_restart_delayed(session_id)` 请求现有活 Worker 在有效 idle 边界重启，`agent_restart_delayed_status(session_id)` 只读查证。running 等终态持久化、报告及队列清理完成，idle 立即调度；不是按秒定时。请求不改 model/settings，不 claim；self/managed 权限与既有 agent 工具一致。无活 Worker 或 Illegal 返回错误（已接受的 restart 正在退役旧进程时重复请求只读回原回执），不启动离线 Worker、不授权恢复；Pause/锁仍约束队列交接。回执 `ok` 只表示请求无错误，需查 `delayedRestart.status` 区分 pending/restarting/completed/failed/cancelled；响应不明先查状态，不盲重试。已 pending/restarting 重复请求合并，completed 后的新请求可再次重启。stdio 与 remote HTTP 共用 catalog/schema。
 - 一个 Session 同一时间只有一个 Worker（spawn 时若有旧 worker 先 kill）。
 - 回复是异步的——`agent_assign` 返回 `queued`，随后 `report_subscribe` 订阅收完成报告，或 `session_get` 读取。
 - Worker 会被 watchdog 自动回收（空闲/静默超时），用前若 `workerStatus` 为 `null` 需重新 `agent_spawn`（或直接 `agent_assign` 自动 spawn）。
 - 握手前提：`PAN_API_URL`（HTTP）必须指向实际运行端口。
 
-## 2. 编排工作流（全景）
+## 2. Session 协作操作
 
-```
-session_create → report_subscribe → agent_assign → queue_pending 收报告 → 查结果 → 收尾
-```
+本节说明工具操作；MA 的派发、等待与验收职责见 [MA 行为准则](references/ma.md)。
 
 ### 2.1 并行 fan-out（推荐主流程：agent_assign + report_subscribe）
 
-```
-1. 为每个任务创建/复用 session（承载 TA 身份的编排对象）
-   session_create(name="fix-h1", adapter="cbc", model="hy3")
-   → 返回 id: "ses_abc123..."（后续请求体的 session_id / MCP 的 session_id 用它，字段映射见 references/http-api.md）
+MA 的并行派发、串行依赖及事件驱动等待规则必须阅读 [MA 行为准则](references/ma.md#派发与事件驱动等待)。本入口不规定 TA 的编排职责。
 
-2. 订阅完成报告（派发前或派发后均可；§3 前置条件见 §3）
-   report_subscribe(session_id="ses_a...")
-   → {"subscribed": true, "reportSubscriptions": [...]}
+### 2.2 串行依赖
 
-3. 异步分派（立即返回，不阻塞）
-   agent_assign(session_id="ses_a...", text="任务A")
-   agent_assign(session_id="ses_b...", text="任务B")
-   → 都返回 {"status": "queued", "workerId": "...", "sessionId": "..."}
-
-4. worker 完成（done/error）→ 完成报告自动入你的落盘队列 queue_pending（§3）
-
-5. 收到全部完成报告后，逐个 session_get 读最终结果汇总
-
-6. 收尾：session_delete / session_batch_delete 释放资源（§2.5 / §5）
-```
-
-**不需要手动轮询**。agent_assign 之后 worker 会自动 spawn（如果该 Agent 无活 worker）。
-
-### 2.2 串行依赖步骤（worker_handoff 已移除）
-
-> `worker_handoff` 与 `POST /api/handoff` 已于 2026-08-26 **彻底移除并归档**（原为立项 4.7 弃用的阻塞原语）。串行依赖同样用 `agent_assign` + `report_subscribe`（§3）：派发后订阅完成报告，报告入你的落盘队列 `queue_pending` 即「串行下一步」的信号——"等"是 MA 的默认 idle 状态，而非阻塞调用。派发带 `task_id` 幂等（§7.4）。
+同样按 [MA 行为准则](references/ma.md#派发与事件驱动等待) 由完成通知推进；旧 `worker_handoff` 阻塞原语已移除。
 
 ### 2.3 在已有会话上继续对话（agent_assign / agent_send / agent_send_force）
 
@@ -100,19 +186,47 @@ session_create → report_subscribe → agent_assign → queue_pending 收报告
 | 方式 | 目标 | 行为 | 适用 |
 |------|------|------|------|
 | `agent_assign(session_id, text, task_id?)` | 以 **Agent** 为目标派**新任务** | 异步分派，立即返回 queued；worker 自动 spawn（无活 worker 时）；完成经 `report_subscribe` 内部报告回调（§3）；传 `task_id` 幂等（§7.4） | **新任务 / 并行 fan-out / 幂等重试（默认首选）** |
-| `agent_send(session_id, text)` | 向**已有 Session** 发消息（多轮协作） | 消息排队，目标空闲（当前任务完成后）才处理，**不打断**进行中任务；**无活 worker 不报错**——入持久队列，watchdog 自动 spawn 后分发 | 多轮追问 / 补充线索 / 不着急的后续指令（排队等待） |
-| `agent_send_force(session_id, text)` | 向**已有 Session** 强制送达 | **restart + send**：重启 worker 进程再发消息，立即生效，**打断**进行中任务；无活 worker 时直接入队不报错 | 操作约束 / 方向变更 / 紧急指令 / worker 卡死·忙·连接异常时兜底 |
+| `agent_send(session_id, text)` | 向**已有 Session** 发消息（多轮协作） | 消息排队，目标空闲（当前任务完成后）才处理，**不打断**进行中任务；**无活 worker 不报错**——入持久队列，watchdog 自动 spawn 后分发 | 明确允许当前任务结束后处理的独立后续事项 |
+| `agent_send_force(session_id, text, client_message_id?)` | 向**已有 Session** 即时尝试送达 | **按能力 Steer 优先**：running stream 原生 admission；idle 普通 handoff；无 Steer 能力才 restart+send；无 Worker 持久入队 | 当前任务的补充 / 澄清 / 纠正 / 约束与验收条件更新 |
+
+**按消息用途选择工具**：向正在执行任务的 TA 更新当前任务，默认使用 `agent_send_force`，包括需求补充、用户澄清、实现纠正、约束或验收条件变化，以及影响当前工作的证据。无须额外判断是否紧急，不因消息较短、语气不急或称为“补充”而改用普通发送。只有明确希望在当前任务结束后处理的独立后续事项，才使用 `agent_send`。Force 是按能力选择发送路径，不等同于必然重启。
+
+上述默认 Force 规则不覆盖 Illegal 保护：Illegal Session 的当前任务补充同样持久入队并锁定，Force 不等同于取消 Illegal。只有显式 Wake（原子发消息、解自己的 Illegal 锁、置队首）、手动解锁或 Start/Restart 才可按有效 ready 条件恢复；保留 owner/unknown、Pause、Manual、报告策略和 lease 的原作用范围。
+
+发送来源由可信发送 Session 与 managedBy 祖先链分类：发往自己的 MA 或更高祖先标为 Report，其余保持 MA；不按正文前缀猜身份，不改变访问/claim/订阅。显式上行仍保留原 task 信封、附件和幂等/force 回执，并遵守 Stop reports。Behavior → Auto report 只控制回答的自动汇报：MA 默认开，System/真用户默认关；插件按注册声明默认（未声明 false），各插件独立覆盖。执行入场持久快照决定本轮行为；Report 输入回答不会再次自动汇报，避免回流循环。契约与恢复/混合批次规则见 [source-aware-auto-report](../../source-aware-auto-report.md)。
+
+force 返回 queued/accepted/rejected/unknown；accepted 仅为 CLI admission，
+不是模型已消费。unknown 保留原事务，禁止自动重发或降级 restart；明确拒绝后
+可显式重试原 item。delayed restart 优先，锁、Pause everything、Stop reports
+自动锁与编辑租约仍有效。self_queue 以同一 adapter 能力选择 Steer/idle handoff/
+无能力 fallback，未来 adapter 不需要专用分支。详见
+[HTTP force/Steer 契约](references/http-api.md#即时-force--原生-steer)。
+
+T-040 任务关联规则（单 Session、单 Worker、FIFO）：`agent_assign(...,
+task_id="T-001")` 入队时把 `T-001` 设为该 Session 的持久活动任务。随后
+`agent_send`/`agent_send_force` 在入队时复制这个 taskId 到自己的 queue item，
+所以连续普通消息可以共同回传 `T-001`，但每条消息仍是独立的 FIFO item，不会被
+assign 幂等去重。新的 assign（如 `T-002`）入队后立即切换活动上下文，后续 send
+继承 `T-002`。正式任务完成或终止后只清空仍等于该 taskId 的活动上下文；已入队的
+普通消息保留自己入队时的快照，之后的新 send 得到 `null`。这只清理路由关联，不
+清理 CLI/session history，因此不改变普通多轮会话的上下文行为。
+
+活动上下文和 queue item 一起持久化。Worker 重启/恢复只恢复未完成的正式 queue
+item；不会从 `lastResult`、history 或“最近任务”猜测已完成任务。单 Worker 的
+FIFO 保证切换顺序：旧任务的已入队普通消息仍先处理，新的 assign 及其后续消息按
+队列顺序处理。`queueItemId` 仍只是内部技术 ID，不是业务编号；本语义不引入
+`sourceQueueItemId`、`deliveryUnitId` 或事件模型。
 
 ```
 1. agent_list()（= session_list）→ 找到目标 session_id 与 workerStatus
 2. 按需选择：
    - 新任务 → agent_assign(session_id, text)      # worker 自动 spawn，无需手动 spawn
-   - 补充指令 → agent_send(session_id, text)      # 排队，不打断；无活 worker 入队待投
-   - 需打断 / 紧急 / 卡死兜底 → agent_send_force(session_id, text)   # restart+send，立即送达
+   - 明确留待当前任务结束的独立后续 → agent_send(session_id, text) # 排队
+   - 更新当前任务：补充 / 澄清 / 纠正 → agent_send_force(session_id, text) # 默认；Steer 优先
    - workerStatus 为 null（已回收/已死）→ 先 agent_spawn(session_id) 重建，再视情况 assign / send
 ```
 
-任务文本的写法（取决于 `cliSessionId` 有无上下文，见 §2.6）。
+MA 如何表达任务、澄清需求和补齐上下文，见 [MA 行为准则](references/ma.md#需求澄清与任务表达)。
 
 ### 2.4 检查状态
 
@@ -122,6 +236,46 @@ session_create → report_subscribe → agent_assign → queue_pending 收报告
 3. 大历史分页: session_history(session_id=..., limit=50, before=...) 或 session_get(limit=...)
 ```
 
+### 定向读取历史正文
+
+推荐 `session_get(session_id, limit=50)`：默认 `roles=["user","assistant","tool"]`、`tool_output="command_only"`。`roles` 可任意组合 user、assistant、tool、thinking；空数组不返回正文。thinking 必须显式选择，工具存储输出必须指定 `tool_output="include_output"`。command_only 仅保留工具名及可确认的 command/cmd 字符串；未知/截断旧格式不猜测参数，其他参数、parts、rawContent、output 字段均不透传。include_output 只返回持久化 content，不能补出未保存的 provider 输出。
+
+`limit` 在筛选后应用，正数最多 200；原 `limit=0`/省略参数保留全量所选历史兼容语义，结果大小不受限，大历史务必指定正数。冷 JSONL 正数分页扫描的内存为 O(limit + 单条记录)，不 hydrate 全历史；精确总数仍需扫描历史，旧内嵌 JSON 记录有单文件解析成本。`historyTotal` 是原始总数，`historyFilteredTotal` 是筛选后总数。按 `nextBefore`（原始历史排他位置）向前翻页，保持相同筛选，null 表示结束；不得拿 messageId 代替 before。并发追加不移动旧位置；发现 epoch/revision 改变时重新开始，以免历史替换导致位置失效；扫描期间变动返回 history_changed。
+
+`session_message_get(session_id, message_id)` 使用同一投影。仅使用既有 `pan:...` 持久 ID；历史无规范 ID 的行返回 `identityKind=legacy_unaddressable` 且不伪造 messageId。旧 positional/native ID 返回 invalid_message_id；目标 Session 不存在返回 session_not_found；ID 不在目标 Session/重复歧义返回 message_not_found；被筛选隐藏的 thinking 返回 message_filtered，需显式 `roles=["thinking"]`。读取不回填 ID、不写历史。两项 MCP 读取均先执行 managed 权限检查，拒绝为 permission_denied；HTTP 为本机可信管理员接口，不能把它视作带 manager 认证的外部入口。
+
+history 投影不带 summary 正文预览。lastResult 保留状态/终态身份和（选择 assistant 时的）最终 result 正文，剔除其他 provider 字段；history 筛选不将 lastResult 当历史行计数。底层 Dashboard 默认 full/history API 兼容路径保持原行为，不应当作安全筛选工具的替代。
+
+### 目标 Session 历史搜索
+
+推荐 `session_history_search(session_id, query="error", limit=50)`。复用已有 `/api/history/search` 的 FTS messages 模式，限定目标 Session，不提供全局搜索；先过既有 managed 权限检查，每页均重新检查。`roles` 默认 user/assistant/tool，`tool_output` 默认 command_only；thinking 必须显式选择，工具完整存储正文必须 `tool_output="include_output"`。command_only 在索引匹配、片段提取及分页之前应用与 session_get 相同的保守工具名/command/cmd 投影；输出专属文本不会命中或影响分页，其他工具参数不会被默认搜索。该模式不是匹配完整输出后再隐藏 snippet。
+
+query 是去首尾空白后的大小写不敏感字面子串（非正则/FTS 查询语法），最长 512 字符。`limit` 默认 50，限制为 1..100；返回 hits 中的有界 snippet、role、持久 messageId、messageIndex 和历史版本，不返回完整正文或 parts。需要完整选中消息时用 `session_message_get` 并保持对应 roles/tool_output。旧无规范 Pan ID 的记录跳过，不回填、不伪造 ID。空 query/空 roles 返回空结果，目标不存在沿用 HTTP `error="Session not found"`；HTTP detail 错误原样透传。
+
+沿 `nextCursor` 续读，保持 Session、query、limit、roles、tool_output 相同，null 代表结束；游标签名且 15 分钟有效。历史版本、索引重建或选项变化可能使其失效，`detail.code=history_search_cursor_expired` 时从无 cursor 重新搜索。搜索不新增轮询或后台索引；复用同一可丢弃 SQLite 文件及既有按需更新/可验证 append proof。工具 command 派生分区按需启用，与原始工具分区分别缓存且共存；索引 schema 升为 4，首次使用按既有机制重建可丢弃索引，不迁移规范历史。输出有界不等于冷索引建立内存/延迟有界；首次/变化后的索引建立沿用既有加载成本。
+
+### 模型目录与声明能力
+
+推荐 `model_catalog(adapter="codex")` 集中读取一个 adapter 的服务缓存模型及已声明能力；省略 adapter 返回已注册 adapter 的各自目录，不扫描或聚合账号。可传 session_id，省略时绑定 PAN_AGENT_SESSION_ID；在读取前使用既有 managed 权限检查。没有 Session 身份时沿用公共模型元数据工具的读取语义。HTTP 为可信本机管理员接口，不将 session_id 当 HTTP 身份认证。
+
+该工具 **不触发发现或刷新**：只读现有 `_cached_models` 或字面 `supported_models` 声明。冷动态源返回 models=[]、modelList.status=unknown；这不表示没有模型。需要既有发现行为时仍使用 `model_list(adapter=...)`，其兼容契约未变；目录本身不会代调该工具。列出的 ID 仅代表缓存可选项，不保证当前账号授权、余额、provider 可达或付费模型实际可用。
+
+`capabilities` 的 resume/fork/nativeSteer/nativeInterrupt/steerReceipt 仅投影 adapter 已声明布尔值，缺失为 value=null/status=unknown，false 保持 false。supportedSettings、executionModes 与 adapterEffortValues 均标明 adapter scope，不表示每个模型支持。动态默认值不读取时 defaultModel 为 unknown，不从列表第一项推断。逐模型 effort 仅取已有明确 model_efforts；Codex 复用现有 models_cache.json 解析器的逐模型声明，其他未声明项 unknown，不用通用 effort 补齐。旧停用的 oneshot 与现有服务配置一样不列为执行模式。
+
+每个字段提供 source/status/scope。modelList.origin 以及源数据更新时间未记录时明确 unknown/null；freshness 的 fresh/stale/ageSeconds/ttlSeconds 只描述已有进程模型缓存 TTL，不代表上游数据新鲜度，缺少可靠时间则 unknown。倍率仅投影可直接读取的字面声明，缺失绝不填 x1；动态 getter 可能读取凭据，目录不调用。尤其 CBC 的倍率刷新依赖当前账号 JWT，目录也不使用缺乏当前账号绑定证明的暖倍率缓存，故该来源在目录中保持 unknown；原 API 的倍率功能不改。倍率 freshness 目前 unknown。目录不读凭据、不跨账号收集、不创建新缓存/轮询、不启动 CLI、不调用模型。安全元数据 hook 失败时不返回原异常内容，缺失字段降级 unknown。
+
+### 自己的报告：订阅状态与 consume
+
+`report_status()` 只读自己的持久 reportSubscriptions 和 agentReportsPaused 配置，不 claim/修复关系，也不证明目标活着、报告已产生或交接。订阅变更仍用 report_subscribe/report_unsubscribe。
+
+报告推荐 `report_consume()`：把当前可处理的 TA 报告按原相对顺序聚集到队首，持久化后组成一条消息强制交给 CLI。running 且支持原生 Steer 时是一条真正的批量 Steer；无 Steer 按既有 Force restart 路由；idle/queued 用普通 handoff，不因无 Steer 能力而阻止发送或额外重启，无 Worker 则创建/恢复 Worker。delayed restart 仍优先。非 report 项保留相互顺序，Job/notice/channel 不混入该批次。复用原报告行、ID、来源及普通 batch 格式/history 映射，不复制入队、不伪造报告。
+
+回执只含 `itemId`（首个原 ID）、`queueItemIds` 和交接状态；没有 result、正文、snippet 或附件文本。`accepted` 仅证明 CLI 接受，绝非 MA 处理完成或模型执行完成；`queued/pending/unknown/unconfirmed` 不能当作成功。保留 itemId，调用 `report_consume(item_id=原ID)` **只查询该批次回执，不写 CLI、不补写 Session、不重发**。任一原成员 ID 均可查询。未结束批次保持同一组成员，未知写入不能重组为新 batch 或自动重投。普通队列/Steer 以同一批次为不可拆交接单元；实际交接与 Action unbuild/settings/startup 共用 Session/Group reservation，已卸载的 loaded pin 阻止写入，reservation 保持到交接写入/回执 owner 结束；已拒绝但未交接的批次仍可由正常消费者按原批次处理。
+
+两工具无 Session 参数，仅绑定本地 stdio 自身身份；remote/SSE、浏览器 Origin/Fetch、非 loopback 不能借用身份。Illegal/manual/Stop-report 实际锁、Pause、readonly、lease、native owner、未知交接等 gate 均保留；不能消费项跳过，不泄漏其身份/数量。编辑 lease 阻止批次聚集和 Steer，不为聚集解锁。无 ID 旧报告跳过，不生成持久身份；未来 stop-report 配置不替代实际行锁。批次形成后若任一成员被锁/编辑/重排则不拆分投递，等待既有 gate 解除。
+
+用户原写法 `report_comsume` 对应规范工具名 **report_consume**，不另设别名。`report_next` 已移除，`report_ack` 不实现。`self_queue_read` 不再提前暴露 TA 报告正文。正文只经真实 CLI 成功交接进入 history，不把读取当消费，也不把 CLI 交接当处理确认。正常订阅通知仍是唤醒路径，不为报告建立轮询。
+
 ### 2.5 清理（收尾）
 
 ```
@@ -130,28 +284,28 @@ session_create → report_subscribe → agent_assign → queue_pending 收报告
    session_batch_delete(session_ids=["ses_a", "ses_b"])   # 批量（MCP 工具已覆盖，逐个过 managed 隔离检查）
 ```
 
-**及时清理**：不再需要的 session 用 delete 释放进程与磁盘；watchdog 只回收进程，不删 session。注意：delete 不删 workdir 磁盘目录（残留见 §7.1 G11）。
+删除会停止 Worker 并删除 Session 元数据；是否应清理由 MA 的验收与收尾规则及当前用户授权决定，任务 done 本身不是删除授权。watchdog 只回收进程，不删 Session。注意：delete 不删 workdir 磁盘目录（残留见 §7.1 G11）。
 
 ### 2.6 派发规范：worker 无记忆，session 有记忆
 
-**记忆模型**：Worker 是**临时进程**——每次 spawn 都是全新进程，**无记忆**；Session 是**持久化容器**——保存 `history` + `cliSessionId`。重新 spawn 时 adapter 检测到 `cliSessionId` 非空即传 `cbc --resume <cliSessionId>`（`packages/core/adapters/cbc/adapter.py` `resume_args`），cbc 从 transcript（JSONL）恢复**完整上下文**（原任务描述、进度、历史对话都在）。session 的记忆来自持久化，不来自 worker。
-
-**派发判定**：派发任务前先 `session_get(session_id)` 查 **`cliSessionId`** 字段：
-
-| `cliSessionId` | 含义 | 任务文本写法 |
-|----------------|------|-------------|
-| **非空** | worker 将 `--resume` 恢复已有完整上下文 | **一律用简短指令**（追加任务 / 恢复中断 / 串行下一步 / 追问修正）：指出现有上下文里要做什么即可，**不要重发完整任务描述**——上下文已有原任务与进度，重发浪费 token，且措辞差异可能让 worker 误判为新任务/新要求 |
-| **为空 / null** | 新 session 或 worker 从未建立，worker 无上下文 | **任务描述必须自包含**：背景 / 目标 / 涉及文件（相对 workdir）/ 边界 / 验收标准 |
-
-- 与 §2.3 的关系：§2.3 解决「找 session + 选择派活方式」，本小节解决「任务文本怎么写」——`cliSessionId` 非空的 session 追加/恢复任务时：`agent_spawn`（`workerStatus` 为 null 时）→ 简短指令。
+任务拆解、自包含派发与续作文本由 [MA 行为准则](references/ma.md#需求澄清与任务表达) 规定。Session 持久保存 history 与 cliSessionId，Worker 重建由 adapter 恢复可用上下文；不能把进程回收当作上下文丢失。
 
 ### 2.7 替身交接（session_handoff）：精简上下文 / 切换 adapter
 
-> 场景：当前 session（A）上下文过大需要精简，或想中途切换 adapter（普通 session **不能**中途切换 adapter）。A 保留为可阅读上下文（归档重命名 `(archive) <原名>`），创建孪生 session B 接管 A 的名字与全部 pan 关系网。
+**先确认新建 B 还是已有 B，再确认来源 A / 目标 B 的精确 ID 与覆盖意图。** `session_id` 永远是归档来源 A；省略 `target_session_id` 才新建，提供则必须命中已有 B。不存在不自动新建，不反向交接。
+
+**以下旧流程只适用于新建 B。** 已有模式默认保留 B 设置、名字、CLI 身份/history 与实际 system_prompt；`copy_settings=true` 和 adapter 覆写明确拒绝。B.original_prompt 元数据按来源 A / 本次显式 original 选择覆盖，但实际 system_prompt 独立冻结，当前和后续 restart/resume/newspawn 都不从元数据合成。必填简报既存 metadata，又作为唯一一条普通输入持久入队，遵守 Pause/Illegal/owner/锁；以返回的 `briefDelivery.queueItemId` 核对，queued 不代表 CLI 已读。A 运行/自调用与原队列不被终止或清空。
+
+逐项设置来源（A / 保留 B / 本次显式值）、模式限制、关系合并冲突、回执与未知不重投规则必须先读 [交接字段决策表与操作手册](references/handoff.md)。用户边界不清楚就问具体缺口，不把 original 元数据、有效系统提示词和实际简报消息当同一层。
+
+已有目标示例：`session_handoff(session_id="ses_A", target_session_id="ses_B", handoff_prompt="交接职责与现状")`。两者均需受管理访问权限；MCP 预检不会先 claim。仅支持同有效 Workspace、同 manager 或两个 root，祖先/父子与绑定冲突整体拒绝。B 原 managed/subscriptions/bindings 合并去重保留，B 管理归档 A；B 原名不改。
+
+新建场景：A 上下文过大需要精简，或想切换 adapter。A 归档保留，创建全新 B 接管名字与关系网：
 
 ```
 session_handoff(session_id="ses_a...",
-                handoff_prompt="【必填】A 的 agent 编写的交接简报：现状、重点、重要开发习惯、原 system_prompt 内容、上下文精华……",
+                handoff_prompt="【必填】A 的 agent 编写的交接简报：现状、重点、重要开发习惯、上下文精华……",
+                override_original_prompt=false,  # 默认继承；true 时须提供 original_prompt 字符串
                 copy_settings=true,          # 1:1 复制 A 的设置（不含 system_prompt）
                 adapter="kimi", model=..., permission_mode=...)   # 切换 adapter 时传
 → {"ok": true, "archivedSession": {...}, "session": {...B...}}
@@ -161,14 +315,18 @@ session_handoff(session_id="ses_a...",
 1. **关系网接替（自动、必然）**：B.managed = A.managed，A 的子会话 `managed_by` 改 B；A 的 `report_subscriptions`、QQ postbox 绑定（`session_qq_subscribe` 的 inbox 提醒）全部转移给 B。A 若曾被某 manager 管理，B 接替 A 在该 manager 下的位置。
 2. **B 自动 manage A**：B.managed 追加 A，A.managed_by = B——A 归档为 B 的被管理会话，B 收到 A 的完成报告（可 `session_get(A)` 持续读取旧上下文）。
 3. **设置复制**：`copy_settings=true` 复制 adapter / adapter_config / model / permission_mode / session_template / pan_access / mcp_servers 等，**明确不含 system_prompt**，且 `cli_session_id` 清空（B 是全新会话，不继承 A 的 CLI 上下文与 history——精简上下文的关键）；`false` 用默认设置（此时**必须**显式传 `adapter`）。
-4. **B.system_prompt = handoff_prompt 与 A 原 system_prompt 拼接**（分「交接上下文 / 原 system prompt」两节）。
+4. **B.original_prompt 默认继承 A.original_prompt**。仅 `override_original_prompt=true` 时使用本次 `original_prompt`（必填字符串，`""` 明确清空；null/非字符串拒绝）；开关须为布尔值。省略/false 时忽略残留文本，独立于 `copy_settings`。A 的两个 prompt 均不修改。B.handoff_prompt 只用本次必填简报，替换旧简报；B.system_prompt 计算为本次简报 + 选定 original_prompt，不继承旧简报。
 5. **重命名**：A → `(archive) <原名>`，B → `<原名>`；A 的原关系网解除。
 
 交接后 B 即可 `agent_assign` 派活；切换 adapter 的典型用法：`copy_settings=false + adapter="kimi" + handoff_prompt=...`。
 
+### 2.8 验收批次、任务卡与报告的可执行写法
+
+MA 的验收记录见 [MA 行为准则](references/ma.md#验收与收尾)，TA 的交付要求见 [TA 行为准则](references/ta.md#交付)。
+
 ## 3. 完成通知：report_subscribe → queue_pending（MA 内部订阅，唯一编排路径）
 
-MA 编排 TA（的 Session/Worker）时，完成通知**一律走内部订阅**：MCP `report_subscribe` 把目标 session 的完成报告（done/error）推送到你的**落盘队列** `queue_pending`，由 consumer 批量拼成一条消息唤醒你。主链路：`session_create → report_subscribe（订阅）→ agent_assign → queue_pending 等完成 → session_get → session_delete`（订阅在 assign 前或后均可）。
+完成报告的内部订阅机制是：MCP `report_subscribe` 把目标 session 的完成报告（done/error）推送到你的**落盘队列** `queue_pending`，由 consumer 批量拼成一条消息唤醒你。MA 的使用流程与等待边界见 [MA 行为准则](references/ma.md#派发与事件驱动等待)。
 
 > **为什么是唯一路径**：异步、落盘可恢复（跨服务重启不丢）、跨协调者、不依赖外部会话/WS。外部 WS 盯梢（`/ws/agent` / `monitor_workers.py`）不再作为编排路径——只供测试 / 排障 / 外部协调者使用（§4 → `references/ws-protocol.md`）。
 
@@ -209,9 +367,9 @@ MA 编排 TA（的 Session/Worker）时，完成通知**一律走内部订阅**�
 
 ## 5. 可用 MCP 工具
 
-> 调用方式见 §0.1：`--mcp-config` 注入路径下工具 **直接可调**（无需 ToolSearch）；仅项目级 `.mcp.json` 发现路径才是 deferred（`ToolSearch("pan")` → `DeferExecuteTool`）。工具命名空间 `mcp__pan__`。**当前共 49 个实际暴露工具**（对照 `packages/mcp/server.py` 的 `@mcp.tool()` 全量核对）。其中 42 个是一等工具，7 个 `worker_*` 是仅为兼容旧调用保留的别名，不应作为新编排 API 使用。可重复执行 `python scripts/check_pan_skill_tools.py` 自检数量和清单完整性。
+> 调用方式见 §0.1：`--mcp-config` 注入路径下工具 **直接可调**（无需 ToolSearch）；仅项目级 `.mcp.json` 发现路径才是 deferred（`ToolSearch("pan")` → `DeferExecuteTool`）。工具命名空间 `mcp__pan__`。**当前共 67 个实际暴露工具**（对照 `packages/mcp/server.py` 的 `@mcp.tool()` 全量核对）。其中 60 个是一等工具，7 个 `worker_*` 是仅为兼容旧调用保留的别名，不应作为新编排 API 使用。可重复执行 `python scripts/check_pan_skill_tools.py` 自检数量和清单完整性。
 >
-> **命名分层（agent-naming 确立）**：`agent_*` 是**一等工具**（编排对象 = Session，承载 MA/TA 身份，以 session_id 寻址，无活进程也容忍）；`worker_*` 是**兼容别名（DEPRECATED）**，内部委托同一实现，仅 `worker_id` 进程寻址为别名独有遗留路径——新代码一律用 `agent_*`。`agent_background_*` 管理的是独立于 Session Worker 的持久 Job，不会把后台进程误算成 Worker。
+> **命名分层（agent-naming 确立）**：`agent_*` 是**一等工具**（编排对象 = Session，承载 MA/TA 身份，以 session_id 寻址，无活进程也容忍）；`worker_*` 是**兼容别名（DEPRECATED）**，内部委托同一实现，仅 `worker_id` 进程寻址为别名独有遗留路径——新代码一律用 `agent_*`。`agent_background_*` 管理的是独立于 Session Worker 的持久 Job，不会把后台进程误算成 Worker。当前共 67 个实际暴露工具；其中时间类 Session 消息 Job 与 OS 进程 Job 使用不同工具族。
 >
 > **巡检优先 `session_list(summary=true)`**：旧版 `session_list` 返回全部 session 完整 history，实测 310KB 会撑爆工具输出上限（§10.2 G8）。**现在 `session_list(summary=true)` 只返回精简字段（id/name/adapter/workerStatus/updatedAt/managedBy），用于巡检/查归属**；确认某个 session 详情再用 `session_get(session_id, limit=15)`。查"自己管了哪些"直接用 `session_managed()`。
 >
@@ -226,12 +384,14 @@ MA 编排 TA（的 Session/Worker）时，完成通知**一律走内部订阅**�
 | `session_list` | `summary?` | 列出所有会话；`summary=true` 只返回精简字段（id/name/adapter/workerStatus/updatedAt/managedBy），不含 history |
 | `session_managed` | (无) | 返回调用者管理的 session 摘要 `[{id, name, workerStatus, updatedAt}]`（需 `PAN_AGENT_SESSION_ID`） |
 | `manager_chain` | (无) | 返回调用方（`PAN_AGENT_SESSION_ID`）的**上级 manager 链**（从最近一级 manager 逐级向上，每级含 `level/id/name/workerStatus/lastResultStatus`）。需调用方身份；独立 MCP 进程（无身份）不可用 |
-| `session_get` | `session_id`, `limit?` | 会话详情（history + lastResult）；limit>0 截断 |
+| `session_get` | `session_id`, `limit?`, `roles?`, `tool_output?`, `before?` | 筛选后的 history + lastResult；默认 user/assistant/tool、command_only；建议 limit=50；nextBefore 续读 |
+| `session_message_get` | `session_id`, `message_id`, `roles?`, `tool_output?` | 按本 Session 已持久化 Pan messageId 读取；复用同一投影和 managed 权限；thinking/output 必须显式选择 |
+| `session_history_search` | `session_id`, `query`, `limit?`, `cursor?`, `roles?`, `tool_output?` | 目标 Session 的已有 FTS 搜索；默认 user/assistant/tool command_only；建议 limit=50；nextCursor 续页，命中后用 session_message_get |
 | `session_usage` | `session_id?` | 查询当前或显式 Pan Session 的持久化 input/output/cache 用量；显式目标复用 `_check_access` managed 隔离。返回 `input`、`output`、`cache.read/write`、`total.tokens/credit`、`source`、`updatedAt`；缺失字段为 `null`，持久化零为 `0`，cache 不重复计入 input/output；优先 `Session.rawUsage`，旧数据回退 `Session.totalUsage`，不返回历史 raw payload |
-| `session_update` | `session_id`, `model?`, `permission_mode?`, `always_thinking_enabled?`, `effort?`, `max_thinking_tokens?`, `mcp_servers?`, `game_id?`, `model_context_window?`, `model_auto_compact_token_limit?`, `clear_model_context_window?`, `clear_model_auto_compact_token_limit?` | PATCH 封装；设置**即时持久化**到 session，worker 下次 (re)spawn 时生效——**managed Agent 可中途更新 `mcp_servers`**（中途换 adapter 才需 `session_handoff`）。`mcp_servers` 只传 manifest 中声明的**服务名列表**（如 `["pan"]`，服务端解析为完整配置）：非空即启用、`[]` 显式清空/禁用、**省略 = 保持不变**；未知/不可用服务名报错，不产生无效配置；模板 `mcp_mode=always/never` 锁死增删（MCP 工具无 `forceMcp` 旁路，仅 HTTP PATCH 可解锁）。两个上下文覆盖值为可选正整数；省略保持当前设置，传对应 `clear_* = true` 持久化清除并交给 Codex/模型默认值。改 MCP 或任一上下文覆盖值（或有活 worker 时改任何进程相关字段）响应带 `requireRestart: true`，重启自动完成：**idle worker 立即 respawn 生效、running worker 回 idle 时自动 respawn、无 worker 下次 spawn 生效**（要立即打断切换才手动 agent_kill + agent_spawn）（references/http-api.md） |
+| `session_update` | `session_id`, `model?`, `permission_mode?`, `always_thinking_enabled?`, `effort?`, `max_thinking_tokens?`, `mcp_servers?`, `game_id?`, `model_context_window?`, `model_auto_compact_token_limit?`, `clear_model_context_window?`, `clear_model_auto_compact_token_limit?`, `workspace_ids?` | PATCH 封装；设置**即时持久化**到 session，worker 下次 (re)spawn 时生效——**managed Agent 可中途更新 `mcp_servers`**（中途换 adapter 才需 `session_handoff`）。`mcp_servers` 只传 manifest 中声明的**服务名列表**（如 `["pan"]`，服务端解析为完整配置）：非空即启用、`[]` 显式清空/禁用、**省略 = 保持不变**；未知/不可用服务名报错，不产生无效配置；模板 `mcp_mode=always/never` 锁死增删（MCP 工具无 `forceMcp` 旁路，仅 HTTP PATCH 可解锁）。**`workspace_ids?` 移动会话到 Workspace**（0 或 1 个 id，`[]` = 取消分组/ungrouped，省略 = 保持不变；复用 Dashboard 同一个 `PUT /api/sessions/{id}/workspaces`）：成员关系只存于 **management-tree 根**，被管理后代通过 managedBy 链**继承**，因此根移动会传播给整棵子树；**目标 session 若已被管理则拒绝**（错误码 `managed_session`），须先 `session_unclaim` 分离——与 Dashboard 拖拽「先分离再移动」一致，杜绝跨 Workspace 的管理树分裂。两个上下文覆盖值为可选正整数；省略保持当前设置，传对应 `clear_* = true` 持久化清除并交给 Codex/模型默认值。改 MCP 或任一上下文覆盖值（或有活 worker 时改任何进程相关字段）响应带 `requireRestart: true`，重启自动完成：**idle worker 立即 respawn 生效、running worker 回 idle 时自动 respawn、无 worker 下次 spawn 生效**（要立即打断切换才手动 agent_kill + agent_spawn）（references/http-api.md） |
 | `session_delete` | `session_id` | 删除会话并 kill worker |
 | `session_batch_delete` | `session_ids` | 批量删除多个会话（逐个过 managed 隔离检查，等价 HTTP `POST /api/sessions/batch-delete`） |
-| `session_handoff` | `session_id`, `handoff_prompt`(**必填**), `copy_settings?`(=true), `adapter?`, `model?`, `permission_mode?` | **替身交接**（§2.7）：创建孪生 session B 接替 A，精简上下文或切换 adapter。B 接管 A 的关系网并自动 manage A；`handoff_prompt` 由 A 的 agent 编写（交接简报），B.system_prompt = 它与 A 原 system_prompt 拼接；`copy_settings` 复制 A 的设置（不含 system_prompt，cli_session_id 清空），false 时须显式传 `adapter` |
+| `session_handoff` | `session_id`（来源A）, `handoff_prompt`(**必填**), `target_session_id?`（已有B）, `copy_settings?`, `override_original_prompt?`(=false), `original_prompt?`, `adapter?`, `model?`, `permission_mode?` | **替身交接**（§2.7）：先确认新建/已有。省略 target 才新建（copy 默认true）；已有 B 默认保留设置/CLI上下文/实际system_prompt，copy=true/adapter覆写拒绝。original 元数据按 A/本次值覆盖，永不改已有 B 有效系统提示词；简报普通入队，返回原 queueItemId，未知不重投。[逐字段来源与限制](references/handoff.md) |
 | `session_readonly` | `session_id`, `enabled?`(默认 true) | 为**当前 manager 已管理**的 session 设置或清除持久只读状态；不会自动 claim。只读目标拒绝其他 session 发来的任务/消息/通知，返回 `readonly_session`；需 `PAN_AGENT_SESSION_ID` |
 | `session_claim` | `session_id` | 当前 agent（`PAN_AGENT_SESSION_ID`）认领会话，建立 managed 关系（立项 4.2）。**claim 自动 report_subscribe**（订阅即接管，开启完成报告推送；后端实现）。走 `POST /api/claim`（带 `_check_access(claim=True)` 隔离检查）；目标已被他人管理则拒绝。需 `PAN_AGENT_SESSION_ID` |
 | `session_claim_many` | `session_ids` | 批量认领：逐个处理，返回 `{"ok": true, "claimed": [...], "failed": [{"sessionId", "error"}]}`，单个失败不影响其余 |
@@ -240,6 +400,16 @@ MA 编排 TA（的 Session/Worker）时，完成通知**一律走内部订阅**�
 | `session_qq_subscribe` | `target_type`, `target_id` | 给当前 agent session 订阅某 QQ 会话的 inbox 更新提醒（`@@@@by qq` 提醒入 `queue_pending`，§7.6）。走 `POST /api/qq/subscribe`，body sessionId=自己（无需 `_check_access`，但需 `PAN_AGENT_SESSION_ID`）。`target_type` 仅 `"user"`/`"group"`；`target_id` 为 QQ 号/群号（转 str） |
 | `session_qq_unsubscribe` | `target_type`, `target_id` | 退订 QQ inbox 更新提醒，走 `POST /api/qq/unsubscribe`，参数同上 |
 | `session_history` | `session_id`, `limit?`, `before?` | 分页历史 |
+
+**Workspace（会话分组）**：Workspace 是命名容器，与 Session 的显示排序解耦。成员关系只持久化在 **management-tree 根** session 的 `workspace_ids`（0 或 1 个）；被管理后代通过 managedBy 链**继承**，不单独持有值——同一管理树整体落在同一个 Workspace，不会跨 Workspace 分裂。`[]` = ungrouped（无 "default" 分区）。以下工具与 Dashboard 共用同一组后端端点，规则/校验/权限边界完全一致（MCP 不获得 UI 没有的能力）。
+
+| 工具 | 参数 | 说明 |
+|------|------|------|
+| `workspace_list` | (无) | 列出全部 Workspace，返回 `[{id, name, order, dirs, createdAt, updatedAt, sessionCount}]`；`id` 供 `session_update`/`workspace_delete` 使用，不返回成员 id 列表（用 `session_list`/`session_get`） |
+| `workspace_create` | `name` | 新建 Workspace（等价 Dashboard「新建工作区」）：name 必填、trim、≤128 字符、全局唯一；校验与 `workspace.created` 广播由共享后端端点执行，MCP 无法创建 UI 不能创建的工作区。新工作区为空，用 `session_update(session_id, workspace_ids=[<id>])` 移入会话。错误码 `invalid_name` / `name_taken` |
+| `workspace_delete` | `workspace_id` | 删除 Workspace 并使其成员变回 ungrouped：从各根 session 清除该 id，被管理后代跟随根一并脱离；**绝不删除 session 本身**。删除后不留 dangling workspace id、不产生跨 Workspace 的 managed 关系。返回 `{"ok":true,"workspaceId":<id>}` 或 `workspace_not_found` |
+
+> **如何把会话移入/移出 Workspace**：用 `session_update(session_id, workspace_ids=[...])`（不是独立工具）。根 session 移动会随管理树**传播**给全体后代；目标若已被管理则返回 `managed_session`，须先用 `session_unclaim` 分离再移动（等于 Dashboard 拖拽时的「分离确认」）。更多请求体细节见 [`references/http-api.md`](references/http-api.md)。
 
 > **复用已删除的 Pan session（2026-08-23 实测）**：Pan session 被 `session_delete`/`session_batch_delete` 删掉后，其底层 **CLI 会话（`~/.codebuddy/projects/` 或 `data/workdirs/<name>/`）仍保留**。可 `session_import(action="list_projects")` 找到对应 project_dir → `list_sessions` 找到该会话 → `import` 恢复成新 Pan session（含全部历史上下文）。**节省资源**：不用重建后重新探索/初始化，尤其适合「worker 已完成任务但需继续排查/跟进」的场景——把刚删的 worker session 恢复后继续派活，worker 带着全部上下文直接上手。
 
@@ -250,16 +420,27 @@ MA 编排 TA（的 Session/Worker）时，完成通知**一律走内部订阅**�
 | `agent_spawn` | `session_id`, `adapter?`, `model?` | 为 Session 生成 worker 进程。已有 worker 会先 kill（一个 Session 一个 worker） |
 | `agent_task` | `session_id`, `text`, `source?` | 发任务（异步，返回 queued）；无活 worker 自动 spawn；`source` 默认 `"agent"` |
 | `agent_assign` | `session_id`, `text`, `task_id?` | **异步分派**（并行 fan-out / 新任务默认首选）：立即返回 queued，worker 自动 spawn；完成经 `report_subscribe` 内部报告回调（§3）/ `session_get` 读取。传 `task_id` 幂等（同 taskId 重发不双跑，见 §7.4） |
-| `agent_send` | `session_id`, `text` | 向 Session 发消息（多轮协作，§2.3）；**仅用于非即时补充**：消息排队送达，不打断进行中任务；**无活 worker 不报错**——入持久队列（返回 `pendingSpawn=true`），watchdog 自动 spawn 后分发；需打断/立即生效用 `agent_send_force`；Pan 内 session 自动加 `////by agent` 前缀（§7.5） |
-| `agent_send_force` | `session_id`, `text` | **强制推送** = restart + send（§2.3）：卡死/忙/连接异常导致普通 `agent_send` 无法送达时兜底；**也用于需要打断当前执行的时效性消息**（操作约束、危险操作警告）；无活 worker 时直接入队不报错；自动加 `////by agent` 前缀（§7.5） |
-| `agent_notify` | `target_session_id`, `text` | **持久化通知**：用于异步、安全地执行脱离当前 Agent/worker 生命周期的后台命令或长时间任务（nohup、长时测试、编译、外部脚本等），后台命令完成后事后回报；不要求 SMA 轮询或阻塞等待。通知进入目标 `queue_pending`，原 worker 退出不丢；无活 worker 自动唤醒/spawn。仅自己或自己 managed 的 Agent 可投递。它不是普通任务派发替代品，普通任务继续用 `agent_assign`/`agent_send`；后台命令仍须遵守权限、审批、安全和结果验证规则，不能绕过审批或隔离。 |
-| `agent_background_start` | `argv`, `cwd`, `target_session_id?`, `label?` | 启动持久后台 Job；默认目标为当前 Agent Session。argv 不经过 shell，MVP 的 `cwd` 仅允许 Pan 项目目录内；Job 由独立 Runner 执行，不占用当前 Session 的 Worker 生命周期 |
-| `agent_background_get` | `job_id` | 读取 Job Registry 事实，包括状态、PID 身份、日志路径和通知状态；只允许当前或 managed Session 目标，不消费目标的 `queue_pending` |
-| `agent_background_list` | `target_session_id?` | 列出后台 Job；省略目标时默认列出当前 Agent Session，显式目标必须是当前或 managed Session。目标 Session 删除后 Job 事实仍可保留 |
-| `agent_background_cancel` | `job_id` | 取消已拥有的 Job 并终止经身份校验的进程树；Runner/任务 PID 创建时间无法验证时返回 `cancel_unsafe`，绝不按不明 PID 强杀 |
+| `agent_send` | `session_id`, `text` | 向 Session 发消息（多轮协作，§2.3）；**仅用于明确留待当前任务结束的独立后续事项**：消息排队送达，不打断进行中任务；**无活 worker 不报错**——入持久队列（返回 `pendingSpawn=true`），watchdog 自动 spawn 后分发；更新当前任务默认用 `agent_send_force`，无须判断是否紧急；Pan 内 session 自动加 `////by agent` 前缀（§7.5） |
+| `agent_send_force` | `session_id`, `text`, `client_message_id?` | 当前任务更新的默认工具（补充、澄清、纠正、约束与验收条件、相关证据），无须判断紧急程度；按 adapter 能力 Steer 优先，idle 普通 handoff，无能力才 restart+send。返回 queued/accepted/rejected/unknown；accepted 不是已消费，unknown 禁止重发或降级重启。稳定 client_message_id 用于事务对账。保留 delayed restart、pause/锁/租约门禁及身份前缀（§2.3/§7.5） |
+| `agent_send_many` | `session_ids`, `text` | 对选定 Session 逐个复用 `agent_send` 的持久 FIFO 语义；返回每个目标结果 |
+| `agent_notify` | `target_session_id`, `text` | **持久化通知**：用于异步、安全地执行脱离当前 Agent/worker 生命周期的后台命令或长时间任务（nohup、长时测试、编译、外部脚本等），后台命令完成后事后回报；不要求 SMA 轮询或阻塞等待。通知进入目标 `queue_pending`，原 worker 退出不丢；无活 worker 自动唤醒/spawn。仅自己或自己 managed 的 Agent 可投递。它不是普通任务派发替代品，普通任务继续用 `agent_assign`/`agent_send`；后台命令仍须遵守权限、审批、安全和结果验证规则，不能绕过审批或隔离。**需要完成通知的长命令优先用 `agent_background_start`**（自带终态通知，见下文使用政策）；`agent_notify` 用于手动事后回报 |
+| `agent_background_start` | `argv`, `cwd`, `name`, `target_session_id?`, `label?`, `hide_window?` | 启动持久后台 Job（独立 Runner，终态自动通知目标 Session）。适用对象：预计**超过 3 分钟**的 OS 命令——3 分钟是一般选择门槛，不是运行 timeout，也不硬性禁止短任务或附带新 API 校验。**MA/TA 均适用：执行前自主判断（入口规则 §0 第 5 条），不需要 MA 提醒或另行授权。** 启动后**不轮询**（见下文使用政策）。创建者由当前 `PAN_AGENT_SESSION_ID` 记录为 `creatorSessionId`，目标记录为 `targetSessionId`；A 可为 managed 的 B 创建 Job，但终态通知只投递给 B。argv 不经过 shell，`cwd` 可为任意已存在目录（Agent 应传绝对路径，含仓库外 worktree）；Job 由独立 Runner 执行，不占用当前 Session 的 Worker 生命周期。Windows 默认 `hide_window=True` 隐藏命令控制台；显式 `False` 显示。HTTP 对应字段为 `hideWindow`，必须是真布尔值 |
+| `agent_background_get` | `job_id` | 读取 Job Registry 事实，包括状态、PID 身份、日志路径和通知状态；只允许当前或 managed Session 目标，不消费目标的 `queue_pending`。**用途 = 终态通知后的结果核验 + 用户明确要求的一次性诊断/取消/异常修复**；不要循环调用它等待运行进度（见下文使用政策） |
+| `agent_background_list` | `target_session_id?` | 列出后台 Job（盘点/诊断用，不作进度等待循环）；省略目标时默认列出当前 Agent Session，显式目标必须是当前或 managed Session。目标 Session 删除后 Job 事实仍可保留 |
+| `agent_background_cancel` | `job_id` | 取消已拥有的 Job 并终止经身份校验的进程树；Runner/任务 PID 创建时间无法验证时返回 `cancel_unsafe`，绝不按不明 PID 强杀。定位为**一次性取消/异常处理**，不是例行进度干预 |
 | `agent_background_retry` | `job_id` | 重试已终态 Job（`completed`/`failed`/`cancelled`）；创建新的 Job ID。`starting`/`running` 返回 `job_not_retryable`，须先取消 |
+| `agent_message_job_create` | `text`, `schedule`, `target_session_id?`, `target_session_ids?`, `description?` | 创建单 Session 时间消息或定时群发 Job；目标列表去重并保持稳定顺序；支持一次性 `at`/`delaySeconds`、固定 `intervalSeconds`、每周 `weekday`+`time`/`timezone`；正文只发送给 Session，不执行 OS shell |
+| `agent_message_job_get` | `job_id` | 查询时间消息/定时群发 Job 的 Session 归属、描述、调度、状态和逐目标最近投递结果 |
+| `agent_message_job_list` | `target_session_id?` | 查询当前或 managed Session 的时间消息/定时群发 Job |
+| `agent_message_job_update` | `job_id`, `schedule?`, `text?`, `description?`, `target_session_ids?` | 调整未终态 Job；群发目标列表和调度编辑会重新进入 `pending` |
+| `agent_message_job_cancel` | `job_id` | 取消未终态时间消息/定时群发 Job；已开始的目标发送无法撤回 |
 | `agent_kill` | `session_id` | 终止 Session 的 worker 进程（Session 数据保留）；**无活 worker 时无害 no-op**（返回 `killed=false`） |
 | `agent_list` | `summary?` | 列出全部 Session 摘要；`session_list` 的别名，参数/返回一致 |
+
+> 定时群发示例：调用 `agent_message_job_create` 时传入
+> `schedule={type: once, delaySeconds: 60}` 和
+> `target_session_ids=[ses_b, ses_c]`。Job 另存调用方 `creatorSessionId`，
+> 实际投递只使用 `targetSessionIds`；目标列表会去重并保持顺序。
 
 ### Worker 管理（兼容别名，DEPRECATED → agent_*）
 
@@ -271,7 +452,7 @@ MA 编排 TA（的 Session/Worker）时，完成通知**一律走内部订阅**�
 | `worker_task` | `session_id?`, `worker_id?`, `text`, `source?` | `agent_task` 别名（session_id 调用时）；`worker_id` 寻址为遗留路径 |
 | `worker_assign` | `session_id`, `text`, `task_id?` | `agent_assign` 的精确别名（委托同一实现，契约一致） |
 | `worker_send` | `worker_id?`, `session_id?`, `text` | `agent_send` 别名（session_id 调用时）；`worker_id` 寻址为遗留路径（worker 已死报 `worker_not_found`） |
-| `worker_send_force` | `worker_id?`, `session_id?`, `text` | `agent_send_force` 别名（session_id 调用时）；`worker_id` 寻址为遗留路径 |
+| `worker_send_force` | `worker_id?`, `session_id?`, `text`, `client_message_id?` | `agent_send_force` 能力路由别名；legacy worker_id 先解析到 Session 后委托同一实现 |
 | `worker_kill` | `worker_id?`, `session_id?` | `agent_kill` 别名（session_id 调用时）；`worker_id` 寻址为遗留路径 |
 | `worker_list` | (无) | 列出所有**运行中的 worker 进程**（物理层面视图；编排巡检用 `agent_list`） |
 
@@ -282,9 +463,26 @@ MA 编排 TA（的 Session/Worker）时，完成通知**一律走内部订阅**�
 - **后台 Job**：`agent_background_start` 创建可查询、可取消、可重试的独立 Runner 任务；stdout/stderr 写入持久日志，Job 事实写入 Registry。Runner 不依赖 Pan Worker、Worker stdout 或 live WebSocket。
 - **后台通知**：`agent_notify` 只是把调用方已经得到的状态/结果写入目标 Session 的 `queue_pending`，不是命令执行器，也不提供额外权限。
 
-后台 Job 进入终态后，Pan 通过稳定事件键 `<jobId>:terminal` 将一次终态通知投影到目标 Session 的 `queue_pending`。Pan 重启会 reconcile 未完成 Job，并重试尚未投递的终态通知；只有投递成功后才标记 `notificationState=delivered`。Job 的 Registry 事实独立于目标 Session，目标被删除或暂时不存在时不会被静默删除。Windows 取消要求 PID 创建时间匹配并杀完整子进程树；跨进程 Registry 更新使用 Job 锁和原子替换。
+后台 Job 进入终态后，Pan 通过稳定事件键 `<jobId>:terminal` 将一次终态通知投影到 `targetSessionId` 的 `queue_pending`。通知 envelope 结构化携带 `noticeKind=background_job_terminal`、`jobId`、`status`、`targetSessionId`/`targetSessionIds` 和可选 `creatorSessionId`；格式化后使用固定 `////by pan system` 前缀，不再从缺失来源推导 `@@@@by agent : unknown | unknown`。A 创建、B 接收时，`creatorSessionId` 只作所有权/审计/权限元数据，不会把通知复制回 A。Pan 重启会 reconcile 未完成 Job，并重试尚未投递的终态通知；只有投递成功后才标记 `notificationState=delivered`。Job 的 Registry 事实独立于目标 Session，目标被删除或暂时不存在时不会被静默删除。Windows 取消要求 PID 创建时间匹配并杀完整子进程树；跨进程 Registry 更新使用 Job 锁和原子替换。
+后台 Job 进入终态后，Pan 通过稳定事件键 `<jobId>:terminal` 将一次终态通知投影到持久化 target Session 的 `queue_pending`。通知 queue item 的 envelope 结构化携带 `noticeKind=background_job_terminal`、`jobId`、`status`、`targetSessionId`/`targetSessionIds` 和可选 `creatorSessionId`；格式化后使用固定 `////by pan system` 前缀，不再从缺失来源推导 `@@@@by agent : unknown | unknown`。creator 只用于来源、所有权、审计和权限，不会被自动当作通知目标。Pan 重启会 reconcile 未完成 Job，并重试尚未投递的终态通知；只有投递成功后才标记 `notificationState=delivered`。Job 的 Registry 事实独立于目标 Session，目标被删除或暂时不存在时不会被静默删除。Windows 取消要求 PID 创建时间匹配并杀完整子进程树；跨进程 Registry 更新使用 Job 锁和原子替换。Session-message/broadcast Job 复用普通 send，不自动复制终态通知回 creator。
 
-当前 MVP 的产品边界：argv 不经过 shell，`cwd` 仅允许 Pan 项目目录内；尚未提供命令白名单、结果文件契约或 Remote/Tunnel 认证。不要把后台 Job 当成绕过权限、审批、managed 隔离或远程安全边界的通道。
+当前产品边界：argv 不经过 shell，`cwd` 可为任意已存在目录（相对路径按服务进程工作目录解析，Agent 应传绝对路径）；尚未提供命令白名单、结果文件契约或 Remote/Tunnel 认证。不要把后台 Job 当成绕过权限、审批、managed 隔离或远程安全边界的通道。
+
+Windows 窗口边界：旧 Job 缺 `hideWindow` 仍默认隐藏，显式 `hide_window=False`
+保留可见控制台。公共 helper 仅约束我们拥有的单次后台创建；Pan 的后台 Python
+bridge、管道 CLI 与辅助启动逐调用点设置策略，不保证任意第三方后代隐藏。
+`DETACHED_PROCESS` 混入 `CREATE_NO_WINDOW` 会使 Windows 忽略后者；独立 Runner、
+ConPTY 和 takeover/用户交互窗口保持专用启动与生命周期语义。真实窗口验收须看
+自有进程的 Windows API 证据，不能仅由 flags、配置或截图反推来源。
+
+**使用政策（MA 与 TA 均适用。仅适用于 `agent_background_*` 这类执行 OS 命令、带终态通知的持久后台 Job——独立 Runner；不适用于 `agent_message_job_*` 时间消息/定时群发 Job、Scheduler 定时任务，也不改变普通 `agent_assign`/`agent_send` 派发流程）**：
+
+1. **执行前自主判断（入口规则）**：准备执行 OS 命令时先按本政策过一遍——**预计超过 3 分钟**（全量测试、build、长脚本等典型场景）默认 `agent_background_start`。这是执行者自己的决定：**不等 MA 提醒、不需 MA 另行授权**（命令本身仍遵守既有权限/审批/安全/managed 隔离，Job 不是绕过通道）。参数要点：`target_session_id` 用自己（自用场景，终态通知才能叫醒自己）；`cwd` 与 argv 中的可执行文件/文件参数用绝对路径；Windows `hide_window=True` 隐藏控制台（显式 `False` 才显示）；stdout/stderr 落持久日志，Registry 记终态。本规则随本 skill 被加载阅读而生效——不存在未加载 skill 也自动触发的机制。
+2. **选择门槛**：这类后台 Job 为承载长时任务、避免轮询而设，一般**预计超过 3 分钟**的命令才用。3 分钟是一般选择门槛，不是运行 timeout，也不是硬性禁止短任务或新增 API 校验。
+3. **启动后禁止轮询**：使用带完成通知的后台 Job 后，**不可轮询查看任务进程/运行进度**——不可循环 `agent_background_get`/`agent_background_list`、不可读日志/tail/logtail、不可 sleep/watch/PID 查询来维持等待。确认启动成功、通知目标和必要状态记录后，若没有其它无关且可独立推进的任务，**立刻 final 结束当前回合进入 idle**；终态通知（`noticeKind=background_job_terminal` 入 `queue_pending`）唤醒后再核验 status/exitcode 与持久日志进行验收。结果入队与当前 Agent 实际接收是两步。
+4. **要实时观察或需交互就别选后台 Job**：如需实时观察执行进度，或命令需要交互式 stdin/TTY，就不要选这种后台 Job，改用适合前台/交互观察的执行方式；不能一边用后台 Job 一边轮询。
+5. **保留能力**：收到终态通知后的结果核验（读日志、用 `agent_background_get` 对账 status/exitcode），以及用户明确要求的一次性诊断/取消/异常修复（`agent_background_cancel`/`agent_background_retry`）。这些不构成例行进度轮询的许可。
+6. **通知不可用先修通知**：终态通知链路不可用时，先解决通知问题或改用非后台执行方式；**不引入"后台 Job + 轮询兜底"的组合**。
 
 `agent_notify(target_session_id, text)` 是“事后回报”原语，不是派发原语。典型顺序是：
 
@@ -293,6 +491,29 @@ MA 编排 TA（的 Session/Worker）时，完成通知**一律走内部订阅**�
 3. Pan 将通知持久化到目标 Session 的 `queue_pending`；即使原 worker 已退出，服务重启后仍可恢复，目标无活 worker 时自动 spawn。
 
 通知和完成报告共用持久队列的报告消费通道，但通知不会变成 `agent_assign` 任务，也不应拿来替代 `agent_assign`/`agent_send`。通知调用本身只负责可靠回报，不授予后台命令额外权限；命令执行与结果验证仍受原有审批、安全及 managed 隔离约束。
+
+`agent_notify` 与后台 Job 终态通知必须按来源区分：`agent_notify` 仍保留
+调用方的 `sourceSessionId` 和现有 `@@@@by agent` 渲染；只有 Scheduler/Runner
+使用显式 `noticeKind=background_job_terminal` 时才渲染 `////by pan system`。
+Agent 创建的定时 Session-message Job 继续走普通 `agent_send`，保留
+`////by agent : <creatorSessionId> | <title>` 前缀和 `sourceSessionId`，不会被
+误分类为系统通知。旧 Job JSON 缺失 `creatorSessionId` 时按无创建者兼容读取。
+
+### 定时任务（Scheduler，闹钟式）
+
+> 像闹钟：设定「任务文本 + 触发时间 + 重复规则」，到点自动把 `text` 派发给目标 session 的 worker（等价到点替你发一次 `agent_assign`）。三种 schedule 用 `kind` 选择：`once`（`at` 本地朴素时间）/ `interval`（`interval_sec` >0）/ `cron`（5 段表达式如 `0 9 * * 1-5`）。目标必须是自己或自己 managed 的 session；写操作会自动 claim 未归属 session，受 `_check_access` 隔离。
+
+| 工具 | 参数 | 说明 |
+|------|------|------|
+| `scheduler_create` | `target_session_id`, `text`, `kind`, `name?`, `at?`, `interval_sec?`, `cron?`, `timezone?`, `enabled?`(默认 true), `max_runs?`, `misfire_policy?` | 创建定时任务。`kind` = `once`/`interval`/`cron`，各自必填参数见上；`timezone` 默认取配置（通常 `Asia/Shanghai`）；`max_runs` null = 无限；`misfire_policy` = `fire_now`/`skip`。返回 `{"ok":true,"task":{...含 nextFireAt}}` 或 `invalid_schedule`/`session_not_found` |
+| `scheduler_list` | `target_session_id?` | 列出定时任务（含 `nextFireAt`/`lastStatus`/`runCount`/`enabled`/`paused`）；按目标过滤在 MCP 层完成，省略 = 全部（只读） |
+| `scheduler_get` | `task_id`, `target_session_id?` | 读取单个任务（`sch_` 前缀 id） |
+| `scheduler_update` | `task_id`, `target_session_id?`, `name?`, `text?`, `schedule?`, `enabled?`, `max_runs?`, `misfire_policy?` | 部分更新；改 `schedule` 会重算 `nextFireAt` |
+| `scheduler_delete` | `task_id`, `target_session_id?` | 删除任务 |
+| `scheduler_pause` | `task_id`, `target_session_id?` | 挂起：跳过触发但时间锚点照常推进（与 `enabled=false` 总开关不同，后者停止推进） |
+| `scheduler_resume` | `task_id`, `target_session_id?` | 恢复挂起任务（不回补漏掉的触发） |
+| `scheduler_run_now` | `task_id`, `target_session_id?` | 立即手动触发一次（独立 dispatch_key 幂等，不影响后续节奏）；异步派发，结果看 `scheduler_runs` |
+| `scheduler_runs` | `task_id`, `target_session_id?`, `limit?`(默认 50) | 执行历史（新→旧）：`runId`/`fireAt`/`actualAt`/`status`(dispatched\|error\|skipped\|expired)/`sessionId`/`error` |
 
 ### 系统通知与提醒
 
@@ -307,6 +528,8 @@ MA 编排 TA（的 Session/Worker）时，完成通知**一律走内部订阅**�
 
 | 工具 | 参数 | 说明 |
 |------|------|------|
+| `report_status` | (无) | 只读自己的持久报告订阅配置，不证明报告已交接 |
+| `report_consume` | item_id? | 无参数按原序聚集可处理报告并批量 Force；同原 ID 仅查交接回执，无正文/隐藏项泄漏 |
 | `report_subscribe` | `session_id` | 订阅 session 的完成报告（需 `PAN_AGENT_SESSION_ID` 环境变量，仅 Pan 内 session 生效）。**订阅即接管**：自动 claim 目标 session 建立 managed 关系（§3）；已归本 manager 管理则仅确保订阅 |
 | `report_unsubscribe` | `session_id` | 仅取消完成报告订阅，**保留 managed 关系**（仅能退订**自己管理**的 session）；想解除整个管理关系用 `session_unclaim`（见下方四操作对比） |
 
@@ -328,6 +551,7 @@ MA 编排 TA（的 Session/Worker）时，完成通知**一律走内部订阅**�
 | 工具 | 参数 | 说明 |
 |------|------|------|
 | `permission_prompt` | `tool_name`, `input?` | **Claude Code 审批桥**：当 claude adapter 以 `--permission-prompt-tool mcp__pan__permission_prompt` 长驻运行时，Claude 的非交互权限请求经本工具转发到 Dashboard 审批栏，返回 `allow`/`deny` 决策（超时默认 360s 自动拒绝）。普通编排流程**不会**主动调用它；只有在 Dashboard 上批准 Claude 工具调用时才间接生效 |
+| `model_catalog` | `adapter?`, `session_id?` | 集中读取服务缓存模型和显式声明能力；建议指定 adapter；未知值不推断支持，不触发发现/凭据读取/账号聚合；model_list 保留原行为 |
 | `model_list` | `adapter`（必填） | 列出指定的**任一已注册 adapter** 的模型与默认模型；省略、空串或空白值不会选择 CBC，而是返回 `adapter_required`、`availableAdapters` 和可执行提示。示例：`model_list(adapter="codex")` 查询 Codex（如 `gpt-5.6-luna`）模型 |
 | `codex_quota` | `window?`(`all`/`first`/`secondary`), `session_id?` | 查询 live Codex Worker 的事件快照；`first` = 五小时窗口，`secondary` = 周窗口。MCP caller 层先做 `_check_access`，受限 caller 只能查 managed graph；底层 loopback HTTP 直连是无 manager 认证的本机受信管理接口，两者不是同一权限契约。`updatedAt`（兼容字段）与 `receivedAt` 都是 Pan Worker 接收 `account/rateLimits/updated` 的本地时间，不是 provider 原始更新时间；不会主动执行 `account/rateLimits/read`，绝对 used/remaining/limit 缺失时返回 `null`。错误码：`invalid_window`、`session_not_found`、`unsupported_provider`、`quota_unavailable`、`quota_ambiguous` |
 | `pan_handbook` | (无) | **返回本 SKILL.md 全文**（读文件实时返回，单一事实源，立项 C）。冷启动 agent 不确定编排流程时先调它；内容与 §0–§11 完全一致 |
@@ -338,11 +562,11 @@ MA 编排 TA（的 Session/Worker）时，完成通知**一律走内部订阅**�
 
 | status | 含义 | 操作 |
 |--------|------|------|
-| `"queued"` | 任务已入队 | 等待 5-10 秒后重查 |
+| `"queued"` | 任务已入队 | 不重复提交；使用已订阅的完成通知，兜底条件见 MA 文档 |
 | `"running"` | Worker 执行中 | 继续等，**不要重复提交** |
 | `"done"` | 任务完成 | 读 `result` 字段 |
 | `"error"` | 任务失败 | 读 `result` 字段取错误 |
-| `"pending"` | 同 task_id 的任务仍在进行中（assign 幂等返回） | 用同 task_id 重试或 session_get 补查 |
+| `"pending"` | 同 task_id 的任务仍在进行中（assign 幂等返回） | 保留原 task_id，等完成通知；不另建任务重复执行 |
 
 `session_list`（= `agent_list`）的 `workerStatus`：
 - `"queued"` / `"running"` / `"idle"`（可发任务）/ `"error"` / `"held"` / `"zombie"`（跳过回收）
@@ -355,7 +579,7 @@ MA 编排 TA（的 Session/Worker）时，完成通知**一律走内部订阅**�
 - 默认：`data/workdirs/<name>`（session 名 slug 化，非法字符替换为 `-`）。
 - **相对基准 = 实际运行的那个 Pan 服务实例的数据根**，不是你的当前项目目录、也不是 mcp-config 的 `cwd`（G3/G12）。实测：8768 服务（cwd `D:\project\Pan`）→ 落 `D:\project\Pan\data\workdirs\<name>`；8767（pan-test）→ 落 `D:\project\pan-test\data\workdirs\<name>`。**以 `session_create` 返回的 `workdir` 字段为准**。
 - 相对值一律按 slug 规则清理后放进 `data/workdirs/`。
-- `session_delete` **不删 workdir 目录**（只 kill worker + 删 session 元数据），磁盘留空目录，需要时自行清理（G11）。
+- `session_delete` **不删 workdir 目录**（只 kill worker + 删 session 元数据），磁盘目录保留；默认 workdir 的孤立目录统一通过 Settings → Data 的独立 workdirs 清理机制处理（G11），Session 到期也不能旁路删除。
 - **绝对路径可指定 Pan 外目录**（如 `D:/some/project`）——Worker 的 `cwd` 就是 workdir，cbc 把 workdir 当项目目录（JSONL + resume 都在这里）。
 - 同名 session 名必须唯一；workdir 默认取 session 名。
 - 文件系统 API（`/api/cbc/browse` 等）限在 workdir 内，`..` 逃逸会被拒绝。
@@ -389,6 +613,12 @@ MA 编排 TA（的 Session/Worker）时，完成通知**一律走内部订阅**�
 - `worker_handoff`（MCP）与 `POST /api/handoff` 已于 **2026-08-26 彻底移除**（原为立项 4.7 弃用后归档）。串行依赖与并行 fan-out 一律 `agent_assign`（别名 `worker_assign`）+ `report_subscribe`（§3）。
 - 理由（原立项 4.7）："等"应是 MA 的默认 idle 状态，而非阻塞调用；阻塞会占用协调者、易被中断。
 - **幂等**：`agent_assign` 的 `task_id` 是幂等键——重发同 task_id：已完成 → 返回缓存结果；进行中 → 返回 `{"status":"pending",...}` 不重复入队（防双跑）。taskId 注册表有 TTL 惰性清理。
+- 普通 `agent_send` 继承的 taskId 仅用于 report 配对，不是幂等键；连续 send
+  不会因为共享同一 taskId 而合并或去重。正式 assign 使用 `taskIdSource=assign`，
+  inherited send 使用 `taskIdSource=active`（这是 queue item 元数据，不是新的业务
+  ID）。
+- 现有进程内 `_task_status` 注册表仍是全局 taskId 作用域；本次只在 queue/history
+  的持久去重路径区分 formal assign 与 inherited send，未扩大或重定义该既有作用域。
 
 ### 7.5 `////by agent` 前缀
 
@@ -401,7 +631,7 @@ MA 编排 TA（的 Session/Worker）时，完成通知**一律走内部订阅**�
 
 - 用途：目标 TA Worker 区分「MA 编排消息」与真实用户消息。
 - 编排时注意：目标 worker 收到带该前缀的消息应识别为编排指令；`agent_assign` 不发此前缀（只有 `agent_send` / `agent_send_force` 拼）。
-- **时效性选择规则**：普通补充信息/线索 → `agent_send`（排队送达，空闲时处理）；**需要打断当前执行的时效性消息**（如操作约束、危险操作警告）→ `agent_send_force`（restart+send，立即生效，不等当前任务完成）。
+- **消息用途选择规则**：更新正在执行的当前任务 → 默认 `agent_send_force`；明确留待当前任务结束的独立后续事项 → `agent_send`（排队）。不要因“补充”或语气不急选择普通发送。`agent_send_force`（能力路由，Steer 优先，无能力才 restart）。force 不绕过 delayed restart、锁、Pause everything 或编辑租约；accepted 仅代表原生 admission，unknown 禁止自动重发。
 
 ### 7.6 pending_signal 队列（+ 落盘 queue_pending）
 
@@ -409,7 +639,7 @@ MA 编排 TA（的 Session/Worker）时，完成通知**一律走内部订阅**�
 - **普通任务**：入队 `{type:"task", id, text, source, taskId?, clientMessageId?}` → consumer 唤醒 → `queued→reserved→writing→sent_to_cli` 交接。
 - **报告信号**：入队 `{"type":"report_signal"}`——只负责唤醒，报告正文在 MA 的落盘队列（真源）。consumer 被唤醒后从落盘队列取 FIFO 头部交付单元（连续 report/QQ 段合并为一个交付单元），拼接成一条消息（`─────` 分隔 + 来源标注）处理。**出队边界 = 本地 CLI 交接成功**（stdin 完整写入 + drain，或 one-shot 进程创建成功并持久化 `sent_to_cli`），**不是**业务终态；交接前崩溃 → 恢复流程按 backoff 归队重投，交接后（at-most-once 边界）不因 provider 无终态而重投——接受窄重复窗口而非静默丢失（语义见 `docs/design/queue-at-most-once.md`）。
 - **QQ 提醒信号（2026-08-22 起）**：`/api/qq/notify` 被 QQ 插件调用后，`enqueue_qq_reminder` 对所有订阅了该 QQ 会话的 session append `{"type":"qq","kind":"qq",...}` 到其 `queue_pending` 并唤醒（同一信号通道）——即订阅者 worker 会收到 `@@@@by qq` 抬头提醒（与报告同队列/同出队边界，见 §3）。
-- 落盘真源 + 内存信号：服务重启不丢未交接项；`queue_delivery_ledger` 是已越过交接边界的幂等收据（**不是第二条队列**）；全局 watchdog 看到 `queue_pending` 非空无活 worker 会自动拉起。
+- 落盘真源 + 内存信号：服务重启不丢未交接项；`queue_delivery_ledger` 是已越过交接边界的幂等收据（**不是第二条队列**）。恢复时未完成的 reserved/writing/in-flight 收据会与 pending 行对账回 queued；若 ledger 已持久化 `sent_to_cli` 而 pending 行残留，以收据为准清除且不重发。全局 watchdog 看到 `queue_pending` 非空无活 worker 会自动拉起。
 
 ### 7.7 其他约定
 
@@ -418,21 +648,9 @@ MA 编排 TA（的 Session/Worker）时，完成通知**一律走内部订阅**�
 - **MCP deferred 判定**：工具搜不到 ≠ 未连接。`ToolSearch` 搜得到 = deferred（`.mcp.json` 路径）；搜不到 = 未连接（多半 `--mcp-config` 没传或 cwd 错）。`--mcp-config` 路径下工具应直接可见。
 - **带 character 的 session 首次任务**会被 memory 加载阻塞（embedding 首次加载 + 网络重试），可配 `memory.enabled: false` 或依赖 15s 超时降级（踩坑 #12）。
 
-## 8. 最佳实践
+## 8. 按角色执行
 
-1. **先查后做**：`session_list()` 了解当前状态再操作。
-2. **命名规范**：Session 名短横线连接、有语义（`fix-h1`、`debug-auth`）；同名不可重复。
-3. **并行 fan-out 用 `agent_assign` + `report_subscribe`**（§3）；串行依赖同样走 assign + report_subscribe（§2.2/§7.4）。
-4. **上下文过大 / 要切 adapter 用 `session_handoff`**（§2.7）：替身交接创建孪生 session B 接替 A，A 归档可读。
-5. **完成通知走 `report_subscribe` → `queue_pending`**（内部订阅，§3）；外部 WS 盯梢仅测试/排障用（§4）。
-6. **订阅即接管**：`report_subscribe` 后完成报告自动入队（并自动 claim 建立管理）；不想要完成报告推送时用 `report_unsubscribe` 退订（**保留管理**）——**不要**用 `session_unclaim`（那是解除整个管理关系，会连带退订，session 变无主，§5）。
-7. **一个 Session 一个任务**：避免混多个不相关任务（taskSeq/result 配对依赖此约束）。
-8. **长任务防误杀**：stream running 卡死判定基于任务运行时长（`worker.task_timeout_sec`，默认 1800s）——长思考/大文件读取不会被静默超时误杀；仍建议复杂任务拆小、读大文件分段。
-9. **及时清理**：`session_delete` / `session_batch_delete` 释放资源；watchdog 只回收进程不删 session。
-10. **不依赖长驻 Worker**：watchdog 自动回收空闲 worker，用完即走，下次调用自动重建。
-11. **workdir 用绝对路径指 Pan 外目录**：多 worker 共改一个项目时，让所有 session 指向同一 workdir。
-12. **错误重试**：返回 `error` 时先查原因（session_get 的 lastResult / queue_pending 里的 zombie 报告），修复后重发。
-13. **复用已删除的 session（session_import）**：Pan session 删除后其 CLI 会话仍保留，用 `session_import(list_projects → list_sessions → import)` 恢复完整上下文复用（§5 会话管理说明）——省去重建后重新探索/初始化，尤其适合「worker 完成但需继续排查/跟进」的场景。清理时 `session_batch_delete` 的 session 都走这条回收路径，不浪费上下文。
+MA 必须阅读 [MA 行为准则](references/ma.md)，TA 必须阅读 [TA 行为准则](references/ta.md)。共用操作以本文件为准，不从另一角色的行为要求推导自己的职责或授权。
 
 ## 9. 常见问题
 
@@ -457,57 +675,17 @@ A: 检查 §3 前置条件：目标 session 是否有 `managed_by`、是否已 `
 **Q: 想保留管理关系，但不想再收完成报告推送？**
 A: 用 `report_unsubscribe`（只关完成报告推送，**保留 managed**）。**不要**用 `session_unclaim`——那是解除整个管理关系（连带退订），session 会变无主（§3 / §5 四操作对比）。
 
-## 10. 冷启动实测记录与待补充清单（D5）
+## 10. 冷启动历史实测入口
 
-> 立项 D5 要求同时验证 **HTTP 路径** 与 **MCP 路径**。下表 G1–G7 为 `docs/archive/冷启动Agent编排实测报告.md` 中 HTTP 路径实测结果；**MCP 路径实测（2026-08-17）见下方「MCP 路径实测」小节**，并据此更新 G2/G5、新增 G8–G12。
+2026-08 HTTP/MCP 冷启动实测及 G1–G12 记录已移至 [历史实测](references/cold-start-history.md)。仅在诊断旧环境、接线与版本差异时阅读；其中旧推荐流程不覆盖当前角色准则。
 
-### 10.1 HTTP 路径实测缺口（原 D5）
+### 10.1 HTTP 历史缺口
 
-| # | 缺口 | 建议补充位置 | 状态 |
-|---|------|-------------|------|
-| G1 | `POST /api/sessions`、`POST /api/spawn`、`POST /api/assign`、`DELETE /api/sessions/{id}` 的**请求体字段未记录**（原 §5 只说"见 server.py"）——纯 HTTP 冷启动在第 1 步就需读代码 | references/http-api.md 补核心端点 body 表 | ✅ |
-| G2 | **MCP server 接线步骤缺失**：实测 ToolSearch 搜不到 `mcp__pan__` 工具时，手册无"如何启动/注入 MCP server 使工具可见"的动作序列 | §0.1/§5（MCP 路径实测） | ✅ §0.1/§5 |
-| G3 | **workdir 相对基准未明确**：默认落点实测为 Pan server 数据根 `D:\project\pan-test\data\workdirs\<name>`，非当前项目目录 | §7.1 | ✅ §7.1 |
-| G4 | **Windows curl 内联 UTF-8 JSON 报 body 解析错误**（实测 `{"detail":"There was an error parsing the body"}`）；应改用 `--data-binary @file` 或 urllib/requests | references/http-api.md | ✅ |
-| G5 | `report_subscribe` 前置 `PAN_AGENT_SESSION_ID` 的**来源/注入方式未说明**（谁注入、何时有） | §3 | ✅ MCP 路径实测 |
-| G6 | **字段映射未说明**：create 返回 `id`，spawn/assign 入参用 `sessionId`；`sessionId` vs `session_id` 命名不一致 | references/http-api.md | ✅ |
-| G7 | 轮询**放弃/超时策略缺失**（多久、几次轮询算失败） | references/http-api.md 轮询兜底策略 | ✅ |
+历史 G1–G7 见上述记录，当前请求体以 [HTTP API](references/http-api.md) 为准。
 
-### 10.2 MCP 路径实测（2026-08-17，MA `mcp__pan__` 直连）
+### 10.2 MCP 历史缺口
 
-**实测链路（一次走通）**：
-`session_create`(ses_d66c08611936941b) → `worker_assign`(queued/worker-2) → 轮询 `session_get`(limit=30) → `lastResult.status="done"`, `result="391"`（子 worker 算 `17×23`）→ `session_delete`(deleted)。
-**第二次**覆盖 `worker_spawn` 显式路径：create → `worker_spawn`(idle) → assign(queued) → 轮询 → `143÷11=13` done → delete。参数名、状态判断、轮询兜底均充分，**MCP 路径主链路顺畅**。
-
-**G2 / G5 处理结论（已覆盖，更新原描述）**：
-
-- **G2（MCP 接线）已解决且写入 §0/§5**：`mcp__pan__` 工具由 Pan adapter 在 spawn worker 时**自动注入**——通过 adapter 生成的 `data/mcp-configs/<session_id>.mcp.json`（含 `{"mcpServers":{"pan":{"command":"...python","args":["-m","packages.mcp.server"],"cwd":"...","type":"stdio"}}}`），经 `--mcp-config` 显式传入，**直接 connected 可见，无需 ToolSearch/DeferExecuteTool**。`ToolSearch`+`DeferExecuteTool` **仅**用于项目级 `.mcp.json` 路径发现的工具（见 §7.7）。手册原 §0/§5 "MCP 工具是 deferred 的"表述对 `--mcp-config` 路径不准确，已修正。
-
-- **G5（`PAN_AGENT_SESSION_ID` 来源）已查实（2026-08-17）**：该变量**由 Pan adapter 注入到 MCP server 进程环境**（写入上述 mcp-config 的 `env` 段：`PAN_AGENT_SESSION_ID=<manager session id>`、`PAN_AGENT_SESSION_TITLE=<title>`）。**来源**：manager（MA 自身）session 被创建并启用 MCP 时，adapter 生成 mcp-config 时填入；**何时**：MCP server 以 stdio 拉起的那一刻就带在环境里，对 MA 透明（其亲 shell `env` 里查不到这些变量，属正常）。
-
-- **G5 关键约束（新发现，致命）**：`report_subscribe` 要求 **manager session 与被管 session 同处一个 Pan 服务实例**。本实测中 MCP server 默认连 **8768**（见 §7.7/§0），而 `PAN_AGENT_SESSION_ID=ses_8f7825d50d340dad` 实际只存在于 **8767**（pan-test）。该环境变量值指向 8767，与 MCP server 的默认目标 8768 **跨端口**，导致 §3 内部报告路径在本布局下失效。**对齐前提**：`--mcp-config` 的 `cwd`/启动端口、`PAN_API_URL`、**与 `PAN_AGENT_SESSION_ID` 所在服务**必须三者一致。
-
-**MCP 路径新发现缺口（G8–G12；2026-08-27 核对：各项建议均已在主文对应位置补齐 ✅——G8 见 §5/§6、G9/G10 三对齐见 §0/§3、G11 见 §2.5/§7.1、G12 见 §7.1）**：
-
-| # | 缺口 / 现象 | 后果 | 建议补充位置 |
-|---|-------------|------|--------------|
-| G8 | `session_list` **无过滤参数**，默认把全部 session 的**完整 history** 序列化返回（实测 310KB / 265906 chars，触发工具输出 token 上限溢出） | 冷启动第一步"先查后做"反而撑爆上下文；必须先 `Read` 落盘文件分段看 | §5/§6：改用 `session_get(limit=)` + `worker_list` 代替全量 `session_list` |
-| G9 | **MCP server 默认端口（8768）与 `PAN_AGENT_SESSION_ID` 所在服务（8767）跨端口**（见 G5 约束） | `report_subscribe` 内部报告路径不可用 | §0/§3：明确"MCP 目标端口 = PAN_AGENT_SESSION_ID 所在端口"三对齐 |
-| G10 | **`report_subscribe` 在本布局返回 `404 "Not Found"`**：实测 8768(main) 服务 `server.py` 无 `report-subscribe` 路由（0 次命中），而本工作树 `server.py` 有（1 次）——即**运行中的服务落后于 MCP 工具版本**（版本 skew） | §3 内部报告走不通；只能退回 references/http-api.md 的轮询兜底 | §3：标注"需运行含 `report-subscribe` 的服务端（本分支 server.py 已含）"；否则用轮询兜底 |
-| G11 | `session_delete` **只 kill worker + 删 session 元数据，不删 workdir 磁盘目录**（实测删除后 `data/workdirs/mcp-cold-probe` 空目录残留） | 磁盘累积空目录，需另清理 | §2.5/§7.1：说明残留，必要时 `rm -rf workdir` |
-| G12 | workdir 默认基准 = **服务进程的数据根**，非固定 pan-test。本实测（8768 服务 cwd=`D:\project\Pan`）落点为 `D:\project\Pan\data/workdirs/<name>`，与 G3 记的 `D:\project\pan-test\...` 不同 | §7.1 的"Pan server 数据根"需指明是**实际运行实例的**数据根，可经 create 返回的 `workdir` 字段确证 | §7.1 |
-
-**MCP 路径推荐操作顺序（据实测固化）**：
-1. 确认 MCP server 目标端口 = `PAN_AGENT_SESSION_ID` 所在端口（否则 G9/G10 命中，退回 references/http-api.md 的轮询兜底）。
-2. `session_create(name, adapter="cbc", model="hy3")` → 记下返回 `id`（= 后续 `session_id` 入参）。
-3. `report_subscribe(session_id)`（§3；若可用）。
-4. `agent_assign(session_id, text)` 立即返回 `queued`（自动 spawn，无需手动 `agent_spawn`；§2.1）。
-5. 等 `queue_pending` 完成报告（兜底：轮询 `session_get(session_id, limit=15)` 直到 `lastResult.status=="done"`，≤30s 内完成，按 §6 不重发）。
-6. 读 `lastResult.result`。
-7. `session_delete(session_id)` 收尾（注意 §7.1 G11 workdir 残留）。
-8. **避免**全量 `session_list`（G8）；状态巡检用 `agent_list` + 定向 `session_get`。
-
----
+历史 G8–G12 见上述记录。当前仍须核实 MCP 目标实例与自身 Session 对齐，区分订阅和管理；Session 删除不删除 workdir。
 
 ## 11. skill 维护规范
 
@@ -524,13 +702,13 @@ A: 用 `report_unsubscribe`（只关完成报告推送，**保留 managed**）�
 - 手册内容禁止只引用代码文件而不给关键结论（参数表 / 返回格式 / 状态语义必须落字）。
 - 验证闭环作为变更验收项：冷启动 agent 测试（仅 MCP + skill、无上下文完成一次编排，立项 §二·5「验证」）。
 
-### 11.2 SKILL.md 双份管理
+### 11.2 skill 主源与同步副本
 
-- **主源**：`docs/skills/pan/SKILL.md`（**git 版本控制**，随代码变更走 PR/提交）。
+- **主源**：`docs/skills/pan/`（**git 版本控制**）；入口 `SKILL.md` 维护共用操作，`references/ma.md` 与 `references/ta.md` 分别维护角色行为。
 - **同步副本**：`.codebuddy/skills/pan/SKILL.md`（CodeBuddy 编辑器加载 skill 用，**不进 git**）。
 - **技术细节子文档**：`docs/skills/pan/references/http-api.md`、`references/ws-protocol.md`（与主源同目录，相对链接引用）。
-- **改内容先改主源，再复制到副本保持同步**——只改副本会让主源落后，下次 checkout/合并会把改动冲掉。
-- 内容变化触发同步：MCP 工具 / HTTP API / workdir 约定 / 编排流程变更时，两处一并更新（本文件 §0 头注）。
+- **先改仓库主源，同步时包含所有变动的引用文档**；只同步入口会导致角色必读链接缺失。用户明确要求暂缓用户级或其他副本同步时遵守该范围，不因维护规则自行复制。
+- MCP 工具 / HTTP API / workdir / 角色规则变化时，记录副本同步需求；按本次用户授权执行同步，不以此隐含授权修改外部 skill 目录。
 
 ---
 
@@ -651,3 +829,12 @@ agent_assign(session_id=..., text="...")  # 开始干活
 - `packages/web/server.py` — HTTP API 与 /ws/agent 实现（单一事实源）
 - `packages/mcp/server.py` — MCP 工具实现（`_api` 与各工具）
 - `packages/core/worker.py` — watchdog / assign / 报告队列实现
+
+
+### Independent orphan workdir retention
+
+`data_retention.workdirs = {"enabled": false, "days": null}` is opt-in, with integer days 1–36500. Session deletion/expiry never deletes its workdir. Settings → Data previews and manually deletes only default `data/workdirs` direct plain directories, using the newest recursive mtime and protecting every Session/Workspace overlapping reference. Links/reparse points, uncertain records and scan limits fail closed. Preview is not deletion authority; deletion rechecks identity, age and references under a directory claim. The coordinator mutex covers only in-memory transaction/claim registration, never scanning, filesystem IO or a complete save. In-flight reference transactions or a changed reference generation prevent claim acquisition; once claimed, overlapping new references are rejected while unrelated saves proceed. Successful deletions enter a bounded 256-entry completion cache; failures release the claim without a completion record. Missing paths in a registered cleanup root remain rejected even after completion-cache eviction; root scopes are capped at 32 and excess scopes fail closed. Workspace dirs are exposed as copies, so in-place edits do not mutate stored references. Automatic cleanup reuses the existing retention scheduler. The N-day mtime heuristic can be inaccurate; prefer manual cleanup. See [HTTP API](references/http-api.md) for the preview/delete endpoints.
+
+### Background Job names
+
+`agent_background_start` requires a meaningful `name` (1-200 characters after trimming); `label` is optional. Example: `agent_background_start(argv=["python", "scripts/check.py"], cwd="D:/project/Pan", name="Validate Job cancellation")`. The web New Job form may leave Name blank to retain automatic `job-N` naming. Existing persisted names remain readable without migration.

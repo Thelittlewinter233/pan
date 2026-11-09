@@ -1,54 +1,64 @@
-import { useState, useCallback, useMemo, useEffect, useRef } from 'react';
-import { NavLink, useLocation, useNavigate } from 'react-router-dom';
+import { SidebarPanelContext } from './SidebarPanelContext';
+import { lazy, Suspense, useContext, useState, useCallback, useMemo, useEffect, useRef } from 'react';
+import { SearchInput } from '@/components/ui/SearchInput';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { useShallow } from 'zustand/react/shallow';
 import { useSessionStore } from '@/stores/sessionStore';
-import { useUIStore } from '@/stores/uiStore';
 import { useWorkspaceStore } from '@/stores/workspaceStore';
+import { useUIStore } from '@/stores/uiStore';
+import { useAppSettingsStore } from '@/stores/appSettingsStore';
 import { useMediaQuery } from '@/hooks/useMediaQuery';
-import { nextSessionDefaultName } from '@/utils/sessionName';
+import { createQuickNewSession } from '@/utils/quickNewSession';
 import { SessionList } from '@/components/session/SessionList';
-import { NewSessionModal } from '@/components/session/NewSessionModal';
-import { ImportModal } from '@/components/session/ImportModal';
-import { ManageModal } from '@/components/session/ManageModal';
-import { PostboxModal } from '@/components/session/PostboxModal';
+import { useHistorySearchViewStore } from '@/stores/historySearchViewStore';
 import { SessionMenu } from '@/components/session/SessionMenu';
-import { SessionDetailsModal } from '@/components/session/SessionDetailsModal';
+import { HandoffSessionModal } from '@/components/session/HandoffSessionModal';
 import { RenameSessionModal } from '@/components/session/RenameSessionModal';
 import { SessionDeleteModal } from '@/components/session/SessionDeleteModal';
 import { collectDescendantIds, hasManagedChildren } from '@/components/session/sessionDeletePlan';
-import { SPECIAL_FILTERS, getSessionListCandidates } from '@/utils/sessionFilters';
-import { EditorDirectoryRoots } from '@/components/editor/EditorDirectoryRoots';
+import { UNGROUPED_WORKSPACES, getSessionListCandidates } from '@/utils/sessionFilters';
 import { SidebarResizer } from './SidebarResizer';
-import { AppSettingsModal } from './AppSettingsModal';
+import { SessionFilterMenu } from './SessionFilterMenu';
+import { ViewEntryGroups } from './ViewEntryGroups';
+import { ViewEntryRail } from './ViewEntryRail';
 import { Button } from '@/components/ui/Button';
+import { SelectedSessionActions } from '@/components/session/SelectedSessionActions';
 import { WorkspaceManagerChangeConfirmationModal } from './WorkspaceManagerChangeConfirmationModal';
 import type { WorkspaceMoveConfirmationRequest } from '@/utils/workspaceMoveConfirmation';
+
+const AppSettingsModal = lazy(() => import('./AppSettingsModal').then((module) => ({ default: module.AppSettingsModal })));
+const NewSessionModal = lazy(() => import('@/components/session/NewSessionModal').then((module) => ({ default: module.NewSessionModal })));
+const ImportModal = lazy(() => import('@/components/session/ImportModal').then((module) => ({ default: module.ImportModal })));
+const ManageModal = lazy(() => import('@/components/session/ManageModal').then((module) => ({ default: module.ManageModal })));
+const PostboxModal = lazy(() => import('@/components/session/PostboxModal').then((module) => ({ default: module.PostboxModal })));
+const SessionDetailsModal = lazy(() => import('@/components/session/SessionDetailsModal').then((module) => ({ default: module.SessionDetailsModal })));
+const EditorDirectoryRoots = lazy(() => import('@/components/editor/EditorDirectoryRoots').then((module) => ({ default: module.EditorDirectoryRoots })));
 import {
-  MessageSquare,
-  Code,
   PanelLeftClose,
   PanelLeft,
   Plus,
   Settings,
   Import,
-  Search,
   ArrowUpDown,
   Layers,
-  ListFilter,
   ChevronUp,
   ChevronDown,
   Sun,
   Moon,
-  ListChecks,
   Trash2,
   X,
 } from 'lucide-react';
 
 export function Sidebar({ mobileWorkspaceExpanded = false }: { mobileWorkspaceExpanded?: boolean }) {
+  const matchingSessionIds = useHistorySearchViewStore((state) => state.matchingSessionIds);
+  const historySearchPreparing = useHistorySearchViewStore((state) => state.preparing);
   const location = useLocation();
   const navigate = useNavigate();
+  const sidebarPanel = useContext(SidebarPanelContext);
+  const isLockerRoute = location.pathname === '/locker';
   const isEditorRoute = location.pathname === '/editor';
   const { isMobile } = useMediaQuery();
+  const showGroupBy = useAppSettingsStore((s) => s.showGroupBy);
 
   // Session store — 细粒度订阅（useShallow）：只在此切片变化时重渲染。
   // 不能用 useSessionStore() 整体订阅：inputDrafts（每次敲键）、
@@ -79,9 +89,8 @@ export function Sidebar({ mobileWorkspaceExpanded = false }: { mobileWorkspaceEx
     sortBy,
     cycleSortBy,
     specialFilters,
+    adapterFilters,
     hiddenSessionIds,
-    toggleSpecialFilter,
-    clearSpecialFilters,
     collapsedGroups,
     collapseAllGroups,
     expandAllGroups,
@@ -103,9 +112,8 @@ export function Sidebar({ mobileWorkspaceExpanded = false }: { mobileWorkspaceEx
     sortBy: s.sortBy,
     cycleSortBy: s.cycleSortBy,
     specialFilters: s.specialFilters,
+    adapterFilters: s.adapterFilters,
     hiddenSessionIds: s.hiddenSessionIds,
-    toggleSpecialFilter: s.toggleSpecialFilter,
-    clearSpecialFilters: s.clearSpecialFilters,
     collapsedGroups: s.collapsedGroups,
     collapseAllGroups: s.collapseAllGroups,
     expandAllGroups: s.expandAllGroups,
@@ -115,10 +123,10 @@ export function Sidebar({ mobileWorkspaceExpanded = false }: { mobileWorkspaceEx
     setDragEnabled: s.setDragEnabled,
     activeWorkspaceId: s.activeWorkspaceId,
   })));
-  // Workspace rail state (batch move menu + scope label).
-  const workspaces = useWorkspaceStore((s) => s.workspaces);
-  const workspacesLoaded = useWorkspaceStore((s) => s.loaded);
-  const loadWorkspaces = useWorkspaceStore((s) => s.loadWorkspaces);
+  const effectiveGroupBy = showGroupBy ? groupBy : 'manager';
+  const activeScopeName = useWorkspaceStore((state) => state.workspaces.find((workspace) => workspace.id === activeWorkspaceId)?.name);
+
+  const [selectedActionBusy, setSelectedActionBusy] = useState(false);
 
   // Local state
   const [showNewModal, setShowNewModal] = useState(false);
@@ -128,9 +136,9 @@ export function Sidebar({ mobileWorkspaceExpanded = false }: { mobileWorkspaceEx
   const [manageSessionId, setManageSessionId] = useState<string | null>(null);
   const [postboxSessionId, setPostboxSessionId] = useState<string | null>(null);
   const [detailsSessionId, setDetailsSessionId] = useState<string | null>(null);
+  const [handoffSessionId, setHandoffSessionId] = useState<string | null>(null);
   const [renameSessionId, setRenameSessionId] = useState<string | null>(null);
   const [showAppSettings, setShowAppSettings] = useState(false);
-  const [showFilterMenu, setShowFilterMenu] = useState(false);
   const [showDragMenu, setShowDragMenu] = useState(false);
   const [workspaceMoveConfirmation, setWorkspaceMoveConfirmation] = useState<(
     WorkspaceMoveConfirmationRequest & { resolve: (confirmed: boolean) => void }
@@ -209,35 +217,48 @@ export function Sidebar({ mobileWorkspaceExpanded = false }: { mobileWorkspaceEx
     if (!sortLongPressedRef.current) clearSortPress();
   }, [clearSortPress]);
 
-  // Group keys for collapse-all (mirrors SessionList workdir/manager grouping)
-  const groupKeys = useMemo(() => {
-    if (groupBy === 'workdir') {
-      const keys = new Set<string>();
-      for (const s of sessions) {
-        if (s.workdir) {
-          keys.add(s.workdir.replace(/\\/g, '/').replace(/\/$/, ''));
-        } else {
-          keys.add('__no_workdir');
-        }
-      }
-      return [...keys];
-    }
-    if (groupBy === 'manager') {
-      return sessions.map((s) => s.id);
-    }
-    return [] as string[];
-  }, [sessions, groupBy]);
-
+  // Scope for collapse-all / expand-all: every collapsible key in the
+  // currently visible (search/filter/workspace-scoped) list, at ALL tree
+  // levels. Derived from the same data-level candidate list SessionList groups
+  // (NOT from rendered DOM nodes), so children hidden under collapsed parents
+  // are included, while sessions filtered out by search/filters/workspace or
+  // hidden are out of scope and keep their own collapse state. Key
+  // normalization mirrors SessionList's workdir/manager grouping.
   const selectableSessions = useMemo(
     () => getSessionListCandidates(sessions, {
+      // Select-all deliberately includes hidden sessions; the normal group
+      // scope below applies the hidden-session projection when needed.
       multiSelectMode: true,
       hiddenSessionIds,
       searchQuery,
       specialFilters,
+      adapterFilters,
       activeWorkspaceId,
+      matchingSessionIds,
     }),
-    [sessions, hiddenSessionIds, searchQuery, specialFilters, activeWorkspaceId],
+    [sessions, hiddenSessionIds, searchQuery, specialFilters, adapterFilters, activeWorkspaceId, matchingSessionIds],
   );
+
+  const groupKeys = useMemo(() => {
+    if (effectiveGroupBy !== 'workdir' && effectiveGroupBy !== 'manager') return [] as string[];
+    const scoped = multiSelectMode
+      ? selectableSessions
+      : selectableSessions.filter((session) => !hiddenSessionIds.has(session.id));
+    if (effectiveGroupBy === 'workdir') {
+      const keys = new Set<string>();
+      for (const s of scoped) {
+        keys.add(s.workdir ? s.workdir.replace(/\\/g, '/').replace(/\/$/, '') : '__no_workdir');
+      }
+      return [...keys];
+    }
+    return scoped.map((s) => s.id);
+  }, [effectiveGroupBy, multiSelectMode, hiddenSessionIds, selectableSessions]);
+
+  // Binary toggle judged against the operation scope only: collapsed state of
+  // out-of-scope keys must not flip the button (e.g. a group collapsed in
+  // another workspace or before a filter was applied).
+  const allScopeCollapsed = groupKeys.length > 0 && groupKeys.every((k) => collapsedGroups.has(k));
+
   const selectableIds = useMemo(
     () => selectableSessions.map((session) => session.id),
     [selectableSessions],
@@ -253,37 +274,6 @@ export function Sidebar({ mobileWorkspaceExpanded = false }: { mobileWorkspaceEx
       for (const id of selectable) next.add(id);
     }
     useSessionStore.setState({ selectedIds: next });
-  };
-
-  /** Batch workspace move (single membership + manager cascade, scoped selection). */
-  const [moveMenuOpen, setMoveMenuOpen] = useState(false);
-  const activeScopeName = activeWorkspaceId === 'all'
-    ? '全部'
-    : workspaces.find((w) => w.id === activeWorkspaceId)?.name ?? '全部';
-
-  // The rail loads workspaces on desktop; the batch menu is reachable on
-  // mobile too, so make sure the list exists before it renders items.
-  useEffect(() => {
-    if (multiSelectMode && !workspacesLoaded) void loadWorkspaces();
-  }, [multiSelectMode, workspacesLoaded, loadWorkspaces]);
-
-  const handleBatchMove = async (workspaceId: string | null) => {
-    setMoveMenuOpen(false);
-    if (selectedIds.size === 0) return;
-    try {
-      const changed = await useWorkspaceStore.getState().moveSessions([...selectedIds], workspaceId);
-      if (changed.length === 0) {
-        showToast(workspaceId ? '所选会话均已在目标工作区' : '所选会话本就没有归属', 'error');
-      } else if (workspaceId) {
-        const name = useWorkspaceStore.getState().workspaces.find((w) => w.id === workspaceId)?.name ?? '工作区';
-        showToast(`已将 ${changed.length} 个会话移入「${name}」`);
-      } else {
-        showToast(`已将 ${changed.length} 个会话移出工作区（未分组）`);
-      }
-      exitMultiSelect();
-    } catch (e) {
-      showToast(e instanceof Error ? e.message : '移动失败', 'error');
-    }
   };
 
   const handleBatchDelete = () => {
@@ -335,13 +325,10 @@ export function Sidebar({ mobileWorkspaceExpanded = false }: { mobileWorkspaceEx
   };
 
   const quickNew = useCallback(() => {
-    const name = nextSessionDefaultName(sessions);
-    const store = useSessionStore.getState();
-    store
-      .createNewSession(name)
+    createQuickNewSession()
       .then(() => showToast('Session created'))
       .catch((e) => showToast(e.message || 'Creation failed', 'error'));
-  }, [sessions, showToast]);
+  }, [showToast]);
 
   // useCallback：SessionList 的 SessionItem 是 React.memo，onSessionMenu 必须
   // 引用稳定（依赖的 setMenuPosition/setMenuSession 均为稳定 setter），否则每次
@@ -353,8 +340,14 @@ export function Sidebar({ mobileWorkspaceExpanded = false }: { mobileWorkspaceEx
     setMenuSession(id);
   }, []);
 
+  // 真实卡片激活的统一回聊语义：从任何非聊天路由（Editor / Jobs / Terminal /
+  // 插件 Panel / Manage 等）点击 Session 卡片都回到 Chat 并显示所点 Session；
+  // 已选中同一 Session 再次点击也同样回聊。已经在聊天路由时不再 navigate，
+  // 避免无意义的历史堆叠。只有卡片主体点击经 SessionList.handleSelect →
+  // onSessionClick 到达这里；批量选择、右键菜单、卡片快捷操作、拖动和后台
+  // store 选择都不会触发导航。
   const handleSessionClick = useCallback(() => {
-    if (location.pathname !== '/jobs') return;
+    if (location.pathname === '/') return;
     navigate('/');
     if (isMobile) setMobileSidebarOpen(false);
   }, [isMobile, location.pathname, navigate, setMobileSidebarOpen]);
@@ -363,7 +356,7 @@ export function Sidebar({ mobileWorkspaceExpanded = false }: { mobileWorkspaceEx
 
   if (sidebarCollapsed && !isMobile) {
     return (
-      <nav className="flex flex-col items-center h-full bg-bg-secondary border-r border-border-default py-3 gap-2" style={{ width: 48 }}>
+      <nav aria-label="页面入口" className="flex flex-col items-center h-full bg-bg-secondary border-r border-border-default py-3 gap-2" style={{ width: 48 }}>
         <button
           onClick={toggleSidebar}
           className="text-text-tertiary hover:text-text-primary p-1.5 rounded transition-colors"
@@ -372,48 +365,10 @@ export function Sidebar({ mobileWorkspaceExpanded = false }: { mobileWorkspaceEx
           <PanelLeft size={18} />
         </button>
 
-        <NavLink
-          to="/"
-          end
-          title="Chat"
-          className={({ isActive }) =>
-            `p-1.5 rounded transition-colors ${
-              isActive
-                ? 'text-accent bg-accent/10'
-                : 'text-text-tertiary hover:text-text-primary hover:bg-bg-hover'
-            }`
-          }
-        >
-          <MessageSquare size={18} />
-        </NavLink>
-
-        <NavLink
-          to="/editor"
-          title="Editor"
-          className={({ isActive }) =>
-            `p-1.5 rounded transition-colors ${
-              isActive
-                ? 'text-accent bg-accent/10'
-                : 'text-text-tertiary hover:text-text-primary hover:bg-bg-hover'
-            }`
-          }
-        >
-          <Code size={18} />
-        </NavLink>
-
-        <NavLink
-          to="/jobs"
-          title="Jobs"
-          className={({ isActive }) =>
-            `p-1.5 rounded transition-colors ${
-              isActive
-                ? 'text-accent bg-accent/10'
-                : 'text-text-tertiary hover:text-text-primary hover:bg-bg-hover'
-            }`
-          }
-        >
-          <ListChecks size={18} />
-        </NavLink>
+        {/* Page entries — same shared list as the expanded strip
+            (ViewEntryGroups), so the collapsed rail always covers every
+            view route with active state, tooltip and click navigation. */}
+        <ViewEntryRail />
 
         <div className="flex-1" />
 
@@ -424,10 +379,9 @@ export function Sidebar({ mobileWorkspaceExpanded = false }: { mobileWorkspaceEx
         >
           <Settings size={18} />
         </button>
-        <AppSettingsModal
-          open={showAppSettings}
-          onClose={() => setShowAppSettings(false)}
-        />
+        {showAppSettings && <Suspense fallback={null}>
+          <AppSettingsModal open onClose={() => setShowAppSettings(false)} />
+        </Suspense>}
 
         <button
           onClick={toggleTheme}
@@ -487,52 +441,10 @@ export function Sidebar({ mobileWorkspaceExpanded = false }: { mobileWorkspaceEx
               </div>
             </div>
 
-            {/* Route nav */}
-            <div className="flex gap-1 mb-2">
-              <NavLink
-                to="/"
-                end
-                className={({ isActive }) =>
-                  `flex-1 flex items-center justify-center gap-1 py-1.5 text-xs rounded transition-colors ${
-                    isActive
-                      ? 'bg-accent/20 text-accent font-medium'
-                      : 'text-text-tertiary hover:text-text-secondary hover:bg-bg-hover'
-                  }`
-                }
-              >
-                <MessageSquare size={12} />
-                Chat
-              </NavLink>
-              <NavLink
-                to="/editor"
-                className={({ isActive }) =>
-                  `flex-1 flex items-center justify-center gap-1 py-1.5 text-xs rounded transition-colors ${
-                    isActive
-                      ? 'bg-accent/20 text-accent font-medium'
-                      : 'text-text-tertiary hover:text-text-secondary hover:bg-bg-hover'
-                  }`
-                }
-              >
-                <Code size={12} />
-                Editor
-              </NavLink>
-              <NavLink
-                to="/jobs"
-                className={({ isActive }) =>
-                  `flex-1 flex items-center justify-center gap-1 py-1.5 text-xs rounded transition-colors ${
-                    isActive
-                      ? 'bg-accent/20 text-accent font-medium'
-                      : 'text-text-tertiary hover:text-text-secondary hover:bg-bg-hover'
-                  }`
-                }
-              >
-                <ListChecks size={12} />
-                Jobs
-              </NavLink>
-            </div>
+            <div className="mb-2"><ViewEntryGroups isMobile={isMobile} /></div>
 
             {/* Buttons */}
-            <div className="flex gap-1">
+            {!isLockerRoute && <div className="flex gap-1">
               <div className="flex flex-[3] min-w-0 overflow-hidden rounded border border-transparent bg-accent">
                 <Button
                   variant="primary"
@@ -565,88 +477,16 @@ export function Sidebar({ mobileWorkspaceExpanded = false }: { mobileWorkspaceEx
                 <Import size={14} />
                 Import
               </Button>
-            </div>
+            </div>}
           </div>
 
+          {isLockerRoute ? (
+            <div ref={sidebarPanel?.[1]} className="flex-1 min-h-0 overflow-hidden" data-testid="locker-sidebar-panel" />
+          ) : <>
           {/* Search + tools bar */}
           <div className="flex items-center gap-1 px-3 py-1.5 border-b border-border-muted bg-bg-secondary">
-            <div className="relative flex-1">
-              <Search size={12} className="absolute left-2 top-1/2 -translate-y-1/2 text-text-tertiary pointer-events-none" />
-              <input
-                type="text"
-                placeholder="Filter..."
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                className="w-full bg-bg-tertiary border border-border-default rounded text-xs py-1 pl-6 pr-6 text-text-primary placeholder:text-text-tertiary outline-none focus:border-accent/50"
-              />
-              {searchQuery && (
-                <button
-                  type="button"
-                  onClick={() => setSearchQuery('')}
-                  className="absolute right-1 top-1/2 -translate-y-1/2 px-1 text-text-tertiary hover:text-text-primary"
-                  aria-label="Clear session search"
-                  title="Clear session search"
-                >
-                  ×
-                </button>
-              )}
-            </div>
-            <div className="relative">
-              <button
-                onClick={() => setShowFilterMenu((v) => !v)}
-                className={`flex items-center gap-1 p-1 rounded transition-colors ${
-                  specialFilters.size > 0
-                    ? 'text-accent bg-accent/10'
-                    : 'text-text-tertiary hover:text-text-primary'
-                }`}
-                title="Special filters"
-                aria-haspopup="menu"
-                aria-expanded={showFilterMenu}
-              >
-                <ListFilter size={14} />
-                {specialFilters.size > 0 && (
-                  <span className="text-[10px] leading-none font-medium">{specialFilters.size}</span>
-                )}
-              </button>
-              {showFilterMenu && (
-                <>
-                  {/* Click-away backdrop */}
-                  <div className="fixed inset-0 z-20" onClick={() => setShowFilterMenu(false)} />
-                  <div
-                    role="menu"
-                    className="absolute left-0 top-full mt-1 z-30 w-64 rounded border border-border-default bg-bg-primary shadow-lg py-1"
-                  >
-                    {SPECIAL_FILTERS.map((f) => (
-                      <label
-                        key={f.id}
-                        role="menuitemcheckbox"
-                        aria-checked={specialFilters.has(f.id)}
-                        className="flex items-start gap-2 px-3 py-1.5 cursor-pointer hover:bg-bg-hover/40 select-none"
-                      >
-                        <input
-                          type="checkbox"
-                          checked={specialFilters.has(f.id)}
-                          onChange={() => toggleSpecialFilter(f.id)}
-                          className="mt-0.5 accent-accent shrink-0"
-                        />
-                        <span className="min-w-0">
-                          <span className="block text-xs text-text-primary">{f.label}</span>
-                          <span className="block text-[10px] text-text-tertiary leading-tight">{f.description}</span>
-                        </span>
-                      </label>
-                    ))}
-                    {specialFilters.size > 0 && (
-                      <button
-                        onClick={clearSpecialFilters}
-                        className="w-full text-left px-3 py-1.5 mt-1 text-xs text-text-tertiary hover:text-text-primary border-t border-border-muted"
-                      >
-                        Clear filters
-                      </button>
-                    )}
-                  </div>
-                </>
-              )}
-            </div>
+            <SearchInput value={searchQuery} onChange={setSearchQuery} placeholder="Filter..." label="session" />
+            <SessionFilterMenu />
             <div ref={sortMenuRef} className="relative">
               <button
                 onClick={handleSortClick}
@@ -693,29 +533,31 @@ export function Sidebar({ mobileWorkspaceExpanded = false }: { mobileWorkspaceEx
                 </div>
               )}
             </div>
-            <button
-              onClick={cycleGroupBy}
-              className={`flex items-center gap-1 p-1 rounded transition-colors ${
-                groupBy !== 'none'
-                  ? 'text-accent bg-accent/10'
-                  : 'text-text-tertiary hover:text-text-primary'
-              }`}
-              title={`Group by ${groupBy === 'workdir' ? 'manager' : groupBy === 'manager' ? 'none' : 'dir'} (click to cycle)`}
-            >
-              <Layers size={14} />
-              <span className="text-[10px] leading-none">
-                {groupBy === 'workdir' ? 'dir' : groupBy === 'manager' ? 'manager' : 'off'}
-              </span>
-            </button>
-            {(groupBy === 'workdir' || groupBy === 'manager') && (
+            {showGroupBy && (
+              <button
+                onClick={cycleGroupBy}
+                className={`flex items-center gap-1 p-1 rounded transition-colors ${
+                  groupBy !== 'none'
+                    ? 'text-accent bg-accent/10'
+                    : 'text-text-tertiary hover:text-text-primary'
+                }`}
+                title={`Group by ${groupBy === 'workdir' ? 'manager' : groupBy === 'manager' ? 'none' : 'dir'} (click to cycle)`}
+              >
+                <Layers size={14} />
+                <span className="text-[10px] leading-none">
+                  {groupBy === 'workdir' ? 'dir' : groupBy === 'manager' ? 'manager' : 'off'}
+                </span>
+              </button>
+            )}
+            {(effectiveGroupBy === 'workdir' || effectiveGroupBy === 'manager') && (
               <button
                 onClick={() =>
-                  collapsedGroups.size > 0 ? expandAllGroups() : collapseAllGroups(groupKeys)
+                  allScopeCollapsed ? expandAllGroups(groupKeys) : collapseAllGroups(groupKeys)
                 }
                 className="p-1 rounded transition-colors text-text-tertiary hover:text-text-primary"
-                title={collapsedGroups.size > 0 ? 'Expand all groups' : 'Collapse all groups'}
+                title={allScopeCollapsed ? 'Expand all groups' : 'Collapse all groups'}
               >
-                {collapsedGroups.size > 0 ? (
+                {allScopeCollapsed ? (
                   <ChevronUp size={14} />
                 ) : (
                   <ChevronDown size={14} />
@@ -731,57 +573,24 @@ export function Sidebar({ mobileWorkspaceExpanded = false }: { mobileWorkspaceEx
                 {selectedIds.size} selected
               </span>
               <span className="min-w-0 max-w-full flex-1 text-[10px] text-text-tertiary truncate" title="批量操作的范围（永不跨工作区）">
-                范围：{activeScopeName}
+                范围：{activeWorkspaceId === 'all' ? '全部' : activeWorkspaceId === UNGROUPED_WORKSPACES ? '无工作区' : activeScopeName ?? activeWorkspaceId}
               </span>
               <div className="sidebar-selection-actions ml-auto flex max-w-full flex-wrap items-center justify-end gap-1.5">
                 <Button
                   variant="ghost"
                   size="sm"
                   onClick={handleToggleSelectAll}
-                  disabled={selectableIds.length === 0}
+                  disabled={selectedActionBusy || selectableIds.length === 0}
                   aria-label={allSelectableSelected ? 'Deselect all visible sessions' : 'Select all visible sessions'}
                 >
                   {allSelectableSelected ? 'Deselect all' : 'Select all'}
                 </Button>
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  onClick={() => setMoveMenuOpen((v) => !v)}
-                  disabled={selectedIds.size === 0}
-                  aria-label="Move selected sessions to workspace"
-                  title="Move selected sessions to workspace"
-                >
-                  Workspace
-                </Button>
-              {moveMenuOpen && (
-                <>
-                  <div className="fixed inset-0 z-40" onClick={() => setMoveMenuOpen(false)} />
-                  <div className="absolute right-0 top-full z-50 mt-1 max-h-64 w-44 overflow-y-auto rounded-md border border-border-default bg-bg-tertiary py-1 shadow-xl">
-                    <button
-                      type="button"
-                      className="w-full px-3 py-1.5 text-left text-xs text-text-primary transition-colors hover:bg-accent/20"
-                      onClick={() => void handleBatchMove(null)}
-                    >
-                      未分组（移出工作区）
-                    </button>
-                    {workspaces.map((workspace) => (
-                      <button
-                        key={workspace.id}
-                        type="button"
-                        className="w-full truncate px-3 py-1.5 text-left text-xs text-text-primary transition-colors hover:bg-accent/20"
-                        onClick={() => void handleBatchMove(workspace.id)}
-                      >
-                        {workspace.name}
-                      </button>
-                    ))}
-                  </div>
-                </>
-              )}
+                <SelectedSessionActions onBusyChange={setSelectedActionBusy} />
                 <Button
                   variant="danger"
                   size="sm"
                   onClick={handleBatchDelete}
-                  disabled={selectedIds.size === 0}
+                  disabled={selectedActionBusy || selectedIds.size === 0}
                   aria-label="Delete selected sessions"
                   title="Delete selected sessions"
                   className="sidebar-selection-action-button"
@@ -793,6 +602,7 @@ export function Sidebar({ mobileWorkspaceExpanded = false }: { mobileWorkspaceEx
                   variant="ghost"
                   size="sm"
                   onClick={exitMultiSelect}
+                  disabled={selectedActionBusy}
                   aria-label="Cancel selection"
                   title="Cancel selection"
                   className="sidebar-selection-action-button"
@@ -806,9 +616,13 @@ export function Sidebar({ mobileWorkspaceExpanded = false }: { mobileWorkspaceEx
 
           {/* Session list */}
           <div className="flex-1 overflow-y-auto">
+            {matchingSessionIds !== null && <div className="px-3 py-2 text-xs text-[var(--color-text-secondary)]" role="status">
+              {matchingSessionIds.size} matching Sessions{historySearchPreparing ? ' · still searching…' : ''}
+            </div>}
             <SessionList onSessionClick={handleSessionClick} onSessionMenu={handleSessionMenu} />
           </div>
 
+          </>}
           {/* Session context menu */}
           {menuSession && (
             <SessionMenu
@@ -826,6 +640,7 @@ export function Sidebar({ mobileWorkspaceExpanded = false }: { mobileWorkspaceEx
               }}
               onPostbox={setPostboxSessionId}
               onDetails={setDetailsSessionId}
+              onHandoff={setHandoffSessionId}
               onRename={setRenameSessionId}
               onDelete={(id) => handleDeleteRequest([id])}
             />
@@ -881,53 +696,11 @@ export function Sidebar({ mobileWorkspaceExpanded = false }: { mobileWorkspaceEx
               </div>
             </div>
 
-            {/* Route nav */}
-            <div className="flex gap-1">
-              <NavLink
-                to="/"
-                end
-                className={({ isActive }) =>
-                  `flex-1 flex items-center justify-center gap-1 py-1.5 text-xs rounded transition-colors ${
-                    isActive
-                      ? 'bg-accent/20 text-accent font-medium'
-                      : 'text-text-tertiary hover:text-text-secondary hover:bg-bg-hover'
-                  }`
-                }
-              >
-                <MessageSquare size={12} />
-                Chat
-              </NavLink>
-              <NavLink
-                to="/editor"
-                className={({ isActive }) =>
-                  `flex-1 flex items-center justify-center gap-1 py-1.5 text-xs rounded transition-colors ${
-                    isActive
-                      ? 'bg-accent/20 text-accent font-medium'
-                      : 'text-text-tertiary hover:text-text-secondary hover:bg-bg-hover'
-                  }`
-                }
-              >
-                <Code size={12} />
-                Editor
-              </NavLink>
-              <NavLink
-                to="/jobs"
-                className={({ isActive }) =>
-                  `flex-1 flex items-center justify-center gap-1 py-1.5 text-xs rounded transition-colors ${
-                    isActive
-                      ? 'bg-accent/20 text-accent font-medium'
-                      : 'text-text-tertiary hover:text-text-secondary hover:bg-bg-hover'
-                  }`
-                }
-              >
-                <ListChecks size={12} />
-                Jobs
-              </NavLink>
-            </div>
+            <ViewEntryGroups isMobile={isMobile} />
           </div>
 
           {/* Directory roots: CWD + workspace dirs + temp dirs, each collapsible */}
-          <EditorDirectoryRoots />
+          <Suspense fallback={null}><EditorDirectoryRoots /></Suspense>
         </>
       )}
 
@@ -935,10 +708,9 @@ export function Sidebar({ mobileWorkspaceExpanded = false }: { mobileWorkspaceEx
       {!isMobile && <SidebarResizer />}
 
       {/* Modals */}
-      <AppSettingsModal
-        open={showAppSettings}
-        onClose={() => setShowAppSettings(false)}
-      />
+      {showAppSettings && <Suspense fallback={null}>
+        <AppSettingsModal open onClose={() => setShowAppSettings(false)} />
+      </Suspense>}
       <WorkspaceManagerChangeConfirmationModal
         request={workspaceMoveConfirmation}
         onClose={() => {
@@ -950,28 +722,28 @@ export function Sidebar({ mobileWorkspaceExpanded = false }: { mobileWorkspaceEx
           setWorkspaceMoveConfirmation(null);
         }}
       />
-      <NewSessionModal
-        open={showNewModal}
-        onClose={() => setShowNewModal(false)}
-      />
-      <ImportModal
-        open={showImportModal}
-        onClose={() => setShowImportModal(false)}
-      />
-      <ManageModal
-        open={!!manageSessionId}
-        onClose={() => setManageSessionId(null)}
-        sessionId={manageSessionId}
-        onViewRelationship={setManageSessionId}
-      />
-      <PostboxModal
-        open={!!postboxSessionId}
-        onClose={() => setPostboxSessionId(null)}
-        sessionId={postboxSessionId}
-      />
-      <SessionDetailsModal
-        session={detailsSessionId ? sessions.find((s) => s.id === detailsSessionId) ?? null : null}
-        onClose={() => setDetailsSessionId(null)}
+      <Suspense fallback={null}>
+        {showNewModal && <NewSessionModal open onClose={() => setShowNewModal(false)} />}
+        {showImportModal && <ImportModal open onClose={() => setShowImportModal(false)} />}
+        {manageSessionId && <ManageModal
+          open
+          onClose={() => setManageSessionId(null)}
+          sessionId={manageSessionId}
+          onViewRelationship={setManageSessionId}
+        />}
+        {postboxSessionId && <PostboxModal
+          open
+          onClose={() => setPostboxSessionId(null)}
+          sessionId={postboxSessionId}
+        />}
+        {detailsSessionId && <SessionDetailsModal
+          session={sessions.find((s) => s.id === detailsSessionId) ?? null}
+          onClose={() => setDetailsSessionId(null)}
+        />}
+      </Suspense>
+      <HandoffSessionModal
+        session={handoffSessionId ? sessions.find((s) => s.id === handoffSessionId) ?? null : null}
+        onClose={() => setHandoffSessionId(null)}
       />
       <RenameSessionModal
         session={renameSessionId ? sessions.find((s) => s.id === renameSessionId) ?? null : null}

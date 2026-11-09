@@ -4,6 +4,9 @@ import {
   useAppSettingsStore,
   DEFAULT_SETTINGS,
   sanitizeSettings,
+  sanitizeShortcuts,
+  sanitizeUnreadRecording,
+  toggleUnreadRecordingScope,
 } from '@/stores/appSettingsStore';
 import { fetchUiSettings, updateUiSettings } from '@/services/api';
 import { getCreationWorkspaceIds } from '@/utils/creationWorkspace';
@@ -31,15 +34,31 @@ describe('appSettingsStore', () => {
     expect(s.loaded).toBe(false);
     expect(s.chatViewStyle).toBe('tui');
     expect(s.defaultGroupBy).toBe('none');
+    expect(s.showGroupBy).toBe(false);
+    expect(s.showChatViewSwitcher).toBe(true);
     expect(s.defaultNewSessionToCurrentWorkspace).toBe(true);
     expect(s.showMetaAgent).toBe(true);
     expect(s.showTaskAgent).toBe(true);
     expect(s.showQQ).toBe(true);
+    expect(s.reportWorkerKillErrors).toBe(false);
+    expect(s.autoForceSend).toEqual({ system: false, ma: false, report: false });
     expect(s.showCodexTerminalInput).toBe(false);
     expect(s.mergeConsecutiveNonBodyBlocks).toBe(false);
     expect(s.keepScrollOnSessionSwitch).toBe(false);
-    expect(s.showMessageNavigationRail).toBe(false);
+    expect(s.showMessageNavigationRail).toBe(true);
+    expect(s.showHistorySearch).toBe(true);
+    expect(s.showSidebarCollapseHandle).toBe(true);
     expect(s.notifications.confirmCrossWorkspaceManagement).toBe(true);
+  });
+
+  it('persists the sidebar collapse handle visibility', () => {
+    useAppSettingsStore.getState().setShowSidebarCollapseHandle(false);
+    expect(useAppSettingsStore.getState().showSidebarCollapseHandle).toBe(false);
+    expect(mockedUpdate).toHaveBeenCalledWith({ showSidebarCollapseHandle: false });
+
+    useAppSettingsStore.getState().setShowSidebarCollapseHandle(true);
+    expect(useAppSettingsStore.getState().showSidebarCollapseHandle).toBe(true);
+    expect(mockedUpdate).toHaveBeenLastCalledWith({ showSidebarCollapseHandle: true });
   });
 
   it('applies backend ui settings on load', async () => {
@@ -52,7 +71,9 @@ describe('appSettingsStore', () => {
       mergeConsecutiveNonBodyBlocks: true,
       keepScrollOnSessionSwitch: true,
       showMessageNavigationRail: true,
+      showHistorySearch: true,
       chatViewStyle: 'bubble',
+      showGroupBy: true,
     });
 
     await useAppSettingsStore.getState().loadSettings();
@@ -67,7 +88,9 @@ describe('appSettingsStore', () => {
     expect(s.mergeConsecutiveNonBodyBlocks).toBe(true);
     expect(s.keepScrollOnSessionSwitch).toBe(true);
     expect(s.showMessageNavigationRail).toBe(true);
+    expect(s.showHistorySearch).toBe(true);
     expect(s.chatViewStyle).toBe('bubble');
+    expect(s.showGroupBy).toBe(true);
   });
 
   it('validates server values on load, falling back to defaults', async () => {
@@ -137,6 +160,7 @@ describe('appSettingsStore', () => {
     useAppSettingsStore.getState().setShowCodexTerminalInput(true);
     useAppSettingsStore.getState().setMergeConsecutiveNonBodyBlocks(true);
     useAppSettingsStore.getState().setChatViewStyle('bubble');
+    useAppSettingsStore.getState().setShowGroupBy(true);
 
     expect(useAppSettingsStore.getState().defaultGroupBy).toBe('workdir');
     expect(mockedUpdate).toHaveBeenNthCalledWith(1, { defaultGroupBy: 'workdir' });
@@ -149,6 +173,8 @@ describe('appSettingsStore', () => {
     expect(mockedUpdate).toHaveBeenNthCalledWith(6, { showCodexTerminalInput: true });
     expect(mockedUpdate).toHaveBeenNthCalledWith(7, { mergeConsecutiveNonBodyBlocks: true });
     expect(mockedUpdate).toHaveBeenNthCalledWith(8, { chatViewStyle: 'bubble' });
+    expect(mockedUpdate).toHaveBeenNthCalledWith(9, { showGroupBy: true });
+    expect(useAppSettingsStore.getState().showGroupBy).toBe(true);
     expect(useAppSettingsStore.getState().chatViewStyle).toBe('bubble');
     expect(useAppSettingsStore.getState().mergeConsecutiveNonBodyBlocks).toBe(true);
 
@@ -166,21 +192,126 @@ describe('appSettingsStore', () => {
     useAppSettingsStore.getState().setShowMessageNavigationRail(true);
     expect(useAppSettingsStore.getState().showMessageNavigationRail).toBe(true);
     expect(mockedUpdate).toHaveBeenLastCalledWith({ showMessageNavigationRail: true });
+
+    useAppSettingsStore.getState().setShowHistorySearch(true);
+    expect(useAppSettingsStore.getState().showHistorySearch).toBe(true);
+    expect(mockedUpdate).toHaveBeenLastCalledWith({ showHistorySearch: true });
+
+    // Turning either feature off persists the explicit false (user choice wins).
+    useAppSettingsStore.getState().setShowMessageNavigationRail(false);
+    expect(useAppSettingsStore.getState().showMessageNavigationRail).toBe(false);
+    expect(mockedUpdate).toHaveBeenLastCalledWith({ showMessageNavigationRail: false });
+
+    useAppSettingsStore.getState().setShowHistorySearch(false);
+    expect(useAppSettingsStore.getState().showHistorySearch).toBe(false);
+    expect(mockedUpdate).toHaveBeenLastCalledWith({ showHistorySearch: false });
+
+    // The Chat view switcher defaults on and persists an explicit false.
+    useAppSettingsStore.getState().setShowChatViewSwitcher(false);
+    expect(useAppSettingsStore.getState().showChatViewSwitcher).toBe(false);
+    expect(mockedUpdate).toHaveBeenLastCalledWith({ showChatViewSwitcher: false });
+    useAppSettingsStore.getState().setShowChatViewSwitcher(true);
+    expect(useAppSettingsStore.getState().showChatViewSwitcher).toBe(true);
+    expect(mockedUpdate).toHaveBeenLastCalledWith({ showChatViewSwitcher: true });
   });
 
   it('persists the cross-workspace management confirmation switch and defaults old settings to enabled', () => {
     expect(sanitizeSettings({ notifications: { codexWarningToast: false } }).notifications)
-      .toEqual({ codexWarningToast: false, confirmCrossWorkspaceManagement: true });
+      .toEqual({ ...DEFAULT_SETTINGS.notifications, codexWarningToast: false });
     useAppSettingsStore.getState().setConfirmCrossWorkspaceManagement(false);
     expect(useAppSettingsStore.getState().notifications.confirmCrossWorkspaceManagement).toBe(false);
     expect(mockedUpdate).toHaveBeenCalledWith({ notifications: { confirmCrossWorkspaceManagement: false } });
   });
 
+  it('persists the Locker desktop notification switch, off by default, and reloads it', async () => {
+    expect(DEFAULT_SETTINGS.notifications.lockerDesktop).toBe(false);
+    expect(sanitizeSettings({}).notifications.lockerDesktop).toBe(false);
+    expect(sanitizeSettings({ notifications: { lockerDesktop: 'yes' } }).notifications.lockerDesktop)
+      .toBe(false);
+    expect(sanitizeSettings({ notifications: { lockerDesktop: true } }).notifications.lockerDesktop)
+      .toBe(true);
+
+    useAppSettingsStore.getState().setLockerDesktop(true);
+    expect(useAppSettingsStore.getState().notifications.lockerDesktop).toBe(true);
+    expect(mockedUpdate).toHaveBeenLastCalledWith({ notifications: { lockerDesktop: true } });
+
+    // The saved value survives a reload (config.json is the source of truth).
+    mockedFetch.mockResolvedValueOnce({ notifications: { lockerDesktop: true } });
+    await useAppSettingsStore.getState().loadSettings();
+    expect(useAppSettingsStore.getState().notifications.lockerDesktop).toBe(true);
+  });
+
+  it('sanitizes reportWorkerKillErrors and defaults old settings to off', () => {    expect(sanitizeSettings({}).reportWorkerKillErrors).toBe(false);
+    expect(sanitizeSettings({ reportWorkerKillErrors: 'yes' }).reportWorkerKillErrors).toBe(false);
+    expect(sanitizeSettings({ reportWorkerKillErrors: true }).reportWorkerKillErrors).toBe(true);
+  });
+
+  it('saveReportWorkerKillErrors persists and applies the server echo', async () => {
+    mockedUpdate.mockResolvedValue({ reportWorkerKillErrors: true });
+
+    await useAppSettingsStore.getState().saveReportWorkerKillErrors(true);
+
+    expect(mockedUpdate).toHaveBeenCalledWith({ reportWorkerKillErrors: true });
+    expect(useAppSettingsStore.getState().reportWorkerKillErrors).toBe(true);
+  });
+
+  it('saveReportWorkerKillErrors rejects and leaves the store unchanged on failure', async () => {
+    mockedUpdate.mockRejectedValueOnce(new Error('config is read-only'));
+
+    await expect(useAppSettingsStore.getState().saveReportWorkerKillErrors(true))
+      .rejects.toThrow('config is read-only');
+
+    expect(useAppSettingsStore.getState().reportWorkerKillErrors).toBe(false);
+  });
+
+  it('sanitizes autoForceSend per key and defaults old settings to all off', () => {
+    expect(sanitizeSettings({}).autoForceSend).toEqual({
+      system: false, ma: false, report: false,
+    });
+    expect(sanitizeSettings({
+      autoForceSend: { system: 'yes', ma: true, report: 1 },
+    }).autoForceSend).toEqual({ system: false, ma: true, report: false });
+    expect(sanitizeSettings({
+      autoForceSend: { system: true, ma: true, report: true },
+    }).autoForceSend).toEqual({ system: true, ma: true, report: true });
+  });
+
+  it('saveAutoForceSend persists the strict object and applies the server echo', async () => {
+    mockedUpdate.mockResolvedValue({
+      autoForceSend: { system: true, ma: false, report: true },
+    });
+
+    await useAppSettingsStore.getState().saveAutoForceSend({
+      system: true, ma: false, report: true,
+    });
+
+    expect(mockedUpdate).toHaveBeenCalledWith({
+      autoForceSend: { system: true, ma: false, report: true },
+    });
+    expect(useAppSettingsStore.getState().autoForceSend).toEqual({
+      system: true, ma: false, report: true,
+    });
+  });
+
+  it('saveAutoForceSend rejects and leaves the store unchanged on failure', async () => {
+    mockedUpdate.mockRejectedValueOnce(new Error('config is read-only'));
+
+    await expect(useAppSettingsStore.getState().saveAutoForceSend({
+      system: true, ma: false, report: false,
+    })).rejects.toThrow('config is read-only');
+
+    expect(useAppSettingsStore.getState().autoForceSend).toEqual({
+      system: false, ma: false, report: false,
+    });
+  });
+
   it('resets all settings to defaults and writes them back', () => {
     useAppSettingsStore.getState().setDefaultGroupBy('manager');
+    useAppSettingsStore.getState().setShowGroupBy(true);
     useAppSettingsStore.getState().setShowMetaAgent(false);
     useAppSettingsStore.getState().setShowQQ(false);
     useAppSettingsStore.getState().setDefaultNewSessionToCurrentWorkspace(false);
+    useAppSettingsStore.getState().setShowChatViewSwitcher(false);
 
     useAppSettingsStore.getState().resetSettings();
 
@@ -195,6 +326,8 @@ describe('appSettingsStore', () => {
     expect(s.mergeConsecutiveNonBodyBlocks).toBe(DEFAULT_SETTINGS.mergeConsecutiveNonBodyBlocks);
     expect(s.keepScrollOnSessionSwitch).toBe(DEFAULT_SETTINGS.keepScrollOnSessionSwitch);
     expect(s.showMessageNavigationRail).toBe(DEFAULT_SETTINGS.showMessageNavigationRail);
+    expect(s.showGroupBy).toBe(DEFAULT_SETTINGS.showGroupBy);
+    expect(s.showChatViewSwitcher).toBe(true);
     expect(mockedUpdate).toHaveBeenLastCalledWith({ ...DEFAULT_SETTINGS });
   });
 
@@ -209,6 +342,7 @@ describe('appSettingsStore', () => {
     const loadPromise = useAppSettingsStore.getState().loadSettings();
     // User toggles a switch before the GET resolves.
     useAppSettingsStore.getState().setShowMetaAgent(false);
+    useAppSettingsStore.getState().setShowGroupBy(true);
     // The GET resolves with the pre-change (stale) server value.
     resolveLoad({
       defaultGroupBy: 'none',
@@ -220,6 +354,7 @@ describe('appSettingsStore', () => {
     await loadPromise;
 
     expect(useAppSettingsStore.getState().showMetaAgent).toBe(false);
+    expect(useAppSettingsStore.getState().showGroupBy).toBe(true);
   });
 
   it('sanitizeSettings fills missing fields with defaults', () => {
@@ -233,7 +368,7 @@ describe('appSettingsStore', () => {
       .defaultNewSessionToCurrentWorkspace).toBe(true);
     expect(
       sanitizeSettings({ notifications: { codexWarningToast: false } }).notifications,
-    ).toEqual({ codexWarningToast: false, confirmCrossWorkspaceManagement: true });
+    ).toEqual({ ...DEFAULT_SETTINGS.notifications, codexWarningToast: false });
     expect(sanitizeSettings(null)).toEqual({ ...DEFAULT_SETTINGS });
     expect(sanitizeSettings({ showCodexTerminalInput: 'yes' }).showCodexTerminalInput)
       .toBe(false);
@@ -251,11 +386,190 @@ describe('appSettingsStore', () => {
     expect(sanitizeSettings({ keepScrollOnSessionSwitch: true }).keepScrollOnSessionSwitch)
       .toBe(true);
     expect(sanitizeSettings({}).keepScrollOnSessionSwitch).toBe(false);
-    // Missing / malformed rail visibility falls back to the (off) default.
+    // Missing / malformed rail visibility falls back to the (on) default,
+    // while an explicit false stays authoritative.
     expect(sanitizeSettings({ showMessageNavigationRail: 'no' }).showMessageNavigationRail)
+      .toBe(true);
+    expect(sanitizeSettings({ showMessageNavigationRail: false }).showMessageNavigationRail)
       .toBe(false);
     expect(sanitizeSettings({ showMessageNavigationRail: true }).showMessageNavigationRail)
       .toBe(true);
-    expect(sanitizeSettings({}).showMessageNavigationRail).toBe(false);
+    expect(sanitizeSettings({}).showMessageNavigationRail).toBe(true);
+    // Same contract for history search: default on, explicit false preserved.
+    expect(sanitizeSettings({ showHistorySearch: 'yes' }).showHistorySearch)
+      .toBe(true);
+    expect(sanitizeSettings({ showHistorySearch: false }).showHistorySearch)
+      .toBe(false);
+    expect(sanitizeSettings({}).showHistorySearch).toBe(true);
+    // Chat view switcher: default on, explicit false authoritative.
+    expect(sanitizeSettings({}).showChatViewSwitcher).toBe(true);
+    expect(sanitizeSettings({ showChatViewSwitcher: 'no' }).showChatViewSwitcher).toBe(true);
+    expect(sanitizeSettings({ showChatViewSwitcher: false }).showChatViewSwitcher).toBe(false);
+    expect(sanitizeSettings({ showChatViewSwitcher: true }).showChatViewSwitcher).toBe(true);
+    expect(sanitizeSettings({ showGroupBy: 'yes' }).showGroupBy).toBe(false);
+    expect(sanitizeSettings({ showGroupBy: true }).showGroupBy).toBe(true);
+    expect(sanitizeSettings({ showSidebarCollapseHandle: 'no' }).showSidebarCollapseHandle)
+      .toBe(true);
+    expect(sanitizeSettings({ showSidebarCollapseHandle: false }).showSidebarCollapseHandle)
+      .toBe(false);
+    expect(sanitizeSettings({ defaultGroupBy: 'dir' }).defaultGroupBy).toBe('none');
+    expect(sanitizeSettings({ defaultGroupBy: 'off' }).defaultGroupBy).toBe('none');
+  });
+
+  it('normalizes unread-recording scope sets with the backend rule', () => {
+    // Missing / invalid values keep the legacy (record everything) default.
+    expect(sanitizeUnreadRecording(undefined)).toEqual(['all']);
+    expect(sanitizeUnreadRecording('none')).toEqual(['all']);
+    expect(sanitizeUnreadRecording({ scopes: ['none'] })).toEqual(['all']);
+    // Empty / fully-invalid sets mean "no recording".
+    expect(sanitizeUnreadRecording([])).toEqual(['none']);
+    expect(sanitizeUnreadRecording(['bogus', 7])).toEqual(['none']);
+    // all / none absorb everything else.
+    expect(sanitizeUnreadRecording(['all', 'pinned'])).toEqual(['all']);
+    expect(sanitizeUnreadRecording(['none', 'bell-on'])).toEqual(['none']);
+    // Categories are a union; bell-on + bell-off is every Session.
+    expect(sanitizeUnreadRecording(['bell-on', 'bell-off'])).toEqual(['all']);
+    // Canonical order regardless of input order.
+    expect(sanitizeUnreadRecording(['pinned', 'bell-on'])).toEqual(['bell-on', 'pinned']);
+  });
+
+  it('applies the exclusive toggle rules for unread-recording scopes', () => {
+    // Category toggles clear All / No sessions.
+    expect(toggleUnreadRecordingScope(['all'], 'bell-on')).toEqual(['bell-on']);
+    expect(toggleUnreadRecordingScope(['none'], 'pinned')).toEqual(['pinned']);
+    // Bell on / Bell off are mutually exclusive.
+    expect(toggleUnreadRecordingScope(['bell-on'], 'bell-off')).toEqual(['bell-off']);
+    // Categories combine as a union.
+    expect(toggleUnreadRecordingScope(['bell-on'], 'pinned')).toEqual(['bell-on', 'pinned']);
+    expect(toggleUnreadRecordingScope(['bell-on', 'pinned'], 'bell-on')).toEqual(['pinned']);
+    // Empty after edits falls back to No sessions.
+    expect(toggleUnreadRecordingScope(['pinned'], 'pinned')).toEqual(['none']);
+    // All / No sessions are exclusive and toggle without a dead end.
+    expect(toggleUnreadRecordingScope(['none'], 'all')).toEqual(['all']);
+    expect(toggleUnreadRecordingScope(['all'], 'all')).toEqual(['none']);
+    expect(toggleUnreadRecordingScope(['none'], 'none')).toEqual(['none']);
+  });
+
+  it('persists unread-recording only after the server saved it', async () => {
+    // The PUT response carries the canonical ui object; the store stores the
+    // normalized answer (here the server turned an empty set into ["none"]).
+    mockedUpdate.mockResolvedValueOnce({ notifications: { unreadRecording: [] } });
+    await useAppSettingsStore.getState().saveUnreadRecording(['none']);
+    expect(mockedUpdate).toHaveBeenCalledWith({
+      notifications: { unreadRecording: ['none'] },
+    });
+    expect(useAppSettingsStore.getState().notifications.unreadRecording).toEqual(['none']);
+  });
+
+  it('keeps the previous unread-recording value when the save fails', async () => {
+    mockedUpdate.mockRejectedValueOnce(new Error('backend down'));
+    await expect(
+      useAppSettingsStore.getState().saveUnreadRecording(['none']),
+    ).rejects.toThrow('backend down');
+    expect(useAppSettingsStore.getState().notifications.unreadRecording).toEqual(['all']);
+  });
+
+  it('surfaces partial apply failures while keeping the saved values', async () => {
+    // The PUT saved the scope set but could not align some Sessions; the
+    // store keeps the saved truth and the error names the honest follow-up.
+    mockedUpdate.mockResolvedValueOnce({
+      notifications: { unreadRecording: ['none'] },
+      unreadRecordingApply: { ok: false, failedSessions: ['ses_a', 'ses_b'] },
+    });
+    await expect(
+      useAppSettingsStore.getState().saveUnreadRecording(['none']),
+    ).rejects.toThrow('2 Session(s) could not be aligned');
+    expect(useAppSettingsStore.getState().notifications.unreadRecording)
+      .toEqual(['none']);
+  });
+
+  it('keeps the legacy all default for old settings objects', () => {
+    expect(sanitizeSettings({}).notifications.unreadRecording).toEqual(['all']);
+    expect(sanitizeSettings({ notifications: {} }).notifications.unreadRecording).toEqual(['all']);
+    expect(sanitizeSettings({ notifications: { unreadRecording: ['bad'] } })
+      .notifications.unreadRecording).toEqual(['none']);
+    expect(sanitizeSettings({ notifications: { unreadRecording: ['pinned'] } })
+      .notifications.unreadRecording).toEqual(['pinned']);
+  });
+});
+
+describe('appSettingsStore shortcuts', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    useAppSettingsStore.setState({ ...DEFAULT_SETTINGS, loaded: false });
+    mockedFetch.mockReset();
+    mockedUpdate.mockReset();
+    mockedFetch.mockResolvedValue({ ...DEFAULT_SETTINGS });
+    mockedUpdate.mockResolvedValue({});
+  });
+
+  it('sanitizes persisted bindings while preserving explicit clears', () => {
+    expect(sanitizeShortcuts({
+      'app.toggleSidebar': 'shift+mod+b',
+      'queue.enqueueLocked': null,
+      'app.commandPalette': 'Mod+S',
+      'bad': 'not-a-binding',
+    })).toEqual({
+      'app.toggleSidebar': 'Mod+Shift+B',
+      'queue.enqueueLocked': null,
+    });
+  });
+
+  it('persists, clears and restores shortcut overrides through the existing ui endpoint', async () => {
+    await useAppSettingsStore.getState().setShortcutBinding('app.toggleSidebar', 'Mod+Shift+B');
+    expect(useAppSettingsStore.getState().shortcuts['app.toggleSidebar'])
+      .toBe('Mod+Shift+B');
+    expect(mockedUpdate).toHaveBeenLastCalledWith({
+      shortcuts: { 'app.toggleSidebar': 'Mod+Shift+B' },
+    });
+
+    await useAppSettingsStore.getState().setShortcutBinding('app.toggleSidebar', null);
+    expect(useAppSettingsStore.getState().shortcuts['app.toggleSidebar']).toBeNull();
+    expect(mockedUpdate).toHaveBeenLastCalledWith({
+      shortcuts: { 'app.toggleSidebar': null },
+    });
+
+    await useAppSettingsStore.getState().resetShortcutBinding('app.toggleSidebar');
+    expect(useAppSettingsStore.getState().shortcuts).toEqual({});
+    expect(mockedUpdate).toHaveBeenLastCalledWith({ shortcuts: {} });
+
+    await useAppSettingsStore.getState().setShortcutBinding('queue.lockAll', 'Mod+Shift+L');
+    await useAppSettingsStore.getState().resetAllShortcuts();
+    expect(useAppSettingsStore.getState().shortcuts).toEqual({});
+    expect(mockedUpdate).toHaveBeenLastCalledWith({ shortcuts: {} });
+  });
+
+  it('keeps composer defaults compatible and reports a failed write without a false saved value', async () => {
+    expect(sanitizeShortcuts({ 'composer.send': 'Enter', 'composer.newline': 'Shift+Enter', 'composer.steer': null }))
+      .toEqual({ 'composer.send': 'Enter', 'composer.newline': 'Shift+Enter', 'composer.steer': null });
+    mockedUpdate.mockRejectedValueOnce(new Error('offline'));
+    await expect(useAppSettingsStore.getState().setShortcutBinding('composer.steer', 'Mod+4')).rejects.toThrow('offline');
+    expect(useAppSettingsStore.getState().shortcuts).toEqual({});
+    await useAppSettingsStore.getState().setShortcutBinding('composer.steer', 'Mod+4');
+    expect(useAppSettingsStore.getState().shortcuts['composer.steer']).toBe('Mod+4');
+  });
+
+  it('rejects reserved combinations instead of silently hijacking the browser', () => {
+    useAppSettingsStore.getState().setShortcutBinding('app.toggleSidebar', 'Mod+S');
+    expect(useAppSettingsStore.getState().shortcuts).toEqual({});
+    expect(mockedUpdate).not.toHaveBeenCalled();
+  });
+
+  it('loads persisted shortcuts with missing and malformed entries falling back safely', async () => {
+    mockedFetch.mockResolvedValue({
+      ...DEFAULT_SETTINGS,
+      shortcuts: {
+        'app.toggleSidebar': 'mod+shift+b',
+        'panel:plugin:alpha/one': 'Mod+3',
+        'queue.lockAll': null,
+        'bad': 7,
+      },
+    } as never);
+    await useAppSettingsStore.getState().loadSettings();
+    expect(useAppSettingsStore.getState().shortcuts).toEqual({
+      'app.toggleSidebar': 'Mod+Shift+B',
+      'panel:plugin:alpha/one': 'Mod+3',
+      'queue.lockAll': null,
+    });
   });
 });

@@ -15,6 +15,10 @@ All persistent data lives in Session (session.py) — 即 Agent 的持久身份�
 from __future__ import annotations
 
 import asyncio
+from contextlib import AsyncExitStack
+from packages.jobs.window import command_window_options
+from packages.plugins.lifecycle import startup as _admit_plugin_startup
+from packages.plugins.lifecycle import native_admission as _plugin_native_admission
 import copy
 import hashlib
 import inspect
@@ -31,8 +35,14 @@ from pathlib import Path
 import psutil
 
 from . import session as _sess
+from . import auto_report as _auto_report
 from . import notifications as _notifications
 from . import codex_quota_store as _codex_quota_store
+from . import legal_offline as _offline
+from . import queue_locks as _message_locks
+from . import session_error_log as _error_log
+from .runtime_issues import map_runtime_issue
+from .system_fields import SystemFieldError
 
 READONLY_SESSION_ERROR = (
     "该 session 当前为只读，必须先取消对该 session 的 readonly 设置后才能发送信息、任务或回报"
@@ -40,6 +50,8 @@ READONLY_SESSION_ERROR = (
 from .adapters import (
     get_adapter,
     get_sessions_provider,
+    provider_kwargs,
+    adapter_supports_native_control,
     CliAdapter,
     resolve_execution_mode,
 )
@@ -196,6 +208,15 @@ class Worker:
 
     字段说明：
     """
+    def __setattr__(self, name, value):
+        previous = self.__dict__.get(name)
+        object.__setattr__(self, name, value)
+        if name == 'status' and previous != value:
+            observer = globals().get('_running_observer')
+            registry = globals().get('workers', {})
+            if observer is not None and registry.get(self.__dict__.get('worker_id')) is self:
+                _observe_running()
+
     worker_id: str
     session_id: str           # Session UUID (ses_<hex>)
     adapter: CliAdapter       # CLI tool adapter instance
@@ -218,6 +239,26 @@ class Worker:
     # Last native Codex thread status for reconnecting dashboards.  Like the
     # interaction cache, this is only valid while this worker process lives.
     native_status: dict | None = None
+    # Separate from status/held and the user's durable queue_paused setting.
+    # Switching/unknown ownership blocks only new handoffs and Pan controls.
+    native_control_mode: str = "pan"
+    native_control_enabled: bool = False  # Latched at spawn, not the desired Session config.
+    native_passthrough_enabled: bool | None = None  # None means runtime policy unconfirmed.
+    native_control_generation: int = 0
+    native_output: bytearray = field(default_factory=bytearray)
+    native_output_total: int = 0
+    native_control_error: str | None = None
+    _offline_ready_token: str | None = None
+    _offline_predecessors: set[str] | None = None
+    _native_reservation_busy: bool = False
+    _native_admission_id: str | None = None
+    _native_admission_ids: set[str] = field(default_factory=set)
+    native_kernel_ready: bool = False
+    _native_external_turn_active: bool = False
+    native_input_uncertain: bool = False
+    _native_mode_receipts: dict[str, asyncio.Future] = field(default_factory=dict)
+    _native_mode_request_id: str | None = None  # Latest issued handoff, including a timed-out one.
+    _native_mode_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     # Latest native Codex token usage notification for reconnecting dashboards.
     # The provider remains the source of truth for persisted/session totals;
     # this is only the live thread/turn snapshot from app-server.
@@ -235,22 +276,37 @@ class Worker:
     # persisted Worker identity. It is used only to route live updates to the
     # matching global quota store.
     codex_profile_key: str | None = None
+    _provider_launch_binding: dict | None = None  # only after durable trusted launch receipt
     # Current turn's native plan/diff snapshots for dashboard reconnect replay.
     native_plan: dict | None = None
     native_diff: dict | None = None
     _task_done: asyncio.Event | None = None  # stream 任务完成信号（_consumer_stream 等待，防多消息同时在 cbc 管道飞行）
     _replaying: bool = False  # 遗留：cbc --resume 的 stdout 重放标志（worker-resume-replay 结论：stdin 有 prompt 时 cbc 不重放，恒为 False；_read_stdout 的 replay 分支保留作 EOF 型重放的死代码兜底）
     takeover_pid: int | None = None  # PID of takeover PowerShell terminal
+    takeover_job: object | None = None  # Windows Codex descendants, including orphans
+    _takeover_stop_task: asyncio.Task | None = None
     pending_restart: bool = False  # 进程相关配置变更后待重启（idle 时自动 respawn）
+    _queue_unit_active: bool = False  # includes terminal publication and queue cleanup
+    _terminal_finishing: bool = False
     # ── 活性探测（watchdog 用）──
     last_activity: float = 0.0  # time.monotonic；stdout 有事件 / 新任务入队时刷新
     _task_started_at: float = 0.0  # time.monotonic；stream 任务开始处理（status→running）时记录，watchdog 据此判定「任务运行时长」超时
     # ── 任务序号（result 与 task 配对用）──
     # 序号计数器在 session.task_seq 上（跨 worker respawn 持久）；send_task
     # 入队时从 session 读、自增后随 item.seq 一起落盘。
+    # Runtime execution order includes report/Job batches; task seq stays queue identity.
+    _execution_seq: int = 0
+    _execution_history_start: int = 0
     _current_seq: int | None = None  # 正在处理的 item 序号（_consumer 取出时记录）
     _current_task_id: str | None = None  # 正在处理的 item 的 taskId（幂等用）
     _current_task_idempotent: bool = False  # formal assign vs inherited send context
+    _current_task_assistant_ids: set[str] = field(default_factory=set)
+    _auto_report_admission: dict | None = None
+    # Canonical identity of the input this execution actually admitted:
+    # ``{"promptMessageId": <history messageId>, "promptSummary": <str|None>}``.
+    # Set only at a durable provider hand-off (or an accepted Steer) and never
+    # derived from history/role/user text afterwards.
+    _prompt_ref: dict | None = None
     _current_source_session_id: str | None = None  # 当前 item 的来源 Session（审计元数据）
     # 当前正在执行的持久 queue item。直到 provider hand-off 成功前，item
     # 仍保留在 Session.queue_pending；这里仅保留运行期引用用于结果配对。
@@ -258,6 +314,19 @@ class Worker:
     # A provider can repeat a terminal event during reconnect/replay.  This
     # runtime guard prevents a second result/report for the same active turn;
     # the durable usage job below provides the restart-side idempotency cursor.
+    _current_task_last_assistant_text: str | None = None
+    # Run identity (task seq) that produced ``_current_task_last_assistant_text``.
+    # Error reports may only attach the text when it provably belongs to the run
+    # being reported, so a stale capture from a previous turn can never leak into
+    # a queued item or a later run.
+    _current_task_last_assistant_seq: int | None = None
+    # Per-run scratch file for non-JSON stdout/stderr.  It is attached to
+    # terminal/crash error samples as ``rawDiagnostics`` (never as errorText)
+    # and is reset at each task hand-off.  Kept on disk so a long diagnostic
+    # stream cannot grow the event-loop heap.
+    _stream_raw_spill: object | None = None
+    _stream_raw_line_count: int = 0
+    _host_exit_illegal: bool = False
     _terminal_handled: bool = False
     # 已完成的协议序列化快照（仅兼容旧测试/嵌入方，队列真源仍在 Session）。
     _current_serialized: bytes | None = None
@@ -281,10 +350,34 @@ class Worker:
     # fully stopped before a new generation starts.  This counter makes that
     # ownership boundary explicit for delayed interrupt fallbacks.
     generation: int = 0
+    offline_token: str = field(default_factory=lambda: uuid.uuid4().hex)
     _interrupt_guard_task: asyncio.Task | None = None
+    _steer_receipts: dict[str, asyncio.Future] = field(default_factory=dict)
+    _steer_contexts: dict[str, dict] = field(default_factory=dict)
+    _steer_run_id: str | None = None
+    _direct_steer_pending: bool = False
+
+
+_running_observer = None
+
+
+def set_running_observer(callback):
+    """One synchronous, nonblocking observer; status remains the sole authority."""
+    global _running_observer
+    _running_observer = callback
+
+
+def _observe_running():
+    if _running_observer is not None:
+        try:
+            _running_observer()
+        except Exception:
+            _log.exception('Worker running observer failed')
 
 
 workers: dict[str, Worker] = {}
+_delayed_restarts: dict[str, dict] = {}
+_delayed_restart_revision = 0
 # Fast session -> current runtime lookup.  Keep the worker-id registry as the
 # compatibility/source-of-truth container; this index only avoids scanning it
 # for the hot session control/status paths.
@@ -294,9 +387,12 @@ _worker_generations: dict[str, int] = {}
 
 def _register_worker(w: Worker) -> None:
     _workers_by_session[w.session_id] = w
+    _observe_running()
 
 
 def _unregister_worker(w: Worker) -> None:
+    _observe_running()
+    _close_raw_capture(w)
     if _workers_by_session.get(w.session_id) is w:
         _workers_by_session.pop(w.session_id, None)
 
@@ -308,7 +404,10 @@ def _next_worker_generation(session_id: str) -> int:
 
 
 def _bump_worker_generation(w: Worker) -> None:
+    _cancel_pending_restart(w)
     w.generation += 1
+    w._provider_launch_binding = None
+    w.offline_token = uuid.uuid4().hex
     _worker_generations[w.session_id] = max(
         _worker_generations.get(w.session_id, -1), w.generation,
     )
@@ -333,7 +432,9 @@ _recovery_required: set[str] = set()
 # backoff.  This is deliberately separate from pending_signal: the timer only
 # emits a generic wake-up and never stores queue payload.
 _queue_retry_tasks: dict[str, asyncio.Task] = {}
+_queue_retry_wakes: dict[str, asyncio.Event] = {}
 _queue_locks: dict[str, asyncio.Lock] = {}
+_unread_done_locks: dict[str, asyncio.Lock] = {}
 _usage_enrichment_locks: dict[str, asyncio.Lock] = {}
 _usage_enrichment_tasks: dict[str, asyncio.Task] = {}
 _usage_enrichment_adapters: dict[str, CliAdapter] = {}
@@ -350,6 +451,11 @@ _ENRICH_RETRY_MAX_SEC = 30.0
 def queue_lock(session_id: str) -> asyncio.Lock:
     """Serialize queue API mutations and Worker reservation decisions per Session."""
     return _queue_locks.setdefault(session_id, asyncio.Lock())
+
+
+def unread_done_lock(session_id: str) -> asyncio.Lock:
+    """Serialize done generation commits with durable read-cursor acknowledgements."""
+    return _unread_done_locks.setdefault(session_id, asyncio.Lock())
 
 
 def _queue_edit_token_digest(token: str) -> str:
@@ -526,7 +632,7 @@ async def _bcast(data: dict):
 # ── helpers (internal) ──
 
 
-async def _next_worker_id() -> str:
+def _next_worker_id() -> str:
     used: set[int] = set()
     for wid in workers:
         try:
@@ -550,66 +656,308 @@ _LEGAL_WORKER_STATES = frozenset({
 _legal_state_locks: dict[str, asyncio.Lock] = {}
 
 
-async def _record_legal_worker_state(
-    w: Worker, state: str, source: str, *, persist: bool = True,
-) -> bool:
-    """Persist a state reached by an explicit, successful Pan transition.
+async def _commit_offline(s, mutate, *, force: bool = False) -> bool:
+    """Caller owns queue_lock. Stage/rollback inside the ordered writer ticket.
 
-    ``worker.status`` remains the live runtime truth and is broadcast at its
-    existing call sites.  This separate ledger is intentionally never called
-    from EOF/zombie handling: an observed process death is not evidence that
-    Pan legally stopped that worker.
+    Earlier/later metadata writers must never save an uncommitted candidate.
+    Cancellation waits for that ticket's observable outcome before propagating.
+    """
+    changed = False
+    def commit():
+        nonlocal changed
+        if _sess.get(s.id, load_history=False) is not s:
+            raise RuntimeError("Session owner changed before legality commit")
+        old = _offline.snapshot(s)
+        candidate = copy.copy(s)
+        for key, value in copy.deepcopy(old).items():
+            setattr(candidate, key, value)
+        _offline.attach_foreground(candidate)
+        result = mutate(candidate)
+        if candidate.offline_run and candidate.offline_run.get("id") in candidate.execution_operations:
+            candidate.execution_operations[candidate.offline_run["id"]] = candidate.offline_run
+        _offline.aggregate(candidate)
+        values = _offline.snapshot(candidate)
+        changed = old != values
+        if changed or force:
+            _sess._save_body(s, offline_override=values)
+        return result
+    await _sess._persist_async_outcome(s.id, commit)
+    return changed
+
+
+def _remember_offline_lock(s, item):
+    _remember_queue_item(s, item, _delivery_state(item))
+
+
+async def _offline_snapshot_event(s) -> None:
+    # Offline legality changes are committed together with queue state.  The
+    # queue snapshot is also the immediate event emitted by EOF/illegal
+    # detection, so carry the authoritative Session legality projection here;
+    # otherwise the web store refreshes queue rows but keeps the old dot colour
+    # until a later full Session refresh.
+    await _bcast({"type": "queue.snapshot", "sessionId": s.id,
+                  "queueRevision": s.queue_revision,
+                  "session": {
+                      "legalOffline": s.legal_offline,
+                      "illegalOffline": _offline.is_illegal(s),
+                      "legalityDiagnostics": _offline.diagnostics(s),
+                  }})
+
+
+async def _prepare_offline_recovery(s) -> None:
+    """Before any new provider can start, classify the previous unfinished run."""
+    async with queue_lock(s.id):
+        if getattr(s, "_obsolete_legality_fields_pending", False):
+            await _commit_offline(s, lambda candidate: None, force=True)
+            s._obsolete_legality_fields_pending = False
+        owner = s.offline_owner
+        tracked_owner = find_worker_by_session(s.id)
+        if owner and not (tracked_owner and _offline.same_owner(owner, _offline.owner(tracked_owner))
+                          and not _runtime_stopped(tracked_owner)):
+            status = await asyncio.to_thread(_offline.previous_owner_status, owner)
+            if status != "dead":
+                raise RuntimeError(f"Previous runtime owner is {status}; refusing a second writer")
+        run = s.offline_run
+        if (s.legal_offline and run and run.get("serviceId") != _offline.SERVICE_ID
+                and run.get("processes")):
+            status = await asyncio.to_thread(_offline.previous_owner_status, run)
+            if status != "dead":
+                raise RuntimeError(f"Previous idle owner is {status}; refusing a second writer")
+        unresolved = _offline.outstanding(s)
+        identities = {(op["token"], op["generation"]): op for op in unresolved}
+        dead = []
+        for identity in identities.values():
+            if (tracked_owner and _offline.same_owner(identity, _offline.owner(tracked_owner))
+                    and not _runtime_stopped(tracked_owner)):
+                continue
+            status = await asyncio.to_thread(_offline.previous_owner_status, identity)
+            if status != "dead":
+                raise RuntimeError(f"Previous execution owner is {status}; refusing a second writer")
+            dead.append(identity)
+        def classify(candidate):
+            _migrate_queue_delivery_state(candidate, restore_ledger=True)
+            for identity in dead:
+                _offline.detect(candidate, "unfinished-run", identity=identity, eligible=lambda item: (
+                    _delivery_state(item) == _DELIVERY_QUEUED and not _queue_item_locked(item)),
+                    remember=lambda item: _remember_offline_lock(candidate, item))
+        changed = await _commit_offline(s, classify) if dead else False
+    if changed:
+        await _offline_snapshot_event(s)
+
+
+async def initialize_legal_offline(sessions) -> None:
+    # Each Session is independently retryable at create_worker, including a
+    # failed startup write. No consumer exists before that same preparation.
+    for s in sessions:
+        try:
+            await _prepare_offline_recovery(s)
+        except Exception:
+            _log.exception("Legality initialization deferred for Session %s", s.id)
+
+
+async def _claim_offline_owner(w: Worker) -> None:
+    """Register the process without claiming readiness or recovering any lock."""
+    s = _session(w)
+    if s is None:
+        return  # Cleanup of a deleted Session must not recreate its metadata.
+    identity = _offline.owner(w)
+    pending = getattr(w.process, '_provider_launch', None)
+    launch = None
+    if pending and pending.receipt and pending.receipt['runtimeEpoch'] == _offline.SERVICE_ID:
+        launch = {**pending.receipt,
+                  'sessionId': w.session_id, 'workerId': w.worker_id, 'generation': w.generation}
+    async with queue_lock(w.session_id):
+        def claim(candidate):
+            if (workers.get(w.worker_id) is not w or w.offline_token != identity["token"]
+                    or w.generation != identity["generation"]):
+                raise RuntimeError("Runtime changed before owner registration")
+            candidate.offline_owner = dict(identity)
+            if launch:
+                candidate.operation_revision += 1
+                candidate.execution_operations[launch['launchId']] = {
+                    **identity, 'id': launch['launchId'], 'kind': 'provider-launch',
+                    'executionSeq': 0,  # process proof is not a resumed task execution
+                    'state': 'completed', 'safeTerminal': True, 'providerLaunchBinding': launch,
+                    'admittedRevision': candidate.operation_revision, 'startedAt': launch['verifiedAt']}
+        await _commit_offline(s, claim)
+        if (launch and workers.get(w.worker_id) is w and w.process is not None
+                and getattr(w.process, '_provider_launch', None) is pending
+                and launch['runtimeEpoch'] == _offline.SERVICE_ID
+                and w.generation == identity['generation'] and w.offline_token == identity['token']):
+            # Publication is in-owner and follows the ordered durable commit.
+            pending.owner = w
+            w._provider_launch_binding = launch
+
+
+async def _activate_offline_worker(w: Worker, *, ready_proof: bool = False,
+                                   expected_owner: dict | None = None) -> None:
+    if w._host_exit_illegal:
+        return
+    if expected_owner is not None and (w.offline_token != expected_owner["token"]
+            or w.generation != expected_owner["generation"]):
+        return
+    if not ready_proof or w._offline_ready_token == w.offline_token:
+        return
+    s = _session(w)
+    if s is None:
+        raise RuntimeError("Session disappeared before Worker activation")
+    identity = _offline.owner(w)
+    async with queue_lock(s.id):
+        if workers.get(w.worker_id) is not w or w.offline_token != identity["token"]:
+            raise RuntimeError("Worker changed before activation")
+        def activate(candidate):
+            if (w._host_exit_illegal or workers.get(w.worker_id) is not w or w.offline_token != identity["token"]
+                    or w.generation != identity["generation"]):
+                raise RuntimeError("Worker changed while activation waited for persistence")
+            return _offline.activate(candidate, identity, predecessors=w._offline_predecessors,
+                                     remember=lambda item: _remember_offline_lock(candidate, item))
+        changed = await _commit_offline(s, activate)
+    if w.offline_token != identity["token"] or w.generation != identity["generation"]:
+        return
+    w._offline_ready_token = identity["token"]
+    if changed:
+        await _offline_snapshot_event(s)
+        if w.pending_signal is not None:
+            w.pending_signal.put_nowait({"type": "queue_signal"})
+
+
+async def _begin_offline_run(w: Worker, *, locked: bool = False) -> dict:
+    identity = _offline.owner(w)
+    s = _session(w)
+    if _shutdown_started or w._host_exit_illegal:
+        raise RuntimeError("Host is shutting down")
+    if s is None:
+        raise RuntimeError("Session disappeared before execution")
+    async def commit():
+        def begin(candidate):
+            if (_shutdown_started or w._host_exit_illegal or workers.get(w.worker_id) is not w or w.offline_token != identity["token"]
+                    or w.generation != identity["generation"] or w.status == "restarting"):
+                raise RuntimeError("Stale execution owner")
+            _offline.begin(candidate, identity)
+            candidate.offline_run["autoReportAdmission"] = copy.deepcopy(w._auto_report_admission)
+        await _commit_offline(s, begin)
+    if locked:
+        await commit()
+    else:
+        async with queue_lock(s.id):
+            await commit()
+    return identity
+
+
+async def _finish_offline_stop(w: Worker, identity: dict, reason: str) -> None:
+    s = _session(w)
+    if w._host_exit_illegal:
+        await _detect_offline_exit(w, identity, "host/signal")
+        return
+    if s is not None and _offline.outstanding(s, identity):
+        if not _runtime_stopped(w):
+            raise RuntimeError("Runtime stop is unconfirmed; legality retained")
+        async with queue_lock(s.id):
+            await _commit_offline(s, lambda candidate: _offline.retire_owner(candidate, identity, reason=reason,
+                proof={"kind": "runtime-stopped", "owner": identity}))
+
+
+async def _detect_offline_exit(w: Worker, identity: dict, reason: str) -> None:
+    s = _session(w)
+    if s is None:
+        return
+    async with queue_lock(s.id):
+        if (workers.get(w.worker_id) is not w or w.offline_token != identity["token"]
+                or w.generation != identity["generation"]
+                or not _offline.outstanding(s, identity)):
+            return
+        def classify(candidate):
+            if (workers.get(w.worker_id) is not w or w.offline_token != identity["token"]
+                    or w.generation != identity["generation"]
+                    or not _offline.outstanding(s, identity)):
+                return
+            _migrate_queue_delivery_state(candidate, restore_ledger=True)
+            _offline.detect(candidate, reason, identity=identity, eligible=lambda item: (
+                _delivery_state(item) == _DELIVERY_QUEUED and not _queue_item_locked(item)),
+                remember=lambda item: _remember_offline_lock(candidate, item))
+        changed = await _commit_offline(s, classify)
+    if changed:
+        await _offline_snapshot_event(s)
+
+
+async def _record_legal_worker_state(w: Worker, state: str, source: str, *, persist: bool = True) -> bool:
+    """Deprecated internal hook: operation admission/terminal owns legality now.
+
+    Retained for embedders until removal; never writes legacy metadata.
     """
     if state not in _LEGAL_WORKER_STATES:
         raise ValueError(f"unsupported legal worker state: {state}")
-    s = _session(w)
-    if s is None:
-        return False
-    if persist:
-        if not await _persist_session_legal_worker_state(w.session_id, state, source):
-            _log.warning(
-                "[Worker %s] failed to persist legal state=%s source=%s",
-                w.worker_id, state, source,
-            )
-            return False
-    else:
-        s.last_legal_worker_state = state
-    _log.info(
-        "[Worker %s] legal state=%s source=%s session=%s",
-        w.worker_id, state, source, w.session_id,
-    )
-    return True
+    return _session(w) is not None
 
 
-async def _persist_session_legal_worker_state(
-    session_id: str, state: str, source: str, *, _locked: bool = False,
-) -> bool:
-    """Persist one legal state on Session metadata and roll back on I/O failure."""
-    if state not in _LEGAL_WORKER_STATES:
-        raise ValueError(f"unsupported legal worker state: {state}")
-    if not _locked:
-        lock = _legal_state_locks.setdefault(session_id, asyncio.Lock())
-        async with lock:
-            return await _persist_session_legal_worker_state(
-                session_id, state, source, _locked=True,
-            )
-    s = _sess.get(session_id)
-    if s is None:
-        return False
-    previous = s.last_legal_worker_state
-    s.last_legal_worker_state = state
+async def clear_session_illegal_for_startup(session_id: str, *, reconcile: bool = False) -> dict:
+    """Retire only diagnosed incidents; never release a live/unknown owner."""
+    lock = await _session_spawn_lock(session_id)
+    async with lock:
+        s = _sess.get(session_id)
+        if s is None:
+            return {"sessionId": session_id, "status": "error", "error": f"Session {session_id} not found"}
+        async with queue_lock(session_id):
+            # Do not let this policy classify or retire a new running operation.
+            tracked = find_worker_by_session(session_id)
+            if tracked is not None and not _runtime_stopped(tracked):
+                raise RuntimeError("Worker runtime is not stopped")
+            incidents = [op for op in _offline.outstanding(s) if reconcile or op.get("state") == "illegal"]
+            for identity in [s.offline_owner, *incidents]:
+                if identity and await asyncio.to_thread(_offline.previous_owner_status, identity) != "dead":
+                    raise RuntimeError("Execution owner alive or unknown; refusing Illegal retirement")
+            def clear(candidate):
+                if reconcile:
+                    _migrate_queue_delivery_state(candidate, restore_ledger=True)
+                    for identity in incidents:
+                        _offline.detect(candidate, "manual/mark-safe-offline", identity=identity,
+                            eligible=lambda item: _delivery_state(item) == _DELIVERY_QUEUED and not _queue_item_locked(item),
+                            remember=lambda item: _remember_offline_lock(candidate, item))
+                return _offline.clear_illegal(candidate, remember=lambda item: _remember_offline_lock(candidate, item))
+            changed = await _commit_offline(s, clear)
+        result = {"sessionId": session_id, "status": "updated", "legalityDiagnostics": _offline.diagnostics(s),
+                  "legalOffline": s.legal_offline, "illegalOffline": _offline.is_illegal(s)}
+    # create_worker takes the same spawn lock: release it before requesting
+    # immediate recovery. Persistence must succeed before any consumer wakes.
     try:
-        await _sess.save_async(s)
-    except Exception as exc:
-        # The in-memory Session is also a source for API projections. Keep it
-        # aligned with durable metadata when the atomic save did not succeed.
-        s.last_legal_worker_state = previous
-        _log.warning(
-            "[Session %s] failed to persist legal state=%s source=%s: %s",
-            session_id, state, source, exc,
-        )
-        return False
-    return True
+        await _offline_snapshot_event(s)
+    finally:
+        if changed and _has_dispatchable_items(s):
+            await _wake_worker(session_id, auto_spawn=False)
+    return result
+
+
+async def set_session_legal_worker_state_running(session_id: str, *, source: str = "manual/mark-illegal") -> dict:
+    """Explicitly mark an offline Session Illegal, using the existing incident ledger."""
+    lock = await _session_spawn_lock(session_id)
+    async with lock:
+        s = _sess.get(session_id)
+        if s is None:
+            return {"sessionId": session_id, "status": "error", "error": f"Session {session_id} not found"}
+        async with queue_lock(session_id):
+            tracked = find_worker_by_session(session_id)
+            if tracked is not None and not _runtime_stopped(tracked):
+                raise RuntimeError("Worker runtime is not stopped")
+            for identity in [s.offline_owner, *_offline.outstanding(s)]:
+                if identity and await asyncio.to_thread(_offline.previous_owner_status, identity) != "dead":
+                    raise RuntimeError("Execution owner alive or unknown; refusing manual state change")
+            def mark(candidate):
+                if _offline.is_illegal(candidate):
+                    return
+                _migrate_queue_delivery_state(candidate, restore_ledger=True)
+                if not _offline.outstanding(candidate):
+                    # Administrative state change, not an invented provider execution.
+                    identity = {"token": uuid.uuid4().hex, "generation": 0, "executionSeq": 0,
+                                "serviceId": _offline.SERVICE_ID, "processes": []}
+                    _offline.admit(candidate, identity, kind="manual-recovery")
+                for identity in list(_offline.outstanding(candidate)):
+                    _offline.detect(candidate, source, identity=identity,
+                        eligible=lambda item: _delivery_state(item) == _DELIVERY_QUEUED and not _queue_item_locked(item),
+                        remember=lambda item: _remember_offline_lock(candidate, item))
+            await _commit_offline(s, mark)
+        await _offline_snapshot_event(s)
+        return {"sessionId": session_id, "status": "updated", "legalOffline": s.legal_offline,
+                "illegalOffline": _offline.is_illegal(s), "legalityDiagnostics": _offline.diagnostics(s)}
 
 
 def _terminal_enrichment_key(
@@ -731,16 +1079,31 @@ def _make_usage_enrichment_snapshot(s) -> _UsageEnrichmentSnapshot:
     )
 
 
-def _merge_usage_enrichment_snapshot(s, snapshot: _UsageEnrichmentSnapshot) -> None:
-    """Merge provider-side model/cursor changes without clobbering live edits."""
-    if snapshot.model != snapshot.model_before:
-        # A live terminal/config path may have selected a model while the
-        # provider lookup was in flight.  Only fill the value if it still has
-        # the snapshot's original value.
-        if s.model == snapshot.model_before:
-            s.model = snapshot.model
+_USAGE_FIELD_MISSING = object()
 
-    missing = object()
+
+def _merge_usage_enrichment_state(
+    s: _sess.Session, snapshot: _UsageEnrichmentSnapshot,
+) -> tuple[dict, str | None]:
+    """Merge provider-side model/cursor changes, returning what was applied.
+
+    A field is only written when the live Session still holds the value the
+    snapshot was taken from, so a concurrent update always wins.  The returned
+    mapping records *exactly* which fields this call wrote (and the value it
+    wrote), which is what a later rollback must be allowed to undo.  Anything the
+    merge skipped must never be rolled back -- it belongs to whoever changed it.
+    """
+    # ``model`` lives on the Session itself, not in ``adapter_config``, so it is
+    # tracked separately rather than sharing the cursor keyspace (no adapter
+    # writes ``adapter_config["model"]``, but overloading the dict would make that
+    # an invariant the rollback silently depends on).
+    applied: dict = {}
+    applied_model: str | None = None
+    if snapshot.model != snapshot.model_before and s.model == snapshot.model_before:
+        s.model = snapshot.model
+        applied_model = snapshot.model
+
+    missing = _USAGE_FIELD_MISSING
     before_config = snapshot.adapter_config_before
     current_config = s.adapter_config
     for key in set(before_config) | set(snapshot.adapter_config):
@@ -757,6 +1120,101 @@ def _merge_usage_enrichment_snapshot(s, snapshot: _UsageEnrichmentSnapshot) -> N
             current_config.pop(key, None)
         else:
             current_config[key] = copy.deepcopy(after)
+        applied[key] = after
+    return applied, applied_model
+
+
+def _restore_usage_enrichment_state(
+    s: _sess.Session, snapshot: _UsageEnrichmentSnapshot, applied: dict,
+    applied_model: str | None = None,
+) -> None:
+    """Undo exactly the fields :func:`_merge_usage_enrichment_state` wrote.
+
+    Usage and the provider cursor are one commit unit: cbc derives "new" entries
+    from ``raw_usage.request_count`` while codex/kimi/opencode persist
+    ``*_prev_usage`` / ``*_last_usage_ts`` cursors. Rolling usage back while
+    leaving a cursor advanced makes the next lookup return nothing, so the job
+    would be consumed with the usage lost.
+
+    Only keys present in ``applied`` are eligible, and each is restored only
+    while it still holds the value this attempt wrote.  A field the merge skipped
+    (because a concurrent writer had already moved it) is never touched here, so
+    a rollback can never take away another writer's value.
+    """
+    missing = _USAGE_FIELD_MISSING
+    if applied_model is not None and s.model == applied_model:
+        s.model = snapshot.model_before
+
+    current_config = s.adapter_config
+    before_config = snapshot.adapter_config_before
+    for key, written in applied.items():
+        # Only undo our own write, and only if nobody changed it since.
+        if current_config.get(key, missing) != written:
+            continue
+        before = before_config.get(key, missing)
+        if before is missing:
+            current_config.pop(key, None)
+        else:
+            current_config[key] = copy.deepcopy(before)
+
+
+def _restore_usage_fields(s, raw_before, total_before, applied_raw) -> bool:
+    """Compare-and-restore ``raw_usage``/``total_usage`` after a failed commit.
+
+    Returns True only when this attempt's own values are still in place and were
+    therefore rolled back; False when a concurrent writer already replaced the
+    usage, in which case that writer keeps ownership of both fields.
+
+    Only our exact candidate object may be restored. Production usage writers
+    are gated; this ownership check also protects independent field updates.
+    """
+    if s.raw_usage is not applied_raw:
+        return False
+    s.raw_usage = raw_before
+    s.total_usage = total_before
+    return True
+
+
+def _commit_usage_enrichment(
+    s: _sess.Session, snapshot: _UsageEnrichmentSnapshot,
+    entries: list[dict] | None, job: dict,
+) -> None:
+    """Publish/save/rollback in ONE persistence ticket, without an await.
+
+    Other Session saves share this ticket queue. A failed writer restores its
+    accounting before the next ticket can serialize it, so terminal/history
+    saves cannot accidentally persist a failed usage candidate.
+    """
+    raw_before = copy.deepcopy(s.raw_usage)
+    total_before = copy.deepcopy(s.total_usage)
+    candidate_raw = s.raw_usage
+    applied: dict = {}
+    applied_model: str | None = None
+    removed = False
+    try:
+        if entries:
+            candidate_raw = _sess.accumulate_raw_usage(
+                copy.deepcopy(s.raw_usage), entries)
+            candidate_total = _sess.compute_total_usage(candidate_raw)
+            s.raw_usage = candidate_raw
+            s.total_usage = candidate_total
+        applied, applied_model = _merge_usage_enrichment_state(s, snapshot)
+        # Preserve the list terminal processing appends to on the event loop.
+        # Replacing it from this writer thread could strand an append holding
+        # the previous list reference. Remove only this job, in place.
+        pending = s.usage_enrichment_pending
+        for candidate in list(pending):
+            if isinstance(candidate, dict) and candidate.get("key") == job.get("key"):
+                pending.remove(candidate)
+        removed = True
+        _sess._save_body(s)
+    except BaseException:
+        if entries:
+            _restore_usage_fields(s, raw_before, total_before, candidate_raw)
+        _restore_usage_enrichment_state(s, snapshot, applied, applied_model)
+        if removed and _enrichment_job(s, job.get("key")) is None:
+            s.usage_enrichment_pending.insert(0, job)
+        raise
 
 
 async def _run_usage_enrichment(session_id: str) -> None:
@@ -829,10 +1287,11 @@ async def _run_usage_enrichment(session_id: str) -> None:
                 await asyncio.sleep(min(next_attempt - time.time(), _ENRICH_RETRY_MAX_SEC))
                 continue
 
-            # Run provider I/O against a detached, minimal snapshot.  The
-            # live Session can receive the next terminal result while this
-            # thread is blocked, without copying or exposing large state.
-            enrichment_session = _make_usage_enrichment_snapshot(s)
+            # Snapshot only after any reimport writer has retired. Provider
+            # I/O remains outside the gate, so terminal progress is unblocked.
+            async with _sess.usage_commit_lock(s):
+                lookup_revision = _sess.usage_revision(s)
+                enrichment_session = _make_usage_enrichment_snapshot(s)
             try:
                 adapter = _usage_enrichment_adapters.get(job.get("key"))
                 if adapter is None:
@@ -851,46 +1310,26 @@ async def _run_usage_enrichment(session_id: str) -> None:
                     continue
                 return
 
-            # Provider success: merge only its usage delta and snapshot cursor
-            # changes.  Live usage/config updates win when the same field was
-            # changed after the snapshot was taken.
-            removed = False
-            try:
-                if enrichment:
-                    prev_total = s.total_usage
-                    s.raw_usage = _sess.accumulate_raw_usage(
-                        s.raw_usage, enrichment)
-                    s.total_usage = _sess.compute_total_usage(s.raw_usage)
-                    prev_credit = prev_total.get("credit", 0) if prev_total else 0
-                    new_credit = s.total_usage.get("credit", 0) if s.total_usage else 0
-                    _log.info(
-                        "[Session %s] usage enrichment credit: %.2f -> %.2f (+%.2f)",
-                        session_id, prev_credit, new_credit,
-                        new_credit - prev_credit,
+            async with _sess.usage_commit_lock(s):
+                # Reimport completed during lookup. Its native cursor and usage
+                # are authoritative; retain the job and query again on that base.
+                if _sess.usage_revision(s) != lookup_revision:
+                    continue
+                try:
+                    await _sess._persist_async_outcome(
+                        s.id, lambda: _commit_usage_enrichment(
+                            s, enrichment_session, enrichment, job),
                     )
-                _merge_usage_enrichment_snapshot(s, enrichment_session)
-                # Remove by key rather than list position: another terminal
-                # may have appended a later job while this one was in a thread.
-                s.usage_enrichment_pending = [
-                    candidate for candidate in (s.usage_enrichment_pending or [])
-                    if candidate is not job and (
-                        not isinstance(candidate, dict)
-                        or candidate.get("key") != job.get("key")
-                    )
-                ]
-                removed = True
-                await _sess.save_async(s)
-            except asyncio.CancelledError:
-                if removed and _enrichment_job(s, job.get("key")) is None:
-                    s.usage_enrichment_pending.insert(0, job)
-                raise
-            except Exception as exc:
-                # A failed save must not turn a successful provider lookup into
-                # a lost durable job.  Keep merged live usage/config, restore
-                # the job, and retry; compare-and-merge makes the retry safe.
-                if removed and _enrichment_job(s, job.get("key")) is None:
-                    s.usage_enrichment_pending.insert(0, job)
-                if await retry_job(s, job, exc):
+                except asyncio.CancelledError:
+                    # The synchronous commit rolls back on writer failure before
+                    # retiring its ticket. Successful writes remain published.
+                    raise
+                except Exception as exc:
+                    failed = exc
+                else:
+                    failed = None
+            if failed is not None:
+                if await retry_job(s, job, failed):
                     continue
                 return
 
@@ -945,10 +1384,563 @@ def recover_pending_usage_enrichment() -> int:
     return scheduled
 
 
-async def _persist_terminal_state(
+# ── session error samples ──
+# The sample log is diagnostic only: these helpers never change status,
+# retries, queue state or legality.  Every call is synchronous and swallows
+# its own write failure inside session_error_log.
+
+_TOOL_ITEM_TYPES = frozenset({
+    "commandexecution", "mcptoolcall", "functioncall", "dynamictoolcall",
+    "filechange", "patchapply", "websearch",
+})
+
+# A stream line over the parser cap is only read back in full when its JSON
+# envelope can be an error.  Recognition is order-independent and top-level
+# only: scanning tracks string/depth state instead of regex-matching nested
+# "type" text, so {"error": ..., "type": "result", ...} is handled.
+_TOP_LEVEL_ERROR_TYPES = frozenset({
+    "error", "codex.turn_error", "codex.item_error", "pan.native_error",
+})
+_TOP_LEVEL_INTEREST = frozenset({
+    "type", "is_error", "cancelled", "is_cancelled",
+})
+
+
+def _decode_json_token(buf: bytearray):
+    try:
+        return json.loads(b'"' + bytes(buf) + b'"')
+    except (ValueError, TypeError):
+        return bytes(buf).decode("utf-8", errors="replace")
+
+
+def _decode_json_scalar(buf: bytearray):
+    try:
+        return json.loads(bytes(buf).strip().decode("utf-8"))
+    except (ValueError, TypeError):
+        return None
+
+
+def _decide_oversized_fields(fields: dict):
+    """Return True/False when the top-level fields already decide, else None."""
+    if "type" not in fields:
+        return None
+    value = fields.get("type")
+    if value not in _TOP_LEVEL_ERROR_TYPES and value != "result":
+        return False
+    if value != "result":
+        return True
+    if (fields.get("is_error") is True
+            or fields.get("cancelled") is True
+            or fields.get("is_cancelled") is True):
+        return True
+    return None
+
+
+def _classify_oversized_json(prefix: bytes, spill) -> bool:
+    """Order-independent, top-level-only error-envelope detection.
+
+    Streams the prefix and the spill file; keeps only the current top-level
+    key/scalar.  Nested objects/arrays are skipped by depth, so a nested
+    ``"type":"result"`` inside assistant/tool text cannot match.  ``type`` may
+    appear after 256 KiB because the spill is scanned too.
+    """
+    def chunks():
+        yield prefix
+        spill.seek(0)
+        while True:
+            chunk = spill.read(65536)
+            if not chunk:
+                return
+            yield chunk
+
+    depth = 0
+    in_string = False
+    escape = False
+    buf = bytearray()
+    state = "start"  # start | key | colon | value | after_value
+    current_key = None
+    fields: dict = {}
+
+    for chunk in chunks():
+        for byte in chunk:
+            if in_string:
+                collect = depth == 1 and (
+                    state == "key"
+                    or (state == "value" and current_key in _TOP_LEVEL_INTEREST)
+                )
+                if escape:
+                    if collect:
+                        buf.append(byte)
+                    escape = False
+                elif byte == 0x5C:  # backslash
+                    if collect:
+                        buf.append(byte)
+                    escape = True
+                elif byte == 0x22:  # quote
+                    in_string = False
+                    if depth == 1:
+                        if state == "key":
+                            current_key = _decode_json_token(buf)
+                            buf.clear()
+                            state = "colon"
+                        elif state == "value":
+                            if current_key in _TOP_LEVEL_INTEREST:
+                                fields[current_key] = _decode_json_token(buf)
+                                buf.clear()
+                                decision = _decide_oversized_fields(fields)
+                                if decision is not None:
+                                    return decision
+                            state = "after_value"
+                else:
+                    if collect:
+                        buf.append(byte)
+                continue
+
+            if depth == 0:
+                if byte == 0x7B:  # {
+                    depth = 1
+                    state = "key"
+                elif byte not in b" \t\r\n":
+                    return False
+                continue
+
+            if byte == 0x22:  # string starts
+                in_string = True
+                escape = False
+                buf.clear()
+                continue
+
+            if depth == 1:
+                if byte in (0x7B, 0x5B):  # nested { or [
+                    depth += 1
+                    if depth == 2:
+                        state = "after_value"
+                    continue
+                if byte == 0x7D:  # }
+                    if (state == "value" and buf
+                            and current_key in _TOP_LEVEL_INTEREST):
+                        fields[current_key] = _decode_json_scalar(buf)
+                    depth -= 1
+                    if depth == 0:
+                        break
+                    continue
+                if byte == 0x5D:  # ]
+                    depth -= 1
+                    continue
+                if byte == 0x3A:  # :
+                    if state == "colon":
+                        state = "value"
+                    continue
+                if byte == 0x2C:  # ,
+                    if (state == "value" and buf
+                            and current_key in _TOP_LEVEL_INTEREST):
+                        fields[current_key] = _decode_json_scalar(buf)
+                        buf.clear()
+                        decision = _decide_oversized_fields(fields)
+                        if decision is not None:
+                            return decision
+                    state = "key"
+                    continue
+                if byte in b" \t\r\n":
+                    continue
+                if state == "value":
+                    if current_key in _TOP_LEVEL_INTEREST:
+                        buf.append(byte)
+                continue
+
+            # depth > 1: skip nested structure without buffering content
+            if byte in (0x7B, 0x5B):
+                depth += 1
+            elif byte in (0x7D, 0x5D):
+                depth -= 1
+        if depth == 0:
+            break
+
+    return bool(_decide_oversized_fields(fields))
+
+
+def _raw_capture(w: Worker):
+    handle = getattr(w, "_stream_raw_spill", None)
+    if handle is None:
+        handle = tempfile.TemporaryFile()
+        w._stream_raw_spill = handle
+        w._stream_raw_line_count = 0
+    return handle
+
+
+def _capture_raw_line(w: Worker, line: bytes) -> None:
+    """Attribute one unparsed stream line as raw diagnostic text, not error."""
+    handle = _raw_capture(w)
+    handle.write(line)
+    if not line.endswith(b"\n"):
+        handle.write(b"\n")
+    w._stream_raw_line_count = int(getattr(w, "_stream_raw_line_count", 0) or 0) + 1
+
+
+def _capture_raw_oversized(w: Worker, prefix: bytes, spill) -> None:
+    """Copy an oversized unparsed line to the diagnostic spill without RAM."""
+    handle = _raw_capture(w)
+    handle.write(prefix)
+    spill.seek(0)
+    while True:
+        chunk = spill.read(65536)
+        if not chunk:
+            break
+        handle.write(chunk)
+    handle.write(b"\n")
+    w._stream_raw_line_count = int(getattr(w, "_stream_raw_line_count", 0) or 0) + 1
+
+
+def _raw_capture_source(w: Worker):
+    handle = getattr(w, "_stream_raw_spill", None)
+    count = int(getattr(w, "_stream_raw_line_count", 0) or 0)
+    if handle is None or count <= 0:
+        return None
+    return (handle, count)
+
+
+def _reset_raw_capture(w: Worker) -> None:
+    handle = getattr(w, "_stream_raw_spill", None)
+    if handle is not None:
+        try:
+            handle.seek(0)
+            handle.truncate(0)
+        except OSError:
+            pass
+    w._stream_raw_line_count = 0
+
+
+def _close_raw_capture(w: Worker) -> None:
+    handle = getattr(w, "_stream_raw_spill", None)
+    if handle is not None:
+        try:
+            handle.close()
+        except OSError:
+            pass
+    w._stream_raw_spill = None
+    w._stream_raw_line_count = 0
+
+
+def _looks_like_structured_text(text: str) -> bool:
+    """True only for a complete JSON object/array, not for arbitrary text.
+
+    A log line such as ``[second stderr line]`` starts with ``[`` but is not
+    JSON; it must be attributed as raw diagnostic text.
+    """
+    stripped = text.lstrip()
+    if not stripped.startswith(("{", "[")):
+        return False
+    try:
+        json.loads(stripped)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+def _oversized_error_event(adapter, prefix: bytes, spill):
+    spill.seek(0)
+    full = prefix + spill.read()
+    event = adapter.parse_event(full.decode("utf-8", errors="replace"))
+    if not isinstance(event, dict):
+        return None
+    if event.get("type") == "result" and not (
+            event.get("is_error")
+            or event.get("cancelled")
+            or event.get("is_cancelled")):
+        return None
+    return event
+
+
+async def _classify_oversized_line(adapter, raw_line: bytes, spill):
+    """Classify an over-cap line as error / raw diagnostic / normal.
+
+    Returns ``("error", event)``, ``("raw", None)`` or ``("drop", None)``.
+    The order-independent top-level scan runs off the event loop; the full
+    event is read only after the scan says it is error-shaped.
+    """
+    prefix = bytes(raw_line)[:_STDOUT_MAX_LINE]
+    if not prefix.lstrip().startswith(b"{"):
+        return "raw", None
+    shaped = await asyncio.to_thread(_classify_oversized_json, prefix, spill)
+    if not shaped:
+        return "drop", None
+    event = _oversized_error_event(adapter, prefix, spill)
+    if event is None:
+        return "drop", None
+    return "error", event
+
+
+def _error_log_identity(w: Worker, s) -> dict:
+    item = getattr(w, "_current_queue_item", None)
+    queue_item_id = None
+    if isinstance(item, dict):
+        value = item.get("queueItemId") or item.get("id")
+        if isinstance(value, str) and value:
+            queue_item_id = value
+    return {
+        "session": s,
+        "session_id": getattr(w, "session_id", None),
+        "session_name": getattr(s, "name", None),
+        "adapter": getattr(getattr(w, "adapter", None), "name", None),
+        "model": getattr(s, "model", None),
+        "worker_id": getattr(w, "worker_id", None),
+        "generation": getattr(w, "generation", None),
+        "task_seq": getattr(w, "_current_seq", None),
+        "task_id": getattr(w, "_current_task_id", None),
+        "execution_seq": getattr(w, "_execution_seq", None) or None,
+        "queue_item_id": queue_item_id,
+        "source_session_id": getattr(w, "_current_source_session_id", None),
+    }
+
+
+def _runtime_issue_sample(w: Worker, s, raw: dict) -> dict | None:
+    """Map diagnostics without letting identity rejection erase the error.
+
+    A conflicting alias set is a fail-closed identity decision, not an error
+    logging failure. Returning None keeps the original JSONL/report/status path
+    intact and prevents an Event from acquiring an ambiguous target.
+    """
+    try:
+        return map_runtime_issue(
+            raw,
+            adapter=getattr(getattr(w, "adapter", None), "name", None),
+            metadata={**_error_log_identity(w, s), 'runtimeEpoch': _offline.SERVICE_ID},
+            delivery={"observed": True, "classified": True,
+                      "persisted": False, "delivered": False, "deduped": False})
+    except SystemFieldError:
+        return None
+
+
+async def _record_terminal_error_sample(
     w: Worker, s, status: str, result_text: str | None,
+    error_context: dict | None,
+) -> None:
+    if status not in {"error", "cancelled"}:
+        return
+    ctx = dict(error_context or {})
+    raw = ctx.get("cli_raw")
+    cli_text = None
+    if isinstance(raw, dict):
+        _, cli_text, _ = _error_log.cli_error_fields(raw)
+    if not (isinstance(cli_text, str) and cli_text.strip()) and ctx.get("cli_error_events"):
+        for candidate in reversed(ctx["cli_error_events"]):
+            _, candidate_text, _ = _error_log.cli_error_fields(candidate)
+            if isinstance(candidate_text, str) and candidate_text.strip():
+                cli_text = candidate_text
+                break
+    result_text = result_text if isinstance(result_text, str) else ""
+    if isinstance(cli_text, str) and cli_text.strip():
+        text, source = cli_text, "cli.error"
+    elif ctx.get("origin") in {"worker.stream.result", "worker.oneshot"}:
+        # The provider reported a failed terminal without an error object.
+        # Keep its complete text, but label it as the terminal result so no
+        # assistant message can be mistaken for the error detail.
+        text, source = result_text, "pan.terminal_result"
+    else:
+        text, source = result_text, "pan.runtime"
+    runtime_issue = _runtime_issue_sample(w, s, raw if isinstance(raw, dict) else {"message": text})
+    may_be_assistant = bool(
+        status == "error" and result_text
+        and w._current_task_last_assistant_text == result_text
+    )
+    try:
+        if ctx.get("previous_captured"):
+            previous = ctx.get("previous_message")
+        else:
+            previous = _sess.history_tail_snapshot(s) if s is not None else None
+    except Exception:
+        previous = None
+    await _error_log.record_session_error_async(
+        kind="cancelled" if status == "cancelled" else "terminal_error",
+        error_text=text,
+        error_text_source=source,
+        terminal=True,
+        pan_status=status,
+        cancelled=(status == "cancelled"),
+        cli_raw=raw,
+        cli_error_events=ctx.get("cli_error_events"),
+        cli_raw_output=ctx.get("cli_raw_output"),
+        cli_origin=ctx.get("origin"),
+        cli_returncode=ctx.get("returncode"),
+        cli_timed_out=ctx.get("timed_out"),
+        pan_extra={
+            "origin": ctx.get("origin"),
+            "terminalResult": result_text,
+            "terminalResultMayBeAssistantText": may_be_assistant,
+            "workerStatus": w.status,
+            "terminalKey": ctx.get("terminal_key"),
+            "returncode": ctx.get("returncode"),
+        },
+        previous_message=previous,
+        previous_captured=True,
+        raw_diagnostics_source=_raw_capture_source(w),
+        runtime_issue=runtime_issue,
+        **_error_log_identity(w, s),
+    )
+
+
+async def _record_transient_error_sample(
+    w: Worker, event: dict, kind: str, *, recovered: bool | None = None,
+) -> None:
+    """Record a non-terminal CLI/native/tool error without changing its flow."""
+    s = _session(w)
+    raw_error = event.get("error")
+    text = ""
+    source = "pan.runtime"
+    if raw_error is not None:
+        _, extracted, extracted_source = _error_log.cli_error_fields(event)
+        if isinstance(extracted, str):
+            text = extracted
+            source = extracted_source or "cli.error"
+    elif isinstance(event.get("error_text"), str):
+        text = event["error_text"]
+        source = "cli.error_text"
+    elif isinstance(event.get("item"), dict):
+        _, extracted, extracted_source = _error_log.cli_error_fields(event["item"])
+        if isinstance(extracted, str):
+            text = extracted
+            source = extracted_source or "cli.error"
+    runtime_issue = _runtime_issue_sample(w, s, event)
+    if not text and event.get("item_status"):
+        source = "cli.item_status"
+    try:
+        previous = _sess.history_tail_snapshot(s) if s is not None else None
+    except Exception:
+        previous = None
+    fingerprint_source = raw_error
+    if fingerprint_source is None and isinstance(event.get("item"), dict):
+        fingerprint_source = event.get("item")
+    try:
+        fingerprint = hashlib.sha1(json.dumps(
+            fingerprint_source if fingerprint_source is not None else text,
+            ensure_ascii=False, sort_keys=True, default=str,
+        ).encode("utf-8")).hexdigest()
+    except Exception:
+        fingerprint = hashlib.sha1(repr(fingerprint_source).encode("utf-8")).hexdigest()
+    dedupe_token = "|".join([
+        str(event.get("type") or ""),
+        str(event.get("turn_id") or event.get("turnId") or ""),
+        str(event.get("item_id") or event.get("itemId") or ""),
+        str(recovered),
+        fingerprint,
+    ])
+    await _error_log.record_session_error_async(
+        kind=kind,
+        error_text=text,
+        error_text_source=source,
+        terminal=False,
+        recovered=recovered,
+        cli_raw=event,
+        cli_origin="worker.stream.event",
+        pan_extra={
+            "origin": "worker.stream.event",
+            "workerStatus": getattr(w, "status", None),
+            "itemType": event.get("item_type"),
+            "itemStatus": event.get("item_status"),
+            "nativeErrorCode": event.get("error") if isinstance(event.get("error"), str) else None,
+        },
+        previous_message=previous,
+        previous_captured=True,
+        dedupe_token=dedupe_token,
+        runtime_issue=runtime_issue,
+        **_error_log_identity(w, s),
+    )
+
+
+async def _record_worker_start_failure(
+    s, session_id: str, worker_id: str, message: str, *,
+    w: Worker | None = None, origin: str = "worker.create",
+) -> None:
+    try:
+        previous = _sess.history_tail_snapshot(s) if s is not None else None
+    except Exception:
+        previous = None
+    identity = (
+        _error_log_identity(w, s) if w is not None else {
+            "session": s,
+            "session_id": session_id,
+            "session_name": getattr(s, "name", None),
+            "adapter": getattr(s, "adapter", None),
+            "model": getattr(s, "model", None),
+            "worker_id": worker_id,
+            "generation": None,
+        }
+    )
+    await _error_log.record_session_error_async(
+        kind="worker_start_failure",
+        error_text=message,
+        error_text_source="pan.runtime",
+        terminal=True,
+        pan_status="error",
+        pan_extra={"origin": origin, "workerStatus": "error"},
+        previous_message=previous,
+        previous_captured=True,
+        **identity,
+    )
+
+
+async def _record_worker_crash(
+    w: Worker, s, returncode, detail: str, *, origin: str,
+) -> None:
+    try:
+        previous = _sess.history_tail_snapshot(s) if s is not None else None
+    except Exception:
+        previous = None
+    await _error_log.record_session_error_async(
+        kind="worker_crash",
+        error_text=detail,
+        error_text_source="pan.runtime",
+        terminal=True,
+        pan_status="error",
+        pan_extra={
+            "origin": origin,
+            "returncode": returncode,
+            "workerStatus": getattr(w, "status", None),
+        },
+        previous_message=previous,
+        previous_captured=True,
+        raw_diagnostics_source=_raw_capture_source(w),
+        **_error_log_identity(w, s),
+    )
+
+
+async def _persist_terminal_state(
+    w: Worker, s, status: str, result_text: str | None, *, expected_owner: dict | None = None,
+    error_context: dict | None = None,
 ) -> dict | None:
     """Persist the minimum terminal fact set before any completion broadcast."""
+    if expected_owner is not None and (w.offline_token != expected_owner["token"]
+            or w.generation != expected_owner["generation"]):
+        return None
+    if not w._terminal_handled:
+        w._terminal_finishing = True
+    try:
+        async with queue_lock(w.session_id):
+            if expected_owner is not None and (
+                    workers.get(w.worker_id) is not w
+                    or w.offline_token != expected_owner["token"]
+                    or w.generation != expected_owner["generation"]):
+                return None
+            async with unread_done_lock(w.session_id):
+                return await _persist_terminal_state_locked(
+                    w, s, status, result_text, error_context=error_context)
+    except BaseException as exc:
+        # Persistence owns its rollback/committed-outcome decision. Never turn
+        # an aborted terminal chain into an idle restart or hide its exception.
+        w._terminal_finishing = False
+        if not isinstance(exc, asyncio.CancelledError):
+            _log.error("[Worker %s] terminal persistence failed session=%s generation=%s",
+                       w.worker_id, w.session_id, w.generation, exc_info=True)
+        _abort_delayed_restart(w, "terminal persistence", exc)
+        raise
+
+
+async def _persist_terminal_state_locked(
+    w: Worker, s, status: str, result_text: str | None,
+    *, error_context: dict | None = None,
+) -> dict | None:
+    if w._host_exit_illegal:
+        return None
     if w._terminal_handled:
         _log.warning(
             "[Worker %s] duplicate terminal event ignored generation=%s",
@@ -960,6 +1952,28 @@ async def _persist_terminal_state(
     task_id = w._current_task_id
     task_idempotent = w._current_task_idempotent
     source_session_id = w._current_source_session_id
+    # Freeze before the logging/persistence awaits. Later turns/generations
+    # must never supply error or assistant context for this terminal receipt.
+    report_diagnostic = _error_report_diagnostic(w, status, task_seq)
+    # The admitted input identity was captured at the durable hand-off/Steer
+    # acceptance; freeze its projection here so queue/history mutations after
+    # this point cannot retarget the report.
+    prompt_fields = _prompt_report_fields(w._prompt_ref)
+    # Freeze before error logging yields. A later input must never become the
+    # anchor of this execution's terminal receipt.
+    terminal_anchor = next((row.get("messageId") for row in reversed(
+        s.history[w._execution_history_start:] if s is not None else [])
+        if isinstance(row, dict) and row.get("messageId")
+        and row.get("role") in {"user", "assistant", "tool", "thinking"}), None)
+    if (error_context or {}).get("previous_captured"):
+        snapshot = (error_context or {}).get("previous_message") or {}
+        terminal_anchor = (snapshot.get("messageId")
+            if snapshot.get("historyEpoch") == getattr(s, "history_epoch", None)
+            and snapshot.get("historyIndex", -1) >= w._execution_history_start else None)
+    terminal_occurred_at = datetime.now().isoformat()
+    if report_diagnostic is not None:
+        report_diagnostic.update(_error_log.terminal_report_fields(
+            (error_context or {}).get("cli_raw")))
     terminal_key = _terminal_enrichment_key(
         task_id, task_seq, w.worker_id, w.generation,
         task_idempotent=task_idempotent,
@@ -973,8 +1987,23 @@ async def _persist_terminal_state(
             f"Session {w.session_id} disappeared before terminal persistence"
         )
     prior_result = s.last_result if isinstance(s.last_result, dict) else None
-    if (prior_result and prior_result.get("terminalKey") == terminal_key
-            and prior_result.get("status") == status):
+    known_history_terminal = next((row for row in reversed(s.history)
+        if isinstance(row, dict) and row.get("kind") == "terminal"
+        and isinstance(row.get("terminal"), dict)
+        and row["terminal"].get("terminalKey") == terminal_key), None)
+    async def finish_replayed_run():
+        # The existing terminal key proves this accepted idempotent execution
+        # is already safe. Settle its current legality without rebroadcasting
+        # results or treating an arbitrary replay as a new Worker activation.
+        identity = _offline.owner(w)
+        if s.legal_offline is False and _offline.same_owner(s.offline_run, identity):
+            await _commit_offline(s, lambda candidate: _offline.finish(
+                candidate, identity, reason="task/durable-terminal-replay"))
+    if ((prior_result and prior_result.get("terminalKey") == terminal_key
+            and (prior_result.get("status") == status or prior_result.get("historyTerminalId")))
+            or (known_history_terminal
+                and known_history_terminal["terminal"].get("order", 0) > 0
+                and known_history_terminal["terminal"]["order"] <= s.result_cursor)):
         # A replacement Worker can observe the provider's already-completed
         # turn again.  The durable terminal key suppresses a second result
         # broadcast when the in-memory guard was lost with the old Worker.
@@ -982,6 +2011,7 @@ async def _persist_terminal_state(
             "[Worker %s] durable duplicate terminal ignored key=%s",
             w.worker_id, terminal_key,
         )
+        await finish_replayed_run()
         w.status = "idle"
         w._terminal_handled = True
         # A duplicate terminal is still a terminal for the current consumer
@@ -1009,11 +2039,21 @@ async def _persist_terminal_state(
             "[Worker %s] durable terminal replay duplicate ignored key=%s",
             w.worker_id, terminal_key,
         )
+        await finish_replayed_run()
         w.status = "idle"
         w._terminal_handled = True
         _signal_task_done(w)
         w.last_activity = time.monotonic()
         return None
+
+    # Record the error sample before the base commit mutates terminal state.
+    # The previous-message snapshot is taken synchronously inside this call,
+    # so a later report/steer/native append cannot replace it.
+    if status in {"error", "cancelled"}:
+        await _record_terminal_error_sample(
+            w, s, status, result_text,
+            {**(error_context or {}), "terminal_key": terminal_key},
+        )
 
     try:
         result_cursor = max(
@@ -1023,13 +2063,29 @@ async def _persist_terminal_state(
         ) + 1
     except (TypeError, ValueError):
         result_cursor = max(0, int(getattr(s, "result_cursor", 0) or 0)) + 1
+    old_terminal_state = {
+        "result_cursor": s.result_cursor,
+        "unread_done_generation": s.unread_done_generation,
+        "unread_done_read_generation": s.unread_done_read_generation,
+        "unread_done_count": s.unread_done_count,
+        "active_task_id": s.active_task_id,
+        "usage_enrichment_pending": list(s.usage_enrichment_pending),
+    }
+    old_runtime_state = {
+        "_current_queue_item": w._current_queue_item,
+        "_current_report_items": list(w._current_report_items),
+        "_current_task_assistant_ids": set(w._current_task_assistant_ids),
+    }
     s.result_cursor = result_cursor
     terminal_record = {
         "resultCursor": result_cursor,
         "terminalKey": terminal_key,
         "status": status,
         "result": result_text,
+        "autoReportAdmission": copy.deepcopy(w._auto_report_admission),
+        **prompt_fields,
         "taskSeq": task_seq,
+        "executionSeq": w._execution_seq or None,
         "taskId": task_id,
         "taskIdempotent": task_idempotent,
         "workerId": w.worker_id,
@@ -1049,6 +2105,7 @@ async def _persist_terminal_state(
         "cli_session_id": s.cli_session_id,
         "timestamp": datetime.now().isoformat(),
         "taskSeq": task_seq,
+        "executionSeq": w._execution_seq or None,
         "taskId": task_id,
         "taskIdempotent": task_idempotent,
         "workerId": w.worker_id,
@@ -1056,12 +2113,102 @@ async def _persist_terminal_state(
         "resultCursor": result_cursor,
         "sourceSessionId": source_session_id,
         "terminalKey": terminal_key,
+        **prompt_fields,
     }
-    if isinstance(result_text, str) and result_text.strip():
+    if report_diagnostic is not None:
+        terminal_record["reportDiagnostic"] = copy.deepcopy(report_diagnostic)
+        s.last_result["reportDiagnostic"] = copy.deepcopy(report_diagnostic)
+    # 未读 done 游标：只在此唯一终态入口（既有三重去重之后）累加 generation，
+    # 每次真实 done 终态 +1，随本次 base commit 落盘。error/cancelled 不计；
+    # report 批次在此刻仍持有 _current_report_items（下方 _ack_current_reports
+    # 才清空）且 task_seq 为 None，不计入 manager 自己的 done——子 report 到达
+    # 不再计一次。count 仅由 generation - read 物化，不是 ack 边界。
+    # 全局未读记录策略（unread_policy）在此判定：被排除的 Session 不累计，
+    # 并把可能残留的旧未读（旧数据/协调写失败）顺带对齐清零，保证
+    # 「排除 ⇒ 持久化 count=0」。判定失败按既有行为记录（绝不失败终态提交）。
+    from packages.core import unread_policy
+    try:
+        record_unread = unread_policy.should_record_unread(s)
+    except Exception:
+        _log.warning(
+            "[Worker %s] unread-recording policy evaluation failed; "
+            "recording done unread as before", w.worker_id, exc_info=True,
+        )
+        record_unread = True
+    generation = max(0, int(getattr(s, "unread_done_generation", 0) or 0))
+    read_generation = max(0, int(
+        getattr(s, "unread_done_read_generation", 0) or 0))
+    if record_unread:
+        if (status == "done" and task_seq is not None
+                and not w._current_report_items):
+            generation += 1
+            s.unread_done_generation = generation
+            s.unread_done_read_generation = min(read_generation, generation)
+            s.unread_done_count = generation - s.unread_done_read_generation
+    elif read_generation < generation:
+        # 排除状态：不累计，且把存量未读对齐清零（单调推进 read）。
+        s.unread_done_read_generation = generation
+        s.unread_done_count = 0
+    if status == "done" and isinstance(result_text, str) and result_text.strip():
         last = s.history[-1] if s.history else None
-        if not (last and last.get("role") == "assistant"
-                and last.get("content") == result_text):
-            _sess.append_history(s, {"role": "assistant", "content": result_text})
+        if last is known_history_terminal and known_history_terminal is not None:
+            anchor = known_history_terminal["terminal"].get("anchorMessageId")
+            last = next((row for row in reversed(s.history)
+                         if anchor and row.get("messageId") == anchor), None)
+        already_appended_this_turn = (
+            last and last.get("role") == "assistant" and last.get("content") == result_text
+            and last.get("messageId") in w._current_task_assistant_ids)
+        if not already_appended_this_turn:
+            entry = {"role": "assistant", "content": result_text}
+            _sess.append_history(s, entry)
+            # Keep this append associated with the turn if the base commit
+            # fails and its terminal event is retried.
+            old_runtime_state["_current_task_assistant_ids"].add(entry["messageId"])
+            terminal_anchor = entry["messageId"]
+    # The history row is the durable terminal fact; terminal_results remains
+    # the existing bounded reconnect receipt. Retry a failed base commit with
+    # the original row/anchor, rather than allocating another event.
+    history_terminal = None
+    if status in {"done", "error"}:
+        history_terminal = known_history_terminal
+        if history_terminal is None:
+            diagnostic = _error_log.terminal_report_fields((error_context or {}).get("cli_raw"))
+            fallback_text, fallback_truncated = _error_log.report_text(result_text)
+            history_terminal = {
+                "role": "terminal", "kind": "terminal", "content": "",
+                "messageId": "terminal:" + terminal_key,
+                "ts": terminal_occurred_at,
+                "terminal": {
+                    "eventId": "terminal:" + terminal_key,
+                    "terminalKey": terminal_key,
+                    "status": status,
+                    "occurredAt": terminal_occurred_at,
+                    "order": result_cursor,
+                    "anchorMessageId": terminal_anchor,
+                    "taskSeq": task_seq, "taskId": task_id,
+                    "executionSeq": w._execution_seq or None,
+                    "workerId": w.worker_id, "generation": w.generation,
+                    **({"error": {
+                        "source": diagnostic["errorSource"] or (error_context or {}).get("origin"),
+                        "code": diagnostic["errorCode"],
+                        "message": diagnostic["errorText"] or fallback_text,
+                        "truncated": diagnostic["errorTextTruncated"] if diagnostic["errorText"] else fallback_truncated,
+                    }} if status == "error" else {}),
+                },
+            }
+            _sess.append_history(s, history_terminal)
+        terminal_record["historyTerminalId"] = history_terminal["messageId"]
+        s.last_result["historyTerminalId"] = history_terminal["messageId"]
+    from packages.core import qq_reports
+    old_qq_outbox = dict(s.qq_report_outbox)
+    # Error Reports use the structured error-event ledger so Session/global
+    # paths share one claim. Successful task reports keep their existing outbox.
+    if (status == "done" and task_seq is not None
+            and not w._current_report_items):
+        body = w._current_task_last_assistant_text or result_text
+        if body:
+            qq_reports.prepare(s, terminal_key, body)
+    w._current_task_assistant_ids.clear()
 
     # The result must cover the canonical history revision after the final
     # append, not the revision that happened to exist when the replay record
@@ -1094,11 +2241,42 @@ async def _persist_terminal_state(
     await _record_legal_worker_state(w, "idle", "task/complete-idle", persist=False)
     # This is the base commit.  If it fails, the exception prevents both
     # worker.result and idle broadcasts, as required by the terminal contract.
-    await _flush_history_now(w)
+    outcome = _sess.DurableOutcome()
+    terminal_owner = _offline.owner(w)
+    offline_before = (s.legal_offline, s.offline_run)
+    rolled_back = False
+    def rollback_terminal():
+        nonlocal rolled_back
+        if rolled_back:
+            return
+        rolled_back = True
+        s.legal_offline, s.offline_run = offline_before
+        s.last_result = prior_result
+        s.terminal_results = prior_terminals
+        for key, value in old_terminal_state.items():
+            setattr(s, key, value)
+        for key, value in old_runtime_state.items():
+            setattr(w, key, value)
+        s.qq_report_outbox = old_qq_outbox
+        w.status = status
+    try:
+        await _flush_history_now(w, outcome=outcome, rollback=rollback_terminal,
+                                 offline_identity=terminal_owner)
+    except BaseException:
+        if outcome.succeeded:
+            # Cancellation still propagates, but the authoritative ticket
+            # committed. Keep its dedup/outbox fact and runtime terminal latch.
+            w.status = status
+            w._terminal_handled = True
+        else:
+            rollback_terminal()
+        raise
     w.status = status
     w._terminal_handled = True
     return {
+        "autoReportAdmission": copy.deepcopy(w._auto_report_admission or {"version": 1, "inputs": [], "enabled": False}),
         "taskSeq": task_seq,
+        "executionSeq": w._execution_seq or None,
         "taskId": task_id,
         "taskIdempotent": task_idempotent,
         "resultCursor": result_cursor,
@@ -1107,13 +2285,18 @@ async def _persist_terminal_state(
         "result": result_text,
         "status": status,
         "enrichmentKey": enrichment_key,
+        "reportDiagnostic": report_diagnostic,
+        "historyTerminalId": history_terminal["messageId"] if history_terminal else None,
         "historyEpoch": getattr(s, "history_epoch", None),
         "historyRevision": getattr(s, "history_revision", 0),
+        **prompt_fields,
     }
 
 
 async def _publish_terminal_events(w: Worker, terminal: dict, s) -> None:
     """Publish result then idle, without waiting for usage enrichment."""
+    from packages.core import qq_reports
+    qq_reports.kick(w.session_id)
     completion_notification = _notifications.dispatch_completion_nonblocking(
         s, terminal["status"], terminal["result"],
     )
@@ -1125,9 +2308,11 @@ async def _publish_terminal_events(w: Worker, terminal: dict, s) -> None:
         "status": terminal["status"],
         "result": terminal["result"],
         "taskSeq": terminal["taskSeq"],
+        "executionSeq": terminal.get("executionSeq"),
         "taskId": terminal["taskId"],
         "resultCursor": terminal["resultCursor"],
         "terminalKey": terminal["terminalKey"],
+        "historyTerminalId": terminal.get("historyTerminalId"),
         "sourceSessionId": terminal["sourceSessionId"],
         "historyEpoch": terminal.get("historyEpoch"),
         "historyRevision": terminal.get("historyRevision", 0),
@@ -1146,6 +2331,7 @@ async def _publish_terminal_events(w: Worker, terminal: dict, s) -> None:
         "generation": w.generation,
         "status": "idle",
         "taskSeq": terminal["taskSeq"],
+        "executionSeq": terminal.get("executionSeq"),
         "sourceSessionId": terminal["sourceSessionId"],
     })
 
@@ -1164,6 +2350,8 @@ def _finish_terminal_bookkeeping(w: Worker, terminal: dict) -> None:
     w._current_task_id = None
     w._current_task_idempotent = False
     w._current_source_session_id = None
+    w._auto_report_admission = None
+    w._prompt_ref = None
     w.last_activity = time.monotonic()
     _signal_task_done(w)
     _maybe_restart_pending(w)
@@ -1179,19 +2367,34 @@ def _runtime_stopped(w: Worker) -> bool:
     return True
 
 
+def begin_host_exit() -> None:
+    """Synchronous signal fence: host signals never constitute safe completion."""
+    begin_shutdown()
+    for w in workers.values():
+        w._host_exit_illegal = True
+
+
 def begin_shutdown() -> None:
     """Close the service gate before an orderly Pan exit begins."""
     global _shutdown_started
     _shutdown_started = True
     stop_global_watchdog()
+    # Writes are awaited per sample, so this only waits for an in-flight
+    # executor task; it does not introduce a background queue.
+    _error_log.flush()
+
+
+def reopen_after_failed_shutdown() -> None:
+    """Restore normal Worker admission after a lifecycle handoff fails."""
+    global _shutdown_started
+    _shutdown_started = False
+    start_global_watchdog()
 
 
 def _mcp_configured(s: _sess.Session | None) -> bool:
-    """Session 是否配置了 MCP 工具（mcp_servers 非空）。
-
-    mcp_servers 是唯一事实源：非空即启用（单一事实源收敛立项）。
-    MCP 是叠加属性：与 worker 的执行模式（output_mode）独立。
-    """
+    """Use v2 logical bindings, or legacy descriptors, independently of output mode."""
+    if s and "plugin_bindings" in s.adapter_config:
+        return any(binding.get("enabled") for binding in s.adapter_config["plugin_bindings"])
     return bool(s and s.adapter_config.get("mcp_servers"))
 
 
@@ -1240,6 +2443,16 @@ def _update_pending_interactions(w: Worker, event: dict) -> dict | None:
     there is no safe request to replay into a newly spawned process.
     """
     event_type = event.get("type")
+    if event_type == "pan.control_mode":
+        future = w._native_mode_receipts.get(event.get("requestId"))
+        if future is not None and not future.done():
+            future.set_result(dict(event))
+        elif w._native_mode_request_id is not None and event.get("requestId") == w._native_mode_request_id:
+            # Timeout/cancellation is not evidence the kernel rejected the
+            # handoff. Consume its late authoritative receipt, but never a
+            # superseded request's frame or an unsolicited ownership claim.
+            _apply_native_mode_receipt(w, event)
+        return None
     if event_type == "codex.thread_status":
         native_status = event.get("native_status")
         w.native_status = dict(native_status) if isinstance(native_status, dict) else None
@@ -1355,41 +2568,122 @@ def clear_native_runtime_state(w: Worker) -> None:
     w.native_rate_limits_updated_at = None
     w.native_plan = None
     w.native_diff = None
+    # The public Worker id/object survives restart, the kernel owner does not.
+    # Settle old callers without cancelling their HTTP tasks; they must never
+    # apply a retiring kernel's receipt to the replacement process.
+    for future in w._native_mode_receipts.values():
+        if not future.done():
+            future.set_result({"ok": False, "error": "Worker restarted"})
+    w._native_mode_receipts.clear()
+    w._native_mode_request_id = None
+    w.native_control_mode = "pan"
+    w.native_control_generation = 0
+    w.native_control_error = None
+    w.native_kernel_ready = False
+    w.native_passthrough_enabled = None
+    w._native_external_turn_active = False
+    w._native_reservation_busy = False
+    if _runtime_stopped(w):
+        w.native_input_uncertain = False
+    w.native_output.clear()
+    w.native_output_total = 0
+
+
+_STDOUT_MAX_LINE = 256 * 1024  # 单行解析上限 256KB（既有阈值，不改变）
+_OVERSIZE_MARKER = b" ... [tool result truncated]"
+
+
+class _CapturedLine(bytes):
+    """One stdout line plus an optional spill file for its overflow.
+
+    A plain ``bytes`` subclass keeps the existing iteration contract and tests
+    working.  ``spill`` is a temporary file containing everything after the
+    first ``_STDOUT_MAX_LINE`` bytes; it is closed by the generator when the
+    consumer advances or the generator is closed.
+    """
+
+    def __new__(cls, value, spill=None):
+        obj = super().__new__(cls, value)
+        obj.spill = spill
+        return obj
 
 
 async def _iter_stdout_lines(w: Worker):
-    """分块读取 worker stdout，按换行切分产出完整行。
+    """分块读取 worker stdout，按换行切分产出行对象。
 
     替代 ``readline()``：Windows asyncio 管道上，超大单行（如 Read 大文件的
     tool result，几百 KB ~ MB）会让 readline 永久挂起（Pan 卡死根因）。分块
-    read(65536) + 自切行不依赖单次读完一行；超过 _STDOUT_MAX_LINE 的行截断为
-    占位，避免大行占满 history 上下文。
+    read(65536) + 自切行不依赖单次读完一行。
+
+    解析阈值仍是 256KB。超过阈值的行只保留前 256KB 供原解析路径使用；溢出
+    字节写入临时文件（``_CapturedLine.spill``），供错误保真路径在识别为错误
+    后完整读取。这样不会把整行堆在内存里，也不改变既有历史截断阈值。
     """
-    _STDOUT_MAX_LINE = 256 * 1024  # 单行上限 256KB，超出截断
-    buf = b""
-    while True:
-        try:
-            chunk = await asyncio.wait_for(
-                w.process.stdout.read(65536), timeout=_STDOUT_READ_TIMEOUT_SEC)
-        except asyncio.TimeoutError:
-            # cbc 静默（长思考 / idle 等待新任务）是正常状态，不代表不活跃；
-            # last_activity 只由真实输出路径（_read_stdout 有效事件）与任务
-            # 入队刷新。此处若刷新会让 watchdog 的 idle/queued 判定永不触发。
-            _log.debug(
-                "[Worker %s] stdout 静默 %.0fs（read timeout），继续等待",
-                w.worker_id, _STDOUT_READ_TIMEOUT_SEC,
-            )
-            continue
-        if not chunk:
-            break  # EOF
-        buf += chunk
-        while b"\n" in buf:
-            line, buf = buf.split(b"\n", 1)
-            if len(line) > _STDOUT_MAX_LINE:
-                line = line[:_STDOUT_MAX_LINE] + b" ... [tool result truncated]"
-            yield line
-    if buf:
-        yield buf  # 最后一行无换行（EOF 残留）
+    current = bytearray()
+    spill = None
+    last_spill = None
+    try:
+        while True:
+            try:
+                chunk = await asyncio.wait_for(
+                    w.process.stdout.read(65536), timeout=_STDOUT_READ_TIMEOUT_SEC)
+            except asyncio.TimeoutError:
+                # cbc 静默（长思考 / idle 等待新任务）是正常状态，不代表不活跃；
+                # last_activity 只由真实输出路径（_read_stdout 有效事件）与任务
+                # 入队刷新。此处若刷新会让 watchdog 的 idle/queued 判定永不触发。
+                _log.debug(
+                    "[Worker %s] stdout 静默 %.0fs（read timeout），继续等待",
+                    w.worker_id, _STDOUT_READ_TIMEOUT_SEC,
+                )
+                continue
+            if not chunk:
+                break  # EOF
+            start = 0
+            while True:
+                newline = chunk.find(b"\n", start)
+                segment = chunk[start:] if newline < 0 else chunk[start:newline]
+                if segment:
+                    room = max(0, _STDOUT_MAX_LINE - len(current))
+                    if spill is None and len(segment) <= room:
+                        current.extend(segment)
+                    else:
+                        if room:
+                            current.extend(segment[:room])
+                            segment = segment[room:]
+                        if segment:
+                            if spill is None:
+                                spill = tempfile.TemporaryFile()
+                            spill.write(segment)
+                if newline < 0:
+                    break
+                if last_spill is not None:
+                    last_spill.close()
+                    last_spill = None
+                if spill is not None:
+                    spill.seek(0)
+                    line = _CapturedLine(bytes(current) + _OVERSIZE_MARKER, spill)
+                    last_spill = spill
+                    spill = None
+                else:
+                    line = _CapturedLine(bytes(current), None)
+                current.clear()
+                yield line
+                start = newline + 1
+        if last_spill is not None:
+            last_spill.close()
+            last_spill = None
+        if spill is not None:
+            spill.seek(0)
+            yield _CapturedLine(bytes(current) + _OVERSIZE_MARKER, spill)
+            last_spill = spill
+            spill = None
+        elif current:
+            yield _CapturedLine(bytes(current), None)  # 最后一行无换行（EOF 残留）
+    finally:
+        if last_spill is not None:
+            last_spill.close()
+        if spill is not None:
+            spill.close()
 
 
 def _signal_task_done(w: Worker) -> None:
@@ -1398,6 +2692,7 @@ def _signal_task_done(w: Worker) -> None:
     与 _consumer_stream 的 ev.wait() 配对：result 处理完成（或进程 EOF）时调用，
     让 consumer 知道当前任务已结束、可以推进下一个排队任务。
     """
+    w._terminal_finishing = False
     ev = getattr(w, "_task_done", None)
     if ev is not None:
         ev.set()
@@ -1449,19 +2744,29 @@ def _ack_current_reports(w: Worker, s) -> None:
     w._current_report_items = []
 
 
-async def _finish_task_error(w: Worker, s, result: str) -> None:
+async def _finish_task_error(w: Worker, s, result: str, *,
+                             error_context: dict | None = None) -> None:
     """把执行前失败也收敛成可见的 terminal result。"""
     if s is None:
         raise RuntimeError(
             f"Session {w.session_id} disappeared before terminal persistence"
         )
-    terminal = await _persist_terminal_state(w, s, "error", result)
+    terminal = await _persist_terminal_state(
+        w, s, "error", result,
+        error_context={
+            "origin": "worker.preflight",
+            "previous_captured": True,
+            "previous_message": _sess.history_tail_snapshot(s),
+            **(error_context or {}),
+        },
+    )
     if terminal is None:
         return
     await _publish_terminal_events(w, terminal, s)
     await _enqueue_report(
         w.session_id, terminal["status"], terminal["result"],
         terminal["taskId"], w.worker_id,
+        diagnostic=terminal.get("reportDiagnostic"),
     )
     _finish_terminal_bookkeeping(w, terminal)
 
@@ -1537,13 +2842,47 @@ async def _flush_history_loop(w: Worker) -> None:
         w._hist_save_task = None
 
 
-async def _flush_history_now(w: Worker) -> None:
+async def _flush_history_now(
+    w: Worker, *, outcome: _sess.DurableOutcome | None = None, rollback=None,
+    offline_identity: dict | None = None,
+) -> None:
     """立即落盘（result 处理 / worker 退出 / kill / 重启前调用），保证缓冲块不丢。
 
     单写者协作：若防抖任务在跑，置 force + 唤醒并 shield 等待其落完（由该任务完成
     落盘），避免与它并发写同一文件；无防抖任务则直接落盘。调用方被取消时 shield
     保护防抖任务继续落盘，取消仍向上传播（不吞 CancelledError）。
     """
+    if outcome is not None:
+        # Terminal commits need their own observable result. The existing
+        # per-Session ticket gate orders this write with debounce writes, so
+        # cancellation cannot mistake an unfinished shielded task for failure.
+        s = _session(w)
+        if s is None:
+            raise RuntimeError("Session disappeared before terminal persistence")
+        w._hist_dirty = False
+        w._hist_block_count = 0
+        w._hist_force_flush = False
+        def commit():
+            try:
+                offline_values = None
+                if offline_identity is not None:
+                    if (w.offline_token != offline_identity["token"]
+                            or w.generation != offline_identity["generation"]):
+                        raise RuntimeError("Stale terminal owner at durable commit")
+                    candidate = copy.copy(s)
+                    for key, value in _offline.snapshot(s).items():
+                        setattr(candidate, key, value)
+                    _offline.attach_foreground(candidate)
+                    if not w._host_exit_illegal:
+                        _offline.finish(candidate, offline_identity, reason="task/safe-terminal")
+                    offline_values = _offline.snapshot(candidate)
+                _sess._save_body(s, offline_override=offline_values)
+            except BaseException:
+                if rollback is not None:
+                    rollback()
+                raise
+        await _sess._persist_async_outcome(s.id, commit, outcome)
+        return
     if w._hist_flush_event is None:
         w._hist_flush_event = asyncio.Event()
     w._hist_force_flush = True
@@ -1564,23 +2903,446 @@ async def _flush_history_now(w: Worker) -> None:
     await _sess.save_async(s)
 
 
+async def _admit_native_operation(w, runtime, *, request_id, thread_id, control_generation, operation, context=None):
+    identity = _offline.owner(w)
+    async with queue_lock(w.session_id):
+        s = _session(w)
+        def valid():
+            return (not _shutdown_started and not w._host_exit_illegal and s is not None and _control_runtime_matches(w.worker_id, runtime)
+                    and w.offline_token == identity["token"] and w.native_control_mode == "native"
+                    and w.native_control_generation == control_generation
+                    and thread_id == s.cli_session_id and w.status not in {"held", "restarting"})
+        if not valid():
+            raise RuntimeError("Auxiliary native owner retired before admission")
+        def commit(candidate):
+            if not valid():
+                raise RuntimeError("Auxiliary native owner changed before persistence")
+            existing = candidate.execution_operations.get(request_id)
+            if existing and (existing.get("safeTerminal") or existing.get("retirement")
+                    or existing.get("state") == "illegal"):
+                raise RuntimeError("Auxiliary admission already retired")
+            record = _offline.admit(candidate, identity, kind=operation, operation_id=request_id,
+                           nativeAdmissionId=request_id, nativeThreadId=thread_id,
+                           nativeControlGeneration=control_generation, connection=copy.deepcopy(context or {}))
+            if existing is None and operation in {"opaque", "compact/active"}:
+                record.update(state="uncertain", uncertainty="execution-resource-proof-unavailable")
+        await _commit_offline(s, commit)
+        record = s.execution_operations[request_id]
+        if record.get("safeTerminal") or record.get("retirement") or record.get("state") == "illegal":
+            raise RuntimeError("Auxiliary admission already retired")
+        if not valid():
+            raise RuntimeError("Auxiliary runtime retired during persistence")
+        return {"requestId": request_id, "runId": request_id}
+
+
+async def _native_operation_event(w, runtime, event) -> bool:
+    if w._host_exit_illegal:
+        return False
+    async with queue_lock(w.session_id):
+        s = _session(w)
+        if s is None or not _control_runtime_matches(w.worker_id, runtime):
+            return False
+        key = event.get("runId") or event.get("requestId")
+        record = s.execution_operations.get(key)
+        identity = _offline.owner(w)
+        if (not record or record.get("kind") == "foreground"
+                or record.get("nativeAdmissionId") != event.get("requestId")
+                or not _offline.same_owner(record, identity)
+                or record.get("state") == "illegal" or record.get("safeTerminal")
+                or record.get("retirement")):
+            return False
+        def commit(candidate):
+            if w._host_exit_illegal or not _control_runtime_matches(w.worker_id, runtime):
+                raise RuntimeError("Auxiliary runtime changed before persistence")
+            op = candidate.execution_operations[key]
+            action = event.get("type")
+            if action == "pan.native_operation_bind":
+                binding = event.get("binding") or {}
+                if op.get("binding") and op["binding"] != binding:
+                    op.update(state="uncertain", uncertainty="conflicting-resource-binding")
+                else:
+                    op["binding"] = copy.deepcopy(binding)
+            elif action == "pan.native_operation_terminal":
+                proof = event.get("proof")
+                binding = event.get("binding") or {}
+                allowed = ((op["kind"] == "command/exec" and proof == "command-deferred-final")
+                    or (op["kind"] == "review/detached" and proof == "review-turn-completed"
+                        and bool(op.get("binding")) and op["binding"] == binding))
+                if allowed and not op.get("uncertainty"):
+                    _offline.finish_operation(candidate, key, identity, reason=proof, proof=proof)
+            elif action == "pan.native_turn_not_forwarded":
+                if not op.get("binding"):
+                    _offline.finish_operation(candidate, key, identity, reason="native/not-forwarded",
+                                              proof="provider-rejected" if event.get("providerRejected") else "not-forwarded")
+            elif action == "pan.native_operation_uncertain":
+                op.update(state="uncertain", uncertainty=event.get("reason") or "unconfirmed-native-operation")
+            candidate.operation_revision += 1
+        changed = await _commit_offline(s, commit)
+    if changed:
+        await _offline_snapshot_event(s)
+    return changed
+
+
+@_plugin_native_admission
+async def _admit_native_turn(w: Worker, runtime, *, request_id: str | None = None,
+                             thread_id: str | None = None,
+                             control_generation: int | None = None,
+                             operation: str = "turn/start", context: dict | None = None) -> dict:
+    if not isinstance(request_id, str) or not request_id:
+        raise RuntimeError("Invalid native admission identity")
+    codex = w.adapter.name == "codex"
+    if codex and operation in {"command/exec", "review/detached", "compact/active", "opaque"}:
+        return await _admit_native_operation(w, runtime, request_id=request_id, thread_id=thread_id,
+            control_generation=control_generation, operation=operation, context=context)
+    if codex and operation not in {"turn/start", "thread/compact/start", "observed-turn"}:
+        raise RuntimeError("Unsupported admission operation")
+    identity = _offline.owner(w)
+    report_context = await _auto_report.context()
+    async with queue_lock(w.session_id):
+        s = _session(w)
+        def valid():
+            if _shutdown_started or w._host_exit_illegal or not _control_runtime_matches(w.worker_id, runtime):
+                return False
+            if codex:
+                return (s is not None and thread_id == s.cli_session_id
+                        and (w.native_control_mode == "native" or (operation == "observed-turn"
+                             and w.native_control_mode == "pan"))
+                        and type(control_generation) is int
+                        and control_generation == w.native_control_generation)
+            return True
+        if s is None or not valid():
+            raise RuntimeError("Native runtime changed or retired before admission")
+        current = s.offline_run or {}
+        if request_id in w._native_admission_ids:
+            if (current.get("nativeAdmissionId") == request_id and current.get("state") == "running"
+                    and _offline.same_owner(current, identity)):
+                return {"requestId": request_id, "runId": current["id"]}
+            raise RuntimeError("Native admission has already retired")
+        if (w._queue_unit_active or w._native_external_turn_active
+                or w.status in {"held", "restarting"}):
+            raise RuntimeError("Native execution conflicts with current owner")
+        next_execution = w._execution_seq + 1
+        admitted = {**identity, "executionSeq": next_execution}
+        native_admission = _auto_report.admission([{"source": "native-tui"}], *report_context)
+        def commit(candidate):
+            if not valid() or w.offline_token != identity["token"]:
+                raise RuntimeError("Native owner changed before durable admission")
+            candidate.task_seq += 1
+            _offline.begin(candidate, admitted)
+            candidate.offline_run.update(autoReportAdmission=copy.deepcopy(native_admission), nativeAdmissionId=request_id,
+                nativeThreadId=thread_id, nativeControlGeneration=control_generation, nativeOperation=operation,
+                nativeAdmissionTiming="after-start" if operation == "observed-turn" else "before-forward")
+        await _commit_offline(s, commit)
+        if not valid():
+            raise RuntimeError("Native runtime retired during admission")
+        # Only publish execution identity after the ordered writer committed it.
+        w._current_seq = s.task_seq
+        w._execution_seq = next_execution
+        w._execution_history_start = len(s.history)
+        w._auto_report_admission = native_admission
+        w._current_task_id = None
+        w._current_task_idempotent = False
+        w._current_source_session_id = None
+        w._terminal_handled = False
+        w._task_started_at = time.monotonic()
+        w._current_queue_item = None
+        w._current_report_items.clear()
+        # Native TUI input has no canonical Pan input message identity, so the
+        # report must carry null instead of guessing one.
+        w._prompt_ref = None
+        w._current_serialized = None
+        w._claimed_queue_index = None
+        w._current_task_assistant_ids.clear()
+        w._current_task_last_assistant_text = ""
+        w._current_task_last_assistant_seq = None
+        w._native_external_turn_active = True
+        w._native_reservation_busy = False
+        w._native_admission_id = request_id
+        w._native_admission_ids.add(request_id)
+        w.status = "running"
+        await _record_legal_worker_state(w, "running", "native/turn-admitted")
+        return {"requestId": request_id, "runId": s.offline_run["id"]}
+
+
+async def _retire_native_admission(w, runtime, event) -> bool:
+    s = _session(w)
+    op = s.execution_operations.get(event.get("runId") or event.get("requestId")) if s else None
+    if op and op.get("kind") != "foreground":
+        return await _native_operation_event(w, runtime, event)
+    async with queue_lock(w.session_id):
+        s = _session(w)
+        run = (s.offline_run or {}) if s else {}
+        if (s is None or not _control_runtime_matches(w.worker_id, runtime)
+                or not event.get("requestId") or run.get("nativeAdmissionId") != event["requestId"]
+                or run.get("state") != "running" or s.legal_offline is not False
+                or not _offline.same_owner(run, _offline.owner(w))
+                or (event.get("runId") is not None and event["runId"] != run.get("id"))
+                or run.get("nativeTurnId")):
+            return False
+        identity = _offline.owner(w)
+        def finish(candidate):
+            if (not _control_runtime_matches(w.worker_id, runtime)
+                    or candidate.offline_run.get("nativeAdmissionId") != event["requestId"]):
+                raise RuntimeError("Native owner changed before cancellation")
+            if not _offline.finish(candidate, identity, reason="native/not-forwarded"):
+                raise RuntimeError("Native execution changed before cancellation")
+        await _commit_offline(s, finish)
+        w._native_external_turn_active = False
+        w._native_reservation_busy = False
+        w._native_admission_id = None
+        w._terminal_handled = True
+        w.status = "idle"
+        await _record_legal_worker_state(w, "idle", "native/not-forwarded")
+        return True
+
+
 async def _read_stdout(w: Worker):
     adapter = w.adapter
+    receipt_runtime = (w, w.generation, w.process, getattr(w.process, "stdin", None))
+    execution_owner = _offline.owner(w)
     s = None  # bound even if stdout yields no parseable event (EOF check below)
     # 分块读取 stdout（read 65536 + 按换行切分），避免大 tool result 单行在
     # Windows asyncio 管道上挂起（Pan 卡死根因）；大行截断占位（_iter_stdout_lines）。
     line_count = 0
     async for line in _iter_stdout_lines(w):
+        if not _control_runtime_matches(w.worker_id, receipt_runtime):
+            return
         line_count += 1
-        line_str = line.decode("utf-8", errors="replace").rstrip("\n")
+        line_bytes = bytes(line)
+        line_str = line_bytes.decode("utf-8", errors="replace").rstrip("\n")
         if not line_str:
             continue
         event = adapter.parse_event(line_str)
         if event is None:
+            spill = getattr(line, "spill", None)
+            if spill is not None:
+                # The parser cap hid the tail.  Recognition is order-
+                # independent and top-level-only; only an error-shaped
+                # envelope is read back in full.
+                try:
+                    status, event = await _classify_oversized_line(
+                        adapter, line_bytes, spill)
+                except (OSError, ValueError) as exc:
+                    _log.warning(
+                        "[Worker %s] oversized line classification failed: %s",
+                        w.worker_id, exc,
+                    )
+                    status, event = "drop", None
+                if status == "raw":
+                    try:
+                        await asyncio.to_thread(
+                            _capture_raw_oversized, w,
+                            line_bytes[:_STDOUT_MAX_LINE], spill)
+                    except OSError as exc:
+                        _log.warning(
+                            "[Worker %s] raw diagnostic capture failed: %s",
+                            w.worker_id, exc,
+                        )
+                    continue
+                if event is None:
+                    continue
+            else:
+                # Unrecognized text is retained as raw diagnostic context for a
+                # later terminal/crash sample; it is never classified as error.
+                if not _looks_like_structured_text(line_str):
+                    _capture_raw_line(w, line_bytes)
+                continue
+        if _route_steer_receipt(w, event, runtime=receipt_runtime):
+            continue
+        if (getattr(adapter, "steer_requires_run_id", False) and not w._terminal_handled
+                and w.status == "running" and _control_runtime_matches(w.worker_id, receipt_runtime)):
+            sid = (_session(w).cli_session_id if _session(w) is not None else None)
+            run = event.get("_requestId")
+            if (sid and event.get("session_id") == sid and isinstance(run, str) and run
+                    and w._steer_run_id is None):
+                w._steer_run_id = run
+        if w.status == "restarting":
+            # Retirement is published only after the turn's result/report and
+            # queue cleanup. Buffered old frames must not reopen that boundary.
             continue
 
         # 活性探测：任何有效输出都刷新 last_activity（watchdog 据此判定卡死）
         w.last_activity = time.monotonic()
+        if event.get("type") in {"pan.control_mode", "pan.native_write"}:
+            if event.get("type") == "pan.native_write":
+                receipt = w._native_mode_receipts.get(event.get("requestId"))
+                if receipt is not None and not receipt.done():
+                    receipt.set_result(event)
+                continue
+            _update_pending_interactions(w, event)
+            continue
+        if event.get("type") == "pan.native_output":
+            import base64
+            try:
+                chunk = base64.b64decode(event.get("data", ""), validate=True)
+            except (ValueError, TypeError):
+                continue
+            if len(chunk) > 65536:
+                continue
+            w.native_output.extend(chunk)
+            w.native_output_total += len(chunk)
+            if len(w.native_output) > 4 * 1024 * 1024:
+                del w.native_output[:len(w.native_output) - 4 * 1024 * 1024]
+            continue
+        if (event.get("type") == "pan.native_input_state"
+                and w.native_control_enabled):
+            w.native_input_uncertain = event.get("uncertain") is not False
+            continue
+        if (event.get("type") == "pan.native_ready"
+                and w.native_control_enabled):
+            # PTY bridges (cbc, kimi) announce transport readiness; the codex
+            # app-server bridge reports readiness through its own init event.
+            w.native_kernel_ready = True
+            continue
+        if (event.get("type") in {"pan.native_operation_bind", "pan.native_operation_terminal",
+                                  "pan.native_operation_uncertain"} and adapter.name == "codex"):
+            await _native_operation_event(w, receipt_runtime, event)
+            continue
+        if event.get("type") == "pan.native_error":
+            # Keep the existing generic Worker field unchanged; the sample log
+            # retains the raw code/detail that field intentionally flattens.
+            await _record_transient_error_sample(w, event, "native_operation_error")
+            w.native_control_error = "Native terminal operation failed"
+            continue
+        if event.get("type") == "pan.native_settings_uncertain":
+            await _record_native_settings_state(w, uncertain=True)
+            continue
+        if event.get("type") == "pan.native_turn_admission" and adapter.name in {"cbc", "codex"}:
+            request_id = event.get("requestId")
+            receipt = {}
+            ok = False
+            try:
+                receipt = await _admit_native_turn(w, receipt_runtime, request_id=request_id,
+                    thread_id=event.get("threadId"), control_generation=event.get("controlGeneration"),
+                    operation=event.get("operation", "turn/start"), context=event.get("connection"))
+                ok = True
+            except Exception:
+                _log.exception("Native admission rejected for Session %s", w.session_id)
+            # A response belongs to this captured pipe only; never the successor.
+            if _control_runtime_matches(w.worker_id, receipt_runtime):
+                receipt_runtime[3].write((json.dumps({"type": "native_admission",
+                    "requestId": request_id, "ok": ok, **receipt}) + "\n").encode())
+                await receipt_runtime[3].drain()
+            continue
+        if event.get("type") == "pan.native_turn_not_forwarded" and adapter.name == "codex":
+            await _retire_native_admission(w, receipt_runtime, event)
+            continue
+        if event.get("type") == "pan.native_turn_started":
+            if adapter.name == "codex":
+                if event.get("observedAfterStart") is True:
+                    await _admit_native_turn(w, receipt_runtime, request_id=event.get("requestId"),
+                        thread_id=event.get("threadId"), control_generation=event.get("controlGeneration"),
+                        operation="observed-turn")
+                async with queue_lock(w.session_id):
+                    s = _session(w)
+                    def bind(candidate):
+                        run = candidate.offline_run or {}
+                        if (not _control_runtime_matches(w.worker_id, receipt_runtime)
+                                or not _offline.same_owner(run, _offline.owner(w))
+                                or run.get("nativeAdmissionId") != event.get("requestId")
+                                or (run.get("id") != event.get("runId") and not (
+                                    event.get("observedAfterStart") is True
+                                    and run.get("nativeAdmissionTiming") == "after-start"))
+                                or run.get("state") != "running"
+                                or not event.get("turn_id")):
+                            raise RuntimeError("Native started without matching durable admission")
+                        previous = run.get("nativeTurnId")
+                        if previous is not None and previous != event["turn_id"]:
+                            raise RuntimeError("Conflicting native turn identity")
+                        run["nativeTurnId"] = event["turn_id"]
+                    if s is not None:
+                        await _commit_offline(s, bind)
+            continue
+        if event.get("type") == "pan.native_busy":
+            w._native_reservation_busy = event.get("busy") is True
+            if not w._native_reservation_busy and not w._native_external_turn_active:
+                _maybe_restart_pending(w)
+                if w.native_control_mode == "pan" and w.pending_signal is not None:
+                    w.pending_signal.put_nowait({"type": "queue_signal"})
+            continue
+        if event.get("type") == "pan.native_user":
+            s = _session(w)
+            text = event.get("text")
+            # cbc/codex admit native turns durably before they run; bridges
+            # without an admission channel (kimi) are observed from the
+            # provider journal instead, so they are recorded while the user
+            # owns the terminal. Identity (nativeItemId + turnId) still gates
+            # replay duplicates below.
+            observed_native = (w.native_control_mode == "native"
+                               and not getattr(adapter, "supports_native_admission", False))
+            if s is not None and (w._native_external_turn_active or observed_native) and isinstance(text, str) and (text or event.get("nativeContent")):
+                run = s.offline_run or {}
+                if adapter.name == "codex" and (
+                        not event.get("requestId") or run.get("nativeAdmissionId") != event["requestId"]
+                        or (run.get("id") != event.get("runId") and not (
+                            event.get("runId") is None and run.get("nativeAdmissionTiming") == "after-start"))
+                        or not _offline.same_owner(run, _offline.owner(w))
+                        or event.get("thread_id") != s.cli_session_id
+                        or event.get("turn_id") != run.get("nativeTurnId")):
+                    continue
+                row = {"role": "user", "content": text, "source": "native-tui"}
+                if not text:
+                    row["messageId"] = _sess._new_pan_message_id()
+                for incoming, durable in (("item_id", "nativeItemId"), ("turn_id", "turnId"),
+                                           ("nativeContent", "nativeContent")):
+                    if event.get(incoming) is not None:
+                        row[durable] = event[incoming]
+                # Replay identity is scoped to this native turn, never body.
+                if row.get("nativeItemId") and row.get("turnId") and any(
+                        old.get("role") == "user" and old.get("source") == "native-tui"
+                        and old.get("nativeItemId") == row["nativeItemId"]
+                        and old.get("turnId") == row["turnId"] for old in s.history):
+                    continue
+                _sess.append_history(s, row)
+                await _sess.save_async(s)
+                await _bcast({"type": "session.updated", "sessionId": w.session_id})
+            continue
+        if event.get("type") == "pan.steer_receipt":
+            receipt = w._steer_receipts.get(event.get("requestId"))
+            if receipt is not None and not receipt.done():
+                receipt.set_result(event)
+            continue
+        if adapter.name == "codex" and event.get("external_turn") is True:
+            s = _session(w)
+            run = (s.offline_run or {}) if s else {}
+            if (not event.get("requestId") or run.get("nativeAdmissionId") != event.get("requestId")
+                    or (run.get("id") != event.get("runId") and not (
+                        event.get("runId") is None and run.get("nativeAdmissionTiming") == "after-start"))
+                    or not _offline.same_owner(run, _offline.owner(w))
+                    or (event.get("turn_id") is not None and run.get("nativeTurnId") != event["turn_id"])):
+                _log.warning("Discarded unowned native external result for %s", w.session_id)
+                continue
+        if w._terminal_handled and not adapter.is_result_event(event):
+            # `worker.result` closes this serialized provider turn. A provider
+            # frame buffered behind its terminal result must not be appended
+            # after the DONE marker or relabelled with the next queue item's
+            # taskSeq. `_consumer_stream` clears this latch immediately before
+            # writing the next prompt to the provider.
+            _log.warning(
+                "[Worker %s] post-terminal provider event ignored generation=%s",
+                w.worker_id, w.generation,
+            )
+            continue
+        event_type = event.get("type")
+        if event_type == "codex.turn_error":
+            # Transient in-turn notice. Existing stream broadcast is preserved;
+            # the sample consumes nothing from it.
+            await _record_transient_error_sample(w, event, "transient_provider_error")
+        elif event_type == "codex.transient_error_recovered":
+            await _record_transient_error_sample(
+                w, event, "transient_provider_error", recovered=True)
+            continue
+        elif event_type == "codex.item_error":
+            item_type = str(event.get("item_type") or "")
+            await _record_transient_error_sample(
+                w, event,
+                "tool_failure" if item_type in _TOOL_ITEM_TYPES else "transient_provider_error",
+            )
+            continue
+        elif event_type == "error":
+            # A bare provider error event is not a terminal result. Keep it
+            # observable without promoting it to a task failure.
+            await _record_transient_error_sample(w, event, "transient_provider_error")
         # Keep only native interactive prompts in the worker-local replay
         # cache.  The cache is consumed by the dashboard after a WS reconnect;
         # normal stream events remain live-only to avoid retaining history.
@@ -1598,9 +3360,13 @@ async def _read_stdout(w: Worker):
                 _log.exception("failed to persist Codex quota snapshot")
 
         # 提取 session_id + model 并写入 Session
-        # 注意：stream 模式（--input-format stream-json）启动时无 init 事件，
-        # spawn 即就绪，所以这里只提取元数据，不做状态转换（worker 初始即 idle）。
+        # An init is adapter readiness proof. Constructed Idle/spawn alone is not.
         if adapter.is_init_event(event):
+            await _activate_offline_worker(w, ready_proof=True, expected_owner=execution_owner)
+            first_ready = not w.native_kernel_ready
+            w.native_kernel_ready = True
+            if first_ready and adapter.name == "codex":
+                await _record_native_settings_state(w, uncertain=False)
             s = _session(w)
             if s:
                 sid = adapter.extract_session_id(event)
@@ -1616,12 +3382,37 @@ async def _read_stdout(w: Worker):
             s = _session(w)
             if s:
                 for b in adapter.extract_assistant_blocks(event):
+                    if event.get("turn_id") is not None:
+                        b.setdefault("turnId", event["turn_id"])
+                    if event.get("block_id") is not None:
+                        b.setdefault("blockId", event["block_id"])
+                    if w._native_external_turn_active:
+                        b.setdefault("source", "native-tui")
                     _sess.append_history(s, b)
+                    if (b.get("role") == "assistant"
+                            and _sess.is_pan_message_id(b.get("messageId"))):
+                        w._current_task_assistant_ids.add(b["messageId"])
+                        if isinstance(b.get("content"), str) and b["content"].strip():
+                            w._current_task_last_assistant_text = b["content"]
+                            w._current_task_last_assistant_seq = w._current_seq
                 # A1 防抖：append 只标记 dirty，由防抖任务批量落盘（不逐块全量 save）
                 _mark_history_dirty(w)
 
         # 任务完成 → 保存 Session + last_result
         if adapter.is_result_event(event):
+            is_error = adapter.is_result_error(event)
+            is_cancelled = bool(event.get("cancelled") or event.get("is_cancelled"))
+            # Snapshot the preceding message before the activation await can
+            # let a concurrent append run.  Only a failure/cancel needs it.
+            previous_snapshot = None
+            previous_captured = False
+            if (is_error or is_cancelled) and not w._replaying:
+                try:
+                    previous_snapshot = _sess.history_tail_snapshot(_session(w))
+                except Exception:
+                    previous_snapshot = None
+                previous_captured = True
+            await _activate_offline_worker(w, ready_proof=True, expected_owner=execution_owner)
             if w._terminal_handled:
                 _log.warning(
                     "[Worker %s] duplicate result event ignored generation=%s",
@@ -1630,13 +3421,12 @@ async def _read_stdout(w: Worker):
                 w.status = "idle"
                 continue
             s = _session(w)
-            is_error = adapter.is_result_error(event)
-            is_cancelled = bool(event.get("cancelled") or event.get("is_cancelled"))
             w.status = "cancelled" if is_cancelled else ("error" if is_error else "done")
 
             # replay 结束：标记完成，不保存（history 无变化）
             if w._replaying:
                 w._replaying = False
+                w._terminal_handled = True
                 w.status = "idle"
                 await _record_legal_worker_state(w, "idle", "task/replay-complete")
                 _signal_task_done(w)
@@ -1648,7 +3438,15 @@ async def _read_stdout(w: Worker):
             # 上，跨 worker respawn 保持单调递增。
             task_seq = w._current_seq
             result_text = adapter.extract_result_text(event)
-            terminal = await _persist_terminal_state(w, s, w.status, result_text)
+            terminal = await _persist_terminal_state(
+                w, s, w.status, result_text, expected_owner=execution_owner,
+                error_context={
+                    "origin": "worker.stream.result",
+                    "cli_raw": event,
+                    "previous_message": previous_snapshot,
+                    "previous_captured": previous_captured,
+                },
+            )
             if terminal is None:
                 continue
             # Base state is durable before this point.  Usage enrichment is only
@@ -1658,9 +3456,19 @@ async def _read_stdout(w: Worker):
             # paired with this turn's queue item, never with a global/previous
             # task id.
             # 订阅制报告：完成 → 若被订阅则 append 到 manager 的落盘队列（立项 4.3）
+            # error 报告从本 run 的已知捕获附最后一条有用消息（result 空时
+            # 保住 429 原因/重置时间，result 已有错误时保留上下文）。
             await _enqueue_report(w.session_id, terminal["status"], terminal["result"],
-                                  terminal["taskId"], w.worker_id)
+                                  terminal["taskId"], w.worker_id,
+                                  admission=terminal.get("autoReportAdmission"),
+                                  diagnostic=terminal.get("reportDiagnostic"),
+                                  prompt=terminal)
+            was_native = w._native_external_turn_active
+            w._native_external_turn_active = False
+            w._native_reservation_busy = False
             _finish_terminal_bookkeeping(w, terminal)
+            if was_native and w.native_control_mode == "pan" and w.pending_signal is not None:
+                w.pending_signal.put_nowait({"type": "queue_signal"})
             continue
 
         # replay 期间不广播 stream 事件
@@ -1671,6 +3479,7 @@ async def _read_stdout(w: Worker):
                 "sessionId": w.session_id,
                 "generation": w.generation,
                 "taskSeq": w._current_seq,
+                "executionSeq": w._execution_seq or None,
                 "taskId": w._current_task_id,
                 "event": event,
             })
@@ -1679,13 +3488,23 @@ async def _read_stdout(w: Worker):
     # A serialized restart marks the object before its first await.  Its old
     # stdout task may still observe EOF in that tiny window; the restart owns
     # the transition and will clean up the process itself.
-    if w.status == "restarting" or workers.get(w.worker_id) is not w:
+    if (w.status == "restarting" or not _control_runtime_matches(w.worker_id, receipt_runtime)):
         _cleanup_system_prompt_file(w.system_prompt_file)
         w.system_prompt_file = None
         return
     _cleanup_system_prompt_file(w.system_prompt_file)
     w.system_prompt_file = None
-    code = w.process.returncode if w.process else "unknown"
+    process = w.process
+    if process is not None and getattr(process, "returncode", None) is None:
+        # Observed EOF can precede asyncio's returncode update on Windows.
+        # Wait briefly so crash diagnostics carry the actual exit code.
+        wait = getattr(process, "wait", None)
+        if callable(wait):
+            try:
+                await asyncio.wait_for(wait(), timeout=1.0)
+            except (asyncio.TimeoutError, ProcessLookupError, OSError):
+                pass
+    code = process.returncode if process is not None else "unknown"
     _log.info("[Worker %s] %s 进程退出，返回码 %s", w.worker_id, adapter.name, code)
     _cancel_claude_permission_requests(w.worker_id, "Claude worker exited")
 
@@ -1693,6 +3512,20 @@ async def _read_stdout(w: Worker):
     # manager 推送 zombie 报告。正常完成后的退出（status 已回 idle）由
     # _enqueue_zombie_report 内部判定跳过——done/error 报告完成时已推送。
     abnormal = w.status in {"running", "queued"}
+    await _detect_offline_exit(w, execution_owner, "process/EOF")
+    # EOF is loss of control, not proof every native descendant has exited.
+    # Retire the tracked runtime before permitting a successor writer.
+    if not _runtime_stopped(w):
+        await _kill_process_tree(w)
+        if not _runtime_stopped(w):
+            w.status = "error"
+            await _record_worker_crash(
+                w, _session(w), code,
+                f"{adapter.name} process exited but its runtime did not stop "
+                f"(returncode={code})",
+                origin="worker.eof_unreaped",
+            )
+            return
     await _enqueue_zombie_report(w, f"process exited (returncode={code})")
 
     # 如果已经通过 result event 收到正常输出（last_result 有内容且非 error），
@@ -1702,6 +3535,11 @@ async def _read_stdout(w: Worker):
         w.status = "idle"
     else:
         w.status = "error"
+        await _record_worker_crash(
+            w, _session(w), code,
+            f"{adapter.name} process exited unexpectedly (returncode={code})",
+            origin="worker.eof",
+        )
         await _bcast({
             "type": "worker.crashed",
             "workerId": w.worker_id,
@@ -1728,6 +3566,7 @@ async def _read_stdout(w: Worker):
         await _flush_history_now(w)
     # 从 workers dict 移除尸体——否则 find_worker_by_session 会返回这个死 worker，
     # 后续 send_task 才报 'process dead'，晚了一步
+    _cancel_pending_restart(w)
     workers.pop(w.worker_id, None)
     _unregister_worker(w)
     if abnormal:
@@ -1927,28 +3766,66 @@ async def _legacy_consumer_reference(w: Worker):
 # one large, fragile edit.
 
 
+def _report_consume_unit(s, item) -> list[dict] | None:
+    """Resolve a frozen report unit from original IDs; never split or invent it."""
+    ids = item.get("reportConsumeIds")
+    if (not isinstance(ids, list) or not ids
+            or not all(isinstance(value, str) and value for value in ids)
+            or len(ids) != len(set(ids))):
+        return None
+    rows = [row for row in s.queue_pending
+            if (row.get("queueItemId") or row.get("id")) in ids]
+    if ([row.get("queueItemId") or row.get("id") for row in rows] != ids
+            or any(row.get("reportConsumeIds") != ids or not _is_pauseable_agent_report(row)
+                   for row in rows)):
+        return None
+    if len(rows) != 1 and any(_queue_item_kind(row) == "task" for row in rows):
+        return None
+    return rows
+
+
 def _select_queue_unit(s) -> list[dict] | None:
-    """Select exactly the FIFO head, batching only contiguous reports."""
+    """Select the first unlocked queued unit in durable FIFO order."""
+    if getattr(s, "queue_paused", False) or _native_handoff_blocked(s):
+        return None
     pending = list(s.queue_pending or [])
     for index, item in enumerate(pending):
         kind = _queue_item_kind(item)
         if kind is None:
             # A malformed/unknown row is durable data, so never skip over it.
             return None
-        if not _is_dispatchable(item):
+        if _delivery_state(item) != _DELIVERY_QUEUED:
             # reserved/writing/sent rows belong to the current/recovering
             # hand-off.  They must not let a later item overtake them.
+            return None
+        if item.get("reportConsumeIds"):
+            unit = _report_consume_unit(s, item)
+            # An existing batch is indivisible, even after edits/setting changes.
+            if (not unit or unit[0] is not item
+                    or any(not queue_item_eligible(s, row) for row in unit)):
+                return None
+            return unit
+        if _queue_item_locked(item):
+            continue
+        if not _retry_due(item):
             return None
         if queue_item_edit_locked(s, _queue_item_id(item)):
             # Keep FIFO ordering while the browser owns this item's edit
             # lease.  Releasing or saving the lease sends a fresh wakeup.
             return None
-        if kind == "task":
+        if not queue_item_eligible(s, item):
+            return None
+        if kind == "task" or item.get("selfConsumeRequested"):
             return [item]
         unit = [item]
         for follower in pending[index + 1:]:
-            if (_queue_item_kind(follower) not in {"report", "qq", "wechat"}
-                    or not _is_dispatchable(follower)):
+            if _queue_item_locked(follower):
+                # A locked row remains in place and ends this delivery batch.
+                break
+            if (follower.get("reportConsumeIds")
+                    or _queue_item_kind(follower) not in {"report", "qq", "wechat"}
+                    or not _is_dispatchable(follower)
+                    or queue_item_edit_locked(s, _queue_item_id(follower))):
                 break
             unit.append(follower)
         return unit
@@ -1976,76 +3853,100 @@ def _task_status_queued(w: Worker, item: dict) -> None:
     })
 
 
-async def _reserve_queue_unit(w: Worker, s, items: list[dict], text: str) -> bool:
-    """Persist reservation/writing states and the user history before hand-off."""
+async def _reserve_queue_unit(w: Worker, s, items: list[dict], text: str,
+                              expected_revisions: list[int] | None = None) -> bool:
+    """Persist reservation/writing states without claiming a delivered history row."""
     if not _process_alive(w):
         return False
+    report_context = await _auto_report.context()
     async with queue_lock(s.id):
+        if w.status == "restarting" or (w.pending_restart and w.status in {"idle", "queued"}):
+            return False
+        current_unit = _select_queue_unit(s)
+        if (current_unit is None
+                or len(current_unit) != len(items)
+                or any(current is not selected
+                       for current, selected in zip(current_unit, items))):
+            # Selection happens before reservation. Re-select under the lock
+            # so a pause toggle or queue reorder between those steps cannot
+            # reserve a task that has just been overtaken by the FIFO head.
+            return False
+        if expected_revisions is not None and expected_revisions != [
+                item.get("revision", 1) for item in items]:
+            # An edit may finish while memory projection awaits. Do not hand
+            # off text computed from the old body after its lease is released.
+            return False
         for item in items:
             if (not any(existing is item for existing in s.queue_pending)
                     or not _is_dispatchable(item)
+                    or _queue_item_locked(item)
                     or queue_item_edit_locked(s, _queue_item_id(item))):
                 return False
 
-        history_items = [item for item in items if not _delivery_mark_in_history(s, item)]
-        history_added = bool(history_items)
-        if history_items:
-            if _queue_item_kind(items[0]) == "task":
-                item = items[0]
-                entry = {
-                    "role": "user",
-                    "content": text,
-                    "delivered_keys": [_delivery_key(item) for item in history_items],
-                    "queueItemIds": [_queue_item_id(item) for item in items],
-                    "source": _task_source(item) or "user",
-                }
-                if item.get("sourceSessionId") is not None:
-                    entry["sourceSessionId"] = item.get("sourceSessionId")
-                if item.get("taskId") is not None:
-                    entry["taskId"] = item.get("taskId")
-                    if item.get("taskIdSource") is not None:
-                        entry["taskIdSource"] = item.get("taskIdSource")
-                if item.get("clientMessageId"):
-                    entry["clientMessageId"] = item["clientMessageId"]
-                if isinstance(item.get("parts"), list):
-                    entry["parts"] = [dict(part) for part in item["parts"] if isinstance(part, dict)]
-            else:
-                entry = {
-                    "role": "user",
-                    "content": text,
-                    "delivered_keys": [_delivery_key(item) for item in history_items],
-                    "queueItemIds": [_queue_item_id(item) for item in items],
-                    "source": "report",
-                }
-                source_ids = sorted({
-                    item.get("sourceSessionId") for item in items
-                    if isinstance(item.get("sourceSessionId"), str)
-                    and item.get("sourceSessionId")
-                })
-                if source_ids:
-                    entry["sourceSessionIds"] = source_ids
-            _sess.append_history(s, entry)
-            history_added = True
+        # Compute on detached candidates; publish only with durable reservation.
+        candidates = copy.deepcopy(items)
+        report_admission = _auto_report.admission(candidates, *report_context)
+        # Reservation proves only ownership. History starts at successful hand-off.
+        history_added = False
 
-        for item in items:
+        # 保留（reserved）会把行移出待处理计数集：版本与状态在同一次落盘提交，
+        # 防止 HTTP 快照与广播补丁之间出现“同版本不同计数”的窗口。
+        old_queue_revision = getattr(s, "queue_revision", 0)
+        if any(item.get("selfConsumeRequested") for item in items):
+            outcome = _sess.DurableOutcome()
+            def reserve_selected():
+                originals = [(item, dict(item)) for item in items]
+                old_revision = s.queue_revision
+                old_ledger = {_queue_item_id(item): s.queue_delivery_ledger.get(_queue_item_id(item))
+                              for item in items}
+                try:
+                    for item, candidate in zip(items, candidates):
+                        item["autoReportAdmission"] = candidate["autoReportAdmission"]
+                        item.update(deliveryState=_DELIVERY_RESERVED, reservedBy=w.worker_id,
+                                    reservedGeneration=w.generation, reservedAt=time.time())
+                        s.queue_delivery_ledger[_queue_item_id(item)] = dict(item)
+                    s.queue_revision += 1
+                    _sess._save_body(s)
+                except BaseException:
+                    for item, original in originals:
+                        item.clear()
+                        item.update(original)
+                    for identity, original in old_ledger.items():
+                        if original is None:
+                            s.queue_delivery_ledger.pop(identity, None)
+                        else:
+                            s.queue_delivery_ledger[identity] = original
+                    s.queue_revision = old_revision
+                    raise
+            await _sess._persist_async_outcome(s.id, reserve_selected, outcome)
+            w._auto_report_admission = report_admission
+            for item in items:
+                item["deliveryState"] = _DELIVERY_WRITING
+            return history_added
+        prior_admissions = [(item, item.get("autoReportAdmission")) for item in items]
+        for item, candidate in zip(items, candidates):
+            item["autoReportAdmission"] = candidate["autoReportAdmission"]
             item["deliveryState"] = _DELIVERY_RESERVED
             item["reservedBy"] = w.worker_id
             item["reservedGeneration"] = w.generation
             item["reservedAt"] = time.time()
             _remember_queue_item(s, item, _DELIVERY_RESERVED)
+        s.queue_revision = old_queue_revision + 1
         try:
             await _save_receipt(s)
         except Exception:
-            if history_added and s.history and set(s.history[-1].get("delivered_keys") or ()) == {
-                _delivery_key(item) for item in history_items
-            }:
-                s.history.pop()
-                _sess.replace_history(s, s.history)
+            s.queue_revision = old_queue_revision
+            for item, previous in prior_admissions:
+                if previous is None:
+                    item.pop("autoReportAdmission", None)
+                else:
+                    item["autoReportAdmission"] = previous
             for item in items:
                 _queue_item_backoff(item, "queue reservation save failed")
                 _remember_queue_item(s, item, _DELIVERY_QUEUED)
             return False
 
+        w._auto_report_admission = report_admission
         # Keep the more precise writing state in memory for API/runtime observers,
         # but the durable RESERVED marker is sufficient for restart recovery: any
         # row left reserved is treated as an unfinished hand-off and requeued.
@@ -2055,15 +3956,27 @@ async def _reserve_queue_unit(w: Worker, s, items: list[dict], text: str) -> boo
 
 
 async def _requeue_queue_unit(w: Worker, s, items: list[dict], reason: str,
-                              history_added: bool = False) -> None:
+                              history_added: bool = False, *, immediate: bool = False) -> None:
+    async with queue_lock(s.id):
+        await _requeue_queue_unit_locked(w, s, items, reason, history_added, immediate=immediate)
+
+
+async def _requeue_queue_unit_locked(w: Worker, s, items: list[dict], reason: str,
+                              history_added: bool = False, *, immediate: bool = False) -> None:
     """Put an unfinished hand-off back, with bounded retry backoff."""
+    requeued = False
     for item in items:
         if _delivery_state(item) == _DELIVERY_SENT:
             continue
-        _queue_item_backoff(item, reason)
+        _queue_item_backoff(item, reason, immediate=immediate)
         _remember_queue_item(s, item, _DELIVERY_QUEUED)
+        requeued = True
         if item.get("type") == "task":
             _task_status_queued(w, item)
+    # 回到 queued 会把行重新计入待处理：版本随状态一起推进（保存失败时内存
+    # 状态保持 requeued，版本不回退也保持单调）。
+    if requeued:
+        s.queue_revision = getattr(s, "queue_revision", 0) + 1
     if history_added:
         for index in range(len(s.history) - 1, -1, -1):
             entry = s.history[index]
@@ -2080,6 +3993,11 @@ async def _requeue_queue_unit(w: Worker, s, items: list[dict], reason: str,
             "[Worker %s] failed to persist queue requeue for session=%s: %s",
             w.worker_id, s.id, exc,
         )
+        if w.pending_restart:
+            # Do not retire a runtime on an uncommitted requeue. Preserve the
+            # legacy retry behavior when no delayed restart was requested.
+            _abort_delayed_restart(w, "queue requeue persistence", exc)
+            raise
     _schedule_queue_retry(s.id)
 
 
@@ -2087,35 +4005,47 @@ async def _commit_queue_handoff(w: Worker, s, items: list[dict]) -> bool:
     """Commit the exact provider hand-off, then remove the durable rows."""
     if not all(any(existing is item for existing in s.queue_pending) for item in items):
         return False
+    # The adapter has crossed its actual hand-off boundary. Persist the body
+    # and receipt now; reservation/writing must never look like a sent turn.
+    history_row = _queue_history_row(items)
+    appended = False
+    if not all(_delivery_mark_in_history(s, item) for item in items):
+        _sess.append_history(s, history_row)
+        appended = True
+    # The hand-off is now real.  Freeze this unit's canonical input identity
+    # before anything else can append history; later queue rows or provider
+    # frames must never replace it.
+    w._prompt_ref = _freeze_prompt_ref(
+        items, history_row if appended else _delivered_prompt_row(s, items, history_row))
+    w._current_handoff_acked = True
+    old_queue_revision = getattr(s, "queue_revision", 0)
+    s.queue_revision = old_queue_revision + 1
     for item in items:
         _set_delivery_state(s, item, _DELIVERY_SENT)
         _clear_delivery_reservation(item)
+    outcome = _sess.DurableOutcome()
     try:
         # The first save is the durable sent_to_cli marker.  A crash between
         # this save and the removal save is recovered by migration.
-        await _save_receipt(s)
+        await _save_receipt(s, outcome=outcome)
     except asyncio.CancelledError:
         w._current_handoff_acked = True
         _remove_queue_items_by_identity(s, items)
+        # Handoff is already real even if cancellation coincided with a failed
+        # writer. An independent owner finishes persistence without resending.
+        await asyncio.shield(_own_queue_steer_task(_persist_queue_steer_state(w, s)))
         raise
     except Exception as exc:
         _log.warning(
-            "[Worker %s] handoff receipt save failed; retrying item(s): %s",
+            "[Worker %s] handoff receipt save failed; retrying persistence only: %s",
             w.worker_id, exc,
         )
-        for item in items:
-            _queue_item_backoff(item, "handoff receipt save failed")
-            if item.get("type") == "task":
-                _task_status_queued(w, item)
         try:
             await _save_receipt(s)
         except Exception:
-            pass
-        _schedule_queue_retry(s.id)
-        return False
+            _mark_history_dirty(w)
 
     w._current_handoff_acked = True
-    s.queue_revision = getattr(s, "queue_revision", 0) + 1
     _remove_queue_items_by_identity(s, items)
     try:
         await _save_receipt(s)
@@ -2126,31 +4056,56 @@ async def _commit_queue_handoff(w: Worker, s, items: list[dict]) -> bool:
             "[Worker %s] queue removal save pending after successful hand-off: %s",
             w.worker_id, exc,
         )
+        _mark_history_dirty(w)
     delivered_ids = [_queue_item_id(item) for item in items]
     delivered_keys = [_delivery_key(item) for item in items]
+    delivered_is_task = _queue_item_kind(items[0]) == "task"
     delivered_text = (
-        items[0].get("text", "")
-        if _queue_item_kind(items[0]) == "task"
+        items[0].get("text", "") if delivered_is_task
         else _format_report_batch(items)
     )
+    # A delivered task row carries the same source metadata its history receipt
+    # gets, so the live projection can classify the row (agent dispatch vs
+    # user/report/automation) before the canonical history refresh lands.  The
+    # report channel keeps its header marker and stays untouched.
+    delivered_message = {
+        "role": "user",
+        "content": delivered_text,
+        "queueItemIds": delivered_ids,
+        "deliveryKeys": delivered_keys,
+    }
+    if delivered_is_task:
+        delivered_message["source"] = _task_source(items[0]) or "user"
+        if items[0].get("sourcePluginId"):
+            delivered_message["sourcePluginId"] = items[0]["sourcePluginId"]
+        if items[0].get("sourceSessionId") is not None:
+            delivered_message["sourceSessionId"] = items[0].get("sourceSessionId")
+        if items[0].get("taskId") is not None:
+            delivered_message["taskId"] = items[0].get("taskId")
+            if items[0].get("taskIdSource") is not None:
+                delivered_message["taskIdSource"] = items[0].get("taskIdSource")
+        if isinstance(items[0].get("parts"), list):
+            delivered_message["parts"] = public_message_parts(items[0].get("parts"))
+    delivered_message.update(_queue_origin_metadata(items))
+    for key in ("messageId", "ts"):
+        if key in history_row:
+            delivered_message[key] = history_row[key]
     await _bcast({
         "type": "queue.item_delivered",
         "sessionId": s.id,
+        # The receipt may trail the first stream frame while persistence
+        # yields. Bind it to this execution so clients can place its input
+        # before these blocks without moving another turn's queued input.
+        "workerId": w.worker_id,
+        "generation": getattr(w, "generation", 0),
+        "executionSeq": w._execution_seq,
         "queueItemIds": delivered_ids,
         # The delivery event is the first client-visible proof that the
         # pending rows crossed the provider hand-off boundary.  Include the
         # post-removal revision so a delayed GET /queue cannot overwrite the
         # delivered snapshot with an older response.
         "queueRevision": getattr(s, "queue_revision", 0),
-        "messages": [{
-            "role": "user",
-            "content": delivered_text,
-            "queueItemIds": delivered_ids,
-            "deliveryKeys": delivered_keys,
-            **({"parts": public_message_parts(items[0].get("parts"))}
-               if _queue_item_kind(items[0]) == "task" and isinstance(items[0].get("parts"), list)
-               else {}),
-        }],
+        "messages": [_public_queue_receipt(delivered_message)],
     })
     await _bcast({
         "type": "queue.snapshot",
@@ -2164,6 +4119,12 @@ async def _deliver_queue_unit(w: Worker, s, items: list[dict]) -> None:
     """Reserve one FIFO unit, hand it to the adapter, and wait for completion."""
     if not items:
         return
+    w._execution_seq += 1
+    w._execution_history_start = len(s.history)
+    # A previous turn's reference can never describe this unit; it is set again
+    # only by a durable hand-off below.
+    w._prompt_ref = None
+    expected_revisions = [item.get("revision", 1) for item in items]
     kind = _queue_item_kind(items[0])
     if kind == "task":
         if not _is_valid_task_item(items[0]) or _task_source(items[0]) is None:
@@ -2184,9 +4145,10 @@ async def _deliver_queue_unit(w: Worker, s, items: list[dict]) -> None:
         w._current_source_session_id = None
         history_text = _format_report_batch(items)
     w._current_queue_item = items[0] if kind == "task" else None
-    w._current_report_items = list(items) if kind == "report" else []
+    w._current_report_items = list(items) if kind != "task" else []
     w._current_handoff_acked = False
     history_added = False
+    w._queue_unit_active = True
     try:
         projected_text = (
             project_message_parts(items[0].get("parts"), history_text)
@@ -2195,7 +4157,8 @@ async def _deliver_queue_unit(w: Worker, s, items: list[dict]) -> None:
         text = await _maybe_inject_memory(s, projected_text)
         # History/UI keeps the safe Markdown fallback, while only the adapter
         # receives the server-path projection in ``text``.
-        history_added = await _reserve_queue_unit(w, s, items, history_text)
+        history_added = await _reserve_queue_unit(
+            w, s, items, history_text, expected_revisions=expected_revisions)
         if not history_added and any(_delivery_state(item) == _DELIVERY_QUEUED
                                      for item in items):
             # A failed reservation has already placed the item back in queue.
@@ -2214,16 +4177,16 @@ async def _deliver_queue_unit(w: Worker, s, items: list[dict]) -> None:
         if supports_callback:
             await consumer(w, text, source, s, on_handoff=on_handoff)
         else:
-            # Compatibility for test doubles and old embedders that wrapped
-            # the four-argument helper.  Production stream/one-shot helpers
-            # above always expose the precise callback boundary.
-            await on_handoff()
-            await consumer(w, text, source, s)
+            # A four-argument replacement cannot expose its actual handoff.
+            # Fail closed and requeue instead of marking a receipt before an
+            # unguarded write. Both production consumers support this callback.
+            raise RuntimeError("Queue consumer must support the handoff callback")
     except asyncio.CancelledError:
         if not w._current_handoff_acked:
             try:
                 await asyncio.shield(_requeue_queue_unit(
-                    w, s, items, "worker cancelled before CLI hand-off", history_added))
+                    w, s, items, "worker cancelled before CLI hand-off", history_added,
+                    immediate=w.pending_restart and w.status == "restarting"))
             except Exception as exc:
                 _log.warning("[Worker %s] cancellation requeue failed: %s", w.worker_id, exc)
         raise
@@ -2234,28 +4197,46 @@ async def _deliver_queue_unit(w: Worker, s, items: list[dict]) -> None:
         if w._current_handoff_acked:
             raise
     finally:
-        if not w._current_handoff_acked and any(
-                _delivery_state(item) in {_DELIVERY_RESERVED, _DELIVERY_WRITING,
-                                           _DELIVERY_IN_FLIGHT}
-                for item in items):
-            await _requeue_queue_unit(
-                w, s, items, "CLI returned before hand-off confirmation", history_added)
-        if w._current_queue_item is items[0] if kind == "task" else False:
-            w._current_queue_item = None
-        if kind == "report":
-            w._current_report_items = []
-        if w._current_task_id == items[0].get("taskId") if kind == "task" else False:
-            w._current_task_id = None
-            w._current_task_idempotent = False
+        try:
+            if not w._current_handoff_acked and any(
+                    _delivery_state(item) in {_DELIVERY_RESERVED, _DELIVERY_WRITING,
+                                               _DELIVERY_IN_FLIGHT}
+                    for item in items):
+                await _requeue_queue_unit(
+                    w, s, items, "CLI returned before hand-off confirmation", history_added,
+                    immediate=w.pending_restart and w.status in {"idle", "queued", "restarting"})
+            if w._current_queue_item is items[0] if kind == "task" else False:
+                w._current_queue_item = None
+            if kind != "task":
+                w._current_report_items = []
+            # The unit is over (terminal already persisted or requeued); its
+            # input reference must not leak into a later turn.
+            w._prompt_ref = None
+            if w._current_task_id == items[0].get("taskId") if kind == "task" else False:
+                w._current_task_id = None
+                w._current_task_idempotent = False
+            if w.status != "restarting" and not w._current_handoff_acked and (getattr(s, "queue_paused", False)
+                                                or w.pending_restart):
+                w.status = "idle"
+                await _record_legal_worker_state(w, "idle", "queue/restart-pending" if w.pending_restart else "queue/paused")
+                await _bcast({"type": "worker.status", "workerId": w.worker_id,
+                              "sessionId": s.id, "generation": w.generation, "status": "idle"})
+        except BaseException as exc:
+            _abort_delayed_restart(w, "queue unit cleanup", exc)
+            raise
+        finally:
+            # Clear even if requeue persistence, legal-state save or broadcast
+            # aborts. Failed cleanup is NOT a safe idle boundary.
+            w._queue_unit_active = False
+        _maybe_restart_pending(w)
         _wake_after_queue_unit(w, s)
 
 
 def _wake_after_queue_unit(w: Worker, s) -> None:
     """Re-arm one generic wakeup without making signals the queue."""
-    if s is None:
+    if s is None or w.status == "restarting":
         return
-    if any(isinstance(item, dict) and _is_dispatchable(item)
-           for item in (s.queue_pending or [])):
+    if _has_sendable_queued_items(s):
         if w.pending_signal is not None:
             w.pending_signal.put_nowait({"type": "queue_signal"})
     else:
@@ -2276,6 +4257,9 @@ async def _consumer(w: Worker):
             continue
         s = _session(w)
         if s is None:
+            continue
+        _maybe_restart_pending(w)
+        if w.status == "restarting":
             continue
         unit = _select_queue_unit(s)
         if unit is None:
@@ -2419,6 +4403,29 @@ def _format_report_batch(reports: list[dict]) -> str:
         lines += [
             "result:",
             _field_value(r.get("result")),
+        ]
+        if r.get("status") == "error" and "errorText" in r:
+            lines += [
+                f"errorSource: {_field_value(r.get('errorSource'))}",
+                f"errorCode: {_field_value(r.get('errorCode'))}",
+                "errorText:", r.get("errorText") or "(no native diagnostics available)",
+            ]
+            if r.get("errorTextTruncated"):
+                lines.append("errorTextTruncated: true")
+        # error 报告的最后消息上下文（仅 error 出口写入这些字段；旧/成功/取消
+        # 报告行没有它们，正文逐字节不变）。缺失时明确标注，避免 MA 把
+        # 「本轮无消息」误读成「诊断丢失」。
+        if "lastMessage" in r or "lastMessageRole" in r:
+            last_message = r.get("lastMessage")
+            if isinstance(last_message, str) and last_message.strip():
+                lines.append(
+                    f"lastMessageRole: {_field_value(r.get('lastMessageRole'))}")
+                lines += ["lastMessage:", last_message]
+                if r.get("lastMessageTruncated"):
+                    lines.append("lastMessageTruncated: true")
+            else:
+                lines.append("lastMessage: (no diagnostics available)")
+        lines += [
             f"sessionId: {_field_value(r.get('sessionId'))}",
             f"taskId: {_field_value(r.get('taskId'))}",
             f"workerId: {_field_value(r.get('workerId'))}",
@@ -2505,6 +4512,7 @@ async def request_claude_permission(
             "sessionId": w.session_id,
             "generation": w.generation,
             "taskSeq": w._current_seq,
+            "executionSeq": w._execution_seq or None,
             "taskId": w._current_task_id,
             "event": event,
         })
@@ -2555,6 +4563,7 @@ async def _resolve_claude_permission(worker_id: str, control: dict) -> bool:
             "sessionId": w.session_id,
             "generation": w.generation,
             "taskSeq": w._current_seq,
+            "executionSeq": w._execution_seq or None,
             "taskId": w._current_task_id,
             "event": {
                 "type": "claude.permission_resolved",
@@ -2599,12 +4608,12 @@ _DELIVERY_QUEUED = "queued"
 _DELIVERY_RESERVED = "reserved"
 _DELIVERY_WRITING = "writing"
 _DELIVERY_SENT = "sent_to_cli"
-# Old states are accepted as migration inputs.  They are deliberately mapped
-# back to queued because the new contract prefers recovery/retry and explicitly
-# accepts the small duplicate window around an uncertain provider hand-off.
+# Old unfinished reservations retain their compatibility retry behavior.
+# Explicit unknown/uncertain outcomes are different: they never authorize replay.
 _DELIVERY_IN_FLIGHT = "in_flight"
 _DELIVERY_WRITE_FAILED = "write_failed"
 _DELIVERY_UNKNOWN = "unknown_after_crash"
+_DELIVERY_UNCERTAIN_STATES = {_DELIVERY_UNKNOWN, "unknown", "uncertain"}
 _DELIVERY_DELETED = "deleted"
 _DELIVERY_STATES = {
     _DELIVERY_QUEUED,
@@ -2615,6 +4624,7 @@ _DELIVERY_STATES = {
     _DELIVERY_WRITE_FAILED,
     _DELIVERY_UNKNOWN,
     _DELIVERY_DELETED,
+    *_DELIVERY_UNCERTAIN_STATES,
 }
 
 _QUEUE_RETRY_BASE_SEC = 1.0
@@ -2656,6 +4666,99 @@ def _queue_item_kind(item: dict) -> str | None:
     if "result" in item:
         return "report"
     return None
+
+
+def _is_pauseable_agent_report(item) -> bool:
+    """Only classify durable child-agent reports as pausable reports.
+
+    Explicit notice and channel types retain their own delivery behavior. The
+    source check also recognizes legacy report envelopes without a type.
+    """
+    if not isinstance(item, dict):
+        return False
+    item_type = item.get("type")
+    if item_type in {"notice", "qq", "wechat"}:
+        return False
+    if item_type == "task":
+        return item.get("source") == "report"
+    if item_type in {"report", "zombie"}:
+        return item.get("source") in {None, "report"}
+    return item_type is None and item.get("source") == "report" and "result" in item
+
+
+def _queue_item_locked(item) -> bool:
+    return isinstance(item, dict) and bool(
+        _message_locks.source(item) is not None or item.get("queueLockAutoReport")
+        or item.get("forceSendHeld")
+        or item.get("queueSteerPending") or item.get("selfConsumeUncertain")
+    )
+
+
+def queue_item_eligible(s, item, *, queued: bool = True) -> bool:
+    """Shared own-queue and final handoff gates; lock sources are authoritative.
+
+    Stop reports materializes queueLockAutoReport on the affected reports;
+    an explicit UI unlock can release a report while the future-report rule
+    remains enabled. Do not infer extra locks from that future-report flag.
+    """
+    return (s is not None and isinstance(item, dict)
+            and not getattr(s, "queue_paused", False) and not _native_handoff_blocked(s)
+            and _queue_item_kind(item) is not None
+            and not _queue_item_locked(item)
+            and not queue_item_edit_locked(s, _queue_item_id(item))
+            and (not queued or _is_dispatchable(item)))
+
+
+def _only_locked_queue_items(s) -> bool:
+    """Whether automatic recovery has only locked queued rows to ignore."""
+    pending = list(getattr(s, "queue_pending", None) or []) if s is not None else []
+    return bool(pending) and all(
+        isinstance(item, dict)
+        and _delivery_state(item) == _DELIVERY_QUEUED
+        and _queue_item_locked(item)
+        for item in pending
+    )
+
+
+def _queue_recovery_blocked(s) -> bool:
+    """A Session pause and locked-only backlog independently block recovery."""
+    native_blocked = _native_handoff_blocked(s)
+    if (s is not None and type(s.adapter_config.get("native_control_next")) is bool
+            and find_worker_by_session(s.id) is None and s.id not in native_starting_sessions):
+        # After Pan restarts there is no old owner to retire. Let normal durable
+        # queue recovery spawn once; _create_worker promotes the saved intent.
+        native_blocked = False
+    return bool(getattr(s, "queue_paused", False)) or native_blocked or (
+        _only_locked_queue_items(s) or (_offline.is_illegal(s) and not _has_sendable_queued_items(s)))
+
+
+native_starting_sessions: set[str] = set()
+
+
+def _native_handoff_blocked(s) -> bool:
+    if s is None:
+        return False
+    if s.id in native_starting_sessions:
+        return True
+    if type(s.adapter_config.get("native_control_next")) is bool:
+        return True
+    w = find_worker_by_session(s.id)
+    return w is not None and (w.native_control_mode != "pan" or w._native_reservation_busy or w._native_external_turn_active
+                             or getattr(w, "native_input_uncertain", False))
+
+
+def _has_sendable_queued_items(s) -> bool:
+    """Whether an immediate queue wake has an unlocked queued item."""
+    if s is None or getattr(s, "queue_paused", False) or _native_handoff_blocked(s):
+        return False
+    return any(
+        isinstance(item, dict)
+        and _queue_item_kind(item) is not None
+        and _delivery_state(item) == _DELIVERY_QUEUED
+        and _retry_due(item)
+        and not _queue_item_locked(item)
+        for item in (s.queue_pending or [])
+    )
 
 
 def _serialize_for_cli(adapter, text: str) -> bytes:
@@ -2703,7 +4806,7 @@ _RECEIPT_COMPACT_KEYS = frozenset({
     "jobId", "creatorSessionId", "targetSessionId", "targetSessionIds",
     "status", "workerId", "seq", "revision", "createdAt", "updatedAt",
     "receiptAt", "deliveredAt", "deletedAt", "deliveryState",
-    "dispatchState", "receiptVersion", "receiptOnly",
+    "dispatchState", "receiptVersion", "receiptOnly", "reportConsumeIds",
 })
 
 
@@ -2865,8 +4968,17 @@ def _history_idempotency_rows(s) -> list[dict]:
                 if isinstance(row, dict)]
     history_path = _sess._history_path(s.id)
     if history_path.exists():
+        # Queue GET runs during Session selection. Use the validated summary
+        # count to parse only the bounded recovery tail, instead of decoding
+        # every JSONL row on the event loop. Stale/incomplete projections still
+        # take the history reader's compatibility path.
+        projection = getattr(s, "summary_projection", None)
+        known_total = (
+            projection.get("history_total")
+            if _sess.is_complete_summary_projection(projection) else None
+        )
         rows, _ = _sess._history_page_from_jsonl(
-            history_path, before=0, limit=limit,
+            history_path, before=0, limit=limit, known_total=known_total,
         )
         return [row for row in rows if isinstance(row, dict)]
     page = _sess.history_page(s.id, limit=limit)
@@ -3035,6 +5147,10 @@ def _clear_delivery_reservation(item: dict) -> None:
 
 def _queue_item_backoff(item: dict, reason: str, *, immediate: bool = False) -> None:
     """Return an item to queued with bounded, persisted retry backoff."""
+    if item.get("selfConsumeAttempted"):
+        # A selected original item whose write outcome is unknown must not be
+        # retried by recovery/watchdog/FIFO, including after main restarts.
+        item["selfConsumeUncertain"] = True
     attempts = item.get("deliveryAttempts", 0)
     try:
         attempts = max(0, int(attempts))
@@ -3232,12 +5348,13 @@ def _prepare_receipt_persistence(s) -> bool:
 
 def _has_dispatchable_items(s) -> bool:
     """Whether a session has work that automatic recovery may actually send."""
-    if s is None:
+    if s is None or getattr(s, "queue_paused", False):
         return False
     if any(
         isinstance(item, dict)
         and _queue_item_kind(item) is not None
         and _delivery_state(item) == _DELIVERY_QUEUED
+        and not _queue_item_locked(item)
         for item in (s.queue_pending or [])
     ):
         return True
@@ -3246,7 +5363,7 @@ def _has_dispatchable_items(s) -> bool:
         isinstance(item, dict)
         and _delivery_state(item) in {
             _DELIVERY_RESERVED, _DELIVERY_WRITING, _DELIVERY_IN_FLIGHT,
-            _DELIVERY_WRITE_FAILED, _DELIVERY_UNKNOWN,
+            _DELIVERY_WRITE_FAILED,
         }
         for item in (s.queue_pending or [])
     )
@@ -3264,8 +5381,13 @@ def _has_dispatchable_items(s) -> bool:
 # 已规划的未来外部来源（open 集合，新增来源先在此登记再使用）：
 #   meta-agent    外部 meta-agent 编排（未来 external orchestration）
 #   automation    定时 / 脚本 / CI 自动化
-SOURCE_TYPES = {"user", "agent", "system_prompt", "report",
+SOURCE_TYPES = {"plugin", "system", "user", "agent", "system_prompt", "report",
                 "meta-agent", "automation"}
+
+# App Settings → Behavior → Message auto force send.  The three switches are
+# independent and default off; each names a structured queue origin, never a
+# body prefix.
+AUTO_FORCE_SOURCE_CLASSES = ("system", "ma", "report")
 
 
 def _normalize_source_type(source, default: str = "agent") -> tuple[str | None, str | None]:
@@ -3304,7 +5426,33 @@ def _validate_source_metadata(target, source, source_session_id,
     if (target is not None and source_sid and source_sid != target.id
             and target.readonly_session and target.managed_by == source_sid):
         return None, None, READONLY_SESSION_ERROR
+    if source_type in {"agent", "meta-agent"} and source_sid and target is not None:
+        source_type = _agent_message_source(source_sid, target.id)
     return source_type, source_sid, None
+
+
+def _agent_message_source(sender_id: str, target_id: str) -> str:
+    # Classify from persisted identity only. A corrupt cyclic chain fails closed
+    # to MA for every target, even if a target was encountered before the loop.
+    ancestors = set()
+    visited = {sender_id}
+    current = _get_session_shallow(sender_id)
+    while current and current.managed_by:
+        parent = _get_session_shallow(current.managed_by)
+        if parent is None:
+            break
+        if parent.id in visited:
+            return "agent"
+        visited.add(parent.id)
+        ancestors.add(parent.id)
+        current = parent
+    return "report" if target_id in ancestors else "agent"
+
+
+async def _capture_auto_report(w, items):
+    snapshot = _auto_report.admission(items, *await _auto_report.context())
+    w._auto_report_admission = snapshot
+    return snapshot
 
 
 def _task_source(item: dict) -> str | None:
@@ -3356,7 +5504,8 @@ def _migrate_queue_delivery_state(s, *, restore_ledger: bool = False) -> bool:
     new contract explicitly accepts that duplicate window, so these rows are
     restored to ``queued`` instead of being silently discarded.  A durable
     ``sent_to_cli`` row is the opposite: it records a completed hand-off and
-    can safely be removed during migration.
+    can safely be removed during migration. Explicit unknown/uncertain receipts
+    remain visible and non-dispatchable, including ledger-only recovery.
     """
     changed = _migrate_legacy_task_items(s)
     keep: list = []
@@ -3410,6 +5559,30 @@ def _migrate_queue_delivery_state(s, *, restore_ledger: bool = False) -> bool:
             _remember_queue_item(s, item, _DELIVERY_SENT)
             changed = True
             continue
+        if state == _DELIVERY_SENT:
+            _remember_queue_item(s, item, _DELIVERY_SENT)
+            changed = True
+            continue
+        uncertain_state = (state if state in _DELIVERY_UNCERTAIN_STATES else
+                           ledger_state if ledger_state in _DELIVERY_UNCERTAIN_STATES else None)
+        if uncertain_state is not None:
+            # Either durable copy can prove the outcome is unresolved. A stale
+            # queued row must never overwrite that evidence. Preserve extension
+            # fields in each copy and make reconciliation repeatable.
+            if item.get("deliveryState") != uncertain_state:
+                item["deliveryState"] = uncertain_state
+                changed = True
+            if item.get("dispatchState") not in {None, uncertain_state}:
+                item["dispatchState"] = uncertain_state
+                changed = True
+            record = dict(ledger_record or {})
+            record.update(item)
+            if record != ledger_record:
+                s.queue_delivery_ledger[_queue_item_id(item)] = record
+                changed = True
+            _index_queue_item(s, record, state=uncertain_state)
+            keep.append(item)
+            continue
         # The pending row is the retryable source of truth, but a stale ledger
         # reservation must not remain visible after recovery.  Treat the
         # provider boundary as uncertain and normalize both copies to queued;
@@ -3417,7 +5590,7 @@ def _migrate_queue_delivery_state(s, *, restore_ledger: bool = False) -> bool:
         # window when the hand-off outcome cannot be known.
         if (state == _DELIVERY_QUEUED and ledger_state in {
                 _DELIVERY_RESERVED, _DELIVERY_WRITING, _DELIVERY_IN_FLIGHT,
-                _DELIVERY_WRITE_FAILED, _DELIVERY_UNKNOWN,
+                _DELIVERY_WRITE_FAILED,
         }):
             item["lastDeliveryState"] = ledger_state
             _queue_item_backoff(item, "reconciled stale queue delivery ledger")
@@ -3425,13 +5598,21 @@ def _migrate_queue_delivery_state(s, *, restore_ledger: bool = False) -> bool:
             keep.append(item)
             changed = True
             continue
-        if state == _DELIVERY_SENT:
-            _remember_queue_item(s, item, _DELIVERY_SENT)
-            changed = True
+        # Queue snapshots also run this migration. A reservation still owned
+        # by the active coordinator is not a crash receipt: normalizing it
+        # would reopen the delivery boundary while stdin is being written.
+        reserved_by = item.get("reservedBy")
+        owner = workers.get(reserved_by) if isinstance(reserved_by, str) else None
+        if (state in {_DELIVERY_RESERVED, _DELIVERY_WRITING, _DELIVERY_IN_FLIGHT}
+                and owner is not None and owner.session_id == s.id
+                and owner.generation == item.get("reservedGeneration")
+                and owner._queue_unit_active and _process_alive(owner)
+                and _worker_owns_queue_item(owner, item)):
+            keep.append(item)
             continue
         if state in {
             _DELIVERY_RESERVED, _DELIVERY_WRITING, _DELIVERY_IN_FLIGHT,
-            _DELIVERY_WRITE_FAILED, _DELIVERY_UNKNOWN,
+            _DELIVERY_WRITE_FAILED,
         }:
             item["lastDeliveryState"] = state
             _queue_item_backoff(item, "recovered unfinished CLI hand-off")
@@ -3478,6 +5659,16 @@ def _migrate_queue_delivery_state(s, *, restore_ledger: bool = False) -> bool:
         restored["queueItemId"] = record_id
         restored.setdefault("id", record_id)
         restored.setdefault("createdAt", time.time())
+        if state in _DELIVERY_UNCERTAIN_STATES:
+            # Restore visibility, not execution authority. Keep the original
+            # receipt and its fields intact; normal claims reject this state.
+            if restored.get("dispatchState") not in {None, state}:
+                restored["dispatchState"] = state
+            keep.append(restored)
+            pending_ids.add(record_id)
+            _remember_queue_item(s, restored, state)
+            changed = True
+            continue
         if state != _DELIVERY_QUEUED:
             restored["lastDeliveryState"] = state
             _queue_item_backoff(restored, "recovered unfinished CLI hand-off")
@@ -3501,9 +5692,11 @@ def _migrate_queue_delivery_state(s, *, restore_ledger: bool = False) -> bool:
 
 def _worker_has_pending_work(w: Worker) -> bool:
     """idle watchdog 回收前检查是否还有待消费信号或持久队列项。"""
+    s = _session(w)
+    if s is not None and getattr(s, "queue_paused", False):
+        return False
     if w.pending_signal is not None and not w.pending_signal.empty():
         return True
-    s = _session(w)
     return _has_dispatchable_items(s)
 
 
@@ -3530,7 +5723,12 @@ def _delivery_key(item: dict) -> str:
         "reservedBy", "reservedGeneration", "reservedAt",
         "deliveryAttempts", "nextAttemptAt", "lastDeliveryError",
         "queueItemId", "receiptAt", "deliveredAt", "deletedAt",
-        "position", "revision",
+        "position", "revision", "autoReportAdmission", "autoReportExecutionSeq",
+        # Last-message context is a derived annotation of the same report, not
+        # report identity: adding/upgrading it must not change the receipt key
+        # of a report that a previous version already delivered.
+        "lastMessage", "lastMessageRole", "lastMessageTruncated",
+        "errorText", "errorCode", "errorSource", "errorTextTruncated",
     }
     if item.get("type") == "task":
         return f"task:{_queue_item_id(item)}"
@@ -3555,8 +5753,13 @@ def _delivery_key_matches(key: str, item: dict) -> bool:
     # The legacy report/QQ hash included delivery phase fields. Its initial
     # pre-handoff shape was queued, with no recovery/terminal timestamps.
     legacy_bookkeeping = {
+        "autoReportAdmission", "autoReportExecutionSeq",
         "deliveryState", "reservedBy", "reservedGeneration", "reservedAt",
         "deliveryAttempts", "nextAttemptAt", "lastDeliveryError", "queueItemId",
+        # Rows written before the last-message context existed never hashed
+        # these derived fields.
+        "lastMessage", "lastMessageRole", "lastMessageTruncated",
+        "errorText", "errorCode", "errorSource", "errorTextTruncated",
     }
     identity = {k: v for k, v in item.items() if k not in legacy_bookkeeping}
     if "dispatchState" in identity:
@@ -3579,7 +5782,7 @@ def _delivery_mark_in_history(s, item: dict) -> bool:
     return False
 
 
-async def _save_receipt(s) -> None:
+async def _save_receipt(s, *, outcome: _sess.DurableOutcome | None = None) -> None:
     """Persist a queue receipt even when restart cancels the consumer.
 
     ``restart_worker`` deliberately cancels the old consumer before killing the
@@ -3593,6 +5796,11 @@ async def _save_receipt(s) -> None:
     # queue hand-off.  This does not alter queue_pending or terminal event
     # ordering; it only removes/compresses old terminal metadata.
     _prepare_receipt_persistence(s)
+    if outcome is not None:
+        # The ordered outcome API already owns cancellation through writer
+        # retirement and exposes both cancelled success and cancelled failure.
+        await _sess.save_async(s, outcome=outcome)
+        return
     save_task = asyncio.create_task(_sess.save_async(s))
     try:
         await asyncio.shield(save_task)
@@ -3604,6 +5812,10 @@ async def _save_receipt(s) -> None:
                 await asyncio.shield(save_task)
             except asyncio.CancelledError:
                 continue
+            except Exception:
+                # Inspect the retired writer below instead of replacing the
+                # caller's cancellation with its concurrent disk exception.
+                break
         if save_task.cancelled():
             # Shield normally prevents this, but an event-loop shutdown or a
             # caller that explicitly cancels the save task can still cancel it.
@@ -3879,6 +6091,11 @@ async def _consume_pending_reports(w: Worker, s):
 
 
 async def _claim_pending_task(w: Worker, task_id: str | None) -> dict | None:
+    async with queue_lock(w.session_id):
+        return await _claim_pending_task_locked(w, task_id)
+
+
+async def _claim_pending_task_locked(w: Worker, task_id: str | None) -> dict | None:
     """Compatibility claim that reserves, but does not remove, a task row."""
     s = _session(w)
     if s is None or not _process_alive(w):
@@ -3895,18 +6112,113 @@ async def _claim_pending_task(w: Worker, task_id: str | None) -> dict | None:
     item["reservedGeneration"] = w.generation
     item["reservedAt"] = time.time()
     _remember_queue_item(s, item, _DELIVERY_RESERVED)
+    # 保留（reserved）会把行移出待处理计数集：版本与状态在同一次落盘提交，
+    # 防止 HTTP 快照与广播补丁之间出现“同版本不同计数”的窗口。
+    old_queue_revision = getattr(s, "queue_revision", 0)
+    s.queue_revision = old_queue_revision + 1
     try:
         await _save_receipt(s)
     except Exception:
+        s.queue_revision = old_queue_revision
         _queue_item_backoff(item, "task reservation save failed")
         _remember_queue_item(s, item, _DELIVERY_QUEUED)
         return None
     return item
 
 
+_REPORT_LAST_MESSAGE_MAX_CHARS = 1200
+
+
+def _error_report_diagnostic(
+    w: Worker, status: str, run_seq: int | None = None,
+) -> dict | None:
+    """Diagnostic fields for an error completion report, or None when N/A.
+
+    An error terminal can carry an empty (or only generic) ``result`` while the
+    run's final assistant message held the real diagnosis — e.g. an explicit 429
+    with the reset time.  Capture that text for the report so the manager can
+    see why the turn failed.
+
+    Provenance is the run, never a guess: the text is only read from the
+    worker's in-memory per-task capture (set from this run's assistant blocks
+    and cleared when a task hand-off starts), plus the recorded task seq, so a
+    stale message from a previous turn can never attach to this report.
+
+    ``run_seq`` identifies the run whose terminal is being reported.  Callers
+    without a run identity (zombie paths) pass None: the capture is then only
+    accepted while the worker is actually running the turn that produced it; a
+    queued item or an idle worker has no message of its own.
+
+    Returns None for non-error statuses (done/cancelled stay untouched) and a
+    field dict otherwise — with explicit ``None`` text when no message was
+    captured, so the rendered report can state that no diagnostics are
+    available instead of silently looking like a lost one.
+    """
+    if status != "error":
+        return None
+    text = w._current_task_last_assistant_text
+    seq = w._current_task_last_assistant_seq
+    if run_seq is None:
+        run_seq = w._current_seq if w.status == "running" else None
+    if not (isinstance(text, str) and text.strip()
+            and seq is not None and run_seq is not None and seq == run_seq):
+        return {
+            "lastMessageRole": None,
+            "lastMessage": None,
+            "lastMessageTruncated": False,
+        }
+    text = _error_log.sanitize(text).strip()
+    truncated = len(text) > _REPORT_LAST_MESSAGE_MAX_CHARS
+    if truncated:
+        # Keep both ends: the reason usually leads and the reset time trails.
+        half = _REPORT_LAST_MESSAGE_MAX_CHARS // 2
+        text = (f"{text[:half].rstrip()}\n"
+                f"...[truncated {len(text)} chars]...\n"
+                f"{text[-half:].lstrip()}")
+    return {
+        "lastMessageRole": "assistant",
+        "lastMessage": text,
+        "lastMessageTruncated": truncated,
+    }
+
+
+def _stage_new_queue_item(s, item: dict, *, wake: bool = False) -> None:
+    """Inside an ordered writer candidate; never use for retry/requeue/edit."""
+    _offline.lock_new_message(s, item)
+    if wake:
+        # This newly created message has no user Manual lock. Release only
+        # the Illegal lock, leaving Pause/leases/owner gates untouched.
+        if _message_locks.source(item) == "illegal":
+            _message_locks.set_lock(item, None)
+        item["wakeMessage"] = True
+        s.queue_pending.insert(0, item)
+    else:
+        s.queue_pending.append(item)
+    for position, row in enumerate(s.queue_pending):
+        row["position"] = position
+    _remember_queue_item(s, item, _DELIVERY_QUEUED)
+    _prepare_receipt_persistence(s)
+    s.queue_revision = getattr(s, "queue_revision", 0) + 1
+
+
+async def _append_new_queue_item(s, item: dict, *, wake: bool = False,
+                                 metadata: dict | None = None) -> dict:
+    # queue_lock is held by caller. Stage before atomic replacement so an
+    # unrelated metadata writer cannot persist an unlocked new Illegal row.
+    def stage(candidate):
+        for key, value in (metadata or {}).items():
+            setattr(candidate, key, copy.deepcopy(value))
+        _stage_new_queue_item(candidate, item.copy(), wake=wake)
+    await _commit_offline(s, stage)
+    return next(row for row in s.queue_pending if row.get("id") == item["id"])
+
+
 async def _enqueue_report(session_id: str, status: str, result: str,
                           task_id: str | None, worker_id: str,
-                          report_type: str | None = None):
+                          report_type: str | None = None,
+                          diagnostic: dict | None = None,
+                          admission: dict | None = None,
+                          prompt: dict | None = None):
     """订阅制报告入队：session 完成 → 若被其 managed_by 订阅，报告 append 到
     manager 的落盘队列 queue_pending，并唤醒 manager 的 consumer。
 
@@ -3917,9 +6229,18 @@ async def _enqueue_report(session_id: str, status: str, result: str,
     report_type：附加的语义标记（如 "zombie"）。非 None 时在报告 dict 里写入
     "type" 字段，供 manager 区分异常死亡与正常完成。
 
+    diagnostic：终态提交前冻结并持久化的 reportDiagnostic（最后助手消息与
+    原生错误字段分开）。成功/取消路径不改变正文；不在此查日志或旧任务。
+
     未订阅 / 无 managed_by → 不 append（保留现有 worker.result 广播不变）。
+
+    prompt：终态冻结的输入引用（promptMessageId/promptSummary）。两个字段始终
+    存在；无法证明真实输入身份时为 null，绝不据此生成伪 message id。摘要开关
+    关闭时该字段为 null，正文不会随报告离开本 Session。
     """
     if _shutdown_started:
+        return
+    if admission is not None and admission.get("enabled") is not True:
         return
     s = _get_session_shallow(session_id)
     if not s or not s.managed_by:
@@ -3946,23 +6267,493 @@ async def _enqueue_report(session_id: str, status: str, result: str,
         "dispatchState": _DELIVERY_QUEUED,
         "revision": 1,
         "createdAt": time.time(),
+        **_prompt_report_fields(prompt),
     }
     item["queueItemId"] = item["id"]
     if report_type is not None:
         item["type"] = report_type
-    item["position"] = len(manager.queue_pending)
-    manager.queue_pending.append(item)
-    _remember_queue_item(manager, item, _DELIVERY_QUEUED)
-    manager.queue_revision = getattr(manager, "queue_revision", 0) + 1
-    await _save_receipt(manager)
+    if diagnostic is not None:
+        item.update(diagnostic)
+    async with queue_lock(manager.id):
+        if (getattr(manager, "agent_reports_paused", False)
+                and _is_pauseable_agent_report(item)):
+            _message_locks.manual_change(item, None, True)
+        item = await _append_new_queue_item(manager, item)
+        queue_revision = manager.queue_revision
     await _bcast({"type": "queue.item_added", "sessionId": manager.id,
                   "queueItemId": item["id"],
-                  "queueRevision": manager.queue_revision,
+                  "queueRevision": queue_revision,
                   "item": dict(item)})
 
     # 唤醒 manager 的 consumer（若 worker 存活）——报告正文在落盘队列，
     # 信号只负责唤醒，不承载正文
     await _wake_worker(s.managed_by)
+    _schedule_auto_force(manager.id, item)
+
+
+_TERMINAL_RESULT_STATUSES = frozenset({"done", "error", "cancelled"})
+
+
+def manual_report_key(session_id: str, task_id: str | None,
+                      task_seq: int | None,
+                      result_cursor: int | None = None) -> str:
+    """Deterministic idempotency key for one explicit run report.
+
+    Keyed on the provable **run** identity only (session + taskId + taskSeq,
+    falling back to the durable result cursor for a run without a taskSeq),
+    never on a client-supplied message id: an arbitrary or repeated message id
+    must not be able to turn one run into several deliveries, while distinct
+    runs of one task id still stay distinct.  Callers derive it from the
+    resolved terminal row, so one run reached through either identity path
+    (taskSeq or resultCursor) keeps exactly one key.
+    """
+    task_part = task_id if task_id else "-"
+    if task_seq is not None:
+        seq_part = str(task_seq)
+    elif result_cursor is not None:
+        seq_part = f"rc:{result_cursor}"
+    else:
+        seq_part = "-"
+    return f"manual:{session_id}:{task_part}:{seq_part}"
+
+
+def task_tail_block_id(s, terminal: dict) -> str | None:
+    """messageId of that task run's final text block, or None when unprovable.
+
+    A durable terminal row records the history epoch/revision it committed at
+    **after** the run's final text row was appended (``_persist_terminal_state``
+    sets it from the post-append revision on purpose), so within an unchanged
+    epoch the recorded revision counts the rows this run covered.  The run's
+    final row therefore sits one before the exclusive end offset:
+
+        covered_end = len(history) - (history_revision_now - terminal_revision)
+        tail_index  = covered_end - 1
+
+    Returns None whenever the relation cannot be proven for this Session
+    (legacy rows without epoch/revision, a rewritten history epoch, an unloaded
+    or empty history, or no assistant row inside the covered region).  Callers
+    must then refuse instead of guessing which block belongs to the task.
+    """
+    epoch = terminal.get("historyEpoch")
+    revision = terminal.get("historyRevision")
+    if not isinstance(epoch, str) or not epoch:
+        return None
+    if getattr(s, "history_epoch", None) != epoch:
+        return None
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision <= 0:
+        return None
+    rows = getattr(s, "history", None)
+    if not isinstance(rows, list) or not rows:
+        return None
+    current = max(0, int(getattr(s, "history_revision", 0) or 0))
+    if revision > current:
+        return None
+    covered_end = len(rows) - (current - revision)
+    if covered_end <= 0 or covered_end > len(rows):
+        return None
+    boundary = rows[covered_end - 1]
+    if boundary.get("kind") == "terminal":
+        anchor = boundary.get("terminal", {}).get("anchorMessageId")
+        return next((row.get("messageId") for row in rows[:covered_end]
+                     if anchor and row.get("messageId") == anchor
+                     and row.get("role") == "assistant"), None)
+    for index in range(covered_end - 1, -1, -1):
+        row = rows[index]
+        if not isinstance(row, dict) or row.get("role") != "assistant":
+            continue
+        message_id = row.get("messageId")
+        return message_id if isinstance(message_id, str) and message_id else None
+    return None
+
+
+def _terminal_row_cursor(row: dict) -> int:
+    """Ordered cursor for one durable terminal row (mirrors the web layer)."""
+    value = row.get("resultCursor")
+    if isinstance(value, bool):
+        value = None
+    try:
+        if value is not None:
+            return max(0, int(value))
+    except (TypeError, ValueError):
+        pass
+    try:
+        return max(0, int(row.get("taskSeq", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def durable_terminal_for_task(s, task_id: str | None,
+                              task_seq: int | None = None) -> dict | None:
+    """Latest durable terminal record for one task, or None.
+
+    Reads the same bounded per-task index the result-replay contract uses
+    (``Session.terminal_results``, newest last; legacy Sessions keep only
+    ``last_result``).  Any completed task in that window stays resolvable, so an
+    older task's report never depends on it still being the newest terminal.
+    ``task_seq`` is an optional stricter match: when provided, the terminal must
+    belong to that exact run.
+    """
+    rows = [
+        dict(item) for item in (getattr(s, "terminal_results", None) or [])
+        if isinstance(item, dict)
+        and item.get("status") in _TERMINAL_RESULT_STATUSES
+        and item.get("taskId") == task_id
+        and (task_seq is None or item.get("taskSeq") == task_seq)
+    ]
+    if not rows:
+        last = getattr(s, "last_result", None)
+        if (isinstance(last, dict)
+                and last.get("status") in _TERMINAL_RESULT_STATUSES
+                and last.get("taskId") == task_id
+                and (task_seq is None or last.get("taskSeq") == task_seq)):
+            return dict(last)
+        return None
+    rows.sort(key=lambda item: (_terminal_row_cursor(item),
+                                str(item.get("terminalKey") or "")))
+    return rows[-1]
+
+
+def _cursor_value(row: dict) -> int | None:
+    """Raw durable result cursor of a terminal row, or None when absent."""
+    raw = row.get("resultCursor")
+    if isinstance(raw, bool):
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def durable_terminal_by_cursor(s, result_cursor) -> dict | None:
+    """Durable terminal record identified by its result cursor, or None.
+
+    The result cursor is the durable, monotonic position of one terminal row
+    in the bounded replay window — the run identity the session identity view
+    exposes for runs without a formal taskId (plain conversations, native
+    turns).  Only **positive** cursors identify a run: production allocates
+    them as max(existing)+1, so the identity view's 0 for an identity-less row
+    is a derived compat value and never a binding.  An exact raw
+    ``resultCursor`` match wins; legacy rows without the field fall back to a
+    compatibility cursor derived ONLY from a stored ``taskSeq`` — a row with no
+    stored taskSeq is never matched, so no cursor can fabricate an identity for
+    it.  When several rows share a compatibility cursor the match is ambiguous
+    and this returns None: the caller must refuse instead of guessing.  The
+    legacy ``last_result`` view is the final fallback, under the same rules.
+    """
+    if isinstance(result_cursor, bool) or not isinstance(result_cursor, int):
+        return None
+    if result_cursor <= 0:
+        return None
+    cursor = result_cursor
+    rows = [
+        dict(item) for item in (getattr(s, "terminal_results", None) or [])
+        if isinstance(item, dict)
+        and item.get("status") in _TERMINAL_RESULT_STATUSES
+        and _cursor_value(item) == cursor
+    ]
+    if len(rows) == 1:
+        return rows[0]
+    if len(rows) > 1:
+        return None  # duplicate raw cursors: never guess
+    compat = [
+        dict(item) for item in (getattr(s, "terminal_results", None) or [])
+        if isinstance(item, dict)
+        and item.get("status") in _TERMINAL_RESULT_STATUSES
+        and _cursor_value(item) is None
+        and item.get("taskSeq") is not None
+        and _terminal_row_cursor(item) == cursor
+    ]
+    if len(compat) == 1:
+        return compat[0]
+    if len(compat) > 1:
+        return None  # ambiguous compatibility cursor: never guess
+    last = getattr(s, "last_result", None)
+    if (isinstance(last, dict)
+            and last.get("status") in _TERMINAL_RESULT_STATUSES
+            and (_cursor_value(last) == cursor
+                 or (_cursor_value(last) is None
+                     and last.get("taskSeq") is not None
+                     and _terminal_row_cursor(last) == cursor))):
+        return dict(last)
+    return None
+
+
+def _find_manual_report_receipt(manager, key: str) -> dict | None:
+    """Locate a delivered manual report by key: durable receipt first, then a
+    still-pending queue row (the receipt is written before the broadcast)."""
+    receipts = getattr(manager, "manual_report_receipts", None) or {}
+    record = receipts.get(key)
+    if isinstance(record, dict):
+        return record
+    for item in getattr(manager, "queue_pending", None) or []:
+        if (isinstance(item, dict) and item.get("manualReportKey") == key):
+            return item
+    return None
+
+
+def _remember_manual_report_receipt(manager, key: str, record: dict) -> None:
+    """Record one delivered manual report, bounded FIFO on the manager."""
+    receipts = getattr(manager, "manual_report_receipts", None)
+    if not isinstance(receipts, dict):
+        receipts = {}
+        manager.manual_report_receipts = receipts
+    receipts.pop(key, None)
+    receipts[key] = record
+    while len(receipts) > _sess.MANUAL_REPORT_RECEIPT_MAX:
+        receipts.pop(next(iter(receipts)))
+
+
+async def enqueue_manual_report(session_id: str, task_id: str | None,
+                                task_seq: int | None,
+                                message_id: str,
+                                result_cursor: int | None = None,
+                                ) -> tuple[dict | None, dict | None]:
+    """Deliver one explicit browser-requested completion report to the manager.
+
+    与 ``_enqueue_report`` 的关系：**路由目标与内容语义完全相同**（manager 的
+    落盘队列 queue_pending + 同一报告 item 形状 + 同一唤醒/广播路径），但：
+
+    - **按运行解析终态**：内容取自该运行在**持久终态索引**
+      （``terminal_results``，旧会话回退 ``last_result``）中的记录，而不是
+      “当前最新终态”。因此更早完成的运行同样可汇报，最新运行在跑也不会
+      使旧运行的汇报失效；索引里找不到该运行的终态 → 明确失败
+      （``no_task_result``），绝不拿别的运行的结果顶替。
+    - **任何已完成运行均可汇报**：正式 assign 任务与无 taskId 的普通对话/
+      原生轮次走同一路径。无 taskId 时调用方必须以该运行的 ``taskSeq`` 或持久
+      ``resultCursor`` 绑定具体运行（两者都经会话身份视图 ``terminalResults``
+      暴露，服务端正文权威）。只有**可证明的持久运行身份**才构成绑定：非空
+      taskId、已存储的 taskSeq、或**正** resultCursor（生产只分配正游标；身份
+      视图给无身份旧行显示的 0 是派生兼容值）。三者都不提供 → 明确失败
+      （``no_run_identity``），绝不退化为“汇报最新终态”；≤0 的 resultCursor
+      按未提供处理（不能引用任何可证明运行，丢弃不会误绑）；解析出的终态若
+      无任何可证明身份 → 同样 ``no_run_identity`` 明确拒绝，不允许派生 0 把
+      无身份旧行解析成可投递运行（跨时间回执会因此串运行）。``resultCursor``
+      与 ``taskId``/``taskSeq`` 同时提供却描述不同运行 → 明确失败
+      （``run_mismatch``），不猜向任何一边。
+    - **校验消息与运行的持久关联**：``messageId`` 必须正是该运行终态的
+      **末块**（由终态行记录的 history epoch/revision 推出边界后取边界内最后
+      一条 assistant 行）。无法证明该关联时明确失败（``block_unproven`` /
+      ``block_mismatch``），不用“最新”近似，也不接受任意消息 id。
+    - **不读取也不修改 report_subscriptions**：manager 退订
+      （``report_unsubscribe`` / report-to-manager 关闭）后，显式手动汇报依然
+      送达；本函数也绝不临时开订阅。
+    - **幂等以运行身份为准**：key 由解析后的终态行推导（sessionId, taskId,
+      taskSeq；该行无 taskSeq 时用其持久 resultCursor），客户端 messageId 只
+      作为审计字段，不能改变去重结果；同一运行反复点击/换 messageId/换身份
+      路径/未确认重试都只送达一次，不同运行各自独立。
+    - 落盘失败整体回滚 → 明确失败，可安全重试；候选的 apply、写入与失败回滚
+      全部在**同一个持久化 ticket** 内执行（旧状态在 ticket 执行时捕获，不覆
+      盖期间其他 writer 的提交），因此已在执行/已排队的 manager writer 都不
+      可能把失败候选写上盘；请求断开（取消）复用 DurableOutcome ticket 规则：
+      已落盘则照常送达并唤醒 manager，未落盘则整体回滚，绝不留下失败候选。
+
+    返回 ``(result, error)``：成功时 result=``{"queueItemId", "managerId",
+    "alreadyReported"}``；失败时 error=``{"code", "message", "retryable"}``。
+    """
+    if _shutdown_started:
+        return None, {"code": "shutting_down",
+                      "message": "Pan main service is shutting down",
+                      "retryable": True}
+    s = _get_session_shallow(session_id)
+    if not s:
+        return None, {"code": "session_not_found",
+                      "message": f"Session {session_id} not found",
+                      "retryable": False}
+    if not s.managed_by:
+        return None, {"code": "no_report_target",
+                      "message": "该 Session 没有 manager，无法汇报",
+                      "retryable": False}
+    # The block proof reads canonical history rows; a cold cache returns the
+    # Session without its history JSONL, so hydrate through the existing read
+    # instead of failing every cold report as unprovable.
+    if not getattr(s, "_history_loaded", True):
+        s = _sess.get(session_id)
+        if not s:
+            return None, {"code": "session_not_found",
+                          "message": f"Session {session_id} not found",
+                          "retryable": False}
+    if not s.managed_by:
+        return None, {"code": "no_report_target",
+                      "message": "该 Session 没有 manager，无法汇报",
+                      "retryable": False}
+    manager = _get_session_shallow(s.managed_by)
+    if not manager:
+        return None, {"code": "no_report_target",
+                      "message": "manager 会话不存在，无法汇报",
+                      "retryable": False}
+    # A cursor at or below zero is not a durable run identity: production only
+    # allocates positive cursors, and the identity view's derived 0 for an
+    # identity-less row must never be submitted as a binding.  Dropping it
+    # cannot mis-bind (it references no provable run), so a request that also
+    # carries a legal identity still resolves through that identity.
+    if (isinstance(result_cursor, bool) or not isinstance(result_cursor, int)
+            or result_cursor <= 0):
+        result_cursor = None
+    if task_id is None and task_seq is None and result_cursor is None:
+        return None, {"code": "no_run_identity",
+                      "message": "汇报必须绑定具体完成运行（taskId/taskSeq/resultCursor 之一），无法推断",
+                      "retryable": False}
+    if result_cursor is not None:
+        # The durable cursor is the strongest run identity: it pins one exact
+        # terminal row.  Any additionally submitted identity must describe the
+        # same run, otherwise the request is refused — never resolved to
+        # whichever side happens to match.
+        terminal = durable_terminal_by_cursor(s, result_cursor)
+        if terminal is None:
+            return None, {"code": "no_task_result",
+                          "message": "该 resultCursor 对应的终态结果不可用，无法汇报",
+                          "retryable": False}
+        if task_seq is not None and terminal.get("taskSeq") != task_seq:
+            return None, {"code": "run_mismatch",
+                          "message": "taskSeq 与 resultCursor 描述的不是同一次运行，无法汇报",
+                          "retryable": False}
+        if task_id is not None and terminal.get("taskId") != task_id:
+            return None, {"code": "run_mismatch",
+                          "message": "taskId 与 resultCursor 描述的不是同一次运行，无法汇报",
+                          "retryable": False}
+    else:
+        terminal = durable_terminal_for_task(s, task_id, task_seq)
+        if terminal is None:
+            return None, {"code": "no_task_result",
+                          "message": "该任务的终态结果不可用，无法汇报",
+                          "retryable": False}
+    run_task_id = terminal.get("taskId")
+    run_task_seq = terminal.get("taskSeq")
+    run_cursor = _cursor_value(terminal)
+    # Provable durable run identity is the delivery precondition: a terminal
+    # row with no taskId, no taskSeq and no positive raw cursor (legacy rows
+    # the identity view can only show as derived 0) must never become a
+    # deliverable run — its degenerate key would collide across runs.
+    if (not run_task_id and run_task_seq is None
+            and not (isinstance(run_cursor, int) and run_cursor > 0)):
+        return None, {"code": "no_run_identity",
+                      "message": "该终态没有可证明的持久运行身份，无法汇报",
+                      "retryable": False}
+    tail_block = task_tail_block_id(s, terminal)
+    if tail_block is None:
+        return None, {"code": "block_unproven",
+                      "message": "无法证明该消息属于该任务的末块，暂不能汇报",
+                      "retryable": False}
+    if tail_block != message_id:
+        return None, {"code": "block_mismatch",
+                      "message": "提交的消息不是该任务的末块，无法汇报",
+                      "retryable": False}
+    key = manual_report_key(session_id, run_task_id, run_task_seq, run_cursor)
+    async with queue_lock(manager.id):
+        existing = _find_manual_report_receipt(manager, key)
+        if existing is not None:
+            return ({
+                "queueItemId": existing.get("queueItemId") or existing.get("id"),
+                "managerId": manager.id,
+                "alreadyReported": True,
+            }, None)
+        item = {
+            "type": "report",
+            "kind": "report",
+            "id": "q_" + uuid.uuid4().hex,
+            "queueItemId": None,
+            "source": "report",
+            "sourceSessionId": session_id,
+            "status": terminal.get("status"),
+            "result": terminal.get("result"),
+            "sessionId": session_id,
+            "taskId": terminal.get("taskId"),
+            "taskSeq": terminal.get("taskSeq"),
+            "workerId": terminal.get("workerId"),
+            "manual": True,
+            "messageId": message_id,
+            "manualReportKey": key,
+            # Same run reference the terminal row froze; legacy run rows have
+            # no such evidence and stay null instead of borrowing an id.
+            **_prompt_report_fields(terminal),
+            "deliveryState": _DELIVERY_QUEUED,
+            "dispatchState": _DELIVERY_QUEUED,
+            "revision": 1,
+            "createdAt": time.time(),
+        }
+        item["queueItemId"] = item["id"]
+
+        if terminal.get("status") == "error" and isinstance(terminal.get("reportDiagnostic"), dict):
+            item.update(copy.deepcopy(terminal["reportDiagnostic"]))
+
+        # Reuse the durable ticket pattern: the candidate APPLY, the write and
+        # its failure rollback all run inside ONE persistence ticket, so no
+        # writer that is already executing or queued for this session can
+        # persist the candidate before a failed rollback.  The queue lock only
+        # orders report writers; it does not serialize with the writer
+        # executor.
+        _prepare_receipt_persistence(manager)
+        outcome = _sess.DurableOutcome()
+        committed = [False]
+        cancelled = [False]
+
+        def _apply_write_or_rollback() -> None:
+            # Snapshot the old state at ticket EXECUTION time: commits another
+            # writer made between submission and execution are part of the
+            # snapshot and are never clobbered by the rollback.
+            old_receipts = dict(getattr(manager, "manual_report_receipts", None) or {})
+            old_queue_revision = getattr(manager, "queue_revision", 0)
+            old_offline = _offline.snapshot(manager)
+
+            def _rollback() -> None:
+                """Undo the whole attempt in memory."""
+                _offline.restore(manager, old_offline)
+                manager.manual_report_receipts = old_receipts
+
+            try:
+                # Apply the candidate in memory inside the ticket.
+                item["position"] = len(manager.queue_pending)
+                _stage_new_queue_item(manager, item)
+                _remember_manual_report_receipt(manager, key, {
+                    "sessionId": session_id,
+                    "taskId": run_task_id,
+                    "taskSeq": run_task_seq,
+                    "messageId": message_id,
+                    "queueItemId": item["id"],
+                    "at": time.time(),
+                })
+                manager.queue_revision = old_queue_revision + 1
+                _sess._save_body(manager)
+                committed[0] = True
+            except BaseException:
+                # Roll the candidate back BEFORE this ticket retires: a later
+                # queued writer for this session serializes after the clean
+                # state instead of persisting the failed candidate.
+                _rollback()
+                raise
+
+        try:
+            await _sess._persist_async_outcome(manager.id, _apply_write_or_rollback, outcome)
+        except asyncio.CancelledError:
+            cancelled[0] = True
+        except Exception as exc:
+            if not committed[0]:
+                # The ticket already rolled the candidate back; nothing durable
+                # was written.
+                return None, {"code": "persist_failed",
+                              "message": f"汇报落盘失败: {exc}",
+                              "retryable": True}
+            # The durable write landed despite the raised error: committed.
+        if cancelled[0] and not committed[0]:
+            # The ticket retired without a committed writer: the candidate was
+            # either never applied or already rolled back inside the ticket, so
+            # no failed candidate is left behind.
+            return None, {"code": "persist_failed",
+                          "message": "汇报未落盘（请求已断开），可重试",
+                          "retryable": True}
+    await _bcast({"type": "queue.item_added", "sessionId": manager.id,
+                  "queueItemId": item["id"],
+                  "queueRevision": manager.queue_revision,
+                  "item": dict(item)})
+    # 与自动汇报同一唤醒路径：正文在落盘队列，信号只负责唤醒。
+    await _wake_worker(s.managed_by)
+    _schedule_auto_force(manager.id, item)
+    if cancelled[0]:
+        # The caller disconnected, but the report is durably delivered: end the
+        # cancelled request without inventing a failure.
+        raise asyncio.CancelledError()
+    return ({"queueItemId": item["id"], "managerId": manager.id,
+             "alreadyReported": False}, None)
 
 
 async def _wake_worker(session_id: str, auto_spawn: bool = False) -> None:
@@ -3976,13 +6767,25 @@ async def _wake_worker(session_id: str, auto_spawn: bool = False) -> None:
     """
     if _shutdown_started:
         return
+    retiring = find_worker_by_session(session_id)
+    if retiring is not None and retiring.pending_restart:
+        _maybe_restart_pending(retiring)
+        if retiring.status == "restarting":
+            return
+    if getattr(_get_session_shallow(session_id), "queue_paused", False):
+        return
     mw = find_worker_by_session(session_id)
     if (mw and mw.pending_signal is not None
             and not (mw.process is not None and mw.process.returncode is not None)):
-        mw.last_activity = time.monotonic()
-        await mw.pending_signal.put({"type": "queue_signal"})
+        if _has_sendable_queued_items(_get_session_shallow(session_id)):
+            mw.last_activity = time.monotonic()
+            await mw.pending_signal.put({"type": "queue_signal"})
+        else:
+            _schedule_queue_retry(session_id)
     elif not mw or mw.status not in {"held", "restarting"}:
         session = _get_session_shallow(session_id)
+        if _queue_recovery_blocked(session):
+            return
         if auto_spawn and (session is None or not session.queue_pending):
             # Legacy callers use auto_spawn to materialize an idle worker even
             # before the first item exists; retain that contract synchronously.
@@ -4029,6 +6832,8 @@ async def enqueue_channel_reminder(
     target_key = f"{target_type}:{target_id}"
     bot_key = f"{target_key}@{bot_uin}" if bot_uin else None
     item = {
+        "source": channel,
+        "sourcePluginId": channel,
         "type": channel,
         "kind": channel,
         "id": "q_" + uuid.uuid4().hex,
@@ -4062,18 +6867,33 @@ async def enqueue_channel_reminder(
         # one dict across sessions would let one worker's in-flight transition
         # suppress delivery to every other subscriber.
         subscriber_item = dict(item)
-        subscriber_item["position"] = len(s.queue_pending)
-        s.queue_pending.append(subscriber_item)
-        _remember_queue_item(s, subscriber_item, _DELIVERY_QUEUED)
-        s.queue_revision = getattr(s, "queue_revision", 0) + 1
-        await _save_receipt(s)
+        async with queue_lock(s.id):
+            subscriber_item = await _append_new_queue_item(s, subscriber_item)
+            queue_revision = s.queue_revision
         await _bcast({"type": "queue.item_added", "sessionId": s.id,
                       "queueItemId": subscriber_item["id"],
-                      "queueRevision": s.queue_revision,
+                      "queueRevision": queue_revision,
                       "item": dict(subscriber_item)})
         await _wake_worker(s.id, auto_spawn=True)
         delivered += 1
     return delivered
+
+
+async def enqueue_plugin_message(plugin_id: str, session_id: str, text: str,
+                                 *, client_message_id: str | None = None) -> dict:
+    if not isinstance(text, str) or not text:
+        return {"error": "text is required"}
+    target = _get_session_shallow(session_id) if isinstance(session_id, str) else None
+    if target is None:
+        return {"error": "Session not found"}
+    async with queue_lock(target.id):
+        item, error = await _persist_task_item(target, text, "plugin", None, None,
+            client_message_id, idempotent_task_id=False, source_plugin_id=plugin_id)
+    if error:
+        return {"error": error}
+    await _wake_worker(target.id, auto_spawn=True)
+    return {"status": "queued", "sessionId": target.id,
+            "queueItemId": _queue_item_id(item) if item else None}
 
 
 async def enqueue_qq_reminder(target_type: str, target_id: str,
@@ -4194,18 +7014,22 @@ async def enqueue_notice(target_session_id: str, text: str,
         list(target_session_ids) if target_session_ids is not None
         else [target_session_id]
     )
-    item["position"] = len(target.queue_pending)
-    target.queue_pending.append(item)
-    _remember_queue_item(target, item, _DELIVERY_QUEUED)
-    target.queue_revision = getattr(target, "queue_revision", 0) + 1
-    await _save_receipt(target)
+    async with queue_lock(target.id):
+        if event_id and any(row.get("eventId") == event_id for row in
+                list(target.queue_pending or []) + list(target.queue_delivery_ledger.values())
+                if isinstance(row, dict)):
+            return {"ok": True, "sessionId": target_session_id,
+                    "pending": len(target.queue_pending), "duplicate": True, "eventId": event_id}
+        item = await _append_new_queue_item(target, item)
+        queue_revision = target.queue_revision
     await _bcast({"type": "queue.item_added", "sessionId": target.id,
                   "queueItemId": item["id"],
-                  "queueRevision": target.queue_revision,
+                  "queueRevision": queue_revision,
                   "item": dict(item)})
     _log.info("[Session %s] queued notice source=%s sourceSessionId=%s",
               target_session_id, source_type, source_sid)
     await _wake_worker(target_session_id, auto_spawn=True)
+    _schedule_auto_force(target.id, item)
     return {"ok": True, "sessionId": target_session_id,
             "pending": len(target.queue_pending)}
 
@@ -4230,7 +7054,9 @@ async def _enqueue_zombie_report(w: Worker, reason: str) -> None:
     w._zombie_reported = True
     task_id = w._current_task_id
     await _enqueue_report(w.session_id, "error", f"worker died: {reason}",
-                          task_id, w.worker_id, report_type="zombie")
+                          task_id, w.worker_id, report_type="zombie",
+                          diagnostic=_error_report_diagnostic(w, "error"),
+                          prompt=w._prompt_ref)
     # A hand-off-complete task has no queue row to recover.  Clear its
     # persisted context after emitting the exact zombie report; an unfinished
     # queue row remains the active retry context for the replacement Worker.
@@ -4313,6 +7139,13 @@ async def _watchdog(w: Worker):
             continue
 
         # stream 模式：running 用任务运行时长判定，queued 用静默时长判定，idle 空闲回收
+        if (w.native_control_mode != "pan" or w._native_reservation_busy or w._native_external_turn_active
+                or w.native_input_uncertain):
+            # User-owned native turns and their resident kernel are not abandoned
+            # Pan tasks. Browser detach/control handoff never reclaims them.
+            # Unknown input is not a timeout receipt: recover=True could resend
+            # already-accepted bytes. Retirement must remain an explicit action.
+            continue
         if w.status == "running":
             # 任务运行时长 = 当前时间 - 任务开始处理时刻（_consumer_stream 进入 running 时记录）。
             # 不用 last_activity（无输出时长）：长思考/大文件读取会长时间无 stdout 输出，
@@ -4376,6 +7209,12 @@ async def _recover_session(session_id: str, *, force: bool = False) -> None:
     if not s:
         _recovery_required.discard(session_id)
         return
+    await _prepare_offline_recovery(s)
+    if _queue_recovery_blocked(s):
+        # A forced recovery requested by an abnormal exit still must not
+        # launch a provider solely to wait on a locked queue backlog.
+        _recovery_required.discard(session_id)
+        return
     if not force and not _has_dispatchable_items(s) and session_id not in _recovery_required:
         return
     current = find_worker_by_session(session_id)
@@ -4404,6 +7243,9 @@ def _schedule_session_recovery(
         # The service is winding down; a fresh recovery spawn would race the
         # loop teardown (see _shutdown_started).  The durable queue keeps the
         # work; the next start recovers it.
+        return None
+    if getattr(_get_session_shallow(session_id), "queue_paused", False):
+        _recovery_required.discard(session_id)
         return None
     if force:
         _recovery_required.add(session_id)
@@ -4468,51 +7310,65 @@ async def drain_recoveries(timeout: float = 10.0) -> int:
     return len(inflight)
 
 
+def _queue_wake_deadlines(session) -> list[float]:
+    """Finite queue gates need a wake when both retry and edit lease are due."""
+    now = time.time()
+    deadlines = []
+    for item in session.queue_pending or []:
+        if (not isinstance(item, dict) or _queue_item_kind(item) is None
+                or _delivery_state(item) != _DELIVERY_QUEUED or _queue_item_locked(item)):
+            continue
+        retry = item.get("nextAttemptAt")
+        due = retry if isinstance(retry, (int, float)) and retry > now else now
+        lease = _active_queue_edit_lock(session, _queue_item_id(item), now)
+        if lease is not None:
+            due = max(due, lease["expiresAt"])
+        if due > now:
+            deadlines.append(due)
+    return deadlines
+
+
 def _schedule_queue_retry(session_id: str) -> asyncio.Task | None:
-    """Wake a session once its earliest persisted retry becomes due."""
+    """Wake at a retry/lease deadline; queue mutations can re-arm the wait."""
     session = _get_session_shallow(session_id)
-    if session is None or not any(
-        isinstance(item, dict)
-        and _queue_item_kind(item) is not None
-        and _delivery_state(item) == _DELIVERY_QUEUED
-        and isinstance(item.get("nextAttemptAt"), (int, float))
-        and item.get("nextAttemptAt") > time.time()
-        for item in (session.queue_pending or [])
-    ):
+    if (session is None or getattr(session, "queue_paused", False)
+            or not _queue_wake_deadlines(session)):
         # Immediate queue items already have a queue_signal.  Only create a
-        # timer for an item that is actually waiting for persisted backoff;
+        # timer for an item actually waiting for backoff or an edit lease;
         # otherwise the timer would emit a duplicate wakeup on every spawn.
         return None
     existing = _queue_retry_tasks.get(session_id)
     if existing is not None and not existing.done():
+        _queue_retry_wakes[session_id].set()
         return existing
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return None
 
+    changed = asyncio.Event()
+    _queue_retry_wakes[session_id] = changed
+
     async def _wait_and_wake() -> None:
         while True:
+            changed.clear()
             s = _get_session_shallow(session_id)
-            if s is None:
+            if s is None or getattr(s, "queue_paused", False):
                 return
-            future_times = [
-                item.get("nextAttemptAt") for item in (s.queue_pending or [])
-                if isinstance(item, dict)
-                and _queue_item_kind(item) is not None
-                and _delivery_state(item) == _DELIVERY_QUEUED
-                and isinstance(item.get("nextAttemptAt"), (int, float))
-                and item.get("nextAttemptAt") > time.time()
-            ]
+            future_times = _queue_wake_deadlines(s)
             if not future_times:
                 worker = find_alive_worker_by_session(session_id)
-                if worker and worker.pending_signal is not None:
+                if (worker and worker.pending_signal is not None
+                        and _has_sendable_queued_items(s)):
                     worker.pending_signal.put_nowait({"type": "queue_signal"})
-                elif _has_dispatchable_items(s):
+                elif worker is None and _has_dispatchable_items(s):
                     _schedule_session_recovery(session_id)
                 return
             delay = max(0.0, min(future_times) - time.time())
-            await asyncio.sleep(min(delay, 60.0))
+            try:
+                await asyncio.wait_for(changed.wait(), delay)
+            except asyncio.TimeoutError:
+                pass
 
     task = loop.create_task(_wait_and_wake(), name=f"pan-queue-retry-{session_id}")
     _queue_retry_tasks[session_id] = task
@@ -4520,6 +7376,7 @@ def _schedule_queue_retry(session_id: str) -> asyncio.Task | None:
     def _finish(done: asyncio.Task) -> None:
         if _queue_retry_tasks.get(session_id) is done:
             _queue_retry_tasks.pop(session_id, None)
+            _queue_retry_wakes.pop(session_id, None)
         if not done.cancelled():
             try:
                 done.result()
@@ -4578,6 +7435,11 @@ async def _global_watchdog_tick():
         # job, and this scan must not spawn a provider merely for enrichment.
         if _has_pending_usage_enrichment(s):
             _schedule_usage_enrichment(s.id)
+        try:
+            await _prepare_offline_recovery(s)
+        except Exception:
+            _log.exception("Legality recovery blocked for Session %s", s.id)
+            continue
         if not _has_dispatchable_items(s) and s.id not in _recovery_required:
             continue
         current = find_worker_by_session(s.id)
@@ -4604,9 +7466,86 @@ async def _global_watchdog_tick():
             )
 
 
+class _QueuePausedBeforeHandoff(Exception):
+    pass
+
+
+class _OneShotSpawnFailed(Exception):
+    """Only raised by the subprocess creation operation, before a handle exists."""
+
+
+
+async def _queue_handoff(w: Worker, s, operation, on_handoff):
+    from packages.plugins.lifecycle import session_claim, action_groups, pinned
+    async with session_claim(s):
+        if set(pinned(s.id)[0]) - action_groups(s.adapter_config):
+            request_delayed_restart(s.id)
+            raise _QueuePausedBeforeHandoff('Loaded Action Group was detached; Worker restart required')
+        return await _queue_handoff_admitted(w, s, operation, on_handoff)
+
+
+async def _queue_handoff_admitted(w: Worker, s, operation, on_handoff):
+    """Serialize pause with write/drain or spawn and receipt, not execution.
+
+    Pause waits for a handoff already holding this lock. Reserved rows that
+    have not entered it remain retractable and are requeued by the caller.
+    """
+    async with queue_lock(s.id):
+        async def reject(reason):
+            if getattr(s, "offline_run", None) and not w._current_handoff_acked:
+                identity = _offline.owner(w)
+                await _commit_offline(s, lambda candidate: _offline.finish(
+                    candidate, identity, reason="before-handoff/rejected"))
+            raise _QueuePausedBeforeHandoff(reason)
+        if w.status == "restarting" or (w.pending_restart and not w._current_handoff_acked):
+            await reject("Worker retiring before CLI hand-off")
+        if getattr(s, "queue_paused", False):
+            await reject("Session queue paused before CLI hand-off")
+        if w.native_control_mode != "pan":
+            await reject("Native control owns CLI hand-off")
+        if w.native_input_uncertain:
+            await reject("Native input acceptance is unknown")
+        items = ([w._current_queue_item] if w._current_queue_item is not None
+                 else w._current_report_items)
+        if any(not queue_item_eligible(s, item, queued=False) for item in items):
+            await reject("Queue item blocked before CLI hand-off")
+        selected = [item for item in items if item.get("selfConsumeRequested")]
+        if selected:
+            outcome = _sess.DurableOutcome()
+            def apply_attempt():
+                originals = [(item, dict(item)) for item in selected]
+                old_ledger = { _queue_item_id(item): s.queue_delivery_ledger.get(_queue_item_id(item))
+                               for item in selected }
+                try:
+                    for item in selected:
+                        item["selfConsumeAttempted"] = True
+                        s.queue_delivery_ledger[_queue_item_id(item)] = dict(item)
+                    _sess._save_body(s)
+                except BaseException:
+                    for item, original in originals:
+                        item.clear()
+                        item.update(original)
+                    for identity, original in old_ledger.items():
+                        if original is None:
+                            s.queue_delivery_ledger.pop(identity, None)
+                        else:
+                            s.queue_delivery_ledger[identity] = original
+                    raise
+            await _sess._persist_async_outcome(s.id, apply_attempt, outcome)
+        # self-consume attempt persistence can yield after running preparation.
+        # A newly accepted retirement intent still wins before actual handoff.
+        if w.status == "restarting" or (w.pending_restart and not w._current_handoff_acked):
+            await reject("Worker retiring before CLI hand-off")
+        result = await operation()
+        if on_handoff is not None:
+            await on_handoff()
+        return result
+
+
 async def _consumer_stream(w: Worker, text: str, source: str, s, *, on_handoff=None):
     """Stream mode: write to the adapter's long-running stdin."""
-    w._terminal_handled = False
+    if w.status == "restarting" or (w.pending_restart and w.status in {"idle", "queued"}):
+        return
     standalone_items = []
     if on_handoff is None:
         if w._current_queue_item is not None:
@@ -4622,6 +7561,7 @@ async def _consumer_stream(w: Worker, text: str, source: str, s, *, on_handoff=N
             w,
             s,
             f"Worker process dead (returncode={w.process.returncode if w.process else 'none'})",
+            error_context={"origin": "worker.preflight.process_dead"},
         )
         return
 
@@ -4637,6 +7577,7 @@ async def _consumer_stream(w: Worker, text: str, source: str, s, *, on_handoff=N
     # 区别于 last_activity（无输出时长）：长思考/大文件读取会长时间无 stdout，
     # 用「任务运行时长」作为 running 超时判据，避免误杀静默思考中的任务。
     w._task_started_at = time.monotonic()
+    await _begin_offline_run(w)
     w.status = "running"
     await _record_legal_worker_state(w, "running", "task/start")
 
@@ -4649,12 +7590,22 @@ async def _consumer_stream(w: Worker, text: str, source: str, s, *, on_handoff=N
     try:
         data = w.adapter.encode_user_message(text)
         w._current_serialized = data + b"\n"
-        written = w.process.stdin.write(w._current_serialized)
-        if written is not None and written != len(w._current_serialized):
-            raise OSError("short stdin write")
-        await w.process.stdin.drain()
-        if on_handoff is not None:
-            await on_handoff()
+        # Keep the previous terminal latched while task-start persistence and
+        # broadcasts yield control. Clear it only at the provider hand-off
+        # boundary so already-buffered post-terminal frames cannot be assigned
+        # to this queue item's taskSeq.
+        async def write_input():
+            _reset_raw_capture(w)
+            w._current_task_last_assistant_text = None
+            w._current_task_last_assistant_seq = None
+            w._current_task_assistant_ids.clear()
+            w._terminal_handled = False
+            w._steer_run_id = None
+            written = w.process.stdin.write(w._current_serialized)
+            if written is not None and written != len(w._current_serialized):
+                raise OSError("short stdin write")
+            await w.process.stdin.drain()
+        await _queue_handoff(w, s, write_input, on_handoff)
     except asyncio.CancelledError:
         if standalone_items and not w._current_handoff_acked:
             await asyncio.shield(_requeue_queue_unit(
@@ -4674,6 +7625,7 @@ async def _consumer_stream(w: Worker, text: str, source: str, s, *, on_handoff=N
         "generation": w.generation,
         "status": "running",
         "taskSeq": w._current_seq,
+        "executionSeq": w._execution_seq or None,
         "source": source,
         "sourceSessionId": w._current_source_session_id,
     })
@@ -4774,6 +7726,12 @@ async def _consumer_oneshot(w: Worker, text: str, source: str, s, *, on_handoff=
 
     详见 docs/design/adapter-p1-oneshot.md §4。
     """
+    if w.status == "restarting" or (w.pending_restart and w.status in {"idle", "queued"}):
+        return
+    _reset_raw_capture(w)
+    w._current_task_last_assistant_text = None
+    w._current_task_last_assistant_seq = None
+    w._current_task_assistant_ids.clear()
     w._terminal_handled = False
     standalone_items = []
     if on_handoff is None:
@@ -4784,6 +7742,7 @@ async def _consumer_oneshot(w: Worker, text: str, source: str, s, *, on_handoff=
         if standalone_items:
             on_handoff = lambda: _commit_queue_handoff(w, s, standalone_items)
 
+    await _begin_offline_run(w)
     w.status = "running"
     await _record_legal_worker_state(w, "running", "task/start")
     await _bcast({
@@ -4793,6 +7752,7 @@ async def _consumer_oneshot(w: Worker, text: str, source: str, s, *, on_handoff=
         "generation": w.generation,
         "status": "running",
         "taskSeq": w._current_seq,
+        "executionSeq": w._execution_seq or None,
         "source": source,
         "sourceSessionId": w._current_source_session_id,
     })
@@ -4809,7 +7769,10 @@ async def _consumer_oneshot(w: Worker, text: str, source: str, s, *, on_handoff=
             "[Worker %s] oneshot_args 返回空 argv（adapter=%s 不支持 oneshot？）；跳过本次任务",
             w.worker_id, getattr(adapter, "name", "?"),
         )
-        await _finish_task_error(w, s, "adapter 不支持 oneshot 执行模式")
+        await _finish_task_error(
+            w, s, "adapter 不支持 oneshot 执行模式",
+            error_context={"origin": "worker.preflight.oneshot_args"},
+        )
         w.last_activity = time.monotonic()
         _maybe_restart_pending(w)
         return
@@ -4820,57 +7783,79 @@ async def _consumer_oneshot(w: Worker, text: str, source: str, s, *, on_handoff=
         w.worker_id, args[0], len(args),
     )
 
+    execution_owner = _offline.owner(w)
+    proc = None
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            cwd=s.workdir or None,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-    except Exception as e:
-        _log.error("[Worker %s] one-shot spawn failed: %s", w.worker_id, e)
-        if standalone_items:
-            await _requeue_queue_unit(w, s, standalone_items,
-                                       f"one-shot spawn failed: {e}")
-        await _finish_task_error(w, s, format_cli_spawn_error(adapter.name, e))
-        # M3: 置 idle 同步刷新活性时间，避免该 worker 刚忙完就被 watchdog 当空闲回收
-        w.last_activity = time.monotonic()
-        _maybe_restart_pending(w)
-        return
+        try:
+            async def spawn_input():
+                nonlocal proc
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        *args,
+                        cwd=s.workdir or None,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.STDOUT,
+                        **command_window_options(),
+                    )
+                except Exception as exc:
+                    raise _OneShotSpawnFailed(str(exc)) from exc
+                w._mcp_proc = proc
+                identity = _offline.owner(w)
+                def attach_process(candidate):
+                    if not _offline.same_owner(candidate.offline_run, identity):
+                        raise RuntimeError("One-shot execution owner changed")
+                    candidate.offline_run = {**candidate.offline_run, "processes": identity["processes"]}
+                    candidate.offline_owner = dict(identity)
+                await _commit_offline(s, attach_process)
+                return proc
+            proc = await _queue_handoff(w, s, spawn_input, on_handoff)
+        except asyncio.CancelledError:
+            if standalone_items and not w._current_handoff_acked:
+                await asyncio.shield(_requeue_queue_unit(
+                    w, s, standalone_items, "worker cancelled before CLI hand-off"))
+            raise
+        except _QueuePausedBeforeHandoff:
+            if standalone_items:
+                await _requeue_queue_unit(w, s, standalone_items, "Session queue paused")
+            else:
+                raise
+            w.status = "idle"
+            await _record_legal_worker_state(w, "idle", "queue/paused")
+            return
+        except _OneShotSpawnFailed as e:
+            _log.error("[Worker %s] one-shot spawn failed: %s", w.worker_id, e)
+            if standalone_items:
+                await _requeue_queue_unit(w, s, standalone_items,
+                                           f"one-shot spawn failed: {e}")
+            await _finish_task_error(
+                w, s, format_cli_spawn_error(adapter.name, e),
+                error_context={"origin": "worker.oneshot.spawn_failed"},
+            )
+            # M3: 置 idle 同步刷新活性时间，避免该 worker 刚忙完就被 watchdog 当空闲回收
+            w.last_activity = time.monotonic()
+            _maybe_restart_pending(w)
+            return
+        except Exception as exc:
+            if standalone_items and not w._current_handoff_acked:
+                await _requeue_queue_unit(w, s, standalone_items,
+                                           f"one-shot hand-off callback failed: {exc}")
+            raise
 
-    # Track in-flight process so kill_worker can terminate it (see #3).
-    w._mcp_proc = proc
+        # Track in-flight process so kill_worker can terminate it (see #3).
+        w._mcp_proc = proc
 
-    # For one-shot adapters, process creation with the complete argv is the
-    # hand-off boundary.  The prompt remains in the adapter's existing argv
-    # protocol; one-shot does not switch to stdin.
-    try:
-        if on_handoff is not None:
-            await on_handoff()
-    except asyncio.CancelledError:
-        if standalone_items and not w._current_handoff_acked:
-            await asyncio.shield(_requeue_queue_unit(
-                w, s, standalone_items, "worker cancelled before CLI hand-off"))
-        raise
-    except Exception:
-        if standalone_items and not w._current_handoff_acked:
-            await _requeue_queue_unit(
-                w, s, standalone_items, "one-shot hand-off commit failed")
-        raise
+        # Save provider/session metadata only; queue removal was committed by the
+        # callback above and does not wait for provider business output.
+        sess = _session(w)
+        if sess:
+            await _sess.save_async(sess)
 
-    # Save provider/session metadata only; queue removal was committed by the
-    # callback above and does not wait for provider business output.
-    sess = _session(w)
-    if sess:
-        await _sess.save_async(sess)
-
-    # Collect output
-    output = b""
-    timed_out = False
-    if not _DEFAULTS_INITIALIZED:
-        load_worker_config()
-    read_timeout = _WORKER_TIMEOUT_SEC
-    try:
+        # Collect output
+        output = b""
+        timed_out = False
+        if not _DEFAULTS_INITIALIZED:
+            load_worker_config()
+        read_timeout = _WORKER_TIMEOUT_SEC
         try:
             while True:
                 chunk = await asyncio.wait_for(proc.stdout.read(4096), timeout=read_timeout)
@@ -4894,14 +7879,36 @@ async def _consumer_oneshot(w: Worker, text: str, source: str, s, *, on_handoff=
             proc.kill()
             await proc.wait()
     finally:
-        # If cancelled (CancelledError) or the process is still alive after
-        # wait(), kill it — prevents orphaned cbc/MCP processes (#3).
-        if proc.returncode is None:
+        # This scope begins before creation and covers the handoff callback,
+        # metadata persistence and reads. Never abandon a successfully created
+        # process when any of those operations raises or is cancelled.
+        if proc is not None:
+            async def cleanup_process():
+                if proc.returncode is None:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=10)
+                except (asyncio.TimeoutError, OSError) as exc:
+                    _log.warning("[Worker %s] one-shot cleanup wait failed: %s", w.worker_id, exc)
+
+            cleanup_task = asyncio.create_task(cleanup_process())
             try:
-                proc.kill()
-            except Exception:
-                pass
-        w._mcp_proc = None
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                # A second cancellation must not interrupt reap/cleanup.
+                while not cleanup_task.done():
+                    try:
+                        await asyncio.shield(cleanup_task)
+                    except asyncio.CancelledError:
+                        continue
+                cleanup_task.result()
+                raise
+            finally:
+                if w._mcp_proc is proc:
+                    w._mcp_proc = None
 
     returncode = proc.returncode
     _log.info(
@@ -4932,19 +7939,25 @@ async def _consumer_oneshot(w: Worker, text: str, source: str, s, *, on_handoff=
     mcp_statuses: list[dict] = []
     assistant_events: list[dict] = []  # raw assistant events, re-broadcast as worker.stream
     assistant_blocks: list[dict] = []  # extracted history blocks (assistant/thinking/tool)
+    error_events: list[dict] = []      # raw structured CLI errors (for the sample log)
+    unparsed_lines: list[str] = []     # non-JSON stdout, kept for the sample log
     for line in output.decode(errors="replace").split("\n"):
         line = line.strip()
         if not line:
             continue
         event = adapter.parse_event(line)
         if event is None:
+            unparsed_lines.append(line)
             continue
+        if event.get("type") == "error":
+            error_events.append(event)
 
         if adapter.is_result_event(event):
             result_event = event
             extracted = adapter.extract_result_text(event)
             result_text = str(extracted) if extracted is not None else ""
         elif adapter.is_init_event(event):
+            await _activate_offline_worker(w, ready_proof=True, expected_owner=execution_owner)
             cli_session_id = adapter.extract_session_id(event)
             captured_model = adapter.extract_model(event)
             if adapter.name == "claude":
@@ -5000,6 +8013,12 @@ async def _consumer_oneshot(w: Worker, text: str, source: str, s, *, on_handoff=
     # Append extracted blocks (assistant/thinking/tool) — same as stream mode.
     for block in assistant_blocks:
         _sess.append_history(s, block)
+        if (block.get("role") == "assistant"
+                and _sess.is_pan_message_id(block.get("messageId"))):
+            w._current_task_assistant_ids.add(block["messageId"])
+            if isinstance(block.get("content"), str) and block["content"].strip():
+                w._current_task_last_assistant_text = block["content"]
+                w._current_task_last_assistant_seq = w._current_seq
 
     # Surface failures the user can actually see (#8 timeout, #9 non-zero exit).
     if result_event is not None and adapter.is_result_error(result_event):
@@ -5028,7 +8047,27 @@ async def _consumer_oneshot(w: Worker, text: str, source: str, s, *, on_handoff=
 
     # Persist last_result/history/task association first.  In particular, do
     # not let usage lookup (which may wait on provider files) sit on this path.
-    terminal = await _persist_terminal_state(w, s, status, result)
+    previous_snapshot = None
+    if status in {"error", "cancelled"}:
+        try:
+            previous_snapshot = _sess.history_tail_snapshot(s)
+        except Exception:
+            previous_snapshot = None
+    if result_event is not None:
+        await _activate_offline_worker(w, ready_proof=True, expected_owner=execution_owner)
+    terminal = await _persist_terminal_state(
+        w, s, status, result, expected_owner=execution_owner,
+        error_context={
+            "origin": "worker.oneshot",
+            "cli_raw": result_event,
+            "cli_error_events": error_events,
+            "cli_raw_output": "\n".join(unparsed_lines),
+            "returncode": returncode,
+            "timed_out": timed_out,
+            "previous_message": previous_snapshot,
+            "previous_captured": True,
+        },
+    )
     if terminal is None:
         return
 
@@ -5042,6 +8081,7 @@ async def _consumer_oneshot(w: Worker, text: str, source: str, s, *, on_handoff=
             "sessionId": w.session_id,
             "generation": w.generation,
             "taskSeq": w._current_seq,
+            "executionSeq": w._execution_seq or None,
             "taskId": w._current_task_id,
             "event": event,
         })
@@ -5051,7 +8091,10 @@ async def _consumer_oneshot(w: Worker, text: str, source: str, s, *, on_handoff=
     await _publish_terminal_events(w, terminal, s)
     # 订阅制报告：完成 → 若被订阅则 append 到 manager 的落盘队列（立项 4.3）
     await _enqueue_report(w.session_id, terminal["status"], terminal["result"],
-                          terminal["taskId"], w.worker_id)
+                          terminal["taskId"], w.worker_id,
+                          admission=terminal.get("autoReportAdmission"),
+                          diagnostic=terminal.get("reportDiagnostic"),
+                          prompt=terminal)
     _finish_terminal_bookkeeping(w, terminal)
 
 
@@ -5082,8 +8125,9 @@ def _recover_pending_signals(w: Worker, s) -> bool:
     pending = s.queue_pending
     if not pending:
         return migrated
-    if any(isinstance(item, dict) and _queue_item_kind(item) is not None
+    if not getattr(s, "queue_paused", False) and any(isinstance(item, dict) and _queue_item_kind(item) is not None
            and _delivery_state(item) == _DELIVERY_QUEUED
+           and not _queue_item_locked(item)
            for item in pending):
         w.pending_signal.put_nowait({"type": "queue_signal"})
     _schedule_queue_retry(s.id)
@@ -5115,7 +8159,9 @@ async def create_worker(session_id: str) -> Worker | str:
         return await _create_worker(session_id)
 
 
-async def restart_or_start_worker(session_id: str) -> Worker | str:
+async def restart_or_start_worker(session_id: str, *, expected_worker_id: str | None = None,
+                                  expected_generation: int | None = None,
+                                  allow_illegal_recovery: bool = True) -> Worker | str:
     """Atomically restart a live session worker, or create one if absent.
 
     The session lock covers the liveness decision and lifecycle transition, so
@@ -5128,23 +8174,45 @@ async def restart_or_start_worker(session_id: str) -> Worker | str:
     if _get_session_shallow(session_id) is None:
         return f"Session {session_id} not found"
     recovery_pending = session_id in _recovery_required
+    requested = find_worker_by_session(session_id)
+    requested_generation = requested.generation if requested else None
     lock = await _session_spawn_lock(session_id)
     async with lock:
         if _shutdown_started:
             return "Pan main service is shutting down"
-        alive = find_alive_worker_by_session(session_id)
+        if not allow_illegal_recovery:
+            target = _get_session_shallow(session_id)
+            await _prepare_offline_recovery(target)
+            if _offline.is_illegal(target):
+                return "illegal_queue_hold"
+        alive = _find_control_worker(session_id)
+        if alive is not None and requested is alive and alive.generation != requested_generation:
+            return alive  # A concurrent click already supplied this generation.
+        if expected_generation is not None and (
+                alive is None or alive.worker_id != expected_worker_id
+                or alive.generation != expected_generation):
+            # An immediate/delayed restart already supplied another generation.
+            # Never interrupt that replacement again for a stale own-queue call.
+            return alive if alive is not None else "Worker identity changed"
+        _cancel_session_restart(session_id)
         if alive is not None:
             if recovery_pending and session_id not in _recovery_required:
                 # A watchdog/lifecycle recovery won the lock and already
                 # supplied the replacement.  Do not immediately respawn it
                 # again merely because the user clicked Restart meanwhile.
                 return alive
-            error = await _restart_worker_unlocked(alive.worker_id)
+            try:
+                error = await _restart_worker_unlocked(alive.worker_id)
+            except (RuntimeError, OSError) as exc:
+                return await _control_stop_failed(alive, exc)
             if error:
                 return error
             _recovery_required.discard(session_id)
             return alive
-        result = await _create_worker(session_id)
+        try:
+            result = await _create_worker(session_id)
+        except (RuntimeError, OSError) as exc:
+            return f"Worker start refused: {exc}"
         if isinstance(result, Worker):
             _recovery_required.discard(session_id)
         return result
@@ -5216,6 +8284,51 @@ def _spawn_system_prompt_args(
     return None
 
 
+async def _apply_pending_native_configuration(s) -> None:
+    """Commit a Session upgrade/downgrade only after the old runtime has stopped.
+
+    Pending intent survives a Pan restart. Preserve thread/history/queue and never
+    mutate the running adapter's transport configuration mid-turn.
+    """
+    desired = s.adapter_config.get("native_control_next")
+    if not adapter_supports_native_control(s.adapter) or type(desired) is not bool:
+        return
+    before = dict(s.adapter_config)
+    if desired:
+        s.adapter_config["native_control"] = True
+        s.adapter_config["output_mode"] = "stream"
+    else:
+        s.adapter_config.pop("native_control", None)
+    s.adapter_config.pop("native_control_next", None)
+    try:
+        await _sess.save_async(s)
+    except BaseException:
+        s.adapter_config.clear()
+        s.adapter_config.update(before)
+        raise
+    await _bcast({"type": "session.updated", "sessionId": s.id})
+
+
+def _native_transport_adapter(adapter):
+    """Native-mode adapter wrapper for adapters whose TUI needs another transport.
+
+    cbc/kimi swap in a PTY bridge adapter; codex uses its own app-server adapter
+    unchanged. Keyed by adapter name only here (transport selection), while the
+    gate itself is the capability bit ``supports_native_control``.
+    """
+    name = getattr(adapter, "name", "")
+    if name == "cbc":
+        from .adapters.cbc.native_adapter import CbcNativeAdapter
+
+        return CbcNativeAdapter()
+    if name == "kimi":
+        from .adapters.kimi.native_adapter import KimiNativeAdapter
+
+        return KimiNativeAdapter()
+    return None
+
+
+@_admit_plugin_startup
 async def _create_worker(session_id: str) -> Worker | str:
     """create_worker 的锁内实现（勿直接调用）。"""
     s = _sess.get(session_id)
@@ -5231,16 +8344,26 @@ async def _create_worker(session_id: str) -> Worker | str:
         )
         return alive
 
+    await _prepare_offline_recovery(s)
     old = find_worker_by_session(session_id)
     if old:
         # 有注册但进程已死的 worker（_read_stdout 尚未 pop）→ 清理后重建。
         # Deliberately do NOT clear cli_session_id: resuming the cbc JSONL is
         # the intended context-continuity mechanism, and clearing it here would
         # force a cold start on every restart (#11, resolved by design).
-        await _kill_worker_unlocked(old.worker_id)
+        stop_error = await _kill_worker_unlocked(old.worker_id)
+        if type(s.adapter_config.get("native_control_next")) is bool and (stop_error or not _runtime_stopped(old)):
+            workers[old.worker_id] = old
+            old._consume_task = None  # Retained owner, never a second queue writer.
+            old.status = "error"
+            _register_worker(old)
+            return "Old Worker runtime did not stop; Session conversion retained"
 
+    await _apply_pending_native_configuration(s)
     try:
         adapter = get_adapter(s.adapter)
+        if s.adapter_config.get("native_control") is True:
+            adapter = _native_transport_adapter(adapter) or adapter
     except KeyError:
         # A legacy/corrupt session may outlive the adapter that created it.
         # Surface an actionable worker error instead of allowing a raw
@@ -5251,8 +8374,6 @@ async def _create_worker(session_id: str) -> Worker | str:
             f"Unknown adapter {s.adapter!r} for session {s.name!r}. "
             f"Available adapters: {available}"
         )
-    worker_id = await _next_worker_id()
-
     mcp_on = _mcp_configured(s)
     mode = resolve_execution_mode(adapter, s)
     prompt_files: list[str] = []
@@ -5260,6 +8381,8 @@ async def _create_worker(session_id: str) -> Worker | str:
     if mode == "oneshot":
         # One-shot mode: no long-running process, consumer spawns per-task
         # (no stdin). See docs/design/adapter-p1-oneshot.md.
+        from packages.plugins.lifecycle import capture_async
+        await capture_async(s)
         proc = None
         spawn_injected = False
     else:
@@ -5267,16 +8390,24 @@ async def _create_worker(session_id: str) -> Worker | str:
         # If MCP is configured (mcp_on, output_mode="stream"), the process is
         # spawned with --mcp-config (build_spawn_args -> mcp_args) so the
         # long-running stream keeps MCP tools (cbc >= 2.137.0).
-        extra_args = _spawn_system_prompt_args(adapter, s, mcp_on, prompt_files)
+        from packages.plugins.lifecycle import io
+        extra_args = await io(_spawn_system_prompt_args, adapter, s, mcp_on, prompt_files)
         spawn_injected = extra_args is not None
         proc = await _spawn_process(session_id, adapter=adapter, extra_args=extra_args)
         if isinstance(proc, str):
             for path in prompt_files:
                 _cleanup_system_prompt_file(path)
+            await _record_worker_start_failure(s, session_id, _next_worker_id(), proc)
             return proc
 
+    # Different Sessions have different spawn locks. Allocate only after the
+    # asynchronous spawn, immediately before synchronous registration, so two
+    # concurrent starts cannot select the same free id and overwrite an owner.
+    worker_id = _next_worker_id()
     w = Worker(worker_id=worker_id, session_id=session_id,
                adapter=adapter,
+               native_control_enabled=adapter_supports_native_control(s.adapter)
+               and s.adapter_config.get("native_control") is True,
                status="idle", process=proc, pending_signal=asyncio.Queue(),
                system_prompt_file=prompt_files[0] if prompt_files else None,
                _task_done=asyncio.Event(),
@@ -5290,6 +8421,14 @@ async def _create_worker(session_id: str) -> Worker | str:
     workers[worker_id] = w
     _register_worker(w)
 
+    w._offline_predecessors = set(s.illegal_batches)
+    try:
+        await _claim_offline_owner(w)
+    except BaseException:
+        await _kill_process_tree(w)
+        workers.pop(worker_id, None)
+        _unregister_worker(w)
+        raise
     if mode != "oneshot":
         w._stdout_task = asyncio.create_task(_read_stdout(w))
     # watchdog 两种模式都启用：stream 做超时+空闲回收，MCP 只做空闲回收
@@ -5349,27 +8488,194 @@ async def _create_worker(session_id: str) -> Worker | str:
     if s.system_prompt and not s.cli_session_id:
         if mode == "oneshot":
             _log.info("[Worker %s] oneshot mode: system_prompt 由 oneshot_args 逐任务注入", worker_id)
-        elif not spawn_injected:
+        elif not spawn_injected and not any(
+                isinstance(item, dict) and item.get("type") == "task"
+                and item.get("source") == "system_prompt"
+                and item.get("text") == s.system_prompt
+                for item in s.queue_pending):
             _log.info("[Worker %s] injecting system_prompt (%d chars)", worker_id, len(s.system_prompt))
             await send_task(worker_id, s.system_prompt, source="system_prompt")
-        else:
+        elif spawn_injected:
             _log.info("[Worker %s] stream mode: system_prompt injected via --system-prompt", worker_id)
+        else:
+            _log.info("[Worker %s] recovering queued system_prompt without reinjection", worker_id)
 
     return w
 
 
+async def reserve_takeover_owner(w: Worker) -> None:
+    """External TUI has no turn/admission channel. Reserve before opening it.
+
+    A lost service cannot prove all detached descendants died merely because
+    the terminal PID vanished. Only confirmed retirement clears this marker.
+    """
+    s = _session(w)
+    if s is None:
+        raise RuntimeError("Session disappeared before takeover")
+    identity = {**_offline.owner(w), "externalTakeover": True, "ownerId": uuid.uuid4().hex,
+                "runtimeExpected": True, "ownershipUnknown": True, "processes": []}
+    async with queue_lock(w.session_id):
+        def reserve(candidate):
+            if (workers.get(w.worker_id) is not w or w.offline_token != identity["token"]
+                    or w.generation != identity["generation"]):
+                raise RuntimeError("Takeover runtime changed before admission")
+            candidate.offline_owner = identity
+        await _commit_offline(s, reserve)
+
+
 async def _kill_takeover_terminal(w: Worker) -> bool:
     """杀掉 takeover 模式打开的终端及子进程树。异步版，不阻塞事件循环。"""
+    if w.takeover_job is not None:
+        job = w.takeover_job
+        if not hasattr(job, "terminate_and_verify"):
+            await asyncio.to_thread(job.stop)
+            raise RuntimeError("Takeover Job has no verifiable retirement proof")
+        # Bound the control response even if a kernel/provider stop stalls.
+        # Keep the single in-flight verifier: a retry must never close/reuse
+        # its Job handle while the original thread still owns the call.
+        if w._takeover_stop_task is None:
+            w._takeover_stop_task = asyncio.create_task(asyncio.to_thread(job.terminate_and_verify))
+        try:
+            proof = await asyncio.wait_for(asyncio.shield(w._takeover_stop_task),
+                                           timeout=_TAKEOVER_STOP_TIMEOUT)
+        except TimeoutError as exc:
+            if w._takeover_stop_task.done():
+                w._takeover_stop_task = None
+                raise
+            raise RuntimeError(
+                f"Takeover retirement timed out after {_TAKEOVER_STOP_TIMEOUT:g}s; verifier retained for retry"
+            ) from exc
+        except Exception:
+            if w._takeover_stop_task.done():
+                w._takeover_stop_task = None
+            raise
+        s = _session(w)
+        if s is not None:
+            captured = copy.deepcopy(s.offline_owner)
+            prior_key = (captured or {}).get("previousOwnerRetirement")
+            prior = s.owner_retirements.get(prior_key, {})
+            if prior.get("proof", {}).get("jobId") == proof["jobId"]:
+                pass  # Persistence succeeded earlier; retry only handle release.
+            elif not captured or not captured.get("externalTakeover"):
+                raise RuntimeError("Takeover owner scope is unconfirmed; retaining Job handle")
+            else:
+                async with queue_lock(s.id):
+                    def retire(candidate):
+                        if candidate.offline_owner != captured or w.takeover_job is not job:
+                            raise RuntimeError("Takeover owner changed during retirement")
+                        key = captured.get("ownerId") or f"{captured['token']}:{captured['generation']}"
+                        candidate.owner_retirements[key] = {"owner": captured, "proof": proof}
+                        _offline.retire_owner(candidate, captured, reason="takeover/stopped", proof=proof)
+                        # A failed Kill may already have classified this external
+                        # operation Illegal. Whole-Job proof now retires it, while
+                        # its queue incident stays locked until successor readiness.
+                        for op in _offline.outstanding(candidate, captured):
+                            if op.get("kind") == "external-takeover":
+                                op["retirement"] = {"safe": True, "proof": proof,
+                                                    "reason": "takeover/stopped"}
+                        _offline.aggregate(candidate)
+                        candidate.offline_owner = {**_offline.owner(w), "previousOwnerRetirement": key}
+                    await _commit_offline(s, retire)
+        # Preserve both the Job and its verifiable empty state until the
+        # ordered metadata replace succeeds. A failed write is retryable.
+        await asyncio.to_thread(job.close_retired)
+        w.takeover_job = None
+        w._takeover_stop_task = None
+        w.takeover_pid = None
+        return True
     if not w.takeover_pid:
+        s = _session(w)
+        if s is not None and (s.offline_owner or {}).get("externalTakeover"):
+            raise RuntimeError("Takeover owner is unknown; refusing a second writer")
         return False
     pid = w.takeover_pid
+    # The generic kill helper logs errors for legacy callers. Its return alone
+    # is not proof of retirement; retain the owner unless every observed PID
+    # identity is confirmed dead. A vanished root cannot prove orphan death.
+    try:
+        root = psutil.Process(pid)
+        identities = [{"pid": p.pid, "createdAt": p.create_time()}
+                      for p in [root, *root.children(recursive=True)]]
+    except (psutil.NoSuchProcess, psutil.AccessDenied) as exc:
+        raise RuntimeError("Takeover owner is unknown; refusing a second writer") from exc
     _log.info("[Worker %s] 杀 takeover 终端 PID=%s", w.worker_id, pid)
     try:
         await asyncio.to_thread(_kill_pid_tree, pid)
         _log.info("[Worker %s] takeover 终端已结束 PID=%s", w.worker_id, pid)
     except Exception as e:
         _log.warning("[Worker %s] 杀 takeover 终端异常: %s", w.worker_id, e)
+        raise RuntimeError("Takeover retirement could not be confirmed") from e
+    status = await asyncio.to_thread(_offline.previous_owner_status, {"processes": identities})
+    if status != "dead":
+        raise RuntimeError(f"Takeover owner is {status}; refusing a second writer")
+    s = _session(w)
+    if s is not None and (s.offline_owner or {}).get("externalTakeover"):
+        raise RuntimeError("Takeover descendant coverage is unknown without a Job retirement proof")
     w.takeover_pid = None
+    await _claim_offline_owner(w)
+    return True
+
+
+_TAKEOVER_STOP_TIMEOUT = 8.0  # Job verification itself normally finishes within 5s.
+
+
+def _find_control_worker(session_id: str) -> Worker | None:
+    """Control retires registered ownership, even without a reusable consumer.
+
+    Queue dispatch deliberately continues using find_alive_worker_by_session.
+    A dead/failed consumer never makes its process or external owner disappear.
+    """
+    return find_worker_by_session(session_id)
+
+
+async def _stop_takeover_for_control(w: Worker) -> str | None:
+    try:
+        await _kill_takeover_terminal(w)
+        return None
+    except Exception as exc:
+        return await _control_stop_failed(w, exc)
+
+
+async def _control_stop_failed(w: Worker, exc: Exception) -> str:
+    # Never report success or leave the UI held after an unconfirmed stop.
+    # Preserve the exact owner and retained Job for a safe retry.
+    w.status = "error"
+    _log.error("[Worker %s] control stop failed; retaining owner", w.worker_id,
+               exc_info=(type(exc), exc, exc.__traceback__))
+    error = f"Worker/Takeover stop failed; owner retained, retry Kill: {exc}"
+    s = _session(w)
+    if s is not None:
+        try:
+            async with queue_lock(s.id):
+                def failed(candidate):
+                    identity = candidate.offline_owner
+                    if not identity:
+                        return
+                    if not _offline.outstanding(candidate, identity):
+                        _offline.admit(candidate, identity,
+                            kind="external-takeover" if identity.get("externalTakeover") else "control-stop",
+                            operation_id=identity.get("ownerId") or f"{identity['token']}:{identity['generation']}:stop")
+                    _offline.detect(candidate, "takeover/stop-failed", identity=identity,
+                        eligible=lambda item: _delivery_state(item) == _DELIVERY_QUEUED
+                            and not _queue_item_locked(item),
+                        remember=lambda item: _remember_offline_lock(candidate, item))
+                await _commit_offline(s, failed)
+            await _offline_snapshot_event(s)
+        except Exception as persistence_error:
+            error += f"; Illegal Offline persistence failed (retry required): {persistence_error}"
+    await _bcast({"type": "worker.status", "workerId": w.worker_id,
+                  "sessionId": w.session_id, "generation": w.generation,
+                  "status": "error", "error": error})
+    return error
+
+
+def _confirm_native_input_retirement(w: Worker) -> bool:
+    if not w.native_input_uncertain:
+        return True
+    if not _runtime_stopped(w):
+        w.status = "error"
+        return False
+    w.native_input_uncertain = False
     return True
 
 
@@ -5429,6 +8735,11 @@ async def _kill_process_tree(w: Worker) -> None:
             except (ProcessLookupError, Exception):
                 pass
         await wait_for_exit(process, "CLI process")
+        launch_cleanup = getattr(process, '_provider_launch_cleanup', None)
+        if launch_cleanup is not None:
+            # The launch Job/handles/private snapshot belong to this lifecycle;
+            # kill/restart must retire them before reporting terminal cleanup.
+            await asyncio.shield(launch_cleanup)
 
     # One-shot mode: w._mcp_proc is the in-flight short-lived provider process
     # (may be None).
@@ -5462,7 +8773,9 @@ async def _takeover_worker_unlocked(worker_id: str) -> str | None:
         return "Pan main service is shutting down"
     if w.status == "held":
         return "Worker already in takeover mode"
+    retiring_owner = _offline.owner(w)
 
+    _cancel_pending_restart(w)
     _cancel_claude_permission_requests(worker_id, "Claude worker entered takeover mode")
 
     current = asyncio.current_task()
@@ -5476,19 +8789,39 @@ async def _takeover_worker_unlocked(worker_id: str) -> str | None:
     clear_native_runtime_state(w)
     await _kill_takeover_terminal(w)
     await _kill_process_tree(w)
+    if not _runtime_stopped(w):
+        return await _control_stop_failed(w, RuntimeError("Runtime stop was not confirmed (timed out); takeover refused"))
+    if not _confirm_native_input_retirement(w):
+        return "Old runtime stop was not confirmed; input uncertainty retained"
     if _runtime_stopped(w):
         await _record_legal_worker_state(w, "held", "pan/takeover")
     w.process = None
     w._mcp_proc = None
     if w._hist_dirty:
         await _flush_history_now(w)
+    await _finish_offline_stop(w, retiring_owner, "pan/takeover")
     w.status = "held"
     return None
+
+
+def _user_kill_report_enabled() -> bool:
+    """用户主动 Kill 是否向 manager 报告 error（App Settings → Behavior）。
+
+    config.json:
+        "ui": { "reportWorkerKillErrors": false }
+
+    缺省该键（旧配置）→ 视为关闭（默认 false）。该开关只抑制用户显式
+    Kill（``report_abnormal=True``）触发的 zombie/error 报告；异常死亡与
+    watchdog 报告不经此函数，始终按原语义上报。
+    """
+    ui = load_config().get("ui") or {}
+    return bool(ui.get("reportWorkerKillErrors", False))
 
 
 async def _kill_worker_unlocked(
     worker_id: str, *, recover: bool = False,
     report_abnormal: bool = False,
+    preserve_restart_intent: bool = False,
 ) -> str | None:
     """Kill the Worker process. Does NOT touch the Session.
 
@@ -5501,10 +8834,19 @@ async def _kill_worker_unlocked(
     w = workers.get(worker_id)
     if not w:
         return "Worker not found"
+    if not preserve_restart_intent:
+        _cancel_pending_restart(w)
+
+    error = await _stop_takeover_for_control(w)
+    if error:
+        return error
 
     abnormal = w.status in {"running", "queued"}
+    retiring_owner = _offline.owner(w)
+    if recover and abnormal:
+        await _detect_offline_exit(w, retiring_owner, "watchdog/aborted")
 
-    if report_abnormal and abnormal:
+    if report_abnormal and abnormal and _user_kill_report_enabled():
         await _enqueue_zombie_report(w, "worker killed")
 
     _cancel_claude_permission_requests(worker_id, "Claude worker was stopped")
@@ -5532,6 +8874,9 @@ async def _kill_worker_unlocked(
     await _kill_process_tree(w)
     await _kill_takeover_terminal(w)
 
+    if not _runtime_stopped(w):
+        return await _control_stop_failed(w, RuntimeError("Runtime stop was not confirmed (timed out); process is still alive"))
+
     if _runtime_stopped(w):
         await _record_legal_worker_state(w, "offline", "pan/kill")
 
@@ -5544,10 +8889,13 @@ async def _kill_worker_unlocked(
         except Exception as exc:
             _log.warning("[Worker %s] failed to persist kill task context clear: %s",
                          worker_id, exc)
+            raise
     # A1 崩溃安全：kill 前 flush 防抖缓冲的流式块
     if w._hist_dirty:
         await _flush_history_now(w)
 
+    if not recover:
+        await _finish_offline_stop(w, retiring_owner, "pan/stop")
     workers.pop(w.worker_id, None)
     _unregister_worker(w)
     await _bcast({
@@ -5571,15 +8919,19 @@ async def kill_worker(worker_id: str, *, recover: bool = False,
     if not w:
         return "Worker not found"
     generation = w.generation
+    _cancel_session_restart(w.session_id)
     lock = await _session_spawn_lock(w.session_id)
     async with lock:
         current = workers.get(worker_id)
         if current is not w or w.generation != generation:
             # A concurrent restart already owns this lifecycle transition.
-            return None
-        return await _kill_worker_unlocked(
-            worker_id, recover=recover, report_abnormal=report_abnormal,
-        )
+            return "Worker identity changed during Kill; retry against the current worker"
+        try:
+            return await _kill_worker_unlocked(
+                worker_id, recover=recover, report_abnormal=report_abnormal,
+            )
+        except (RuntimeError, OSError) as exc:
+            return await _control_stop_failed(w, exc)
 
 
 async def kill_session_worker(session_id: str, *,
@@ -5587,14 +8939,37 @@ async def kill_session_worker(session_id: str, *,
     """Kill the live worker for a session, if present."""
     if _get_session_shallow(session_id) is None:
         return f"Session {session_id} not found"
+    _cancel_session_restart(session_id)
     lock = await _session_spawn_lock(session_id)
     async with lock:
-        w = find_alive_worker_by_session(session_id)
+        w = _find_control_worker(session_id)
         if w is None:
+            s = _get_session_shallow(session_id)
+            identity = (s.offline_owner or {}) if s else {}
+            if identity.get("externalTakeover"):
+                # After host loss there is no retained Job handle. Reconstruct
+                # only the control identity to diagnose the incident, never a
+                # provider/runtime or permission to start a second writer.
+                retained = Worker(worker_id=identity["workerId"], session_id=session_id,
+                                  adapter=get_adapter(s.adapter), status="error",
+                                  offline_token=identity["token"], generation=identity["generation"])
+                return await _control_stop_failed(retained, RuntimeError(
+                    "External takeover owner is unknown after host loss; verify its process tree before recovery"))
+            if identity:
+                status = await asyncio.to_thread(_offline.previous_owner_status, identity)
+                if status != "dead":
+                    retained = Worker(worker_id=identity["workerId"], session_id=session_id,
+                                      adapter=get_adapter(s.adapter), status="error",
+                                      offline_token=identity["token"], generation=identity["generation"])
+                    return await _control_stop_failed(retained, RuntimeError(
+                        f"Untracked runtime owner is {status}; verify its process tree before recovery"))
             return None
-        error = await _kill_worker_unlocked(
-            w.worker_id, report_abnormal=report_abnormal,
-        )
+        try:
+            error = await _kill_worker_unlocked(
+                w.worker_id, report_abnormal=report_abnormal,
+            )
+        except (RuntimeError, OSError) as exc:
+            return await _control_stop_failed(w, exc)
         return error or w
 
 
@@ -5604,24 +8979,32 @@ async def takeover_worker(worker_id: str) -> str | None:
     if not w:
         return "Worker not found"
     generation = w.generation
+    _cancel_session_restart(w.session_id)
     lock = await _session_spawn_lock(w.session_id)
     async with lock:
         current = workers.get(worker_id)
         if current is not w or w.generation != generation:
             return None
-        return await _takeover_worker_unlocked(worker_id)
+        try:
+            return await _takeover_worker_unlocked(worker_id)
+        except (RuntimeError, OSError) as exc:
+            return await _control_stop_failed(w, exc)
 
 
 async def takeover_session_worker(session_id: str) -> Worker | str | None:
     """Put the live worker for a session into takeover mode, if present."""
     if _get_session_shallow(session_id) is None:
         return f"Session {session_id} not found"
+    _cancel_session_restart(session_id)
     lock = await _session_spawn_lock(session_id)
     async with lock:
-        w = find_alive_worker_by_session(session_id)
+        w = _find_control_worker(session_id)
         if w is None:
             return None
-        error = await _takeover_worker_unlocked(w.worker_id)
+        try:
+            error = await _takeover_worker_unlocked(w.worker_id)
+        except (RuntimeError, OSError) as exc:
+            return await _control_stop_failed(w, exc)
         return error or w
 
 
@@ -5634,6 +9017,7 @@ async def cleanup_worker_background(worker_id: str, session_id: str):
     w = workers.get(worker_id)
     if not w:
         return
+    _cancel_pending_restart(w)
     try:
         if not w:
             return
@@ -5678,35 +9062,174 @@ async def cleanup_worker_background(worker_id: str, session_id: str):
 
 
 def _maybe_restart_pending(w: Worker) -> None:
-    """Worker 回到 idle 时若标记了 pending_restart，异步 respawn 让配置变更生效。
+    """Linearize idle retirement BEFORE scheduling or waking the next FIFO unit.
 
-    在 worker 置 idle 的各路径调用；仅 pending_restart 时触发，其他情况为无操作。
+    A temporary idle during terminal persistence/publication is not an idle
+    boundary. A handed-off queue unit must finish its report/finally cleanup.
+    Preparation before running is cancellable: lifecycle stop awaits its
+    reservation unwind, rather than waiting for memory/network preparation.
+    No lock or await is needed for this event-loop-local decision.
     """
-    if w.pending_restart and w.process is not None:
+    if (not w.pending_restart or w.status not in {"idle", "queued"}
+            or w._native_reservation_busy or w._native_external_turn_active
+            or (w._queue_unit_active and w._current_handoff_acked)
+            or w._terminal_finishing or workers.get(w.worker_id) is not w):
+        return
+    intent = _delayed_restarts.get(w.session_id)
+    if (intent is None or intent["status"] != "pending"
+            or intent["workerId"] != w.worker_id
+            or intent["generation"] != w.generation):
+        return
+    # The old consumer can no longer reserve or hand off another queue item.
+    w.status = "restarting"
+    _set_restart_intent(intent, "restarting")
+    asyncio.create_task(_respawn_worker(w, intent))
+
+
+def delayed_restart_state(session_id: str) -> dict | None:
+    intent = _delayed_restarts.get(session_id)
+    return dict(intent) if intent else None
+
+
+def _set_restart_intent(intent: dict, status: str, error: str | None = None) -> None:
+    global _delayed_restart_revision
+    _delayed_restart_revision += 1
+    intent.update(status=status, error=error, revision=_delayed_restart_revision)
+    # Snapshot now: a later transition must not mutate an already queued event.
+    asyncio.create_task(_bcast({"type": "worker.delayed_restart",
+                               "sessionId": intent["sessionId"],
+                               "delayedRestart": dict(intent)}))
+
+
+def _abort_delayed_restart(w: Worker, boundary: str, exc: BaseException) -> None:
+    """Expose an unsafe completion boundary without scheduling a replacement.
+
+    The original exception remains the caller's responsibility. Clearing the
+    intent projection lets an immediate Restart recover this runtime; terminal
+    persistence retains its existing rollback/dedup semantics.
+    """
+    intent = _delayed_restarts.get(w.session_id)
+    if (intent and intent["workerId"] == w.worker_id
+            and intent["generation"] == w.generation
+            and intent["status"] in {"pending", "restarting"}):
         w.pending_restart = False
-        _log.info("[Worker %s] 配置变更：idle 后 respawn", w.worker_id)
-        asyncio.create_task(_respawn_worker(w))
+        w.status = "error"
+        cancelled = isinstance(exc, asyncio.CancelledError)
+        _set_restart_intent(intent, "cancelled" if cancelled else "failed",
+                            f"{boundary}: {type(exc).__name__}: {exc}; use Restart to recover")
 
 
-async def _respawn_worker(w: Worker) -> None:
-    """kill 当前进程 + 重新 spawn（resume 上下文），用于进程相关配置变更后生效。"""
-    sid, wid = w.session_id, w.worker_id
-    generation = w.generation
+def _cancel_pending_restart(w: Worker) -> None:
+    """Immediate lifecycle operations supersede this generation's intent."""
+    w.pending_restart = False
+    intent = _delayed_restarts.get(w.session_id)
+    if (intent and intent["workerId"] == w.worker_id
+            and intent["generation"] == w.generation
+            and intent["status"] in {"pending", "restarting"}):
+        _set_restart_intent(intent, "cancelled")
+
+
+def _cancel_session_restart(session_id: str) -> None:
+    """An immediate user lifecycle request wins even while spawn lock is held."""
+    intent = _delayed_restarts.get(session_id)
+    if intent and intent["status"] in {"pending", "restarting"}:
+        w = find_worker_by_session(session_id)
+        if w is not None:
+            w.pending_restart = False
+        _set_restart_intent(intent, "cancelled")
+
+
+def request_delayed_restart(session_id: str) -> dict | str:
+    """Merge settings/user intent; absent runtime follows Restart's start policy.
+
+    Acceptance and generation capture are synchronous. Lifecycle I/O reuses
+    the existing per-session spawn lock; no global/queue lock waits for exit.
+    Intent is runtime-only and never migrates to a different Worker generation.
+    """
+    if _shutdown_started:
+        return "Pan main service is shutting down"
+    if _get_session_shallow(session_id) is None:
+        return f"Session {session_id} not found"
+    prior = _delayed_restarts.get(session_id)
+    if prior and prior["status"] in {"pending", "restarting"}:
+        owner = workers.get(prior["workerId"])
+        if prior["status"] == "restarting" or (
+                owner is not None and owner.generation == prior["generation"]):
+            return dict(prior)
+        _set_restart_intent(prior, "cancelled", "Worker generation was replaced")
+    tracked = find_worker_by_session(session_id)
+    if tracked is not None and tracked.status == "held":
+        return "Worker is held (takeover mode); use Restart after finishing takeover"
+    w = find_alive_worker_by_session(session_id)
+    if w is not None and w.status not in {"idle", "running", "queued", "done", "error", "cancelled"}:
+        return f"Worker is {w.status}; delayed restart requires an idle or active task runtime"
+    if (w is not None and w.status in {"done", "error", "cancelled"}
+            and not w._terminal_finishing and not w._queue_unit_active):
+        return f"Worker is {w.status}; use Restart to recover the runtime"
+    intent = {"sessionId": session_id, "workerId": w.worker_id if w else None,
+              "generation": w.generation if w else None,
+              "action": "restart" if w else "start"}
+    _delayed_restarts[session_id] = intent
+    _set_restart_intent(intent, "pending" if w else "restarting")
+    if w:
+        w.pending_restart = True
+        _maybe_restart_pending(w)
+    else:
+        asyncio.create_task(_respawn_worker(None, intent))
+    return dict(intent)
+
+
+async def _respawn_worker(w: Worker | None, intent: dict) -> None:
+    """Reuse settings respawn; fence the captured generation under its lock."""
+    sid = intent["sessionId"]
     lock = await _session_spawn_lock(sid)
     try:
         async with lock:
-            if workers.get(wid) is not w or w.generation != generation:
+            if _delayed_restarts.get(sid) is not intent or intent["status"] != "restarting":
                 return
-            await _kill_worker_unlocked(wid)
+            if _shutdown_started:
+                _set_restart_intent(intent, "cancelled", "Pan main service is shutting down")
+                return
+            if w is not None:
+                if workers.get(w.worker_id) is not w or w.generation != intent["generation"]:
+                    _set_restart_intent(intent, "cancelled", "Worker generation was replaced")
+                    return
+                error = await _kill_worker_unlocked(w.worker_id, preserve_restart_intent=True)
+                if error:
+                    raise RuntimeError(error)
+                if not _runtime_stopped(w):
+                    # The existing kill path has already removed its registry
+                    # entry. Retain the fenced runtime so recovery cannot open
+                    # a second native writer while the old process still lives.
+                    workers[w.worker_id] = w
+                    w._consume_task = None  # fenced live runtime, no queue writer
+                    _register_worker(w)
+                    raise RuntimeError("Old Worker runtime did not stop; replacement was not started")
+            if intent["status"] != "restarting":
+                return
             result = await _create_worker(sid)
-        if isinstance(result, Worker):
-            _log.info("[Worker %s] respawn 完成 -> %s", wid, result.worker_id)
-        else:
-            _log.warning("[Worker %s] respawn 失败: %s", wid, result)
-    except Exception as e:
-        _log.error("[Worker %s] respawn 异常: %s", wid, e)
+            if isinstance(result, str):
+                raise RuntimeError(result)
+            if intent["status"] != "restarting":
+                return
+            intent["replacementWorkerId"] = result.worker_id
+            intent["replacementGeneration"] = result.generation
+            _set_restart_intent(intent, "completed")
+    except asyncio.CancelledError:
+        if intent["status"] == "restarting":
+            _set_restart_intent(intent, "cancelled", "Restart coordinator cancelled")
+        raise
+    except Exception as exc:
+        if w is not None:
+            w.pending_restart = False
+            if workers.get(w.worker_id) is w:
+                w.status = "error"
+        if intent["status"] == "restarting":
+            _set_restart_intent(intent, "failed", str(exc))
+        _log.exception("[Session %s] delayed restart failed", sid)
 
 
+@_admit_plugin_startup
 async def _spawn_process(session_id: str,
                          adapter: CliAdapter,
                          extra_args: list[str] | None = None
@@ -5716,16 +9239,54 @@ async def _spawn_process(session_id: str,
         return f"Session {session_id} not found"
 
     try:
-        args = adapter.build_spawn_args(s, extra_args)
+        from packages.plugins.lifecycle import capture_async, io
+        await capture_async(s)
+        args = await io(adapter.build_spawn_args, s, extra_args)
         _log_mcp_launch(worker_id=s.worker_id if hasattr(s, "worker_id") else session_id,
                         session=s, args=args)
-        return await asyncio.create_subprocess_exec(
+        from packages.core.adapters.codex import provider_launch
+        pending = None
+        if adapter.name == 'codex':
+            preparation = asyncio.create_task(io(provider_launch.prepare, adapter, s, _sess.SESSION_DIR.parent))
+            try:
+                pending = await asyncio.shield(preparation)
+            except asyncio.CancelledError:
+                # Retire the off-loop write before deleting its owned directory.
+                result = await preparation
+                if result:await io(result.close)
+                raise
+            except Exception:
+                return 'Fixed provider launch configuration unavailable'
+        proc = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
             *args,
             stdout=asyncio.subprocess.PIPE,
             stdin=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             cwd=s.workdir or None,
-        )
+              **({'env': await io(pending.environment)} if pending else {}),
+            **command_window_options(),
+            )
+            if pending:
+                proc._provider_launch = pending
+                await pending.accept(proc)
+                async def cleanup_launch():
+                    await proc.wait()
+                    await io(pending.close)
+                proc._provider_launch_cleanup = asyncio.create_task(cleanup_launch())
+            return proc
+        except BaseException as exc:
+            if proc:
+                if proc.stdin:proc.stdin.close()
+                if proc.returncode is None:
+                    try:proc.kill()
+                    except ProcessLookupError:pass
+                await proc.wait()
+            if pending:await io(pending.close)
+            if isinstance(exc,asyncio.CancelledError):raise
+            if pending:return 'Fixed provider launch was not confirmed'
+            raise
     except FileNotFoundError as e:
         return format_cli_spawn_error(adapter.name, e)
     except ValueError as e:
@@ -5746,9 +9307,17 @@ async def _restart_tasks(w: Worker):
     w._current_queue_item = None
     w._claimed_queue_index = None
     w._current_report_items = []
+    w._prompt_ref = None
     w._current_handoff_acked = False
+    w._queue_unit_active = False
+    w._terminal_finishing = False
     w._task_started_at = 0.0
     w.last_activity = time.monotonic()
+    w._offline_ready_token = None
+    w._native_admission_id = None
+    s = _session(w)
+    w._offline_predecessors = set(s.illegal_batches) if s else set()
+    await _claim_offline_owner(w)
     if w.process is not None:
         w._stdout_task = asyncio.create_task(_read_stdout(w))
     if not _DEFAULTS_INITIALIZED:
@@ -5771,6 +9340,14 @@ async def _restart_worker_unlocked(worker_id: str) -> str | None:
     w = workers.get(worker_id)
     if not w:
         return "Worker not found"
+    _cancel_pending_restart(w)
+    retiring_owner = _offline.owner(w)
+
+    # Stop the takeover owner before changing generation/state or spawning.
+    # A failed stop leaves a held worker retryable and cannot create a writer.
+    error = await _stop_takeover_for_control(w)
+    if error:
+        return error
 
     _cancel_claude_permission_requests(worker_id, "Claude worker was restarted")
 
@@ -5801,6 +9378,13 @@ async def _restart_worker_unlocked(worker_id: str) -> str | None:
 
     # kill existing cbc process tree（psutil 递归杀，避免 node.exe 孤儿）
     await _kill_process_tree(w)
+    if not _runtime_stopped(w):
+        return await _control_stop_failed(w, RuntimeError("Runtime stop was not confirmed (timed out); process is still alive"))
+    if not _confirm_native_input_retirement(w):
+        return "Old runtime stop was not confirmed; input uncertainty retained"
+    if w._hist_dirty:
+        await _flush_history_now(w)
+    await _finish_offline_stop(w, retiring_owner, "pan/restart-stop")
     if _runtime_stopped(w):
         await _record_legal_worker_state(w, "offline", "pan/restart-stop")
     w.process = None
@@ -5810,6 +9394,9 @@ async def _restart_worker_unlocked(worker_id: str) -> str | None:
     # calling _spawn_process here would launch a stream CLI with the wrong
     # protocol and can leave force-send callers waiting forever.
     if resolve_execution_mode(w.adapter, _session(w)) == "oneshot":
+        from packages.plugins.lifecycle import session_claim, capture_async
+        async with session_claim(_session(w)):
+            await capture_async(_session(w))
         w.status = "idle"
         await _restart_tasks(w)
         await _record_legal_worker_state(w, "idle", "pan/restart-start")
@@ -5827,6 +9414,10 @@ async def _restart_worker_unlocked(worker_id: str) -> str | None:
     proc = await _spawn_process(w.session_id, adapter=w.adapter)
     if isinstance(proc, str):
         w.status = "error"
+        await _record_worker_start_failure(
+            _session(w), w.session_id, w.worker_id, proc,
+            w=w, origin="worker.pan_restart",
+        )
         _schedule_session_recovery(w.session_id)
         return f"Spawn failed ({w.session_id}): {proc}"
     w.process = proc
@@ -5857,12 +9448,16 @@ async def restart_worker(worker_id: str) -> str | None:
     if not w:
         return "Worker not found"
     generation = w.generation
+    _cancel_session_restart(w.session_id)
     lock = await _session_spawn_lock(w.session_id)
     async with lock:
         current = workers.get(worker_id)
         if current is not w or w.generation != generation:
             return None
-        return await _restart_worker_unlocked(worker_id)
+        try:
+            return await _restart_worker_unlocked(worker_id)
+        except (RuntimeError, OSError) as exc:
+            return await _control_stop_failed(w, exc)
 
 
 async def _respawn_worker_unlocked(worker_id: str, extra_args: list[str] | None = None) -> str | None:
@@ -5870,6 +9465,8 @@ async def _respawn_worker_unlocked(worker_id: str, extra_args: list[str] | None 
     w = workers.get(worker_id)
     if not w:
         return "Worker not found"
+    _cancel_pending_restart(w)
+    retiring_owner = _offline.owner(w)
 
     _cancel_claude_permission_requests(worker_id, "Claude worker was respawned")
 
@@ -5892,6 +9489,11 @@ async def _respawn_worker_unlocked(worker_id: str, extra_args: list[str] | None 
 
     await _kill_takeover_terminal(w)
     await _kill_process_tree(w)
+    if not _confirm_native_input_retirement(w):
+        return "Old runtime stop was not confirmed; input uncertainty retained"
+    if w._hist_dirty:
+        await _flush_history_now(w)
+    await _finish_offline_stop(w, retiring_owner, "pan/respawn-stop")
     if _runtime_stopped(w):
         await _record_legal_worker_state(w, "offline", "pan/respawn-stop")
     w.process = None
@@ -5900,6 +9502,9 @@ async def _respawn_worker_unlocked(worker_id: str, extra_args: list[str] | None 
     # their consumer path for the same reason as restart: their provider
     # process is created per task by _consumer_oneshot, never by this helper.
     if resolve_execution_mode(w.adapter, _session(w)) == "oneshot":
+        from packages.plugins.lifecycle import session_claim, capture_async
+        async with session_claim(_session(w)):
+            await capture_async(_session(w))
         w.status = "idle"
         await _restart_tasks(w)
         await _record_legal_worker_state(w, "idle", "pan/respawn-start")
@@ -5915,6 +9520,10 @@ async def _respawn_worker_unlocked(worker_id: str, extra_args: list[str] | None 
     proc = await _spawn_process(w.session_id, adapter=w.adapter, extra_args=extra_args)
     if isinstance(proc, str):
         w.status = "error"
+        await _record_worker_start_failure(
+            _session(w), w.session_id, w.worker_id, proc,
+            w=w, origin="worker.restart",
+        )
         _schedule_session_recovery(w.session_id)
         return proc
     w.process = proc
@@ -5940,6 +9549,7 @@ async def respawn_worker(worker_id: str, extra_args: list[str] | None = None) ->
     if not w:
         return "Worker not found"
     generation = w.generation
+    _cancel_session_restart(w.session_id)
     lock = await _session_spawn_lock(w.session_id)
     async with lock:
         current = workers.get(worker_id)
@@ -5984,8 +9594,11 @@ async def branch_worker(worker_id: str, new_session_id: str) -> Worker | str:
         s.adapter_config["always_thinking_enabled"] = s.adapter_config.get("always_thinking_enabled") or orig.adapter_config.get("always_thinking_enabled")
         if not s.adapter_config.get("max_thinking_tokens"):
             s.adapter_config["max_thinking_tokens"] = orig.adapter_config.get("max_thinking_tokens")
-        # For adapters that fork via file copy (e.g. kimi), pass the parent's
-        # cli_session_id so fork_args can create the branched session.
+        # For adapters whose fork lives in the SessionsProvider (kimi/claude/
+        # opencode/codex), pass the parent's cli_session_id so the provider
+        # fork below can locate the native session. Adapters with a native
+        # fork flag (cbc --fork-session) instead return non-empty extra_args
+        # from fork_args and skip the provider path entirely.
         if orig.cli_session_id and not s.cli_session_id:
             s.cli_session_id = orig.cli_session_id
         if not s.system_prompt:
@@ -6015,31 +9628,48 @@ async def branch_worker(worker_id: str, new_session_id: str) -> Worker | str:
     if not extra_args and provider is not None:
         if not orig or not orig.cli_session_id:
             return "Session has no native CLI session ID — cannot fork"
+        # kimi 的方案 C 隔离 HOME：MCP 会话的原生状态只在隔离 HOME 内，
+        # provider_kwargs 按签名过滤（仅 kimi 的 fork_session/parse_history/
+        # get_raw_usage 接受 kimi_home），其余 adapter 不受影响。
+        home_kwargs = provider_kwargs(
+            provider.fork_session,
+            kimi_home=orig.adapter_config.get("kimi_home_dir"))
         try:
             new_cli_id = await asyncio.to_thread(
                 provider.fork_session,
                 orig.cli_session_id,
                 s.name,
                 s.workdir or None,
+                **home_kwargs,
             )
             s.cli_session_id = new_cli_id
             parsed_history = await asyncio.to_thread(
-                provider.parse_history, new_cli_id, s.workdir or None
+                provider.parse_history, new_cli_id, s.workdir or None,
+                **provider_kwargs(provider.parse_history,
+                                  kimi_home=orig.adapter_config.get("kimi_home_dir")),
             )
-            _sess.replace_history(s, parsed_history)
+            _sess.replace_history(
+                s, _sess.assign_pan_message_ids(parsed_history),
+            )
             raw_usage_entries = await asyncio.to_thread(
-                provider.get_raw_usage, new_cli_id, s.workdir or None
+                provider.get_raw_usage, new_cli_id, s.workdir or None,
+                **provider_kwargs(provider.get_raw_usage,
+                                  kimi_home=orig.adapter_config.get("kimi_home_dir")),
             )
-            s.raw_usage = _sess.accumulate_raw_usage(None, raw_usage_entries)
-            s.total_usage = _sess.compute_total_usage(s.raw_usage)
+            # New branch Session has no Worker or pending enrichment yet.
+            _sess.replace_usage_totals(
+                s, _sess.accumulate_raw_usage(None, _sess.normalize_native_usage_entries(
+                    s.adapter, raw_usage_entries)),
+                native_entries=raw_usage_entries)
         except Exception as exc:
             return f"Fork failed: {exc}"
 
-    new_id = await _next_worker_id()
     proc = await _spawn_process(new_session_id, adapter=w.adapter, extra_args=extra_args)
     if isinstance(proc, str):
         return proc
 
+    # Match normal startup: no await between choosing a free id and registering.
+    new_id = _next_worker_id()
     new_w = Worker(worker_id=new_id, session_id=new_session_id,
                    adapter=w.adapter,
                    status="idle", process=proc, pending_signal=asyncio.Queue(),
@@ -6055,6 +9685,14 @@ async def branch_worker(worker_id: str, new_session_id: str) -> Worker | str:
     # 回合（父历史不回填 → 展示层缺父回合，属既有局限，非模型上下文缺陷）。
     workers[new_id] = new_w
     _register_worker(new_w)
+    new_w._offline_predecessors = set(s.illegal_batches)
+    try:
+        await _claim_offline_owner(new_w)
+    except BaseException:
+        await _kill_process_tree(new_w)
+        workers.pop(new_id,None)
+        _unregister_worker(new_w)
+        raise
     new_w.last_activity = time.monotonic()
     new_w._stdout_task = asyncio.create_task(_read_stdout(new_w))
     new_w._consume_task = asyncio.create_task(_consumer(new_w))
@@ -6076,10 +9714,250 @@ async def branch_worker(worker_id: str, new_session_id: str) -> Worker | str:
     return new_w
 
 
-async def _send_control_message_unlocked(worker_id: str, control: dict) -> str | None:
+def _apply_native_mode_receipt(w: Worker, receipt: dict) -> bool:
+    generation = receipt.get("generation")
+    if (receipt.get("mode") not in {"pan", "native"}
+            or type(generation) is not int or generation < w.native_control_generation):
+        return False
+    w.native_control_mode = receipt["mode"]
+    w.native_control_generation = generation
+    w._native_mode_request_id = None
+    w.native_control_error = None if receipt.get("ok") is True else "Native control request rejected"
+    if receipt.get("native_busy") is True:
+        w._native_reservation_busy = True
+    if w.native_control_mode == "pan" and w.pending_signal is not None:
+        w.pending_signal.put_nowait({"type": "queue_signal"})
+    return True
+
+
+async def switch_native_control(worker_id: str, mode: str, *, timeout: float = 15.0) -> dict:
+    """Internal handoff seam; no process lifecycle or durable queue mutation.
+
+    A lost acknowledgement retains the handoff gate; retry can reconcile the
+    kernel's authoritative generation. Never guess ownership after timeout.
+    """
+    w = workers.get(worker_id)
+    if (w is None or not getattr(w.adapter, "supports_native_control", False)
+            or mode not in {"pan", "native"}):
+        return {"ok": False, "error": "Unsupported native control"}
+    s = _session(w)
+    if s is None or s.adapter_config.get("native_control") is not True:
+        return {"ok": False, "error": "Native control is not enabled"}
+    runtime_generation = w.generation
+    deadline = time.monotonic() + max(0.0, timeout)
+    try:
+        await asyncio.wait_for(w._native_mode_lock.acquire(), max(0.0, deadline - time.monotonic()))
+    except asyncio.TimeoutError:
+        return {"ok": False, "error": "Control switch busy"}
+    request_id = uuid.uuid4().hex
+    future = asyncio.get_running_loop().create_future()
+    try:
+        async def handoff():
+            if w.generation != runtime_generation or w.status == "restarting":
+                raise RuntimeError("Worker restarted")
+            if w.process is None or w.process.returncode is not None or w.process.stdin is None:
+                raise RuntimeError("Worker process is not running")
+            w.native_control_mode = "switching"
+            w._native_mode_request_id = request_id
+            w._native_mode_receipts[request_id] = future
+            wire = w.adapter.encode_control_message({"type": "control_mode", "mode": mode,
+                "generation": w.native_control_generation, "requestId": request_id}) + b"\n"
+            w.process.stdin.write(wire)
+            await w.process.stdin.drain()
+        async def locked_handoff():
+            async with queue_lock(w.session_id):
+                await handoff()
+        await asyncio.wait_for(locked_handoff(), max(0.0, deadline - time.monotonic()))
+        receipt = await asyncio.wait_for(asyncio.shield(future), max(0.0, deadline - time.monotonic()))
+        if w.generation != runtime_generation:
+            return {"ok": False, "error": "Worker restarted"}
+        if not _apply_native_mode_receipt(w, receipt):
+            return {"ok": False, "error": "Invalid control receipt"}
+        return receipt
+    except (asyncio.TimeoutError, OSError, RuntimeError):
+        if w.generation == runtime_generation and w.native_control_mode == "switching":
+            w.native_control_error = "Control ownership unconfirmed"
+        return {"ok": False, "error": "Control ownership unconfirmed"}
+    finally:
+        w._native_mode_receipts.pop(request_id, None)
+        w._native_mode_lock.release()
+
+
+async def write_native_control(worker_id: str, control: dict, *, timeout: float = 2.0) -> dict:
+    """Private native input/resize seam; receipt is emitted after the PTY write."""
+    w = workers.get(worker_id)
+    policy = control.get("type") == "native_passthrough"
+    # Interrupt via the control channel with a receipt is a declared capability
+    # (cbc: ESC + hook FinalStop; kimi: Ctrl+C + wire turn.ended). Codex keeps
+    # its own stdin interrupt path in _interrupt_worker_unlocked.
+    native_interrupt = bool(w and w.native_control_enabled
+                            and control.get("type") == "interrupt"
+                            and getattr(w.adapter, "interrupt_via_native_control", False))
+    if (w is None or not getattr(w.adapter, "supports_native_control", False) or
+            (policy and (not w.native_control_enabled or not w.native_kernel_ready)) or
+            (native_interrupt and w.native_control_mode != "pan") or
+            (not policy and not native_interrupt and w.native_control_mode != "native")):
+        return {"ok": False, "error": "Native control is not active"}
+    if policy and (set(control) != {"type", "enabled"} or type(control.get("enabled")) is not bool):
+        return {"ok": False, "error": "Invalid native policy"}
+    if policy and w.adapter.name != "codex":
+        return {"ok": False, "error": "Unsupported native policy"}
+    if not policy and (type(control.get("generation")) is not int or control.get("generation") != w.native_control_generation):
+        return {"ok": False, "error": "Stale control generation"}
+    if not native_interrupt and control.get("type") not in {"native_input", "native_resize", "native_passthrough"}:
+        return {"ok": False, "error": "Unsupported native operation"}
+    if len(w._native_mode_receipts) >= 32:
+        return {"ok": False, "error": "Native input busy"}
+    runtime_generation = w.generation
+    request_id = uuid.uuid4().hex
+    future = asyncio.get_running_loop().create_future()
+    w._native_mode_receipts[request_id] = future
+    async def send():
+        async with queue_lock(w.session_id):
+            if (w.generation != runtime_generation or w.status == "restarting"
+                    or (native_interrupt and w.native_control_mode != "pan")
+                    or (not policy and not native_interrupt and w.native_control_mode != "native") or w.process is None
+                    or w.process.returncode is not None or w.process.stdin is None):
+                raise RuntimeError("Native worker is unavailable")
+            w.process.stdin.write(w.adapter.encode_control_message({**control, "requestId": request_id}) + b"\n")
+            await w.process.stdin.drain()
+        return await asyncio.shield(future)
+    try:
+        receipt = await asyncio.wait_for(send(), timeout)
+        if w.generation != runtime_generation:
+            return {"ok": False, "error": "Native worker changed"}
+        if policy and receipt.get("ok") is True:
+            w.native_passthrough_enabled = control["enabled"]
+        return receipt
+    except (asyncio.TimeoutError, OSError, RuntimeError):
+        return {"ok": False, "error": "Native operation unconfirmed"}
+    finally:
+        w._native_mode_receipts.pop(request_id, None)
+
+
+async def _record_native_settings_state(w: Worker, *, uncertain: bool) -> None:
+    """Only a new kernel's init clears the durable uncertainty marker."""
+    s = _session(w)
+    if s is None:
+        return
+    if uncertain:
+        if s.adapter_config.get("native_settings_uncertain") is True:
+            return
+        s.adapter_config["native_settings_uncertain"] = True
+    else:
+        w.native_passthrough_enabled = s.adapter_config.get("native_passthrough") is True
+        if "native_settings_uncertain" not in s.adapter_config:
+            return
+        s.adapter_config.pop("native_settings_uncertain", None)
+    await _sess.save_async(s)
+    await _bcast({"type": "session.updated", "sessionId": w.session_id})
+
+
+def steer_delivery_route(w: Worker | None, s) -> str:
+    """Capability-driven urgent delivery; lifecycle intent always wins idle work.
+
+    Only a *running* Worker can be urgently re-routed.  Idle/queued/held or
+    missing runtimes (including an empty queue) use the ordinary durable send
+    path: no Steer attempt and no restart.  A running Worker prefers native
+    Steer when its adapter supports it; otherwise the caller moves the
+    original item to the queue head and restarts + sends.  Illegal sessions
+    stay locked for the explicit Wake route and are never force-routed here.
+    """
+    if w is None:
+        return "queue"
+    if s is not None and _offline.is_illegal(s):
+        return "queue"
+    if w.status == "restarting" or (w.pending_restart and w.status != "running"):
+        return "queue"
+    capable = (resolve_execution_mode(w.adapter, s) == "stream"
+               and getattr(w.adapter, "supports_native_steer", False))
+    if w.pending_restart and not capable:
+        return "queue"
+    if capable:
+        return "steer" if w.status == "running" else "queue"
+    if w.status != "running":
+        # An idle non-Steer adapter needs a normal consumer handoff, not a
+        # restart: force semantics must not replace an empty queue with a
+        # fresh process.
+        return "queue"
+    if any(queue_item_edit_locked(s, item_id)
+           for item_id in list(getattr(s, "queue_edit_locks", {}))):
+        return "queue"
+    return "restart"
+
+
+def _steer_origin(w: Worker) -> dict:
+    s = _session(w)
+    return {"runId": w._steer_run_id, "cliSessionId": s.cli_session_id if s else None,
+            "workerId": w.worker_id, "workerGeneration": w.generation,
+            "taskSeq": w._current_seq, "executionSeq": w._execution_seq,
+            "taskId": w._current_task_id, "status": "accepted", "consumption": "unconfirmed"}
+
+
+def _prepare_steer_control(w: Worker, text: str, request_id: str, origin=None) -> dict:
+    control = {"type": "steer", "text": text, "requestId": request_id}
+    if getattr(w.adapter, "steer_requires_run_id", False):
+        origin = origin or _steer_origin(w)
+        if not origin.get("runId") or not origin.get("cliSessionId"):
+            raise ValueError("CBC Steer requires a confirmed active CLI session/run")
+        control.update(sessionId=origin["cliSessionId"], expectedRequestId=origin["runId"])
+    return control
+
+
+def _route_steer_receipt(w: Worker, event: dict, *, runtime=None) -> bool:
+    normalize = getattr(w.adapter, "normalize_steer_receipt", None)
+    receipt = (event if event.get("type") == "pan.steer_receipt" else
+               normalize(event) if normalize is not None else None)
+    if receipt is None:
+        return False
+    request = receipt.get("requestId")
+    future = w._steer_receipts.get(request)
+    context = w._steer_contexts.get(request)
+    if future is not None and not future.done():
+        if context is not None:
+            expected = context["runtime"]
+            source = runtime or (w, w.generation, w.process, getattr(w.process, "stdin", None))
+            if (source[0] is not expected[0] or source[1] != expected[1]
+                    or source[2] is not expected[2] or source[3] is not expected[3]):
+                return True  # A replacement reader cannot acknowledge the old pipe.
+            if (getattr(w.adapter, "steer_requires_run_id", False)
+                    and receipt.get("outcome") == "accepted"
+                    and receipt.get("cliSessionId") != context["origin"].get("cliSessionId")):
+                receipt = {"ok": False, "outcome": "unknown", "error": "CBC Steer Session receipt mismatch"}
+        future.set_result(receipt)
+    return True  # Duplicate/unowned control receipts never become chat history.
+
+
+def _control_runtime_matches(worker_id: str, runtime) -> bool:
+    owner, generation, process, stdin = runtime
+    return (workers.get(worker_id) is owner
+            and getattr(owner, "generation", None) == generation
+            and owner.process is process
+            and getattr(process, "stdin", None) is stdin)
+
+
+async def _send_control_message_unlocked(worker_id: str, control: dict, *, drain: bool = True,
+                                         _expected_runtime=None, outcome=None) -> str | None:
+    if outcome is None:
+        outcome = {}
+    outcome['status'] = 'rejected'
     w = workers.get(worker_id)
     if not w:
         return "Worker not found"
+    runtime = _expected_runtime or (
+        w, getattr(w, "generation", None), w.process, getattr(w.process, "stdin", None))
+    if not _control_runtime_matches(worker_id, runtime):
+        return "Worker changed before control handoff"
+    if w.native_control_mode != "pan":
+        return "Pan controls are suspended during native control"
+    if isinstance(control, dict) and control.get("type") == "steer":
+        if w.status != "running":
+            return "Steer requires a running Worker"
+        if not getattr(w.adapter, "supports_native_steer", False):
+            return "Adapter does not support native Steer"
+        if (getattr(w.adapter, "steer_requires_run_id", False)
+                and (w._terminal_handled or control.get("expectedRequestId") != w._steer_run_id)):
+            return "CBC turn changed before Steer handoff"
     if not isinstance(control, dict) or control.get("type") not in {
         "interrupt", "steer", "compact", "approval_response", "user_input_response", "permission_response",
         "elicitation_response", "terminal_input", "terminal_terminate",
@@ -6101,14 +9979,28 @@ async def _send_control_message_unlocked(worker_id: str, control: dict) -> str |
     if encode_control is None:
         return f"Adapter '{w.adapter.name}' does not support worker controls"
     try:
-        w.process.stdin.write(encode_control(control) + b"\n")
-        await w.process.stdin.drain()
+        stdin = runtime[3]
+        wire = encode_control(control) + b"\n"
+        # Encoding/permission handling must not retarget an earlier request.
+        if not _control_runtime_matches(worker_id, runtime):
+            return "Worker changed before control handoff"
+        if (control.get("type") == "steer" and getattr(w.adapter, "steer_requires_run_id", False)
+                and (w.status != "running" or w._terminal_handled or w.native_control_mode != "pan"
+                     or control.get("expectedRequestId") != w._steer_run_id)):
+            return "CBC turn changed before Steer handoff"
+        outcome['status'] = 'unknown'  # Once attempted, prose cannot prove no handoff.
+        written = stdin.write(wire)
+        if isinstance(written, int) and written != len(wire):
+            raise OSError("partial control write")
+        if drain:
+            await stdin.drain()
     except (BrokenPipeError, ConnectionError, OSError, RuntimeError, TypeError, ValueError):
         return "Worker control write failed"
+    outcome['status'] = 'accepted'
     return None
 
 
-async def send_control_message(worker_id: str, control: dict) -> str | None:
+async def send_control_message(worker_id: str, control: dict, *, _expected_runtime=None, outcome=None) -> str | None:
     """Send an out-of-band control, serializing Steer against queue edits.
 
     Native adapters may use this for controls that are not user turns, such
@@ -6116,24 +10008,50 @@ async def send_control_message(worker_id: str, control: dict) -> str | None:
     wire encoding; workers without that optional capability keep existing
     behavior.
     """
+    if outcome is None:
+        outcome = {}
+    outcome['status'] = 'rejected'
     w = workers.get(worker_id)
     if not w:
         return "Worker not found"
+    runtime = _expected_runtime or (
+        w, getattr(w, "generation", None), w.process, getattr(w.process, "stdin", None))
+    if not _control_runtime_matches(worker_id, runtime):
+        return "Worker changed before control handoff"
     if isinstance(control, dict) and control.get("type") == "steer":
         s = _session(w)
         if s is not None:
             async with queue_lock(s.id):
+                if not _control_runtime_matches(worker_id, runtime):
+                    return "Worker changed before control handoff"
+                if s.readonly_session:
+                    return READONLY_SESSION_ERROR
+                if s.queue_paused:
+                    return "Pause everything blocks Steer"
                 if any(queue_item_edit_locked(s, item_id)
                        for item_id in list(getattr(s, "queue_edit_locks", {}))):
                     return "Cannot Steer while a queued message is being edited"
                 # Keep the lease check and stdin write in one critical section
                 # so direct API/programmatic Steer cannot race edit acquisition.
-                return await _send_control_message_unlocked(worker_id, control)
-    return await _send_control_message_unlocked(worker_id, control)
+                error = await _send_control_message_unlocked(
+                    worker_id, control, drain=False, _expected_runtime=runtime, outcome=outcome)
+                if error:
+                    return error
+                stdin = runtime[3]
+            # Backpressure is after the synchronous handoff. New queue appends
+            # and edit acquisition need not wait for this control's drain.
+            try:
+                outcome['status'] = 'unknown'
+                await stdin.drain()
+            except (BrokenPipeError, ConnectionError, OSError, RuntimeError, TypeError, ValueError):
+                return "Worker control write failed"
+            outcome['status'] = 'accepted'
+            return None
+    return await _send_control_message_unlocked(worker_id, control, _expected_runtime=runtime, outcome=outcome)
 
 
 async def steer_worker(worker_id: str, text: str,
-                       message_id: str | None = None) -> str | None:
+                       message_id: str | None = None, *, outcome=None) -> str | None:
     """Inject a follow-up instruction into a native running turn.
 
     Codex app-server's ``turn/steer`` changes the native thread, but it does
@@ -6141,6 +10059,9 @@ async def steer_worker(worker_id: str, text: str,
     only after the control write succeeds so Pan history stays aligned with
     the native conversation.
     """
+    if outcome is None:
+        outcome = {}
+    outcome['status'] = 'rejected'
     text = str(text or "").strip()
     if not text:
         return "Steer text is required"
@@ -6150,13 +10071,90 @@ async def steer_worker(worker_id: str, text: str,
         or len(message_id) > 128
     ):
         return "Invalid Steer message id"
-    err = await send_control_message(worker_id, {"type": "steer", "text": text})
-    if err:
-        return err
     w = workers.get(worker_id)
-    s = _session(w) if w else None
+    if w is None:
+        return "Steer requires a running Worker"
+    s = _session(w)
+    prior = s.adapter_config.get("_steer_requests", {}).get(message_id) if s else None
+    if prior and prior.get("sessionId") == s.id:
+        if prior.get("bodyHash") != hashlib.sha256(text.encode()).hexdigest():
+            return "Steer message id already belongs to different text"
+        outcome['status'] = 'accepted' if prior.get('status') == 'accepted' else 'unknown'
+        return None if outcome['status'] == 'accepted' else "Steer outcome unknown: original request retained; do not resend"
+    if s is not None and message_id and any(
+            row.get("clientMessageId") == message_id or row.get("messageId") == message_id
+            for row in s.history if isinstance(row, dict)):
+        outcome['status'] = 'accepted'
+        return None
+    if w.status != "running":
+        return "Steer requires a running Worker"
+    if not getattr(w.adapter, "supports_native_steer", False):
+        return "Adapter does not support native Steer"
+    if w._direct_steer_pending:
+        outcome['status'] = 'unknown'
+        return "Previous Steer is awaiting a provider receipt; do not resend"
+    if s is not None and getattr(w.adapter, "steer_requires_run_id", False) and any(
+            entry.get("sessionId") == s.id and entry.get("status") == "unknown"
+            for entry in s.adapter_config.get("_steer_requests", {}).values() if isinstance(entry, dict)):
+        outcome['status'] = 'unknown'
+        return "Steer outcome unknown: previous request retained; do not resend"
+    origin = _steer_origin(w) if getattr(w.adapter, "steer_requires_run_id", False) else None
+    ledger = None
+    request_id = uuid.uuid4().hex
+    runtime = (w, w.generation, w.process, getattr(w.process, "stdin", None))
+    if origin is not None:
+        if s is None or s.readonly_session:
+            return READONLY_SESSION_ERROR if s else "Session not found"
+        ledger = s.adapter_config.setdefault("_steer_requests", {})
+        identity = message_id or "steer:" + request_id
+        try:
+            w.adapter.encode_control_message(_prepare_steer_control(w, text, request_id, origin))
+        except (ValueError, TypeError, RuntimeError):
+            return "CBC Steer requires a confirmed active CLI session/run and supported stream protocol"
+    w._direct_steer_pending = True
+    if ledger is not None:
+        durable = _sess.DurableOutcome()
+        def reserve_direct():
+            ledger[identity] = {"sessionId": s.id, "requestId": request_id, "status": "unknown",
+                                "bodyHash": hashlib.sha256(text.encode()).hexdigest(), "origin": origin}
+            _sess._save_body(s)
+        try:
+            await _sess._persist_async_outcome(s.id, reserve_direct, durable)
+        except BaseException:
+            # No sender exists yet, so cancellation/save failure proves no handoff.
+            ledger.pop(identity, None)
+            w._direct_steer_pending = False
+            await asyncio.shield(_persist_queue_steer_state(w, s))
+            raise
+    async def settle_direct(status, error):
+        if status == 'unknown':
+            return
+        w._direct_steer_pending = False
+        if status == 'accepted':
+            await _record_direct_steer(w, text, message_id, origin=origin,
+                                       ledger_id=identity if ledger is not None else None)
+        elif ledger is not None:
+            ledger.pop(identity, None)  # Confirmed pre-handoff/provider rejection only.
+            await _persist_queue_steer_state(w, s)
+    async def complete_late(status, error):
+        await settle_direct(status, error)
+    err = await _send_steer_with_receipt(w, text, on_late_receipt=complete_late,
+                                        origin=origin, request_id=request_id, runtime=runtime, outcome=outcome)
+    await settle_direct(outcome['status'], err)
+    return err
+
+
+async def _record_direct_steer(w: Worker, text: str, message_id: str | None, *, origin=None, ledger_id=None):
+    s = _session(w)
     if s is not None:
-        history_row = {"role": "user", "content": text}
+        if message_id and any(row.get("clientMessageId") == message_id or row.get("messageId") == message_id
+                              for row in s.history if isinstance(row, dict)):
+            return
+        history_row = {"role": "user", "content": text, "source": "user"}
+        if origin is not None:
+            history_row["steer"] = dict(origin)
+        if ledger_id is not None:
+            s.adapter_config["_steer_requests"][ledger_id]["status"] = "accepted"
         if message_id:
             history_row["messageId"] = message_id
         _sess.append_history(s, history_row)
@@ -6171,9 +10169,842 @@ async def steer_worker(worker_id: str, text: str,
                 break
             except Exception:
                 if attempt == 1:
-                    raise
+                    _mark_history_dirty(w)
+                    _log.exception("Steer accepted; history persistence pending session=%s", s.id)
                 await asyncio.sleep(0)
+        await _bcast({"type": "queue.item_delivered", "sessionId": s.id,
+                      "queueItemIds": [], "messages": [history_row]})
+
+
+async def _send_steer_with_receipt(w: Worker, text: str, *, on_late_receipt=None,
+                                   origin=None, request_id=None, runtime=None, outcome=None) -> str | None:
+    """Codex confirms turn/steer; Claude's documented boundary is stdin drain."""
+    if outcome is None:
+        outcome = {}
+    outcome['status'] = 'rejected'
+    send_outcome = {}
+    request_id = request_id or uuid.uuid4().hex
+    future = asyncio.get_running_loop().create_future()
+    wants_receipt = getattr(w.adapter, "supports_steer_receipt", False)
+    if wants_receipt:
+        w._steer_receipts[request_id] = future
+    late_receipt = False
+    sender = None
+    # Bind before the sender task gets its first scheduling opportunity.
+    runtime = runtime or (w, w.generation, w.process, getattr(w.process, "stdin", None))
+    w._steer_contexts[request_id] = {"runtime": runtime, "origin": origin or _steer_origin(w)}
+
+    def retain_late_receipt():
+        nonlocal late_receipt
+        if on_late_receipt is None:
+            return
+        late_receipt = True
+        def settle_late(done):
+            w._steer_receipts.pop(request_id, None)
+            w._steer_contexts.pop(request_id, None)
+            if not done.cancelled():
+                status, detail = _steer_receipt_result(done.result())
+                error = "Steer outcome unknown: " + str(detail) if status == "unknown" else detail
+                task = asyncio.create_task(on_late_receipt(status, error))
+                task.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
+        future.add_done_callback(settle_late)
+
+    try:
+        try:
+            if not _control_runtime_matches(w.worker_id, runtime):
+                return "Worker changed before control handoff"
+            control = _prepare_steer_control(w, text, request_id, origin)
+        except ValueError as exc:
+            return str(exc)
+        if not _process_alive(w):
+            return "Worker process is not running"
+        if not wants_receipt:
+            error = await send_control_message(w.worker_id, control, _expected_runtime=runtime, outcome=send_outcome)
+            outcome['status'] = send_outcome.get('status', 'unknown')
+            return ("Steer outcome unknown: control write/drain failed"
+                    if outcome['status'] == 'unknown' else error)
+        sender = asyncio.create_task(send_control_message(w.worker_id, control, _expected_runtime=runtime, outcome=send_outcome))
+        # Never infer acceptance from stdout activity, completion or stdin write.
+        # A missing receipt is ambiguous and must not be retried automatically.
+        deadline = time.monotonic() + 30
+        while _process_alive(w) and time.monotonic() < deadline:
+            waiting = {future} | ({sender} if not sender.done() else set())
+            await asyncio.wait(waiting, timeout=min(1, max(0, deadline-time.monotonic())),
+                               return_when=asyncio.FIRST_COMPLETED)
+            if future.done():
+                status, detail = _steer_receipt_result(future.result())
+                outcome['status'] = status
+                return ("Steer outcome unknown: " + str(detail) if status == "unknown" else detail)
+            if sender.done():
+                error = sender.result()
+                if error and send_outcome.get('status') == 'rejected':
+                    outcome['status'] = 'rejected'
+                    return error
+        retain_late_receipt()
+        outcome['status'] = 'unknown'
+        return "Steer outcome unknown: provider receipt missing; do not resend"
+    except asyncio.CancelledError:
+        outcome['status'] = 'unknown'
+        if wants_receipt:
+            retain_late_receipt()
+        raise
+    finally:
+        if sender is not None:
+            if not sender.done():
+                sender.cancel()
+            await asyncio.gather(sender, return_exceptions=True)
+        if not late_receipt:
+            w._steer_receipts.pop(request_id, None)
+            w._steer_contexts.pop(request_id, None)
+
+
+def _queue_origin_metadata(items: list[dict]) -> dict:
+    """Preserve Pan identity independently of the provider's user wire role."""
+    envelopes = []
+    for item in items:
+        envelope = copy.deepcopy(item)
+        for key in ("reservedBy", "reservedGeneration", "reservedAt", "queueSteerPending", "queueSteerRequestId",
+                    "queueSteerWorkerId", "queueSteerGeneration", "queueSteerOrigin", "forceSendHeld"):
+            envelope.pop(key, None)
+        if isinstance(envelope.get("parts"), list):
+            envelope["parts"] = public_message_parts(envelope["parts"])
+        envelopes.append(envelope)
+    first = items[0]
+    kind = _queue_item_kind(first)
+    metadata = {"kind": kind, "queueEnvelopes": envelopes,
+                "source": (_task_source(first) if kind == "task" else
+                           first.get("source") or kind)}
+    for key in ("sourcePluginId", "autoReportAdmission", "sourceSessionId", "taskId", "taskIdSource", "clientMessageId",
+                "eventId", "channel", "envelope", "noticeKind", "jobId"):
+        if key in first:
+            metadata[key] = copy.deepcopy(first[key])
+    if isinstance(first.get("parts"), list):
+        metadata["parts"] = public_message_parts(first["parts"])
+    source_ids = sorted({item["sourceSessionId"] for item in items
+                         if isinstance(item.get("sourceSessionId"), str) and item["sourceSessionId"]})
+    if source_ids and (kind != "task" or len(source_ids) > 1):
+        metadata["sourceSessionIds"] = source_ids
+    return metadata
+
+
+def _public_queue_receipt(value):
+    """Strip internal paths recursively, including retained origin envelopes."""
+    if isinstance(value, dict):
+        return {key: _public_queue_receipt(part) for key, part in value.items() if key != "__serverPath"}
+    if isinstance(value, list):
+        return [_public_queue_receipt(part) for part in value]
+    return value
+
+
+def _queue_history_row(items: list[dict], text: str | None = None) -> dict:
+    first = items[0]
+    if text is None:
+        text = first.get("text", "") if _queue_item_kind(first) == "task" else _format_report_batch(items)
+    row = {"role": "user", "content": text, "queueItemIds": [_queue_item_id(item) for item in items],
+           "delivered_keys": [_delivery_key(item) for item in items], **_queue_origin_metadata(items)}
+    if isinstance(first.get("parts"), list):
+        # Storage retains canonical attachment paths; public receipts strip them.
+        row["parts"] = copy.deepcopy(first["parts"])
+    source_ids = sorted({item["sourceSessionId"] for item in items
+                         if isinstance(item.get("sourceSessionId"), str) and item["sourceSessionId"]})
+    if len(source_ids) > 1:
+        row["sourceSessionIds"] = source_ids
+    return row
+
+
+def _freeze_prompt_ref(items: list[dict], history_row) -> dict | None:
+    """Freeze the canonical input identity at the actual provider hand-off.
+
+    ``queueItemId`` is the delivery transaction key, not a message identity:
+    the canonical messageId is the one ``session.append_history`` assigned to
+    the input row during this successful hand-off (or accepted Steer).  The
+    summary is a prefix of that same row's canonical ``content``, so looking up
+    the reported messageId always yields a body starting with the summary.
+
+    A merged batch is exactly one provider-visible message (one history row).
+    Its summary is attached only when every contributing item's frozen
+    decision explicitly enabled summaries; any off/unknown/Report item makes
+    the summary null, because one enabled source must never preview bodies that
+    another disabled/report source contributed to the same row.  Nothing is
+    invented when the row has no Pan messageId (legacy/no admission evidence).
+    """
+    row = history_row if isinstance(history_row, dict) else {}
+    message_id = row.get("messageId")
+    if not isinstance(message_id, str) or not _sess.is_pan_message_id(message_id):
+        return None
+    content = row.get("content")
+    decisions = [item.get("autoReportAdmission") if isinstance(item, dict) else None
+                 for item in items]
+    summary = None
+    if (decisions and isinstance(content, str) and content
+            and all(isinstance(decision, dict) and decision.get("summary") is True
+                    for decision in decisions)):
+        summary = _auto_report.summary_excerpt(content)
+    return {"promptMessageId": message_id, "promptSummary": summary}
+
+
+def _delivered_prompt_row(s, items: list[dict], history_row):
+    """Recover the canonical row an already-marked delivery wrote, never a new id.
+
+    A recovery row must prove **every** member's delivery key on the same row;
+    a row carrying only part of this unit belongs to a different/partial batch
+    and must not lend its messageId.  Missing proof returns None.
+    """
+    if isinstance(history_row, dict) and _sess.is_pan_message_id(history_row.get("messageId")):
+        return history_row
+    keys = {_delivery_key(item) for item in items}
+    if not keys:
+        return None
+    for row in reversed(getattr(s, "history", None) or []):
+        if not isinstance(row, dict):
+            continue
+        if keys <= set(row.get("delivered_keys") or ()):
+            return row
     return None
+
+
+def _prompt_report_fields(prompt) -> dict:
+    """Report-facing prompt fields; both keys are always present, null if unproven."""
+    source = prompt if isinstance(prompt, dict) else {}
+    message_id = source.get("promptMessageId")
+    summary = source.get("promptSummary")
+    return {
+        "promptMessageId": message_id if isinstance(message_id, str) and message_id else None,
+        "promptSummary": summary if isinstance(summary, str) and summary else None,
+    }
+
+
+_queue_steer_tasks: dict[tuple[str, str], asyncio.Task] = {}
+_queue_steer_owners: set[asyncio.Task] = set()
+
+
+def _own_queue_steer_task(coroutine) -> asyncio.Task:
+    task = asyncio.create_task(coroutine)
+    _queue_steer_owners.add(task)
+    def finished(done):
+        _queue_steer_owners.discard(done)
+        if not done.cancelled() and done.exception() is not None:
+            _log.error("Queue Steer owner failed", exc_info=done.exception())
+    task.add_done_callback(finished)
+    return task
+
+
+async def _persist_queue_steer_state(w: Worker, s) -> bool:
+    """Retain ownership through cancellation and retry persistence, never control."""
+    for attempt in range(2):
+        outcome = _sess.DurableOutcome()
+        try:
+            await _save_receipt(s, outcome=outcome)
+            return True
+        except BaseException:
+            if outcome.succeeded:
+                return True
+            if attempt == 1:
+                _mark_history_dirty(w)
+                _log.exception("Queue Steer persistence unresolved session=%s", s.id)
+    return False
+
+
+async def _queue_steer_bcast(event: dict) -> None:
+    try:
+        await _bcast(event)
+    except Exception:
+        _log.exception("Queue Steer broadcast failed; durable receipt remains authoritative")
+
+
+def _steer_receipt_result(value) -> tuple[str, str | None]:
+    """Keep structured provider rejection distinct from a bridge write failure."""
+    if value is None:  # Legacy in-process accepted receipt.
+        return "accepted", None
+    if isinstance(value, dict):
+        if value.get("ok") is True and value.get("outcome") in {None, "accepted"}:
+            return "accepted", None
+        detail = str(value.get("error") or "Provider did not accept Steer")
+        if value.get("ok") is False and value.get("outcome") == "rejected":
+            return "rejected", detail
+        return "unknown", detail
+    # Legacy untyped failures have no proof of rejection. Never parse prose.
+    return "unknown", str(value)
+
+
+async def steer_queue_item(session_id: str, item_id: str, expected_revision: int, *, outcome=None):
+    """Use the original durable item; serialize controls with lifecycle and FIFO."""
+    key = (session_id, item_id)
+    if outcome is None:
+        outcome = {}
+    outcome["status"] = "rejected"  # No write until the synchronous boundary.
+    if key in _queue_steer_tasks:
+        outcome["status"] = "unknown"
+        return "Queue Steer is already awaiting a provider receipt"
+    task = asyncio.create_task(_steer_queue_item(session_id, item_id, expected_revision, outcome=outcome))
+    _queue_steer_tasks[key] = task
+    def finished(done):
+        _queue_steer_tasks.pop(key, None)
+        if not done.cancelled():
+            done.exception()  # Retain exception ownership after an HTTP timeout.
+    task.add_done_callback(finished)
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), 10)
+    except asyncio.TimeoutError:
+        outcome["status"] = "unknown"  # The server owner may still attempt delivery.
+        return "Steer awaiting provider receipt; item retained and blocked against duplicate delivery"
+
+
+async def _steer_queue_item(session_id: str, item_id: str, expected_revision: int, *, outcome=None):
+    if outcome is None:
+        outcome = {"status": "rejected"}
+    async with AsyncExitStack() as admission:
+        lock = await _session_spawn_lock(session_id)
+        async with lock:
+            w = find_alive_worker_by_session(session_id)
+            s = _get_session_shallow(session_id)
+            if s is None:
+                return "Session not found"
+            # Match startup's spawn -> Session reservation order. Keep the
+            # Action claim through the actual write/drain/receipt owner, while
+            # releasing the spawn/queue locks before waiting for provider IO.
+            from packages.plugins.lifecycle import session_claim, action_groups, pinned
+            await admission.enter_async_context(session_claim(s))
+            if set(pinned(s.id)[0]) - action_groups(s.adapter_config):
+                request_delayed_restart(s.id)
+                return "Loaded Action Group detached; restart Worker before queue Steer"
+            if s.readonly_session:
+                return READONLY_SESSION_ERROR
+            if w is None or w.status != "running":
+                return "Queue Steer requires an existing running Worker; idle restart has priority"
+            if not getattr(w.adapter, "supports_native_steer", False):
+                return "Adapter does not support native Steer"
+            report_context = await _auto_report.context()
+            async with queue_lock(session_id):
+                if s.readonly_session:
+                    return READONLY_SESSION_ERROR
+                item = next((it for it in s.queue_pending if _queue_item_id(it) == item_id), None)
+                if item is None or _delivery_state(item) != _DELIVERY_QUEUED:
+                    return "Queue item is no longer queued"
+                if item.get("revision", 1) != expected_revision:
+                    return "Queue item revision conflict"
+                if s.queue_paused:
+                    return "Pause everything blocks queue Steer"
+                eligible_item = dict(item) if item.get("forceSend") else item
+                if item.get("forceSend"):
+                    eligible_item.pop("forceSendHeld", None)
+                if not queue_item_eligible(s, eligible_item):
+                    return "Queue item is locked or awaiting Steer confirmation"
+                if any(queue_item_edit_locked(s, identity) for identity in list(s.queue_edit_locks)):
+                    return "Cannot Steer while a queued message is being edited"
+                items = _report_consume_unit(s, item) if item.get("reportConsumeIds") else [item]
+                if (not items or items[0] is not item
+                        or (item.get("reportConsumeIds")
+                            and any(not queue_item_eligible(s, row) for row in items))):
+                    return "Report batch is unavailable"
+                kind = _queue_item_kind(item)
+                if kind == "task":
+                    if not _is_valid_task_item(item) or _task_source(item) is None:
+                        return "Task source/body cannot be preserved losslessly"
+                    history_text = item["text"]
+                    parts = item.get("parts")
+                    if isinstance(parts, list) and any(
+                            not isinstance(part, dict) or part.get("type") not in {"text", "attachment"}
+                            or (part.get("type") == "text" and not isinstance(part.get("text", part.get("value")), str))
+                            or (part.get("type") == "attachment" and not part.get("__serverPath"))
+                            for part in parts):
+                        return "Task parts cannot be steered losslessly; canonical attachment paths are required"
+                    try:
+                        native_text = project_message_parts(parts, history_text)
+                    except ValueError as exc:
+                        return f"Queue attachment cannot be steered: {exc}"
+                elif kind in {"report", "qq", "wechat"}:
+                    if any(row.get("parts") for row in items):
+                        return "Structured report/channel attachments cannot be steered losslessly"
+                    history_text = native_text = _format_report_batch(items)
+                else:
+                    return "Unknown queue kind cannot be steered losslessly"
+                # Encode before reserving: encoding failure proves no provider write.
+                request_id = uuid.uuid4().hex
+                process, generation = w.process, w.generation
+                stdin = getattr(process, "stdin", None)
+                runtime = (w, generation, process, stdin)
+                origin = _steer_origin(w) if getattr(w.adapter, "steer_requires_run_id", False) else None
+                try:
+                    wire = w.adapter.encode_control_message(
+                        _prepare_steer_control(w, native_text, request_id, origin)) + b"\n"
+                except (AttributeError, TypeError, ValueError, RuntimeError, OSError) as exc:
+                    return f"Steer encoding failed before handoff: {exc}"
+                admission_candidates = copy.deepcopy(items)
+                _auto_report.admission(admission_candidates, *report_context)
+                admission_execution_seq = w._execution_seq
+                # Apply, write and failed rollback inside the same writer ticket.
+                durable = _sess.DurableOutcome()
+                def apply_reservation():
+                    originals = [(row, dict(row)) for row in items]
+                    old_revision = s.queue_revision
+                    try:
+                        for row, candidate in zip(items, admission_candidates):
+                            row["autoReportAdmission"] = candidate["autoReportAdmission"]
+                            row["autoReportExecutionSeq"] = admission_execution_seq
+                            row["queueSteerPending"] = True
+                            row["queueSteerRequestId"] = request_id
+                            row["queueSteerWorkerId"] = w.worker_id
+                            row["queueSteerGeneration"] = generation
+                            if origin is not None:
+                                row["queueSteerOrigin"] = origin
+                        s.queue_revision += 1
+                        _sess._save_body(s)
+                    except BaseException:
+                        for row, original in originals:
+                            row.clear()
+                            row.update(original)
+                        s.queue_revision = old_revision
+                        raise
+                try:
+                    await _sess._persist_async_outcome(s.id, apply_reservation, durable)
+                except BaseException:
+                    if not durable.succeeded:
+                        raise
+                    # Cancellation may follow a successful ticket. In either case
+                    # no control has been written: durably release the reservation.
+                    for row in items:
+                        row.pop("queueSteerPending", None)
+                        row.pop("queueSteerRequestId", None)
+                        row.pop("queueSteerWorkerId", None)
+                        row.pop("queueSteerGeneration", None)
+                        row.pop("queueSteerOrigin", None)
+                    s.queue_revision += 1
+                    cleanup = _own_queue_steer_task(_persist_queue_steer_state(w, s))
+                    while not cleanup.done():
+                        try:
+                            await asyncio.shield(cleanup)
+                        except asyncio.CancelledError:
+                            continue
+                    raise
+                def still_allowed(row):
+                    candidate = dict(row)
+                    candidate.pop("queueSteerPending", None)
+                    if candidate.get("forceSend"):
+                        candidate.pop("forceSendHeld", None)
+                    return queue_item_eligible(s, candidate)
+                if (s.readonly_session or (item.get("reportConsumeIds") and _offline.is_illegal(s))
+                        or any(not still_allowed(row) for row in items)
+                        or any(queue_item_edit_locked(s, identity) for identity in list(s.queue_edit_locks))
+                        or w.native_control_mode != "pan" or not _control_runtime_matches(w.worker_id, runtime)
+                        or w.status != "running" or (origin is not None and
+                        (w._terminal_handled or w._steer_run_id != origin["runId"]))
+                        or process is None or process.returncode is not None or stdin is None):
+                    for row in items:
+                        row.pop("queueSteerPending", None)
+                        row.pop("queueSteerRequestId", None)
+                        row.pop("queueSteerWorkerId", None)
+                        row.pop("queueSteerGeneration", None)
+                        row.pop("queueSteerOrigin", None)
+                    s.queue_revision += 1
+                    await _persist_queue_steer_state(w, s)
+                    return "Worker turn ended before Steer handoff"
+                future = asyncio.get_running_loop().create_future()
+                wants_receipt = getattr(w.adapter, "supports_steer_receipt", False)
+                if wants_receipt:
+                    w._steer_receipts[request_id] = future
+                    w._steer_contexts[request_id] = {"runtime": runtime, "origin": origin or _steer_origin(w)}
+                    def settle_receipt(done):
+                        if w._steer_receipts.get(request_id) is done:
+                            w._steer_receipts.pop(request_id, None)
+                        w._steer_contexts.pop(request_id, None)
+                        if not done.cancelled():
+                            disposition, detail = _steer_receipt_result(done.result())
+                            _own_queue_steer_task(_settle_queue_steer(
+                                w, s, items, history_text, detail, request_id, generation,
+                                disposition=disposition))
+                    future.add_done_callback(settle_receipt)
+                # This synchronous write is the pause/lease linearization boundary.
+                # Once attempted, even a write/drain error is conservatively unknown.
+                write_error = None
+                outcome["status"] = "unknown"
+                try:
+                    written = stdin.write(wire)
+                    if isinstance(written, int) and written != len(wire):
+                        raise OSError("partial Steer control write")
+                except (BrokenPipeError, ConnectionError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                    write_error = str(exc)
+                owner = _own_queue_steer_task(_finish_queue_steer(
+                    w, s, items, history_text, request_id, generation, process,
+                    future if wants_receipt else None, write_error, outcome=outcome, stdin=stdin))
+        # No spawn/queue lock spans provider IO; Action reservation remains.
+        return await _sess.await_persistence(owner)
+
+
+async def _finish_queue_steer(w, s, item, text, request_id, generation, process, future, write_error, *, outcome=None, stdin=None):
+    await _queue_steer_bcast({"type": "queue.snapshot", "sessionId": s.id,
+                             "queueRevision": s.queue_revision})
+    drain = asyncio.create_task((stdin if stdin is not None else process.stdin).drain()) if write_error is None else None
+    error = "Steer outcome unknown: control write/drain failed"
+    disposition = "unknown"
+    deadline = asyncio.get_running_loop().time() + 30
+    try:
+        if drain is not None:
+            waiting = {drain} | ({future} if future is not None else set())
+            await asyncio.wait(waiting, timeout=30, return_when=asyncio.FIRST_COMPLETED)
+        if future is not None:
+            if not future.done():
+                await asyncio.wait({future}, timeout=max(0, deadline-asyncio.get_running_loop().time()))
+            if future.done() and not future.cancelled():
+                disposition, error = _steer_receipt_result(future.result())
+            else:
+                error = "Steer outcome unknown: provider receipt missing; item retained, no automatic retry"
+        elif drain is not None and drain.done() and not drain.cancelled() and drain.exception() is None:
+            disposition = "accepted"
+            error = None
+        await _settle_queue_steer(w, s, item, text, error, request_id, generation, disposition=disposition)
+        if outcome is not None:
+            outcome["status"] = disposition
+        return error
+    finally:
+        if drain is not None:
+            if not drain.done():
+                drain.cancel()
+            await asyncio.gather(drain, return_exceptions=True)
+
+
+async def _settle_queue_steer(w: Worker, s, item: dict, history_text: str, error: str | None,
+                            request_id: str, generation: int, *, disposition: str = "unknown"):
+    """Apply an authoritative receipt, including one arriving after HTTP timeout."""
+    items = item if isinstance(item, list) else [item]
+    item = items[0]
+    delivery = None
+    async with queue_lock(s.id):
+        if any(not any(candidate is row for candidate in s.queue_pending)
+               or not row.get("queueSteerPending") or row.get("queueSteerRequestId") != request_id
+               or row.get("queueSteerWorkerId") != w.worker_id or row.get("queueSteerGeneration") != generation
+               for row in items):
+            return
+        if error:
+            for row in items:
+                if disposition == "rejected":
+                    for key in ("queueSteerPending", "queueSteerRequestId", "queueSteerWorkerId",
+                                "queueSteerGeneration", "queueSteerOrigin"):
+                        row.pop(key, None)
+                row["lastSteerError"] = error
+            s.queue_revision += 1
+            await _persist_queue_steer_state(w, s)
+            if (not item.get("queueSteerPending") and workers.get(w.worker_id) is w
+                    and w.generation == generation):
+                _wake_after_queue_unit(w, s)
+        else:
+            origin = item.get("queueSteerOrigin")
+            for member in items:
+                for key in ("queueSteerPending", "queueSteerRequestId", "queueSteerWorkerId",
+                            "queueSteerGeneration", "queueSteerOrigin"):
+                    member.pop(key, None)
+            # Settle original receipts even after retirement, but never attach an
+            # old provider acceptance to another generation/execution's policy.
+            additions = [member["autoReportAdmission"] for member in items
+                         if member.get("autoReportExecutionSeq") == w._execution_seq
+                         and isinstance(member.get("autoReportAdmission"), dict)]
+            row = _queue_history_row(items, history_text)
+            if origin is not None:
+                row["steer"] = dict(origin)
+            _sess.append_history(s, row)
+            if (additions and workers.get(w.worker_id) is w
+                    and w.generation == generation and not w._terminal_handled):
+                previous = w._auto_report_admission or {"version": 1, "inputs": [], "enabled": False}
+                w._auto_report_admission = {"version": 1,
+                    "inputs": [*previous["inputs"], *copy.deepcopy(additions)],
+                    "enabled": previous["enabled"] or any(d["enabled"] and d["origin"]["kind"] != "report" for d in additions)}
+                if s.offline_run:
+                    s.offline_run["autoReportAdmission"] = copy.deepcopy(w._auto_report_admission)
+                # An actually accepted Steer is this turn's latest admitted
+                # input. Rejected/unknown never reach this branch, and a late
+                # receipt for another execution keeps the original reference.
+                w._prompt_ref = _freeze_prompt_ref(items, row)
+            # One native admission, one history row, one receipt per original ID.
+            for member in items:
+                _set_delivery_state(s, member, _DELIVERY_SENT)
+                if origin is not None:
+                    s.queue_delivery_ledger[_queue_item_id(member)]["steer"] = dict(origin)
+            s.queue_revision += 1
+            _remove_queue_items_by_identity(s, items)
+            await _persist_queue_steer_state(w, s)
+            delivery = {"type": "queue.item_delivered", "sessionId": s.id,
+                          "queueItemIds": [_queue_item_id(member) for member in items], "queueRevision": s.queue_revision,
+                          "messages": [_public_queue_receipt({**row, **_queue_origin_metadata(items)})]}
+    if delivery is not None:
+        await _queue_steer_bcast(delivery)
+    await _queue_steer_bcast({"type": "queue.snapshot", "sessionId": s.id,
+                  "queueRevision": s.queue_revision})
+
+# ── Automatic Force send for newly enqueued structured sources ──
+#
+# App Settings → Behavior exposes three independent switches.  A newly
+# enqueued item is classified from its durable source fields (never from the
+# body text), then routed through the same capability path as an explicit
+# Force send:
+#   running + native Steer → steer the original item by id;
+#   running + no Steer     → move the original item to the queue head and
+#                            restart + send;
+#   idle/no Worker/empty   → ordinary durable handoff (no restart).
+# The queue item is never copied, so its queueItemId, source, task, parts and
+# body identity stay authoritative.  Pause, read-only, Illegal, locks, edit
+# leases, delayed restarts and an unconfirmed/rejected Steer retain the item
+# and are never bypassed.
+
+_auto_force_tasks: dict[tuple[str, str], asyncio.Task] = {}
+
+
+def auto_force_settings() -> dict[str, bool]:
+    """Read the three persisted switches strictly (missing/invalid = off)."""
+    ui = load_config().get("ui") or {}
+    raw = ui.get("autoForceSend")
+    if not isinstance(raw, dict):
+        raw = {}
+    return {name: raw.get(name) is True for name in AUTO_FORCE_SOURCE_CLASSES}
+
+
+def _is_manager_ancestor(source_session_id, target) -> bool:
+    """Whether *source_session_id* is an ancestor in the target's manager chain.
+
+    MA messages are structurally identified by the managedBy relation, not by
+    the ``////by agent`` body prefix or by the current template/MCP mount.
+    """
+    if not isinstance(source_session_id, str) or not source_session_id:
+        return False
+    target_id = getattr(target, "id", None)
+    if target is None or source_session_id == target_id:
+        return False
+    seen = {target_id}
+    current = getattr(target, "managed_by", None)
+    while isinstance(current, str) and current and current not in seen:
+        if current == source_session_id:
+            return True
+        seen.add(current)
+        manager = _get_session_shallow(current)
+        current = getattr(manager, "managed_by", None) if manager is not None else None
+    return False
+
+
+def classify_auto_force_source(item: dict, target) -> str | None:
+    """Classify one durable queue row as system(job) / ma / report / None.
+
+    Only structured fields participate.  A report/notice row is a Job
+    terminal only with the explicit ``noticeKind`` (or the legacy terminal
+    envelope); other automation notices stay unclassified.  An agent task is
+    an MA message only when its sender Session is an ancestor of the target
+    and it is not a formal assign dispatch.
+    """
+    if not isinstance(item, dict) or target is None:
+        return None
+    kind = _queue_item_kind(item)
+    if kind is None:
+        return None
+    source = _task_source(item) if kind == "task" else item.get("source")
+    if kind == "task" and source == "report" and item.get("explicitReport"):
+        return None if _is_formal_task_item(item) else "report"
+    if kind == "report":
+        if item.get("noticeKind") == "background_job_terminal":
+            return "system"
+        envelope = item.get("envelope") if isinstance(item.get("envelope"), dict) else {}
+        event_id = item.get("eventId")
+        legacy_job_terminal = (
+            source == "automation"
+            and (item.get("jobId") is not None
+                 or envelope.get("jobId") is not None
+                 or (isinstance(event_id, str) and event_id.endswith(":terminal")))
+        )
+        if legacy_job_terminal:
+            return "system"
+        if source == "report":
+            return "report"
+        if source not in {"agent", "meta-agent"}:
+            return None
+    elif kind == "task":
+        if source not in {"agent", "meta-agent"}:
+            return None
+        # A formal assign owns taskId idempotency and is a task dispatch, not
+        # a message that may be injected into a running turn.
+        if item.get("taskIdSource") == "assign":
+            return None
+    else:
+        return None
+    if source == "meta-agent":
+        return "ma"
+    source_session_id = item.get("sourceSessionId")
+    if isinstance(source_session_id, str) and _is_manager_ancestor(source_session_id, target):
+        return "ma"
+    return None
+
+
+def _schedule_auto_force(session_id: str, item: dict) -> asyncio.Task | None:
+    """Start one event-driven automatic Force attempt for a just-enqueued row."""
+    target = _get_session_shallow(session_id)
+    if (target is None or target.readonly_session
+            or getattr(target, "queue_paused", False)
+            or _offline.is_illegal(target)):
+        return None
+    source_class = classify_auto_force_source(item, target)
+    if source_class is None or not auto_force_settings().get(source_class):
+        return None
+    item_id = _queue_item_id(item)
+    key = (session_id, item_id)
+    existing = _auto_force_tasks.get(key)
+    if existing is not None and not existing.done():
+        return existing
+    task = asyncio.create_task(_auto_force_item(session_id, item_id, source_class))
+    _auto_force_tasks[key] = task
+
+    def finished(done):
+        if _auto_force_tasks.get(key) is done:
+            _auto_force_tasks.pop(key, None)
+        if not done.cancelled():
+            exc = done.exception()
+            if exc is not None:
+                _log.warning(
+                    "[Session %s] automatic Force attempt failed: %s",
+                    session_id, exc)
+
+    task.add_done_callback(finished)
+    return task
+
+
+async def wait_auto_force(session_id: str | None = None, timeout: float = 15.0) -> None:
+    """Await in-flight automatic Force attempts (event-driven, no polling)."""
+    tasks = [
+        task for (queued_session_id, _), task in list(_auto_force_tasks.items())
+        if session_id is None or queued_session_id == session_id
+    ]
+    if tasks:
+        await asyncio.wait(tasks, timeout=timeout)
+
+
+def _move_queue_item_to_front(s, item: dict) -> bool:
+    """Move one existing row to the absolute head and renumber positions."""
+    pending = list(s.queue_pending or [])
+    index = next((position for position, queued in enumerate(pending)
+                  if queued is item), None)
+    if index is None or index == 0:
+        return False
+    pending.pop(index)
+    pending.insert(0, item)
+    s.queue_pending = pending
+    for position, queued in enumerate(pending):
+        if isinstance(queued, dict):
+            queued["position"] = position
+    return True
+
+
+async def _auto_force_item(session_id: str, item_id: str,
+                           source_class: str) -> dict:
+    """Route one existing durable item through automatic Force semantics."""
+    s = _get_session_shallow(session_id)
+    if s is None:
+        return {"status": "skipped", "reason": "session_missing"}
+    if s.readonly_session:
+        return {"status": "skipped", "reason": "readonly"}
+    if getattr(s, "queue_paused", False):
+        return {"status": "skipped", "reason": "paused"}
+    if _offline.is_illegal(s):
+        return {"status": "skipped", "reason": "illegal"}
+    item = next((queued for queued in (s.queue_pending or [])
+                 if isinstance(queued, dict)
+                 and _queue_item_id(queued) == item_id), None)
+    if item is None or item.get("reportConsumeIds"):
+        return {"status": "skipped", "reason": "not_queued"}
+    if not auto_force_settings().get(source_class):
+        return {"status": "skipped", "reason": "disabled"}
+    if classify_auto_force_source(item, s) != source_class:
+        return {"status": "skipped", "reason": "source_changed"}
+    # A prior attempt that reached the provider, or one awaiting a receipt,
+    # is never repeated automatically.  A rejected/unknown row stays durable
+    # for ordinary FIFO or an explicit caller retry.
+    if item.get("queueSteerPending") or item.get("lastSteerError"):
+        return {"status": "skipped", "reason": "previous_attempt"}
+    w = find_alive_worker_by_session(session_id)
+    if w is None:
+        return {"status": "skipped", "reason": "no_live_worker"}
+    route = steer_delivery_route(w, s)
+    if route == "steer":
+        disposition = {}
+        error = await steer_queue_item(
+            session_id, item_id, item.get("revision", 1), outcome=disposition)
+        return {
+            "status": disposition.get("status", "unknown" if error else "accepted"),
+            "error": error,
+            "route": "steer",
+        }
+    if route == "restart":
+        return await _auto_force_restart_item(session_id, item_id)
+    return {"status": "skipped", "reason": route}
+
+
+async def _auto_force_restart_item(session_id: str, item_id: str) -> dict:
+    """Move the original item to the head, then restart and send it once."""
+    lock = await _session_spawn_lock(session_id)
+    async with lock:
+        s = _get_session_shallow(session_id)
+        if s is None:
+            return {"status": "skipped", "reason": "session_missing"}
+        if s.readonly_session:
+            return {"status": "skipped", "reason": "readonly"}
+        if getattr(s, "queue_paused", False):
+            return {"status": "skipped", "reason": "paused"}
+        if _offline.is_illegal(s):
+            return {"status": "skipped", "reason": "illegal"}
+        w = find_alive_worker_by_session(session_id)
+        if w is None or w.status != "running":
+            return {"status": "skipped", "reason": "not_running"}
+        if steer_delivery_route(w, s) != "restart":
+            return {"status": "skipped", "reason": "route_changed"}
+        async with queue_lock(s.id):
+            if s.readonly_session or _offline.is_illegal(s):
+                return {"status": "skipped", "reason": "illegal"}
+            if getattr(s, "queue_paused", False):
+                return {"status": "skipped", "reason": "paused"}
+            item = next((queued for queued in (s.queue_pending or [])
+                         if isinstance(queued, dict)
+                         and _queue_item_id(queued) == item_id), None)
+            if item is None or item.get("reportConsumeIds") or _delivery_state(item) != _DELIVERY_QUEUED:
+                return {"status": "skipped", "reason": "not_queued"}
+            if (queue_item_edit_locked(s, item_id)
+                    or _queue_item_locked(item)
+                    or not queue_item_eligible(s, item)
+                    or any(queue_item_edit_locked(s, identity)
+                           for identity in list(getattr(s, "queue_edit_locks", {})))):
+                return {"status": "skipped", "reason": "locked"}
+            old_pending = list(s.queue_pending or [])
+            old_positions = {id(queued): queued.get("position")
+                             for queued in old_pending if isinstance(queued, dict)}
+            old_revision = s.queue_revision
+            _move_queue_item_to_front(s, item)
+            s.queue_revision = old_revision + 1
+            try:
+                await _save_receipt(s)
+            except Exception:
+                s.queue_pending = old_pending
+                for queued in old_pending:
+                    if isinstance(queued, dict):
+                        if old_positions.get(id(queued)) is None:
+                            queued.pop("position", None)
+                        else:
+                            queued["position"] = old_positions[id(queued)]
+                s.queue_revision = old_revision
+                raise
+            queue_revision = s.queue_revision
+        await _bcast({"type": "queue.snapshot", "sessionId": session_id,
+                      "queueRevision": queue_revision})
+        # The snapshot broadcast yields after ordering. A newly detected
+        # incident still owns admission; automatic Force cannot recover it.
+        await _prepare_offline_recovery(s)
+        if _offline.is_illegal(s):
+            return {"status": "skipped", "reason": "illegal"}
+        if (s.readonly_session or getattr(s, "queue_paused", False)
+                or find_alive_worker_by_session(session_id) is not w
+                or steer_delivery_route(w, s) != "restart"
+                or not queue_item_eligible(s, item)
+                or any(queue_item_edit_locked(s, identity)
+                       for identity in list(getattr(s, "queue_edit_locks", {})))):
+            return {"status": "skipped", "reason": "gate_changed"}
+        error = await _restart_worker_unlocked(w.worker_id)
+        if error:
+            return {"status": "error", "error": error, "route": "restart"}
+        _recovery_required.discard(session_id)
+        return {"status": "restarted", "route": "restart",
+                "workerId": w.worker_id, "queueItemId": item_id}
 
 
 async def _interrupt_worker_unlocked(worker_id: str) -> str | None:
@@ -6182,6 +11013,13 @@ async def _interrupt_worker_unlocked(worker_id: str) -> str | None:
         return "Worker not found"
     if w.status != "running":
         return "Worker is not running"
+    if getattr(w.adapter, "interrupt_via_native_control", False) and w.native_control_enabled:
+        receipt = await write_native_control(worker_id, {
+            "type": "interrupt", "generation": w.native_control_generation})
+        # Cancellation uncertainty must not secretly become kill/resume of the
+        # resident native kernel; the provider's terminal reason establishes
+        # the actual result (cbc FinalStop, kimi wire turn.ended).
+        return None if receipt.get("ok") is True else "Native interruption was not confirmed"
     # Codex app-server can interrupt the active turn while preserving the
     # long-lived native thread and app-server process.  Fall back to the
     # established kill+resume path for adapters without this optional
@@ -6265,14 +11103,24 @@ async def _persist_task_item(s, text: str, source: str, seq: int | None,
                              source_session_id: str | None = None,
                              parts: list[dict] | None = None,
                              *, idempotent_task_id: bool = True,
-                             activate_task: bool = False) -> tuple[dict | None, str | None]:
-    """Durably append one task, atomically with the browser receipt ledger."""
+                             activate_task: bool = False,
+                             locked: bool = False, wake: bool = False,
+                             auto_force: bool = True,
+                             source_plugin_id: str | None = None) -> tuple[dict | None, str | None]:
+    """Durably append one task, atomically with the browser receipt ledger.
+
+    ``auto_force=False`` is used by the explicit Force branches, which already
+    choose their delivery route; every ordinary enqueue schedules the
+    automatic-source classifier after the durable write succeeds.
+    """
     if _shutdown_started:
         return None, "Pan main service is shutting down"
     source_type, source_sid, source_error = _validate_source_metadata(
         s, source, source_session_id)
     if source_error:
         return None, source_error
+    if source_plugin_id is not None and not any(p["id"] == source_plugin_id for p in (await _auto_report.context())[1]):
+        return None, "Plugin has no registered message source capability"
     _ensure_idempotency_index(s)
     if client_message_id:
         existing = _find_queue_item_by_idempotency(
@@ -6293,13 +11141,10 @@ async def _persist_task_item(s, text: str, source: str, seq: int | None,
             return existing, None
         if _durable_task_id_seen(s, task_id):
             return None, None
-    old_seq = s.task_seq
-    old_accepted_input_ids = list(s.accepted_input_ids)
-    old_queue_revision = getattr(s, "queue_revision", 0)
-    old_active_task_id = getattr(s, "active_task_id", None)
+    metadata = {}
     if seq is None:
-        s.task_seq += 1
-        seq = s.task_seq
+        seq = s.task_seq + 1
+        metadata["task_seq"] = seq
     item = {
         "type": "task",
         "kind": "task",
@@ -6314,6 +11159,14 @@ async def _persist_task_item(s, text: str, source: str, seq: int | None,
         "revision": 1,
         "createdAt": time.time(),
     }
+    if source_plugin_id is not None:
+        item["sourcePluginId"] = source_plugin_id
+    if source_type == "report" and source_sid:
+        item["explicitReport"] = True
+        if getattr(s, "agent_reports_paused", False):
+            _message_locks.manual_change(item, None, True)
+    if locked:
+        _message_locks.set_lock(item, "manual")
     if task_id is not None:
         # An inherited id is reporting context only; an assign id is also the
         # durable idempotency key.
@@ -6328,26 +11181,14 @@ async def _persist_task_item(s, text: str, source: str, seq: int | None,
         item["parts"] = [dict(part) for part in parts]
     if client_message_id:
         item["clientMessageId"] = client_message_id
-        s.accepted_input_ids.append(client_message_id)
-        if len(s.accepted_input_ids) > _ACCEPTED_INPUT_ID_LIMIT:
-            del s.accepted_input_ids[:-_ACCEPTED_INPUT_ID_LIMIT]
-    item["position"] = len(s.queue_pending)
-    s.queue_pending.append(item)
+        metadata["accepted_input_ids"] = (
+            list(s.accepted_input_ids) + [client_message_id])[-_ACCEPTED_INPUT_ID_LIMIT:]
     if activate_task:
-        s.active_task_id = task_id
-    _remember_queue_item(s, item, _DELIVERY_QUEUED)
-    s.queue_revision = old_queue_revision + 1
+        metadata["active_task_id"] = task_id
     try:
-        await _save_receipt(s)
+        item = await _append_new_queue_item(s, item, wake=wake, metadata=metadata)
     except Exception as exc:
-        # Do not poison retry idempotency after a failed durable write.
-        s.queue_pending = [queued for queued in s.queue_pending if queued is not item]
-        s.task_seq = old_seq
-        s.accepted_input_ids = old_accepted_input_ids
-        s.queue_revision = old_queue_revision
-        s.active_task_id = old_active_task_id
-        s.queue_delivery_ledger.pop(item["id"], None)
-        _remove_idempotency_receipt(s, item, item["id"])
+        # The ordered writer staged everything, including browser idempotency.
         return None, f"Failed to persist queued task: {exc}"
     _log.info("[Session %s] queued task id=%s source=%s sourceSessionId=%s",
               s.id, item["id"], source_type, source_sid)
@@ -6359,12 +11200,43 @@ async def _persist_task_item(s, text: str, source: str, seq: int | None,
                       **({"parts": public_message_parts(item.get("parts"))}
                          if isinstance(item.get("parts"), list) else {}),
                   }})
+    if auto_force:
+        _schedule_auto_force(s.id, item)
     return item, None
+
+
+def configured_wake_message() -> str:
+    from .config import load_config
+    raw = load_config().get("session_lifecycle", {})
+    value = raw.get("wakeMessage") if isinstance(raw, dict) else None
+    return value if isinstance(value, str) and value.strip() and len(value) <= 32000 else "继续"
+
+
+async def wake_session(session_id: str, *, client_message_id: str | None = None,
+                       source: str = "user", source_session_id: str | None = None) -> dict:
+    """Explicit wake: enqueue, release only its Illegal lock and place first.
+
+    Persist all three in one ordered write. A repeated receipt never moves or
+    unlocks an existing item again. Actual successor readiness clears Illegal.
+    """
+    s = _get_session_shallow(session_id)
+    if s is None:
+        return {"status": "error", "result": f"Session {session_id} not found"}
+    async with queue_lock(session_id):
+        item, error = await _persist_task_item(s, configured_wake_message(), source,
+            None, None, client_message_id, source_session_id, wake=True, auto_force=False)
+        if error:
+            return {"status": "error", "result": error}
+        item_id = _queue_item_id(item) if item else None
+    await _wake_worker(session_id, auto_spawn=False)
+    return {"status": "queued", "sessionId": session_id, "queueItemId": item_id,
+            "queuePaused": bool(s.queue_paused)}
 
 
 async def enqueue_user_message(session_id: str, text: str,
                                client_message_id: str | None = None,
-                               parts: list[dict] | None = None) -> dict:
+                               parts: list[dict] | None = None,
+                               *, locked: bool = False) -> dict:
     """Canonical durable entry point for browser/user queue messages.
 
     The queue item and receipt are written before acknowledging the request.
@@ -6385,7 +11257,8 @@ async def enqueue_user_message(session_id: str, text: str,
         if existing is not None:
             state = _delivery_state(existing)
             return {
-                "status": "sent" if state == _DELIVERY_SENT else "queued",
+                "status": (state if state in _DELIVERY_UNCERTAIN_STATES else
+                           "sent" if state == _DELIVERY_SENT else "queued"),
                 "sessionId": session_id,
                 "workerId": None,
                 "queueItemId": _queue_item_id(existing),
@@ -6394,10 +11267,12 @@ async def enqueue_user_message(session_id: str, text: str,
             }
         if parts is None:
             item, error = await _persist_task_item(
-                s, text, "user", None, None, client_message_id, None)
+                s, text, "user", None, None, client_message_id, None,
+                locked=locked, auto_force=False)
         else:
             item, error = await _persist_task_item(
-                s, text, "user", None, None, client_message_id, None, parts)
+                s, text, "user", None, None, client_message_id, None, parts,
+                locked=locked, auto_force=False)
         if error:
             return {"status": "error", "result": error}
         if item is None:
@@ -6408,9 +11283,12 @@ async def enqueue_user_message(session_id: str, text: str,
             item = existing
         live = find_alive_worker_by_session(session_id)
         if live is not None and item in (s.queue_pending or []):
-            if live.pending_signal is not None:
+            if live.pending_signal is not None and _has_sendable_queued_items(s):
                 await live.pending_signal.put({"type": "queue_signal"})
-        elif live is None and item in (s.queue_pending or []):
+            else:
+                _schedule_queue_retry(session_id)
+        elif (live is None and item in (s.queue_pending or [])
+              and _has_dispatchable_items(s)):
             _schedule_session_recovery(session_id)
         return {
             "status": "queued",
@@ -6504,7 +11382,8 @@ async def send_task(worker_id: str, text: str, source: str = "agent",
                     seq: int | None = None, task_id: str | None = None,
                     client_message_id: str | None = None,
                     source_session_id: str | None = None,
-                    idempotent_task_id: bool = True) -> str | None:
+                    idempotent_task_id: bool = True,
+                    auto_force: bool = True) -> str | None:
     w = workers.get(worker_id)
     if not w:
         return "Worker not found"
@@ -6530,10 +11409,12 @@ async def send_task(worker_id: str, text: str, source: str = "agent",
     # 任务 item 持久化到 session.queue_pending（落盘真源）；pending_signal
     # 只放无正文 queue_signal，consumer 每次只看 FIFO 队首。worker 死亡/回收
     # 后由 create_worker / 全局 watchdog 自动恢复消费。
-    item, persist_error = await _persist_task_item(
-        s, text, source, seq, task_id, client_message_id, source_sid,
-        idempotent_task_id=idempotent_task_id,
-        activate_task=idempotent_task_id and task_id is not None)
+    async with queue_lock(s.id):
+        item, persist_error = await _persist_task_item(
+            s, text, source, seq, task_id, client_message_id, source_sid,
+            idempotent_task_id=idempotent_task_id,
+            activate_task=idempotent_task_id and task_id is not None,
+            auto_force=auto_force)
     if persist_error:
         return persist_error
     if item is None:
@@ -6567,6 +11448,11 @@ async def _ensure_worker(session_id: str) -> tuple[Worker | None, str | None]:
     """确保 session 有活的 worker。返回 (worker, None) 或 (None, error)。"""
     w = find_worker_by_session(session_id)
     if w is None or not _process_alive(w):
+        target = _get_session_shallow(session_id)
+        if target and _offline.outstanding(target):
+            await _prepare_offline_recovery(target)
+            if _offline.is_illegal(target):
+                return None, "illegal_queue_hold"
         created = await create_worker(session_id)
         if isinstance(created, str):
             return None, created
@@ -6644,12 +11530,34 @@ async def assign(session_id: str, text: str, source: str = "agent",
             "taskId": task_id, "ts": time.monotonic(),
         }
 
+    if getattr(target, "queue_paused", False) or _offline.is_illegal(target):
+        async with queue_lock(session_id):
+            item, error = await _persist_task_item(
+                target, text, source_type, None, task_id, None, source_sid,
+                activate_task=True, auto_force=False)
+        if error:
+            if task_id is not None:
+                _task_status.pop(task_id, None)
+            return {"status": "error", "result": error}
+        await _wake_worker(session_id, auto_spawn=False)
+        return {"status": "queued", "workerId": None, "sessionId": session_id,
+                "taskId": task_id, "queuePaused": bool(getattr(target, "queue_paused", False))}
+
     try:
         w, err = await _ensure_worker(session_id)
     except asyncio.CancelledError:
         if task_id is not None and _task_status.get(task_id) is task_reservation:
             _task_status.pop(task_id, None)
         raise
+    if err == "illegal_queue_hold":
+        async with queue_lock(session_id):
+            item, error = await _persist_task_item(target, text, source_type, None,
+                task_id, None, source_sid, activate_task=task_id is not None)
+        if error and task_id is not None:
+            _task_status.pop(task_id, None)
+        return ({"status": "error", "result": error} if error else
+                {"status": "queued", "sessionId": session_id, "taskId": task_id,
+                 "queueItemId": _queue_item_id(item) if item else None})
     if err:
         if task_id is not None and _task_status.get(task_id) is task_reservation:
             task_reservation.update({
@@ -6661,7 +11569,9 @@ async def assign(session_id: str, text: str, source: str = "agent",
         task_reservation["workerId"] = w.worker_id
         task_reservation["ts"] = time.monotonic()
 
-    send_kwargs = {"source": source_type, "task_id": task_id}
+    # A formal assign is a task dispatch, not a follow-up message: it must
+    # queue behind the current turn instead of being injected as a Steer.
+    send_kwargs = {"source": source_type, "task_id": task_id, "auto_force": False}
     if source_sid is not None:
         send_kwargs["source_session_id"] = source_sid
     send_err = await send_task(w.worker_id, text, **send_kwargs)
@@ -6709,7 +11619,9 @@ async def send_session(session_id: str, text: str, source: str = "agent",
     worker（CLI 进程）是顺带的。
 
     - 有活 worker（含 oneshot 注册，process 为 None）→ 常规投递；
-      force=True 先 restart 再投递（worker_send_force 语义）。
+      force=True 仅在 running 时按能力路由：支持原生 Steer 则按原队列项
+      Steer；不支持才把原项提到队首后 restart+send。idle/queued/held 或
+      空队列一律普通 handoff，不重启。
     - 无活 worker（从未 spawn / 进程已死）→ **不报错**：消息入该 session 的
       持久队列 queue_pending（type=task），由全局 watchdog（queue_pending
       非空 && 无活 worker → create_worker）spawn 后经 _recover_pending_signals
@@ -6734,30 +11646,208 @@ async def send_session(session_id: str, text: str, source: str = "agent",
     # from a later/previous result.
     inherited_task_id = (
         getattr(target, "active_task_id", None)
-        if source_type == "agent" else None
+        if source_type in {"agent", "report"} and (source_type == "agent" or source_sid) else None
     )
+    def force_body_conflict(item):
+        if item.get('text') != text:
+            return {'status': 'rejected', 'outcome': 'rejected', 'retryable': False,
+                    'sessionId': session_id, 'queueItemId': _queue_item_id(item),
+                    'result': 'Force message id already belongs to different text'}
+        return None
+    if force and client_message_id:
+        existing = _find_queue_item_by_idempotency(target, client_message_id=client_message_id)
+        if existing is not None:
+            conflict = force_body_conflict(existing)
+            if conflict:
+                return conflict
+            pending = next((row for row in target.queue_pending if _queue_item_id(row) == _queue_item_id(existing)), None)
+            if _delivery_state(existing) == _DELIVERY_SENT:
+                return {"status": "accepted", "outcome": "accepted", "consumption": "unconfirmed",
+                        "sessionId": session_id, "queueItemId": _queue_item_id(existing), "duplicate": True}
+            if pending and pending.get("forceSend") and (pending.get("queueSteerPending") or not pending.get("lastSteerError")):
+                return {"status": "unknown", "outcome": "unknown", "retryable": False,
+                        "sessionId": session_id, "queueItemId": _queue_item_id(existing), "duplicate": True}
     w = find_alive_worker_by_session(session_id)
     alive = w is not None
-    if not alive:
+    if not alive or getattr(target, "queue_paused", False):
         s = _get_session_shallow(session_id)
         if not s:
             return {"status": "error", "result": f"Session {session_id} not found"}
-        item, persist_error = await _persist_task_item(
-            s, text, source_type, None, inherited_task_id,
-            client_message_id, source_sid,
-            idempotent_task_id=False)
+        async with queue_lock(session_id):
+            item, persist_error = await _persist_task_item(
+                s, text, source_type, None, inherited_task_id,
+                client_message_id, source_sid,
+                idempotent_task_id=False)
         if persist_error:
             return {"status": "error", "result": persist_error}
         # The queue write is the acknowledgement boundary.  Start recovery
         # now; watchdog is intentionally only the eventual retry path.
-        _schedule_session_recovery(session_id)
-        return {"status": "queued", "workerId": None, "sessionId": session_id,
-                "pendingSpawn": True}
-    if force:
-        restarted = await restart_or_start_worker(session_id)
+        paused = bool(getattr(s, "queue_paused", False))
+        live = find_alive_worker_by_session(session_id)
+        recovery = _schedule_session_recovery(session_id) if not paused and live is None else None
+        if not paused and live is not None:
+            await _wake_worker(session_id, auto_spawn=False)
+        return {"status": "queued", "workerId": live.worker_id if live else None,
+                "sessionId": session_id, "queuePaused": paused,
+                "pendingSpawn": recovery is not None}
+    if _offline.is_illegal(target):
+        force = False
+    route = steer_delivery_route(w, target) if force else "queue"
+    if force and route == "steer":
+        async with queue_lock(session_id):
+            if _offline.is_illegal(target):
+                # Illegal was discovered after routing. It owns the item and
+                # forbids Force from clearing it; enqueue under the same lock.
+                item, error = await _persist_task_item(
+                    target, text, source_type, None, inherited_task_id,
+                    client_message_id, source_sid, idempotent_task_id=False,
+                    auto_force=False)
+                if error:
+                    return {"status": "error", "result": error}
+                return {"status": "queued", "sessionId": session_id,
+                        "queueItemId": _queue_item_id(item) if item else None}
+            prior = _find_queue_item_by_idempotency(target, client_message_id=client_message_id)
+            item = None
+            if prior is not None:
+                conflict = force_body_conflict(prior)
+                if conflict:
+                    return conflict
+                state = _delivery_state(prior)
+                pending = next((row for row in target.queue_pending if _queue_item_id(row) == _queue_item_id(prior)), None)
+                if (pending and pending.get("forceSend") and pending.get("lastSteerError")
+                        and not pending.get("queueSteerPending") and pending.get("text") == text):
+                    item = pending  # An explicit retry after proved rejection retains the original item.
+                else:
+                    status = "accepted" if state == _DELIVERY_SENT else "unknown"
+                    return {"status": status, "outcome": status, "consumption": "unconfirmed",
+                            "queueItemId": _queue_item_id(prior), "sessionId": session_id,
+                            "workerId": w.worker_id, "duplicate": True}
+            if item is None:
+                item, error = await _persist_task_item(target, text, source_type, None,
+                    inherited_task_id, client_message_id, source_sid,
+                    idempotent_task_id=False, locked=True, auto_force=False)
+                if error:
+                    return {"status": "rejected", "outcome": "rejected", "result": error}
+            # The lock prevents ordinary FIFO from racing this immediate attempt.
+            item["forceSend"] = True
+            item["forceSendHeld"] = True
+            if prior is None:
+                _message_locks.set_lock(item, None)  # Replace only the just-created transaction hold.
+            await _save_receipt(target)
+        disposition = {}
+        error = await steer_queue_item(session_id, _queue_item_id(item), item.get("revision", 1), outcome=disposition)
+        status = disposition.get("status", "unknown") if error else "accepted"
+        return {"status": status, "outcome": status, "consumption": "unconfirmed",
+                "workerId": w.worker_id, "sessionId": session_id, "queueItemId": _queue_item_id(item),
+                **({"result": error, "retryable": status == "rejected"} if error else {})}
+    if force and route == "restart":
+        # Preserve the original durable item: persist once, move that row to
+        # the head so the replacement consumer delivers it first, then
+        # restart.  Never create a second queue identity for this message.
+        async with queue_lock(session_id):
+            if _offline.is_illegal(target):
+                item, error = await _persist_task_item(
+                    target, text, source_type, None, inherited_task_id,
+                    client_message_id, source_sid, idempotent_task_id=False,
+                    auto_force=False)
+                if error:
+                    return {"status": "error", "result": error}
+                return {"status": "queued", "sessionId": session_id,
+                        "queueItemId": _queue_item_id(item) if item else None}
+            prior = _find_queue_item_by_idempotency(
+                target, client_message_id=client_message_id)
+            item = None
+            if prior is not None:
+                conflict = force_body_conflict(prior)
+                if conflict:
+                    return conflict
+                state = _delivery_state(prior)
+                pending = next((row for row in target.queue_pending
+                                if _queue_item_id(row) == _queue_item_id(prior)), None)
+                if (pending and pending.get("forceSend")
+                        and pending.get("lastSteerError")
+                        and not pending.get("queueSteerPending")
+                        and pending.get("text") == text):
+                    item = pending
+                    # A proved rejection may be retried through restart; the
+                    # old Steer hold must not keep the row locked.  Clearing
+                    # the error makes a later duplicate resolve as unknown
+                    # instead of triggering another restart.
+                    item.pop("forceSendHeld", None)
+                    item.pop("queueSteerRequestId", None)
+                    item.pop("queueSteerWorkerId", None)
+                    item.pop("queueSteerGeneration", None)
+                    item.pop("queueSteerOrigin", None)
+                    item.pop("lastSteerError", None)
+                else:
+                    status = "accepted" if state == _DELIVERY_SENT else "unknown"
+                    return {"status": status, "outcome": status,
+                            "consumption": "unconfirmed",
+                            "queueItemId": _queue_item_id(prior),
+                            "sessionId": session_id, "workerId": w.worker_id,
+                            "duplicate": True}
+            if item is None:
+                item, error = await _persist_task_item(
+                    target, text, source_type, None, inherited_task_id,
+                    client_message_id, source_sid, idempotent_task_id=False,
+                    auto_force=False)
+                if error:
+                    return {"status": "rejected", "outcome": "rejected",
+                            "result": error}
+                item["forceSend"] = True
+            # Re-check the gates after the durable write.  An idle transition,
+            # Pause, read-only Session or an edit lease must not be bypassed
+            # by a restart that was decided before the enqueue.
+            live = find_alive_worker_by_session(session_id)
+            blocked = (
+                live is not None and live.status != "running"
+            ) or target.readonly_session or getattr(target, "queue_paused", False) \
+                or _offline.is_illegal(target) \
+                or any(queue_item_edit_locked(target, identity)
+                       for identity in list(getattr(target, "queue_edit_locks", {})))
+            if live is None or blocked:
+                await _save_receipt(target)
+                if not (target.readonly_session
+                        or getattr(target, "queue_paused", False)
+                        or _offline.is_illegal(target)):
+                    await _wake_worker(session_id, auto_spawn=False)
+                return {"status": "queued", "sessionId": session_id,
+                        "queueItemId": _queue_item_id(item),
+                        "workerId": live.worker_id if live else None,
+                        "queueRevision": target.queue_revision}
+            old_pending = list(target.queue_pending or [])
+            old_positions = {id(queued): queued.get("position")
+                             for queued in old_pending if isinstance(queued, dict)}
+            old_revision = target.queue_revision
+            _move_queue_item_to_front(target, item)
+            target.queue_revision = old_revision + 1
+            try:
+                await _save_receipt(target)
+            except Exception as exc:
+                target.queue_pending = old_pending
+                for queued in old_pending:
+                    if isinstance(queued, dict):
+                        if old_positions.get(id(queued)) is None:
+                            queued.pop("position", None)
+                        else:
+                            queued["position"] = old_positions[id(queued)]
+                target.queue_revision = old_revision
+                return {"status": "error",
+                        "result": f"Failed to persist force queue order: {exc}"}
+            queue_revision = target.queue_revision
+            item_id = _queue_item_id(item)
+        await _bcast({"type": "queue.snapshot", "sessionId": session_id,
+                      "queueRevision": queue_revision})
+        restarted = await restart_or_start_worker(session_id, allow_illegal_recovery=False)
+        if restarted == "illegal_queue_hold":
+            return {"status": "queued", "sessionId": session_id,
+                    "queueItemId": item_id, "queueRevision": queue_revision}
         if isinstance(restarted, str):
-            return {"status": "error", "result": restarted}
-        w = restarted
+            return {"status": "error", "result": restarted,
+                    "queueItemId": item_id}
+        return {"status": "queued", "workerId": restarted.worker_id,
+                "sessionId": session_id, "queueItemId": item_id,
+                "queueRevision": queue_revision}
     send_err = await send_task(w.worker_id, text, source=source_type,
                                task_id=inherited_task_id,
                                client_message_id=client_message_id,
@@ -6796,16 +11886,28 @@ def find_worker_by_session(session_id: str) -> Worker | None:
 
 
 async def steer_session_worker(session_id: str, text: str,
-                               message_id: str | None = None) -> Worker | str | None:
+                               message_id: str | None = None, *, outcome=None) -> Worker | str | None:
     """Steer the session's live worker without exposing its runtime id."""
-    if _get_session_shallow(session_id) is None:
+    if outcome is None:
+        outcome = {}
+    outcome['status'] = 'rejected'
+    session = _get_session_shallow(session_id)
+    if session is None:
         return f"Session {session_id} not found"
+    prior = session.adapter_config.get("_steer_requests", {}).get(message_id)
+    if prior and prior.get("sessionId") == session_id and prior.get("status") != "accepted":
+        outcome['status'] = 'unknown'
+        return "Steer outcome unknown: original request retained; do not resend"
+    if any(entry.get("sessionId") == session_id and entry.get("status") == "unknown"
+           for entry in session.adapter_config.get("_steer_requests", {}).values() if isinstance(entry, dict)):
+        outcome['status'] = 'unknown'
+        return "Steer outcome unknown: previous request retained; do not resend"
     lock = await _session_spawn_lock(session_id)
     async with lock:
         w = find_alive_worker_by_session(session_id)
         if w is None:
             return None
-        error = await steer_worker(w.worker_id, text, message_id)
+        error = await steer_worker(w.worker_id, text, message_id, outcome=outcome)
         return error or w
 
 
@@ -6841,66 +11943,28 @@ def find_alive_worker_by_session(session_id: str) -> Worker | None:
     return None
 
 
-async def sync_legal_worker_state_to_runtime(
-    session_id: str, *, source: str = "session-recovery/sync-actual",
-) -> dict:
-    """Copy a Session's observed runtime state into its legal-state ledger.
-
-    The per-Session spawn lock makes this snapshot mutually exclusive with
-    create/restart. The UI and HTTP layer never choose or write a state value.
-    When no Worker or provider process remains, the runtime state is offline.
-    """
-    lock = await _session_spawn_lock(session_id)
-    async with lock:
-        legal_lock = _legal_state_locks.setdefault(session_id, asyncio.Lock())
-        async with legal_lock:
-            w = find_alive_worker_by_session(session_id)
-            if w is None:
-                tracked = find_worker_by_session(session_id)
-                if tracked is not None and not _runtime_stopped(tracked):
-                    return {
-                        "sessionId": session_id,
-                        "status": "error",
-                        "error": f"Worker runtime is not stopped (status: {tracked.status})",
-                    }
-                state = "offline"
-                runtime_status = "offline"
-            elif w.status in _LEGAL_WORKER_STATES:
-                state = w.status
-                runtime_status = w.status
-            else:
-                return {
-                    "sessionId": session_id,
-                    "status": "error",
-                    "error": f"unsupported runtime Worker state: {w.status}",
-                }
-            if not await _persist_session_legal_worker_state(
-                    session_id, state, source, _locked=True):
-                return {
-                    "sessionId": session_id,
-                    "status": "error",
-                    "error": "failed to persist Session legal state",
-                }
-            return {
-                "sessionId": session_id,
-                "status": "updated",
-                "legalWorkerState": state,
-                "runtimeWorkerStatus": runtime_status,
-            }
+def find_alive_workers_by_session() -> dict[str, Worker]:
+    """Snapshot live workers for a whole Session list in one registry walk."""
+    candidates: dict[str, Worker] = {}
+    for session_id, indexed in _workers_by_session.items():
+        if workers.get(indexed.worker_id) is indexed:
+            candidates[session_id] = indexed
+    # Legacy embedders may populate the public registry without the index.
+    for item in workers.values():
+        candidates.setdefault(item.session_id, item)
+    return {
+        session_id: item for session_id, item in candidates.items()
+        if (item._consume_task is None or not item._consume_task.done())
+        and _process_alive(item)
+    }
 
 
-async def _sync_legal_state_if_stopped(session_id: str, state: str, source: str) -> bool:
-    """Persist a requested exit state only while the Session has no live Worker."""
-    lock = await _session_spawn_lock(session_id)
-    async with lock:
-        legal_lock = _legal_state_locks.setdefault(session_id, asyncio.Lock())
-        async with legal_lock:
-            tracked = find_worker_by_session(session_id)
-            if tracked is not None and not _runtime_stopped(tracked):
-                return False
-            return await _persist_session_legal_worker_state(
-                session_id, state, source, _locked=True,
-            )
+async def sync_legal_worker_state_to_runtime(session_id: str, *, source: str = "manual/mark-safe-offline") -> dict:
+    """Compatibility entry point: explicitly cancel pending recovery/Illegal."""
+    try:
+        return await clear_session_illegal_for_startup(session_id, reconcile=True)
+    except RuntimeError as exc:
+        return {"sessionId": session_id, "status": "error", "error": str(exc)}
 
 
 async def shutdown_all(
@@ -6908,6 +11972,7 @@ async def shutdown_all(
     mark_legal_offline: bool = False,
     preserve_legal_running_session_ids: list[str] | tuple[str, ...] = (),
     mark_legal_offline_session_ids: list[str] | tuple[str, ...] = (),
+    legal_state_source: str = "pan/main-exit",
 ):
     """关闭所有 worker 的 cbc 进程树 + takeover 终端。
 
@@ -6916,6 +11981,7 @@ async def shutdown_all(
     errors: list[str] = []
     preserve_ids = set(preserve_legal_running_session_ids)
     offline_ids = set(mark_legal_offline_session_ids)
+    legal_state_source = str(legal_state_source or "pan/main-exit")
 
     for task in list(_queue_retry_tasks.values()):
         try:
@@ -6937,6 +12003,12 @@ async def shutdown_all(
         w = workers.get(wid)
         if not w:
             continue
+        worker_errors_before = len(errors)
+        if not mark_legal_offline or w.session_id in preserve_ids:
+            try:
+                await _detect_offline_exit(w, _offline.owner(w), legal_state_source + "/unauthorized-or-preserved")
+            except Exception as exc:
+                errors.append(f"Worker {wid} Illegal commit failed: {exc}")
         stop_steps = (
             (w._watchdog_task, "watchdog cancellation"),
             (w._consume_task, "consumer cancellation"),
@@ -6968,25 +12040,15 @@ async def shutdown_all(
         except Exception as exc:
             errors.append(f"Worker {wid} takeover terminal stop failed: {exc}")
         if (mark_legal_offline and w.session_id not in preserve_ids
+                and _runtime_stopped(w) and len(errors) == worker_errors_before):
+            try:
+                await _finish_offline_stop(w, _offline.owner(w), legal_state_source)
+            except Exception as exc:
+                errors.append(f"Worker {wid} legality commit failed: {exc}")
+        if (mark_legal_offline and w.session_id not in preserve_ids
                 and _runtime_stopped(w)):
-            if not await _record_legal_worker_state(w, "offline", "pan/main-exit"):
+            if not await _record_legal_worker_state(w, "offline", legal_state_source):
                 errors.append(f"Worker {wid} legal offline state was not persisted")
-
-    for session_id in sorted(offline_ids):
-        # Includes persisted running Sessions that had no Worker at shutdown.
-        # The check under the Session spawn lock prevents marking a concurrent
-        # live Worker offline.
-        if not await _sync_legal_state_if_stopped(
-                session_id, "offline", "pan/main-exit"):
-            errors.append(f"Session {session_id} legal offline state was not persisted")
-
-    for session_id in sorted(preserve_ids):
-        # Worker cancellation/finalization may have recorded a terminal state
-        # while Exit was draining. Restore the pre-exit legal running snapshot
-        # after every Worker has stopped.
-        if not await _persist_session_legal_worker_state(
-                session_id, "running", "pan/main-exit-preserve-running"):
-            errors.append(f"Session {session_id} legal running state was not persisted")
 
     workers.clear()
     _workers_by_session.clear()

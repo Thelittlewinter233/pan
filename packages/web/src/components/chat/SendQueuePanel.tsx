@@ -1,16 +1,27 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSessionStore } from '@/stores/sessionStore';
 import { useQueueStore } from '@/stores/queueStore';
 import { useUIStore } from '@/stores/uiStore';
 import type { AgentQueueItem } from '@/types';
+import { useAppSettingsStore } from '@/stores/appSettingsStore';
+import { useAdapterStore } from '@/stores/adapterStore';
+import { useWorkerStore } from '@/stores/workerStore';
+import { steerSessionQueueItem } from '@/services/api';
+import { Button } from '@/components/ui/Button';
 import { Modal } from '@/components/ui/Modal';
 import { copyText } from '@/utils/clipboard';
-import { Pencil, ArrowUp, ArrowDown, Trash2, Check, X, ClipboardList, Copy } from 'lucide-react';
+import { QueueSourceSession } from '@/components/chat/QueueSourceSession';
+import { registerQueueSelectedEditHandler } from '@/shortcuts/queueBridge';
+import { Pencil, ArrowUp, ArrowDown, Trash2, Check, ClipboardList, Copy, Pause, Play, Lock, Unlock, Plus, ChevronDown } from 'lucide-react';
 
 const EMPTY: AgentQueueItem[] = [];
 const BUTTON = 'rounded p-1 text-text-secondary hover:bg-bg-tertiary hover:text-text-primary transition-colors disabled:opacity-30 disabled:cursor-not-allowed';
 const PREVIEW_PRIMARY = 'inline-flex items-center gap-1.5 rounded-md bg-accent px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent/90 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent';
 const PREVIEW_SECONDARY = 'inline-flex items-center gap-1.5 rounded-md border border-border-default bg-bg-tertiary px-3 py-1.5 text-xs font-medium text-text-secondary transition-colors hover:bg-bg-hover hover:text-text-primary focus:outline-none focus-visible:ring-2 focus-visible:ring-accent';
+const REPORT_PAUSE_BUTTON = 'inline-flex items-center gap-1 whitespace-nowrap rounded-md border px-2 py-1 text-xs font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-50';
+/** Mobile grid action button: same tokens as REPORT_PAUSE_BUTTON but with a
+ *  larger touch target (~36px) and full-width centering inside the 2-col grid. */
+const MOBILE_ACTION_BUTTON = 'inline-flex w-full items-center justify-center gap-1 whitespace-nowrap rounded-md border px-3 py-2 text-xs font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-50';
 
 function label(item: AgentQueueItem): string {
   if (item.source === 'user') return '用户';
@@ -20,8 +31,15 @@ function label(item: AgentQueueItem): string {
 }
 
 /** Read-only full-text preview of a single queued message. Reuses the shared
- *  Modal (Escape / close button / click-outside) and the clipboard helper. */
-function QueueMessagePreview({ item, onClose }: { item: AgentQueueItem; onClose: () => void }) {
+ *  Modal (Escape / close button / click-outside) and the clipboard helper.
+ *  编辑入口走既有 startEdit 流程（确认设置 + 编辑锁完整正文），预览文本
+ *  （可能为截断预览）绝不会作为编辑正文传入主输入框。 */
+function QueueMessagePreview({ item, canEdit, onEdit, onClose }: {
+  item: AgentQueueItem;
+  canEdit: boolean;
+  onEdit: (item: AgentQueueItem) => void;
+  onClose: () => void;
+}) {
   const showToast = useUIStore((state) => state.showToast);
   const [copied, setCopied] = useState(false);
 
@@ -43,6 +61,9 @@ function QueueMessagePreview({ item, onClose }: { item: AgentQueueItem; onClose:
         <span className="self-start rounded border border-border-default bg-bg-tertiary px-1 py-px text-[10px] leading-tight text-text-secondary">
           {label(item)} {item.kind}
         </span>
+        {/* Structured origin only: agent/report items carry meta.sourceSessionId
+            from the server. Other sources render nothing. */}
+        <QueueSourceSession item={item} onClose={onClose} />
         <div
           tabIndex={0}
           role="region"
@@ -52,6 +73,12 @@ function QueueMessagePreview({ item, onClose }: { item: AgentQueueItem; onClose:
           {item.text}
         </div>
         <div className="flex justify-end gap-2">
+          {canEdit && (
+            <button type="button" onClick={() => onEdit(item)} className={PREVIEW_PRIMARY}>
+              <Pencil size={14} />
+              编辑
+            </button>
+          )}
           <button type="button" onClick={handleCopy} className={PREVIEW_PRIMARY}>
             {copied ? <Check size={14} /> : <Copy size={14} />}
             {copied ? '已复制' : '复制'}
@@ -63,68 +90,338 @@ function QueueMessagePreview({ item, onClose }: { item: AgentQueueItem; onClose:
   );
 }
 
-export function SendQueuePanel() {
+export function SendQueuePanel({ nativeMode = false, onNewRemindingCard, remindingCardMode = false }: {
+  nativeMode?: boolean;
+  onNewRemindingCard?: () => void;
+  remindingCardMode?: boolean;
+}) {
   const sessionId = useSessionStore((state) => state.currentSessionId);
-  const open = useQueueStore((state) => state.panelOpen);
+  const readonlySession = useSessionStore((state) => state.sessions.find((session) => session.id === state.currentSessionId)?.readonlySession === true);
+  const panelOpen = useQueueStore((state) => state.panelOpen);
+  // Native mode has no composer toggle; keep the durable queue accessible
+  // without changing the user's saved Pan layout preference.
+  const open = nativeMode || panelOpen;
+  const queuePaused = useQueueStore((state) => sessionId ? state.queuePaused[sessionId] ?? false : false);
+  const queuePauseLoaded = useQueueStore((state) => sessionId ? state.queuePauseLoaded[sessionId] ?? false : false);
+  const queuePauseUpdating = useQueueStore((state) => sessionId ? state.queuePauseUpdating[sessionId] ?? false : false);
+  const setQueuePaused = useQueueStore((state) => state.setQueuePaused);
+  const reportsPaused = useQueueStore((state) => sessionId ? state.agentReportsPaused[sessionId] ?? false : false);
+  const reportPauseLoaded = useQueueStore((state) => sessionId ? state.agentReportsPauseLoaded[sessionId] ?? false : false);
+  const reportPauseUpdating = useQueueStore((state) => sessionId ? state.agentReportsPauseUpdating[sessionId] ?? false : false);
+  const lockUpdating = useQueueStore((state) => sessionId ? state.queueLockUpdating[sessionId] ?? false : false);
+  const lockedComposerMode = useQueueStore((state) => sessionId ? state.lockedComposerModes[sessionId] ?? false : false);
   const items = (useQueueStore((state) => sessionId ? state.queues[sessionId] : undefined) ?? EMPTY)
     .filter((item) => item.meta?.dispatchState === 'queued');
   const edit = useQueueStore((state) => sessionId ? state.edits[sessionId] : null);
+  // Shared with the shortcut actions: the keyboard highlight must be reachable
+  // from the registry's run() even while the composer owns focus.
+  const selectedId = useQueueStore((state) => sessionId ? state.queueSelection[sessionId] ?? null : null);
+  const setQueueSelection = useQueueStore((state) => state.setQueueSelection);
   const load = useQueueStore((state) => state.loadForSession);
+  const setReportsPaused = useQueueStore((state) => state.setAgentReportsPaused);
+  const setItemLocked = useQueueStore((state) => state.setQueueItemLocked);
+  const setItemsLocked = useQueueStore((state) => state.setQueueItemsLocked);
+  const setLockedComposerMode = useQueueStore((state) => state.setLockedComposerMode);
   const startEdit = useQueueStore((state) => state.startEdit);
-  const updateDraft = useQueueStore((state) => state.updateEditDraft);
-  const saveEdit = useQueueStore((state) => state.saveEdit);
-  const cancelEdit = useQueueStore((state) => state.cancelEdit);
   const remove = useQueueStore((state) => state.removeAgentItem);
   const move = useQueueStore((state) => state.moveQueueItem);
   const clear = useQueueStore((state) => state.clear);
+  const selectedAdapter = useSessionStore((state) => state.sessions.find((session) => session.id === state.currentSessionId)?.adapter);
+  const selectedTransportAllowsSteer = useSessionStore((state) => {
+    const selected = state.sessions.find((session) => session.id === state.currentSessionId);
+    return selected?.outputMode !== 'oneshot' && !(selected?.adapter === 'cbc' && selected.nativeControl);
+  });
+  const supportsSteer = useAdapterStore((state) => !nativeMode && selectedTransportAllowsSteer && state.adapters.some((adapter) => adapter.name === selectedAdapter && adapter.supportsSteer === true));
+  const runtimeWorker = useWorkerStore((state) => sessionId ? state.workers[sessionId] : undefined);
+  const [steering, setSteering] = useState<Set<string>>(new Set());
+  const requestSteer = async (item: AgentQueueItem) => {
+    const sid = sessionId;
+    if (!sid || steering.has(`${sid}:${item.id}`)) return;
+    const key = `${sid}:${item.id}`;
+    setSteering((current) => new Set(current).add(key));
+    try {
+      await steerSessionQueueItem(sid, item.id, item.meta?.revision ?? 1);
+      useUIStore.getState().showToast('CLI 已接受 Steer，等待当前任务处理');
+    } catch (error) {
+      useUIStore.getState().showToast(error instanceof Error ? error.message : String(error), 'error');
+    } finally {
+      await useQueueStore.getState().loadAgentQueue(sid);
+      setSteering((current) => { const next = new Set(current); next.delete(key); return next; });
+    }
+  };
   const [preview, setPreview] = useState<AgentQueueItem | null>(null);
 
-  useEffect(() => { load(sessionId); }, [load, sessionId]);
+  const [confirmation, setConfirmation] = useState<{ sessionId: string; itemId: string } | null>(null);
+  // Mobile-only: collapsed toolbar of queue-wide actions. Defaults to collapsed
+  // and is re-collapsed on session switch so state never leaks across sessions.
+  const [actionsOpen, setActionsOpen] = useState(false);
+  const requestEdit = useCallback(async (item: AgentQueueItem) => {
+    if (!sessionId || useQueueStore.getState().edits[sessionId]) return;
+    const requestedSession = sessionId;
+    await useAppSettingsStore.getState().ensureSettingsLoaded();
+    if (useSessionStore.getState().currentSessionId !== requestedSession) return;
+    if (!(item.kind === 'task' && item.source === 'user') && useAppSettingsStore.getState().notifications.confirmAgentSystemQueueEdit) {
+      setConfirmation({ sessionId: requestedSession, itemId: item.id });
+    } else startEdit(item.id);
+  }, [sessionId, startEdit]);
+  // `queue.editSelected` reuses this exact transaction (confirmation, lease,
+  // composer hand-off) instead of re-implementing it in the registry.
+  useEffect(() => registerQueueSelectedEditHandler((requestedSession, itemId) => {
+    if (!sessionId || requestedSession !== sessionId) return false;
+    if (useSessionStore.getState().currentSessionId !== requestedSession) return false;
+    const item = (useQueueStore.getState().queues[requestedSession] ?? [])
+      .find((candidate) => candidate.id === itemId);
+    if (!item || item.meta?.dispatchState !== 'queued') return false;
+    void requestEdit(item);
+    return true;
+  }), [requestEdit, sessionId]);
+  useEffect(() => { load(sessionId); setConfirmation(null); setActionsOpen(false); }, [load, sessionId]);
 
   const displayItems = useMemo(() => {
     if (!edit) return items;
     const copy = items.slice();
     const index = copy.findIndex((item) => item.id === edit.id);
     if (index >= 0) {
-      copy[index] = { ...copy[index]!, text: edit.text };
+      copy[index] = { ...copy[index]!, text: edit.composerValue
+        ? edit.composerValue.parts.map(part => part.type === 'text' ? part.value : part.type === 'url' ? part.label || part.url
+          : edit.attachments?.find(attachment => attachment.occurrenceId === (part.occurrenceId || part.attachmentId))?.displayName || '').join('')
+        : edit.text };
     }
     return copy;
   }, [edit, items]);
 
+  const listRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!sessionId) return;
+    // Drop a highlight that belongs to a closed panel or a row that is gone;
+    // otherwise the next Alt+Arrow would continue from an invisible position.
+    const missing = selectedId !== null && !displayItems.some((item) => item.id === selectedId);
+    if (!open || missing) setQueueSelection(sessionId, null);
+  }, [displayItems, open, selectedId, sessionId, setQueueSelection]);
+
+  useEffect(() => {
+    if (!open || !selectedId) return;
+    // Keyboard selection may land outside the scroll viewport. `nearest`
+    // keeps a hover-selected row (already visible) perfectly still.
+    listRef.current?.querySelector<HTMLElement>('[data-queue-selected="true"]')
+      ?.scrollIntoView?.({ block: 'nearest' });
+  }, [open, selectedId]);
+
+  const allLocked = items.length > 0 && items.every((item) => item.meta?.locked === true);
+  const hasQueued = items.some((item) => item.meta?.dispatchState === 'queued');
+
   return (
     <div className={`grid transition-[grid-template-rows] duration-200 ease-out ${open ? 'grid-rows-[1fr]' : 'grid-rows-[0fr]'}`}>
-      <div className="overflow-hidden">
+      <div className="overflow-hidden bg-bg-secondary">
         <div className="px-3 pt-2 pb-1">
-          <div className="flex items-center gap-2 pb-1.5">
+          {/* Desktop toolbar: unchanged single-row entry point (md and up). */}
+          <div className="hidden flex-wrap items-center gap-2 pb-1.5 md:flex">
             <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-text-secondary">
               <ClipboardList size={14} /> 服务端队列
               <span className="rounded-full bg-bg-tertiary px-1.5 py-0.5 text-[10px] leading-none">{displayItems.length}</span>
             </span>
             <div className="flex-1" />
-            {items.some((item) => item.meta?.dispatchState === 'queued') && (
+            <button type="button" className={`${REPORT_PAUSE_BUTTON} ${lockedComposerMode
+              ? 'border-danger bg-danger/10 text-danger hover:bg-danger/15'
+              : 'border-border-default text-text-secondary hover:bg-bg-hover'}`}
+              disabled={!sessionId} onClick={() => { if (sessionId) setLockedComposerMode(sessionId, !lockedComposerMode); }}
+              aria-label={lockedComposerMode ? 'Cancel locked message mode' : 'New locked message'}
+              aria-pressed={lockedComposerMode}
+              title={lockedComposerMode ? 'Cancel locked message mode' : 'New locked message'}>
+              <Plus size={12} aria-hidden="true" /> {lockedComposerMode ? 'cancel locked msg' : 'new locked msg'}
+            </button>
+            {onNewRemindingCard && (
+              <button type="button" data-testid="new-reminding-card" className={`${REPORT_PAUSE_BUTTON} ${remindingCardMode
+                ? 'border-accent bg-accent/10 text-accent hover:bg-accent/15'
+                : 'border-border-default text-text-secondary hover:bg-bg-hover'}`}
+                disabled={!sessionId} onClick={onNewRemindingCard} aria-pressed={remindingCardMode}
+                aria-label="create reminding card"
+                title="create reminding card">
+                <Plus size={12} aria-hidden="true" /> create reminding card
+              </button>
+            )}
+            <button type="button" className={REPORT_PAUSE_BUTTON + ' border-border-default text-text-secondary hover:bg-bg-hover'}
+              disabled={!sessionId || items.length === 0 || lockUpdating || reportPauseUpdating}
+              onClick={() => { if (sessionId) void setItemsLocked(sessionId, true); }}
+              aria-label="Lock all queued messages" title="Lock all queued messages">
+              <Lock size={12} aria-hidden="true" /> Lock all
+            </button>
+            <button type="button" className={REPORT_PAUSE_BUTTON + ' border-border-default text-text-secondary hover:bg-bg-hover'}
+              disabled={!sessionId || items.length === 0 || lockUpdating || reportPauseUpdating}
+              onClick={() => { if (sessionId) void setItemsLocked(sessionId, false); }}
+              aria-label="Unlock all queued messages" title="Unlock all queued messages">
+              <Unlock size={12} aria-hidden="true" /> Unlock all
+            </button>
+            <button
+              type="button"
+              className={`${REPORT_PAUSE_BUTTON} ${reportsPaused
+                ? 'border-accent/40 bg-accent/10 text-accent hover:bg-accent/15'
+                : 'border-border-default bg-bg-tertiary text-text-secondary hover:bg-bg-hover hover:text-text-primary'}`}
+              aria-label={reportsPaused ? 'Resume reports' : 'Pause reports'}
+              aria-pressed={reportsPaused}
+              title={reportsPaused ? 'Resume reports' : 'Pause reports'}
+              disabled={!sessionId || !reportPauseLoaded || reportPauseUpdating || lockUpdating}
+              onClick={() => { if (sessionId) void setReportsPaused(sessionId, !reportsPaused); }}
+            >
+              {reportsPaused ? <Play size={12} aria-hidden="true" /> : <Pause size={12} aria-hidden="true" />}
+              {reportsPaused ? 'Resume reports' : 'Pause reports'}
+            </button>
+            <button type="button"
+              className={`${REPORT_PAUSE_BUTTON} ${queuePaused
+                ? 'border-danger bg-danger/10 text-danger hover:bg-danger/15'
+                : 'border-border-default text-text-secondary hover:bg-bg-hover'}`}
+              aria-label={queuePaused ? 'Resume everything' : 'Pause everything'}
+              aria-pressed={queuePaused}
+              title="暂停或恢复当前 Session 的全部队列；已交接任务继续执行"
+              disabled={!sessionId || !queuePauseLoaded || queuePauseUpdating}
+              onClick={() => { if (sessionId) void setQueuePaused(sessionId, !queuePaused); }}>
+              {queuePaused ? <Play size={12} aria-hidden="true" /> : <Pause size={12} aria-hidden="true" />}
+              {queuePaused ? 'Resume everything' : 'Pause everything'}
+            </button>
+            {hasQueued && (
               <button onClick={clear} className="inline-flex items-center gap-1 rounded px-1.5 py-1 text-xs text-text-tertiary hover:bg-danger/10 hover:text-danger" title="清空仍在队列中的消息">
                 <Trash2 size={12} /> 清空
               </button>
             )}
           </div>
-          <div className="queue-list-scroll max-h-[45vh] overflow-y-auto rounded-md border border-border-muted bg-bg-secondary/60">
+          {/* Mobile toolbar: title/count left, single collapsible "队列操作" toggle
+              right. Expanded content is a two-column grid so long labels never
+              wrap into a ragged multi-row strip on 320–390px screens. */}
+          <div className="flex items-center gap-2 pb-1.5 md:hidden">
+            <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-text-secondary">
+              <ClipboardList size={14} /> 服务端队列
+              <span className="rounded-full bg-bg-tertiary px-1.5 py-0.5 text-[10px] leading-none">{displayItems.length}</span>
+            </span>
+            <div className="flex-1" />
+            {!actionsOpen && (lockedComposerMode || allLocked || queuePaused || reportsPaused) && (
+              <span className="flex shrink-0 items-center gap-1" role="img"
+                aria-label={[lockedComposerMode ? '锁定消息模式' : '', allLocked && !lockedComposerMode ? '全部已锁' : '', queuePaused ? '队列已暂停' : '', reportsPaused ? '报告已暂停' : ''].filter(Boolean).join('，')}>
+                {(lockedComposerMode || allLocked) && <Lock size={10} className="text-danger" aria-hidden="true" />}
+                {queuePaused && <Pause size={10} className="text-danger" aria-hidden="true" />}
+                {reportsPaused && <Pause size={10} className="text-accent" aria-hidden="true" />}
+              </span>
+            )}
+            <button type="button"
+              className={`${REPORT_PAUSE_BUTTON} shrink-0 border-border-default text-text-secondary hover:bg-bg-hover`}
+              aria-expanded={actionsOpen}
+              aria-controls="send-queue-actions"
+              onClick={() => setActionsOpen((value) => !value)}>
+              队列操作
+              <ChevronDown size={12} aria-hidden="true"
+                className={`transition-transform duration-150 motion-reduce:transition-none ${actionsOpen ? 'rotate-180' : ''}`} />
+            </button>
+          </div>
+          <div
+            id="send-queue-actions"
+            className={`grid transition-[grid-template-rows] duration-150 ease-out motion-reduce:transition-none md:hidden ${actionsOpen ? 'visible grid-rows-[1fr]' : 'invisible grid-rows-[0fr]'}`}
+          >
+            {/* visibility swap keeps collapsed buttons out of the a11y tree/tab order */}
+            <div className="overflow-hidden">
+              <div className="grid grid-cols-2 gap-1.5 pb-1.5">
+                <button type="button" className={`${MOBILE_ACTION_BUTTON} ${lockedComposerMode
+                  ? 'border-danger bg-danger/10 text-danger hover:bg-danger/15'
+                  : 'border-border-default text-text-secondary hover:bg-bg-hover'}`}
+                  disabled={!sessionId} onClick={() => { if (sessionId) setLockedComposerMode(sessionId, !lockedComposerMode); }}
+                  aria-label={lockedComposerMode ? 'Cancel locked message mode' : 'New locked message'}
+                  aria-pressed={lockedComposerMode}>
+                  <Plus size={12} aria-hidden="true" /> {lockedComposerMode ? 'cancel locked msg' : 'new locked msg'}
+                </button>
+                {onNewRemindingCard && (
+                  <button type="button" data-testid="new-reminding-card" className={`${MOBILE_ACTION_BUTTON} ${remindingCardMode
+                    ? 'border-accent bg-accent/10 text-accent hover:bg-accent/15'
+                    : 'border-border-default text-text-secondary hover:bg-bg-hover'}`}
+                    disabled={!sessionId} onClick={onNewRemindingCard} aria-pressed={remindingCardMode}
+                    aria-label="create reminding card">
+                    <Plus size={12} aria-hidden="true" /> create reminding card
+                  </button>
+                )}
+                <button type="button" className={`${MOBILE_ACTION_BUTTON} border-border-default text-text-secondary hover:bg-bg-hover`}
+                  disabled={!sessionId || items.length === 0 || lockUpdating || reportPauseUpdating}
+                  onClick={() => { if (sessionId) void setItemsLocked(sessionId, true); }}
+                  aria-label="Lock all queued messages">
+                  <Lock size={12} aria-hidden="true" /> Lock all
+                </button>
+                <button type="button" className={`${MOBILE_ACTION_BUTTON} border-border-default text-text-secondary hover:bg-bg-hover`}
+                  disabled={!sessionId || items.length === 0 || lockUpdating || reportPauseUpdating}
+                  onClick={() => { if (sessionId) void setItemsLocked(sessionId, false); }}
+                  aria-label="Unlock all queued messages">
+                  <Unlock size={12} aria-hidden="true" /> Unlock all
+                </button>
+                <button type="button"
+                  className={`${MOBILE_ACTION_BUTTON} ${reportsPaused
+                    ? 'border-accent/40 bg-accent/10 text-accent hover:bg-accent/15'
+                    : 'border-border-default bg-bg-tertiary text-text-secondary hover:bg-bg-hover hover:text-text-primary'}`}
+                  aria-label={reportsPaused ? 'Resume reports' : 'Pause reports'}
+                  aria-pressed={reportsPaused}
+                  disabled={!sessionId || !reportPauseLoaded || reportPauseUpdating || lockUpdating}
+                  onClick={() => { if (sessionId) void setReportsPaused(sessionId, !reportsPaused); }}
+                >
+                  {reportsPaused ? <Play size={12} aria-hidden="true" /> : <Pause size={12} aria-hidden="true" />}
+                  {reportsPaused ? 'Resume reports' : 'Pause reports'}
+                </button>
+                <button type="button"
+                  className={`${MOBILE_ACTION_BUTTON} ${queuePaused
+                    ? 'border-danger bg-danger/10 text-danger hover:bg-danger/15'
+                    : 'border-border-default text-text-secondary hover:bg-bg-hover'}`}
+                  aria-label={queuePaused ? 'Resume everything' : 'Pause everything'}
+                  aria-pressed={queuePaused}
+                  disabled={!sessionId || !queuePauseLoaded || queuePauseUpdating}
+                  onClick={() => { if (sessionId) void setQueuePaused(sessionId, !queuePaused); }}>
+                  {queuePaused ? <Play size={12} aria-hidden="true" /> : <Pause size={12} aria-hidden="true" />}
+                  {queuePaused ? 'Resume everything' : 'Pause everything'}
+                </button>
+                {hasQueued && (
+                  <>
+                    <div className="col-span-2 border-t border-border-muted" aria-hidden="true" />
+                    <button type="button" onClick={clear}
+                      className="col-span-2 -mt-0.5 inline-flex w-full items-center justify-center gap-1 whitespace-nowrap rounded-md border border-danger/40 px-3 py-2 text-xs font-medium text-danger transition-colors hover:bg-danger/10 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                      title="清空仍在队列中的消息">
+                      <Trash2 size={12} aria-hidden="true" /> 清空
+                    </button>
+                  </>
+                )}
+              </div>
+            </div>
+          </div>
+          <div ref={listRef} className="queue-list-scroll max-h-[45dvh] overflow-y-auto rounded-md border border-border-muted bg-bg-secondary">
             {displayItems.length === 0 ? (
               <div className="px-3 py-3 text-center text-xs text-text-tertiary">队列为空</div>
             ) : (
               <div className="p-1">
                 {displayItems.map((item, index) => {
-                  const editing = edit?.id === item.id;
-                  const editable = item.kind === 'task' && item.source === 'user';
+                  const editable = item.meta?.dispatchState === 'queued';
+                  const locked = item.meta?.locked === true;
+                  // Keyboard selection and pointer hover share the very same
+                  // `bg-bg-hover` token, so both states are visually identical.
+                  const selected = item.id === selectedId;
+                  const illegalLock = locked && item.meta?.lockSource === 'illegal';
+                  // Report-policy lock materialized by Pause reports; identified by
+                  // the structured queueLockAutoReport flag, never by body text.
+                  const reportLock = locked && !illegalLock && item.meta?.lockAutoReport === true;
+                  // Pause everything hold is display-only on this button: the row
+                  // itself stays unlocked and the P glyph never implies a lock.
+                  const pauseHold = !locked && queuePaused;
+                  const steerReason = readonlySession ? 'Session 为只读'
+                    : queuePaused ? 'Pause everything 阻止队列 Steer'
+                    : !queuePauseLoaded || queuePauseUpdating ? '正在确认服务端队列状态'
+                    : edit ? '请先保存或取消队列编辑'
+                    : item.meta?.steerPending ? item.meta.steerError || '正在等待 provider Steer 回执'
+                    : locked ? '消息已锁定，请先解锁'
+                    : runtimeWorker?.sessionId !== sessionId || runtimeWorker?.status !== 'running' ? 'Steer 需要正在运行的 Worker；idle 时优先执行待重启'
+                    : steering.has(`${sessionId}:${item.id}`) ? '正在执行 Steer'
+                    : !editable ? '条目已不在待发队列' : '';
+                  // Pointer wins: entering a row moves the highlight here.
+                  // Leaving does not clear it, so the keyboard continues from
+                  // the row the mouse last touched.
                   return (
-                    <div key={item.id} className="queue-row-in group flex items-center gap-2 rounded px-2 py-1.5 text-sm hover:bg-bg-hover">
-                      {editing ? (
-                        <>
-                        <textarea autoFocus rows={2} value={edit.text} disabled={edit.acquiring || edit.saving || edit.releasing} onChange={(event) => updateDraft(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); saveEdit(); } else if (event.key === 'Escape') { event.preventDefault(); cancelEdit(); } }} className="flex-1 resize-none rounded border border-accent/50 bg-bg-tertiary px-2 py-1 text-sm text-text-primary focus:outline-none disabled:opacity-60" />
-                          <button className={BUTTON} disabled={edit.acquiring || edit.saving || edit.releasing} onClick={saveEdit} title="保存"><Check size={14} /></button>
-                          <button className={BUTTON} disabled={edit.acquiring || edit.saving || edit.releasing} onClick={cancelEdit} title="取消"><X size={14} /></button>
-                        </>
-                      ) : (
-                        <>
+                    <div
+                      key={item.id}
+                      data-queue-row={item.id}
+                      data-queue-selected={selected ? 'true' : undefined}
+                      onMouseEnter={() => { if (sessionId) setQueueSelection(sessionId, item.id); }}
+                      className={`queue-row-in group flex items-center gap-2 rounded px-2 py-1.5 text-sm hover:bg-bg-hover ${selected ? 'bg-bg-hover' : ''}`}
+                    >
+                      <>
                           <span className="shrink-0 rounded border border-border-default bg-bg-tertiary px-1 py-px text-[10px] leading-tight text-text-secondary">{label(item)} {item.kind}</span>
                           <button
                             type="button"
@@ -136,13 +433,36 @@ export function SendQueuePanel() {
                             {item.text}
                           </button>
                           <span className="flex shrink-0 items-center gap-0.5 md:opacity-0 md:group-hover:opacity-100 md:focus-within:opacity-100 max-md:opacity-100">
-                            {editable && <button className={BUTTON} onClick={() => startEdit(item.id)} title="编辑"><Pencil size={12} /></button>}
+                            {supportsSteer && <button type="button" className={BUTTON + ' px-1.5 text-xs'} disabled={!!steerReason}
+                              aria-label={`Steer queued message ${index + 1}`} title={steerReason || '通过 adapter 原生 Steer 交接原队列消息'}
+                              onClick={() => void requestSteer(item)}>Steer</button>}
+                            {editable && <button className={BUTTON} disabled={!!edit || readonlySession} onClick={() => void requestEdit(item)} title="编辑"><Pencil size={12} /></button>}
                             <button className={BUTTON} disabled={index === 0} onClick={() => move(item.id, -1)} title="上移"><ArrowUp size={12} /></button>
                             <button className={BUTTON} disabled={index === displayItems.length - 1} onClick={() => move(item.id, 1)} title="下移"><ArrowDown size={12} /></button>
                             <button className={BUTTON + ' text-danger hover:bg-danger/10'} onClick={() => void remove(item.id)} title="删除"><Trash2 size={12} /></button>
                           </span>
-                        </>
-                      )}
+                      </>
+                      <button type="button"
+                        className={`${BUTTON} shrink-0 ${locked ? 'border border-danger text-danger hover:bg-danger/10' : 'border border-border-default'}`}
+                        disabled={!sessionId || lockUpdating || reportPauseUpdating}
+                        onClick={() => { if (sessionId) void setItemLocked(sessionId, item.id, !locked); }}
+                        aria-label={locked ? `Unlock queued message ${index + 1}` : `Lock queued message ${index + 1}`}
+                        aria-pressed={locked}
+                        title={illegalLock ? "This message is locked because the Worker entered Illegal status. You can unlock it manually, or mark the Session as safely offline to unlock it automatically." : locked ? 'Unlock' : 'Lock'}>
+                        {illegalLock ? (
+                          <span className="relative block h-3 w-3 text-danger" aria-hidden="true">
+                            <span className="absolute -top-0.5 left-0 text-[13px] font-bold italic leading-none">i</span>
+                            <Lock size={8} className="absolute -bottom-0.5 -right-0.5" strokeWidth={2.5} />
+                          </span>
+                        ) : reportLock ? (
+                          <span className="relative block h-3.5 w-4 text-danger" aria-hidden="true">
+                            <span className="absolute -top-0.5 left-0 text-[11px] font-bold italic leading-none">Re</span>
+                            <Lock size={8} className="absolute -bottom-0.5 -right-0.5" strokeWidth={2.5} />
+                          </span>
+                        ) : pauseHold ? (
+                          <span className="block h-3 w-3 text-center text-[12px] font-bold leading-3 text-danger" aria-hidden="true">P</span>
+                        ) : locked ? <Lock size={12} aria-hidden="true" /> : <Unlock size={12} aria-hidden="true" />}
+                      </button>
                     </div>
                   );
                 })}
@@ -151,7 +471,30 @@ export function SendQueuePanel() {
           </div>
         </div>
       </div>
-      {preview && <QueueMessagePreview item={preview} onClose={() => setPreview(null)} />}
+      <Modal open={!!confirmation && confirmation.sessionId === sessionId} onClose={() => setConfirmation(null)} title="确认修改" size="sm">
+        <p className="text-sm text-text-primary">是否确认修改agent/系统消息？</p>
+        <div className="mt-4 flex justify-end gap-2">
+          <Button variant="secondary" onClick={() => setConfirmation(null)}>取消</Button>
+          <Button onClick={() => {
+            if (confirmation && useSessionStore.getState().currentSessionId === confirmation.sessionId) startEdit(confirmation.itemId);
+            setConfirmation(null);
+          }}>确认</Button>
+        </div>
+      </Modal>
+      {preview && (
+        <QueueMessagePreview
+          key={preview.id}
+          item={preview}
+          canEdit={!!sessionId && !edit && !readonlySession && preview.meta?.dispatchState === 'queued'}
+          onEdit={(item) => {
+            // 先关阅读窗再进入既有编辑流程；lease/确认失败时 toast 可观察，
+            // 队列原文仍在服务端与面板行中，不会丢失。
+            setPreview(null);
+            void requestEdit(item);
+          }}
+          onClose={() => setPreview(null)}
+        />
+      )}
     </div>
   );
 }

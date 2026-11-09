@@ -25,6 +25,11 @@ import threading
 from pathlib import Path
 from queue import Queue
 
+# These bridges also run by absolute filename from a Session workdir.
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+from packages.jobs.window import command_window_options
+
 
 def _write_stdout_line(text: str) -> None:
     """以 UTF-8 写入 stdout 并换行，避免 Windows 管道默认编码问题。"""
@@ -238,17 +243,22 @@ def _main_loop(node: str, codex_js: str, extra_opts: list[str],
                     stderr=subprocess.PIPE,
                     cwd=cwd or None,
                     close_fds=True,
+                    **command_window_options(),
                 )
             except FileNotFoundError:
                 _write_stdout_line(json.dumps({
                     "type": "result", "is_error": True,
                     "result": f"Codex executable not found: {codex_js}",
+                    "error_source": "wrapper_exception",
+                    "error": {"message": f"Codex executable not found: {codex_js}"},
                 }, ensure_ascii=False))
                 continue
             except OSError as e:
                 _write_stdout_line(json.dumps({
                     "type": "result", "is_error": True,
                     "result": f"OS error spawning Codex: {e}",
+                    "error_source": "wrapper_exception",
+                    "error": {"message": f"OS error spawning Codex: {e}"},
                 }, ensure_ascii=False))
                 continue
 
@@ -271,12 +281,19 @@ def _main_loop(node: str, codex_js: str, extra_opts: list[str],
                 result_event = {
                     "type": "result", "is_error": True,
                     "result": f"[codex] {message}",
+                    "error": err,
+                    "error_text": str(message),
+                    "error_source": "codex_error_payload",
                 }
             elif proc.returncode not in (None, 0) and not last_text:
                 tail = (stderr_bytes or b"").decode("utf-8", errors="replace")[-2000:].strip()
+                full_stderr = (stderr_bytes or b"").decode("utf-8", errors="replace").strip()
                 result_event = {
                     "type": "result", "is_error": True,
                     "result": f"codex exited with code {proc.returncode}:\n{tail}",
+                    "error": {"exitCode": proc.returncode, "stderr": full_stderr},
+                    "error_text": full_stderr,
+                    "error_source": "codex_stderr",
                 }
             else:
                 result_event = {

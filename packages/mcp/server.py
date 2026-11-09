@@ -10,9 +10,14 @@ Tools exposed:
     - session_list: List all sessions (optional lean summary mode)
     - session_managed: List the caller's managed sessions (summary)
     - manager_chain: Return the caller's manager chain (upper-level managers)
-    - session_get: Get session details (optional history limit)
+    - session_get: Get filtered session history bodies and result metadata
+    - session_message_get: Read one existing durable message ID in its Session
+    - session_history_search: Search one accessible Session with bounded snippets
     - session_usage: Get persisted session input/output/cache usage
-    - session_update: Update session settings (model/effort/mcp etc.)
+    - session_update: Update session settings (model/effort/mcp/workspace etc.)
+    - workspace_list: List durable Workspaces (name/id/order/dirs/member count)
+    - workspace_create: Create a Workspace (same rules as the Dashboard)
+    - workspace_delete: Delete a Workspace (detaches its members; no dangling ids)
     - session_delete: Delete a session
     - session_batch_delete: Delete multiple sessions at once
     - session_claim: Claim a session (establish managed relationship; auto-subscribes reports)
@@ -20,20 +25,25 @@ Tools exposed:
     - session_unclaim: Release the managed relationship entirely (auto-unsubscribes reports; session becomes unmanaged)
     - session_unclaim_many: Batch-unclaim multiple sessions
     - session_readonly: Set or clear readonly on a session already managed by caller
-    - session_handoff: 替身交接——创建孪生 session B 接替 A（精简上下文/切换 adapter）
+    - session_handoff: 替身交接——新建或选择已有 B 接替来源 A，按模式区分提示元数据与实际消息
     - agent_spawn: Spawn a worker process (CLI) for an agent (= session)
     - agent_task: Send a task to an agent (auto-spawns if no live worker)
     - agent_assign: Async task dispatch to an agent, returns immediately (preferred)
     - agent_send: Send a message to an agent (queued; no live worker → pending queue)
-    - agent_send_force: Force-push to an agent (restart + send; no live worker → queue)
+    - agent_send_force: Urgent delivery (capability-routed Steer first, otherwise restart; no worker → queue)
     - agent_notify: Deliver a notification/reminder to an agent (self or managed only;
       persisted queue + immediate auto-spawn when no live worker)
+    - agent_inbox: Shared Locker list/read/consume and subscription/mode/backlog/recovery
     - notification_send: Send a Pan system notification to self or managed session
     - reminder_register/list/cancel: Manage durable one-shot reminders
     - agent_background_start/get/list/cancel/retry: Manage a durable Runner job
+    - agent_message_job_create/get/list/update/cancel: Schedule Session messages or broadcasts
+    - agent_send_many: Send one message to selected Sessions
     - scheduler_create/list/get/update/delete/pause/resume/run_now/runs:
       Scheduled tasks (闹钟式定时任务：设定任务文本 + 触发时间/重复规则，到点自动派给目标 session)
     - agent_kill: Kill an agent's worker process (no worker → harmless no-op)
+    - agent_restart_delayed: Restart a live Worker at its next valid idle boundary
+    - agent_restart_delayed_status: Read the delayed restart receipt without mutation
     - agent_list: List all agents (= sessions) — alias of session_list
     - worker_spawn / worker_task / worker_assign / worker_send / worker_send_force /
       worker_kill / worker_list: DEPRECATED compat aliases — prefer agent_*.
@@ -54,6 +64,7 @@ Environment variables:
 """
 
 from __future__ import annotations
+from pydantic import StrictBool, StrictStr
 
 import argparse
 import json
@@ -61,7 +72,7 @@ import os
 import urllib.request
 import urllib.error
 from pathlib import Path
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import CallToolResult, TextContent
@@ -69,12 +80,125 @@ from mcp.types import CallToolResult, TextContent
 _pan_api_url = os.environ.get("PAN_API_URL", "http://127.0.0.1:8768")
 
 mcp = FastMCP("Pan")
+_terminal_transport = "stdio"
+
+
+def _terminal_api(operation: str, arguments: dict) -> dict:
+    """Local stdio only: never lend this process's caller to remote MCP clients."""
+    def failure(code):
+        return {"ok": False, "error": {"code": code}}
+    try:
+        url = urlsplit(_pan_api_url)
+        if (_terminal_transport != "stdio" or url.scheme != "http" or
+                url.hostname not in {"127.0.0.1", "::1"} or url.username or url.password or
+                url.path not in {"", "/"} or url.query or url.fragment):
+            return failure("local-stdio-required")
+        url.port  # invalid configured ports fail closed
+    except ValueError:
+        return failure("local-stdio-required")
+    sid = os.environ.get("PAN_AGENT_SESSION_ID")
+    if not sid or len(sid) > 128:
+        return failure("caller-required")
+    caller = _caller_identity()
+    if not isinstance(caller, dict) or caller.get("id") != sid:
+        return failure("caller-unverified")
+    data = {key: value for key, value in arguments.items() if value is not None}
+    if operation == "create" and "session_id" not in data:
+        data["session_id"] = sid
+    req = urllib.request.Request(f"{_pan_api_url.rstrip('/')}/api/terminal-tools/{operation}",
+        data=json.dumps(data).encode("utf-8"), method="POST",
+        headers={"Content-Type": "application/json", "X-Pan-Terminal-Caller": sid})
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None
+    try:
+        with urllib.request.build_opener(NoRedirect).open(req, timeout=35.0) as response:
+            raw = response.read(256 * 1024 + 1)
+            if len(raw) > 256 * 1024:
+                return failure("response-too-large")
+            return json.loads(raw)
+    except urllib.error.HTTPError as error:
+        # The dedicated endpoint returns only static categories; never relay
+        # arbitrary HTTP bodies/proxy text from a different local server.
+        return failure({403: "permission-denied", 422: "invalid-request", 429: "busy",
+                        503: "terminal-unavailable"}.get(error.code, "terminal-tool-failed"))
+    except Exception:
+        return failure("terminal-tool-unavailable")
+
+
+from packages.mcp.terminal_tools import register_terminal_tools
+register_terminal_tools(mcp, _terminal_api)
+
+
+def _self_queue_api(operation: str, item_id: str | None = None) -> dict:
+    """Never lend a local worker's identity to remote MCP clients."""
+    sid = os.environ.get("PAN_AGENT_SESSION_ID")
+    url = urlsplit(_pan_api_url)
+    if (_terminal_transport != "stdio" or not sid or url.scheme != "http"
+            or url.hostname not in {"127.0.0.1", "::1"} or url.username or url.password
+            or url.path not in {"", "/"} or url.query or url.fragment):
+        return {"ok": False, "error": "caller_unavailable"}
+    req = urllib.request.Request(
+        f"{_pan_api_url.rstrip('/')}/api/self-queue/{operation}",
+        data=json.dumps({"itemId": item_id} if operation == "consume" or (
+            operation == "report-consume" and item_id is not None) else {}).encode("utf-8"),
+        method="POST", headers={"Content-Type": "application/json", "X-Pan-Queue-Caller": sid})
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None
+    try:
+        with urllib.request.build_opener(NoRedirect).open(req, timeout=15) as response:
+            return json.loads(response.read())
+    except Exception:
+        # A consume may have interrupted its own caller after real handoff.
+        # Inspect the original ID again; never recreate/repost its contents.
+        return {"ok": False, "status": "unconfirmed", "retryable": False}
+
+
+@mcp.tool()
+def self_queue_read() -> dict:
+    """Read visible own queue messages; child-agent reports expose identity only.
+
+    Child-agent report bodies/results/attachments are withheld until actual CLI
+    handoff. Prefer report_consume() for reports; non-report bodies are unchanged.
+    Locked, paused and unavailable messages are hidden. Reading does not consume.
+    Caller identity is bound by Pan; no session selection is accepted.
+    完整编排流程见 /pan skill。
+    """
+    return _self_queue_api("read")
+
+
+@mcp.tool()
+def self_queue_consume(item_id: str) -> dict:
+    """Consume a visible message in your own queue by its original ID, interrupting your task.
+
+    Only status=consumed proves handoff. Pending/unconfirmed means no success
+    claim; use the same original ID to inspect its receipt, never resend its body.
+    Rejected with retryable=true proves this attempt was not accepted and allows
+    an explicit retry with the same original ID. Unknown results are not retried.
+    Locked or paused IDs are unavailable even if previously read. No session
+    selection is accepted. Original message identity and metadata are retained.
+    完整编排流程见 /pan skill。
+    """
+    return _self_queue_api("consume", item_id)
 
 _IMPORT_ADAPTERS = ("cbc", "kimi", "opencode", "claude", "codex")
 
 
 def _api(method: str, path: str, body: dict | None = None, timeout: float = 30.0) -> dict:
     """Call Pan's HTTP API and return parsed JSON response."""
+    from packages.automation.authorization import object_path
+    if object_path(path):
+        if _terminal_transport != 'stdio':
+            return {'ok': False, 'error': {'code': 403, 'message': 'Trusted local MCP transport required'}}
+        try:
+            from packages.plugins.ipc import request
+            return request({'operation': 'authorization_objects',
+                            'session_id': os.environ.get('PAN_AGENT_SESSION_ID', ''),
+                            'method': method, 'path': path, 'body': body})
+        except Exception:
+            return {'ok': False, 'error': {'code': 'object_transport_unavailable',
+                    'message': 'Trusted MCP object transport unavailable; outcome unconfirmed, do not replay'}}
     url = f"{_pan_api_url}{path}"
     data = json.dumps(body).encode("utf-8") if body else None
     req = urllib.request.Request(url, data=data, method=method)
@@ -148,7 +272,8 @@ def _caller_identity() -> dict | None:
     sid = os.environ.get("PAN_AGENT_SESSION_ID")
     if not sid:
         return None
-    result = _api("GET", f"/api/sessions/{sid}")
+    # Authorization/source identity does not need the caller's conversation.
+    result = _api("GET", f"/api/sessions/{sid}?view=metadata")
     if not isinstance(result, dict) or result.get("error") or "id" not in result:
         return None
     result = dict(result)
@@ -163,7 +288,10 @@ def _caller_identity() -> dict | None:
     return result
 
 
-def _check_access(session_id: str, claim: bool = False) -> dict | None:
+_CALLER_UNSET = object()
+
+
+def _check_access(session_id: str, claim: bool = False, *, caller=_CALLER_UNSET) -> dict | None:
     """Enforce managed-session isolation on a target session.
 
     Rules:
@@ -177,8 +305,11 @@ def _check_access(session_id: str, claim: bool = False) -> dict | None:
     - Otherwise → permission denied (ok:false + error).
 
     Returns None when allowed, or an error dict when denied.
+    Send callers may reuse their identity snapshot within this one tool call;
+    identity and permissions are never cached across calls.
     """
-    caller = _caller_identity()
+    if caller is _CALLER_UNSET:
+        caller = _caller_identity()
     if not caller:
         return None
     if session_id == caller.get("id"):
@@ -300,6 +431,21 @@ def _agent_message_prefix(text: str) -> str:
     return text
 
 
+@mcp.tool()
+def system_fields() -> dict:
+    """Discover canonical Event system fields, aliases and Action target rules.
+
+    Read-only contract shared with GET /api/automation/system-fields. Each field
+    declares its type, source, optionality, sensitivity and whether it may be
+    used as an Action target. System fields are trusted host/adapter identity;
+    event payload keys never create or override them, and IDs are never guessed
+    from message text. Input aliases such as session_id are accepted only while
+    admitting an Event; stored Events use canonical camelCase names.
+    完整编排流程见 /pan skill。
+    """
+    return _api("GET", "/api/automation/system-fields")
+
+
 def _worker_unresolvable(worker_id: str) -> dict:
     """Deny error for worker tools when _worker_session_id() returns None.
 
@@ -330,6 +476,7 @@ def session_create(
     pan_access: dict | None = None,
     model_context_window: int | None = None,
     model_auto_compact_token_limit: int | None = None,
+    plugin_bindings: list[dict] | None = None,
 ) -> dict:
     """Create a new session (persistent conversation container).
 
@@ -349,6 +496,8 @@ def session_create(
         game_id: RuleWhisper game binding.
         pan_access: Capability flags dict, keys: restrictToManaged /
             canClaimUnmanaged / autoClaimCreated (all default False).
+        plugin_bindings: Optional plugin selections with plugin_id, enabled and
+            mode (standalone, pan_native or gateway). [] explicitly disables tools.
         model_context_window / model_auto_compact_token_limit: Optional
             positive Codex config overrides. Omitted values are not sent and
             are not persisted; non-Codex adapters reject explicit values.
@@ -383,6 +532,8 @@ def session_create(
         body["modelContextWindow"] = model_context_window
     if model_auto_compact_token_limit is not None:
         body["modelAutoCompactTokenLimit"] = model_auto_compact_token_limit
+    if plugin_bindings is not None:
+        body["pluginBindings"] = plugin_bindings
     result = _strip_usage(_api("POST", "/api/sessions", body))
     # meta-agent 创建的 session 自动归其管理（立项 4.2）
     if isinstance(result, dict) and result.get("id"):
@@ -671,14 +822,28 @@ def manager_chain() -> dict:
 
 
 @mcp.tool()
-def session_get(session_id: str, limit: int = 0) -> dict:
-    """Get full session details including history and last result.
+def session_get(session_id: str, limit: int = 0, roles: list[str] | None = None,
+                tool_output: str = "command_only", before: int | None = None) -> dict:
+    """Get session details with a safe filtered history body projection.
 
     Args:
         session_id: Session ID (e.g. "ses_abc123def4567890")
-        limit: Max history entries to return (0 = full history, default). When
-            set, history is truncated to the latest `limit` entries and
-            historyTruncated/historyTotal markers are added.
+        limit: Limit AFTER filtering. 0 retains full-history compatibility;
+            prefer 50 for bounded reads (positive values capped at 200).
+        roles: user, assistant, tool, thinking. Default/recommended:
+            [user, assistant, tool]. Empty list returns no history bodies.
+        tool_output: command_only (default/recommended) or include_output.
+            command_only retains the tool name and explicit command/cmd strings;
+            opaque or truncated legacy calls expose no arguments. No parts or
+            raw content is returned. include_output returns stored tool content.
+        before: Exclusive canonical index from nextBefore, for older pages.
+            Keep the same filters. Null nextBefore means complete. History
+            replacement invalidates positions; restart on epoch/revision change.
+
+    Rows keep only existing durable Pan messageId values; legacy rows carry
+    identityKind=legacy_unaddressable. historyTotal is canonical row count;
+    historyFilteredTotal counts selected bodies. lastResult retains terminal
+    metadata and final result text only when assistant is selected. For large histories always use limit=50.
 
     调用链（编排主链第 3 步·查结果）：读 lastResult.status——"done" 取 result，
     "error" 读错误排查；完成后 `session_delete` 收尾。巡检用 limit 截断
@@ -688,14 +853,92 @@ def session_get(session_id: str, limit: int = 0) -> dict:
     denied = _check_access(session_id)
     if denied:
         return denied
-    result = _api("GET", f"/api/sessions/{session_id}")
-    if limit and "history" in result and isinstance(result["history"], list):
-        history = result["history"]
-        result = dict(result)
-        result["history"] = history[-limit:]
-        result["historyTruncated"] = len(history) > limit
-        result["historyTotal"] = len(history)
+    from packages.core.history_read import options
+    try:
+        selected, _ = options(roles, tool_output)
+    except ValueError as exc:
+        return {"ok": False, "error": {"code": "invalid_params", "message": str(exc)}}
+    query = urlencode({"historyLimit": limit, "historyRoles": ",".join(sorted(selected)),
+                       "toolOutput": tool_output, "before": before or 0})
+    result = _api("GET", f"/api/sessions/{quote(session_id, safe='')}?{query}")
     return _strip_usage(result)
+
+
+@mcp.tool()
+def session_message_get(session_id: str, message_id: str,
+                        roles: list[str] | None = None,
+                        tool_output: str = "command_only") -> dict:
+    """Read one persisted Pan messageId within one accessible Session.
+
+    Uses session_get's body projection: default roles user/assistant/tool,
+    tool_output=command_only. Opt into thinking via roles=[thinking], or stored
+    tool output via tool_output=include_output. Never returns raw parts.
+    Legacy positional/native ids are rejected (invalid_message_id); missing,
+    cross-Session or ambiguous ids return message_not_found. A hidden thinking
+    row returns message_filtered. No identity is generated or persisted by read.
+    Managed-session checks run before reading; denial returns permission_denied.
+    HTTP is trusted-local admin; MCP owns the caller's managed read boundary.
+    完整编排流程见 /pan skill。
+    """
+    denied = _check_access(session_id)
+    if denied:
+        return denied
+    from packages.core.history_read import options
+    try:
+        selected, _ = options(roles, tool_output)
+    except ValueError as exc:
+        return {"ok": False, "error": {"code": "invalid_params", "message": str(exc)}}
+    query = urlencode({"roles": ",".join(sorted(selected)), "toolOutput": tool_output})
+    return _api("GET", f"/api/sessions/{quote(session_id, safe='')}/messages/{quote(message_id, safe='')}?{query}")
+
+
+@mcp.tool()
+def session_history_search(session_id: str, query: str, limit: int = 50,
+                           cursor: str | None = None,
+                           roles: list[str] | None = None,
+                           tool_output: str = "command_only") -> dict:
+    """Search literal text in one accessible Session using the existing FTS index.
+
+    Recommended: session_history_search(session_id, query="error", limit=50).
+    Default roles are user/assistant/tool, with tool_output=command_only:
+    only the shared tool name/command projection is searched and excerpted,
+    so output-only text cannot affect hits or pagination. Other tool arguments
+    are conservatively omitted, as in session_get. Opt into stored tool output
+    with include_output, or thinking with roles=[thinking]. roles=[] searches
+    nothing. Query is trimmed, case-insensitive literal text (no regex/FTS
+    syntax), at most 512 characters. Limit is clamped to 1..100 after matching.
+
+    Returns bounded hits with snippet, role, persistent messageId, canonical
+    messageIndex and history version; no complete history, parts or raw output.
+    Read a hit with session_message_get using the same projection options.
+    Missing legacy IDs are skipped, never created. No global search is exposed.
+
+    Pass nextCursor back as cursor with the same Session/query/limit/options
+    until null. It is signed, expires after 15 minutes, and is invalidated by
+    history changes, index rebuild or option changes; restart without cursor
+    on HTTP detail.code=history_search_cursor_expired (409). HTTP error details
+    pass through; missing Session returns error="Session not found". Managed
+    permission checks run before search; denial returns permission_denied.
+    Uses the existing lazy disposable SQLite index, with no background worker
+    or polling. Cold indexing can load history; only result output is bounded.
+    完整编排流程见 /pan skill。
+    """
+    if not session_id or not session_id.strip():
+        return {"ok": False, "error": {"code": "invalid_params", "message": "session_id is required; global search is not exposed"}}
+    denied = _check_access(session_id)
+    if denied:
+        return denied
+    from packages.core.history_read import options
+    try:
+        selected, _ = options(roles, tool_output)
+    except ValueError as exc:
+        return {"ok": False, "error": {"code": "invalid_params", "message": str(exc)}}
+    params = {"sessionId": session_id, "q": query, "limit": limit,
+              "roles": ",".join(sorted(selected)), "toolOutput": tool_output,
+              "countMode": "messages"}
+    if cursor is not None:
+        params["cursor"] = cursor
+    return _api("GET", "/api/history/search?" + urlencode(params))
 
 
 @mcp.tool()
@@ -785,55 +1028,87 @@ def session_batch_delete(session_ids: list[str]) -> dict:
 def session_handoff(
     session_id: str,
     handoff_prompt: str,
-    copy_settings: bool = True,
+    copy_settings: StrictBool | None = None,
     adapter: str | None = None,
     model: str | None = None,
     permission_mode: str | None = None,
+    override_original_prompt: StrictBool = False,
+    original_prompt: StrictStr | None = None,
+    target_session_id: StrictStr | None = None,
 ) -> dict:
-    """替身交接：创建孪生 session B 接替 session A（精简上下文 / 切换 adapter）。
+    """替身交接（精简上下文 / 切换 adapter）。先确认用户要新建 B 还是已有 B，明确 A/B ID，不能反向。
 
-    场景：A 的上下文过大需要精简，或 A 想中途切换 adapter（普通 session 不能
-    切）。A 保留为可阅读上下文（重命名为 `(archive) <原名>`），B 接管 A 的名字
-    与全部 pan 关系网，随后解除 A 的原关系网。
+    分层：session_id 是将归档的来源 A；target_session_id 省略=新建 B，
+    提供=只使用该既有 B，不存在报错，绝不悄悄新建。不要把所有字段当设置覆盖。
 
-    行为（session_handoff v1）：
-    1. **关系网接替（自动、必然）**：B.managed = A.managed，A 的子会话
-       managed_by 改 B；A 的 report_subscriptions、QQ postbox 绑定
-       （session_qq_subscribe 订阅的 inbox 提醒）全部转移给 B。
-    2. **B 自动 manage A**：B.managed 追加 A，A.managed_by = B——A 归档为 B 的
-       被管理会话，B 会收到 A 的完成报告（可据 A 的 lastResult 持续读取旧上下文）。
-    3. **可选设置复制**：copy_settings=true 时 1:1 复制 A 的 adapter、
-       adapter_config、model、permission_mode、session_template、pan_access、
-       mcp_servers 等（**明确不含 system_prompt**；cli_session_id 清空——B 是
-       全新会话，不继承 A 的 CLI 上下文）；false 时 B 用默认设置（此时必须显式
-       传 adapter，否则报错）。
-    4. **B 的 system_prompt = 本次 handoff_prompt 与 A.original_prompt 拼接**（分
-       「交接上下文 / 原 system prompt」两节）。
-    5. **重命名**：A → `(archive) <原名>`，B → `<原名>`。
+    已有 B：保留名字、history、cli_session_id、workdir、adapter/config、
+    template、pan_access、插件绑定与约束。copy_settings 省略/false 保留 B；
+    true 拒绝，不能沿用新建默认来覆盖已有上下文。adapter 参数拒绝。
+    model/permission_mode 只在无活/native Worker 时可显式覆盖，省略保留 B。
+    original_prompt 是 Pan 元数据：默认覆盖为 A.original_prompt；
+    override_original_prompt=true 时用本次 original_prompt（字符串，空串清空）。
+    目标实际 system_prompt 逐字冻结，当前与以后 restart/resume/newspawn 都不从
+    这些元数据重合成。handoff_prompt 同时覆盖简报元数据并作为一条普通输入排队；
+    返回 briefDelivery.queueItemId 供核对，queued 不代表 CLI 已看到。
+    保留 Pause/Illegal/锁/owner/generation，绝不 kill/unlock/force。来源可运行并
+    自调用，其队列和最终报告保留；按新关系将 A 的报告送给 B。
+    B 原 managed/report/QQ/WeChat 合并去重，B 管理归档 A。祖先/父子、不同
+    manager、不同有效 Workspace、损坏关系、第三方 QQ/WeChat 冲突在修改前拒绝。
+    跨 Workspace 归属尚无产品策略，当前不支持。B 原名保留，A 加 archive 前缀。
+
+    新建 B（旧兼容）：copy_settings 省略=true，复制 A 设置，false 必须显式
+    adapter；model/permission_mode 优先于来源。CLI 身份/history 不复制。
+    original_prompt 按上述继承/覆写选择，B.system_prompt = 本次简报 + 选定
+    original_prompt（只有新建模式使用合成器），B 取 A 原名。
+
+    两种模式都转移 A 关系网、归档 A、B 管理 A。已有模式重复相同请求只查原回执，
+    更改参数拒绝；结果未知先查询 A.handoffReceipt 与 B 原 queueItemId/history，
+    禁止自动重投、换 ID 或降级为新建。source 和 target 都须有管理访问权限，
+    访问检查不会预先 claim 修改关系。详细逐字段来源见 /pan skill §2.7。
 
     Args:
-        session_id: 被交接的 session（A）id
-        handoff_prompt: 【必填】交接简报——由 session A 的 agent 编写，让 B 彻底
-            了解现状与重点（重要开发习惯、现状、上下文精华等）。原始提示会自动
-            保留，无需重复抄入简报。仅本次简报成为 B.handoff_prompt，不叠加旧简报。
-        copy_settings: 是否 1:1 复制 A 的设置（见上）。默认 true。
-        adapter: 切换 adapter 时传入（copy_settings=false 时必填）
-        model: 覆盖模型（copy_settings=true 时优先于复制值）
-        permission_mode: 覆盖权限模式
+        session_id: 来源 A，交接后归档；不是接班者。
+        target_session_id: 已有接班者 B 的精确 ID；省略才新建。
+        handoff_prompt: 必填交接简报，已有模式是一条普通输入，不是 system prompt。
+        copy_settings: 新建默认 true；已有默认保留，仅允许省略/false。
+        override_original_prompt: 默认 false 从 A 取元数据；true 使用本次文本。
+        original_prompt: 覆写开关 true 时必填；已有模式永不注入 CLI。
+        adapter: 只支持新建模式；copy_settings=false 时必填。
+        model: 显式覆盖模型，已有模式要求无活/native Worker。
+        permission_mode: 显式覆盖权限模式，已有模式要求无活/native Worker。
 
-    调用链：走 POST /api/sessions/{session_id}/handoff。切换 adapter 的典型
-    用法：copy_settings=false + adapter="kimi" + handoff_prompt=...。交接后
-    B 即可 agent_assign（兼容别名 worker_assign）派活；A 归档但可 session_get 读取。
     完整编排流程见 /pan skill。
     """
-    denied = _check_access(session_id, claim=True)
+    # Validate before access checks: claim=True may establish managed relationships.
+    if type(override_original_prompt) is not bool or (
+        override_original_prompt and not isinstance(original_prompt, str)
+    ):
+        return {"ok": False, "error": {"code": "invalid_params", "message":
+            "override_original_prompt must be a boolean; when true, original_prompt must be a string (empty clears)"}}
+    if target_session_id is not None:
+        if not target_session_id or copy_settings is True or adapter is not None:
+            return {"ok": False, "error": {"code": "invalid_params", "message":
+                "Existing B requires a nonempty target_session_id, preserves settings (omit copy_settings/false), and rejects adapter override"}}
+        caller = _caller_identity()
+        for sid in (session_id, target_session_id):
+            denied = _check_access(sid, caller=caller)
+            if denied:
+                return denied
+    denied = _check_access(session_id, claim=target_session_id is None)
     if denied:
         return denied
-    if not copy_settings and not adapter:
+    if target_session_id is None and copy_settings is False and not adapter:
         return {"ok": False, "error": {
             "code": "missing_params",
             "message": "adapter is required when copy_settings is false"}}
-    body: dict = {"handoffPrompt": handoff_prompt, "copySettings": copy_settings}
+    body: dict = {"handoffPrompt": handoff_prompt}
+    if copy_settings is not None:
+        body["copySettings"] = copy_settings
+    if target_session_id is not None:
+        body["targetSessionId"] = target_session_id
+    if override_original_prompt:
+        body["overrideOriginalPrompt"] = True
+        body["originalPrompt"] = original_prompt
     if adapter:
         body["adapter"] = adapter
     if model:
@@ -1002,6 +1277,9 @@ def session_update(
     model_auto_compact_token_limit: int | None = None,
     clear_model_context_window: bool = False,
     clear_model_auto_compact_token_limit: bool = False,
+    workspace_ids: list[str] | None = None,
+    plugin_bindings: list[dict] | None = None,
+    expected_plugin_revision: int | None = None,
 ) -> dict:
     """Update session-level settings without spawning a worker.
 
@@ -1036,9 +1314,24 @@ def session_update(
             positive Codex overrides. Omitted values preserve the current
             setting. Use the matching clear_* flag to persistently remove it
             and delegate to Codex/model defaults.
+        workspace_ids: Move the Session to a Workspace, or to ungrouped.
+            Workspace 成员关系只存于 **management-tree 根** session：
+            列表至多一个 id（``[]`` = 取消分组/ungrouped，省略 = 保持不变）。
+            Workspace 必须已存在（workspace_list 查看）。**继承语义（硬约束）**：
+            被管理的子 session 通过 managedBy 链继承根的 workspace，**不能**
+            被单独放到另一个 workspace（会造成管理树跨 workspace 分裂）。
+            因此若目标 session 已被管理（managedBy 非空），本工具会拒绝并
+            要求先 ``session_unclaim`` 分离（与 Dashboard 拖拽「先分离再移动」
+            的既有行为一致）；对根 session 设置则会随管理树向下传播给全体后代。
+        plugin_bindings: Logical plugin selections; mutually exclusive with
+            mcp_servers. Native/standalone connection changes restart when idle;
+            changes within an existing gateway connection apply immediately.
+        expected_plugin_revision: Optional revision from session_get, rejects a
+            stale plugin selection rather than overwriting another editor.
 
     权限边界：_check_access 管理隔离——受限 caller（restrictToManaged）只能
-    更新自己管理的 session。
+    更新自己管理的 session；workspace 变更复用 Dashboard 使用的同一后端端点
+    （PUT /api/sessions/{id}/workspaces），规则、校验、权限边界完全一致。
 
     完整编排流程见 /pan skill。
     """
@@ -1058,6 +1351,10 @@ def session_update(
         body["maxThinkingTokens"] = max_thinking_tokens
     if mcp_servers is not None:
         body["mcpServers"] = mcp_servers
+    if plugin_bindings is not None:
+        body["pluginBindings"] = plugin_bindings
+    if expected_plugin_revision is not None:
+        body["expectedPluginRevision"] = expected_plugin_revision
     if game_id is not None:
         body["gameId"] = game_id or None
     if model_context_window is not None:
@@ -1068,7 +1365,144 @@ def session_update(
         body["modelAutoCompactTokenLimit"] = model_auto_compact_token_limit
     elif clear_model_auto_compact_token_limit:
         body["modelAutoCompactTokenLimit"] = None
-    return _strip_usage(_api("PATCH", f"/api/sessions/{session_id}", body))
+    # No workspace change requested → preserve the original single-PATCH path.
+    if workspace_ids is None:
+        return _strip_usage(_api("PATCH", f"/api/sessions/{session_id}", body))
+    settings_result = None
+    if body:
+        settings_result = _strip_usage(_api("PATCH", f"/api/sessions/{session_id}", body))
+        if isinstance(settings_result, dict) and settings_result.get("error"):
+            return settings_result
+    workspace_result = _move_session_workspace(session_id, workspace_ids)
+    if (not isinstance(workspace_result, dict)
+            or workspace_result.get("error") or workspace_result.get("ok") is False):
+        return workspace_result
+    if isinstance(settings_result, dict) and settings_result.get("requireRestart"):
+        workspace_result = dict(workspace_result)
+        workspace_result["requireRestart"] = True
+    return workspace_result
+
+
+def _workspace_public_view(workspace: dict) -> dict:
+    """Project a Workspace API dict to stable, non-internal fields.
+
+    Keeps id/name/order/dirs/timestamps plus a member count; drops the member
+    id list (callers use session_list / workspace_list when they need it) so a
+    large Workspace does not bloat the MCP response.
+    """
+    return {
+        "id": workspace.get("id"),
+        "name": workspace.get("name"),
+        "order": workspace.get("order"),
+        "dirs": list(workspace.get("dirs") or []),
+        "createdAt": workspace.get("createdAt"),
+        "updatedAt": workspace.get("updatedAt"),
+        "sessionCount": workspace.get("sessionCount"),
+    }
+
+
+def _move_session_workspace(session_id: str, workspace_ids: list[str]) -> dict:
+    """Move a Session to a Workspace via the Dashboard's own HTTP endpoint.
+
+    Reuses PUT /api/sessions/{id}/workspaces so validation, membership rules
+    and the managed-tree hard constraint are identical to the UI. Local
+    pre-checks only mirror the endpoint's cheap shape checks; existence of the
+    target Workspace and the managed-session refusal stay server-authoritative.
+    """
+    if (not isinstance(workspace_ids, list)
+            or not all(isinstance(wid, str) and wid for wid in workspace_ids)
+            or len(set(workspace_ids)) != len(workspace_ids)):
+        return {"ok": False, "error": {"code": "invalid_workspace_ids",
+                "message": "workspace_ids must be a unique array of workspace ids"}}
+    if len(workspace_ids) > 1:
+        return {"ok": False, "error": {"code": "invalid_workspace_ids",
+                "message": "A Session can belong to at most one Workspace"}}
+    return _api("PUT", f"/api/sessions/{session_id}/workspaces",
+                {"workspaceIds": list(workspace_ids)})
+
+
+# ---------------------------------------------------------------------------
+# Workspace tools (durable named Session groups)
+#
+# 继承/约束语义（与 Dashboard 完全一致，MCP 不额外放宽）：
+#   - Workspace 是命名容器，成员关系只持久化在 management-tree 根 session 的
+#     workspace_ids（0 或 1 个）；被管理后代通过 managedBy 链继承，不单独存值。
+#   - 一个 Session 至多属于一个 Workspace；[]（空）= ungrouped，无 "default" 分区。
+#   - 删除 Workspace 会从各根 session 清除该 id，后代自动跟随——不会留下
+#     dangling workspace id，也不会产生跨 Workspace 的 managed 关系。
+#   - 这些工具与 UI 共用同一组后端端点，权限边界一致（本机 loopback、无额外
+#     鉴权）；MCP 不获得 UI 没有的能力。
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def workspace_list() -> dict:
+    """List durable Workspaces (named Session groups).
+
+    Returns ``{"ok": true, "workspaces": [{id, name, order, dirs, createdAt,
+    updatedAt, sessionCount}]}``. ``id`` is what session_update's
+    ``workspace_ids`` and workspace_delete take; ``name`` is the human label.
+
+    Membership model (hard constraint, identical to the Dashboard):
+    一个 Workspace 的成员关系只存储在 **management-tree 根** session 上，
+    被管理的后代通过 managedBy 链**继承**，不单独持有 workspace id。因此同一
+    管理树的根与全部后代始终落在同一个 Workspace；不存在跨 Workspace 的管理
+    关系。``[]`` 表示 ungrouped（不属于任何 Workspace，没有 "default" 分区）。
+
+    完整编排流程见 /pan skill。
+    """
+    result = _api("GET", "/api/workspaces")
+    if not isinstance(result, dict):
+        return result
+    workspaces = result.get("workspaces")
+    if not isinstance(workspaces, list):
+        return result
+    return {"ok": True,
+            "workspaces": [_workspace_public_view(w)
+                           for w in workspaces if isinstance(w, dict)]}
+
+
+@mcp.tool()
+def workspace_create(name: str) -> dict:
+    """Create a durable Workspace (named Session group).
+
+    Behaves exactly like the Dashboard's "new workspace": name is required,
+    trimmed, ≤128 chars, and must be unique. Validation and the
+    ``workspace.created`` broadcast are performed by the shared backend
+    endpoint, so MCP cannot create a Workspace the UI could not. The new
+    Workspace starts empty; move Sessions into it with
+    ``session_update(session_id, workspace_ids=[<id>])``.
+
+    Args:
+        name: Workspace name (trimmed, non-empty, ≤128 chars, unique)
+
+    Error codes mirror the UI: ``invalid_name`` (empty/too long),
+    ``name_taken`` (duplicate). 完整编排流程见 /pan skill。
+    """
+    result = _api("POST", "/api/workspaces", {"name": name})
+    if isinstance(result, dict) and result.get("ok") and isinstance(result.get("workspace"), dict):
+        result = dict(result)
+        result["workspace"] = _workspace_public_view(result["workspace"])
+    return result
+
+
+@mcp.tool()
+def workspace_delete(workspace_id: str) -> dict:
+    """Delete a Workspace and detach all of its members.
+
+    Matches the Dashboard delete exactly: every root Session that persisted
+    this Workspace id has it removed (managed descendants follow the root and
+    immediately become ungrouped with it), then the Workspace metadata is
+    deleted. No dangling workspace id and no cross-Workspace managed link can
+    result — a management tree is either fully inside or fully outside the
+    Workspace before and after deletion. Sessions themselves are never deleted.
+
+    Args:
+        workspace_id: Workspace id from workspace_list
+
+    Returns ``{"ok": true, "workspaceId": <id>}`` or ``workspace_not_found``.
+    完整编排流程见 /pan skill。
+    """
+    return _api("DELETE", f"/api/workspaces/{quote(workspace_id, safe='')}")
 
 
 @mcp.tool()
@@ -1094,6 +1528,44 @@ def session_history(session_id: str, limit: int = 50, before: int | None = None)
 # ---------------------------------------------------------------------------
 # Report subscription tools (立项 4.3 订阅制)
 # ---------------------------------------------------------------------------
+
+@mcp.tool()
+def report_status() -> dict:
+    """Read your own persisted report subscription configuration.
+
+    Returns sessionId, reportSubscriptions and agentReportsPaused. This is
+    stored subscription configuration, not proof that a target is alive or a
+    report was delivered. Does not claim, subscribe, repair, count hidden queue
+    rows, or read other Sessions. Bound local stdio identity only; no Session
+    argument and no identity lending to remote/SSE MCP clients.
+    完整编排流程见 /pan skill。
+    """
+    return _self_queue_api("report-status")
+
+
+@mcp.tool()
+def report_consume(item_id: str | None = None) -> dict:
+    """Force eligible child-agent reports into CLI context as one original-ID batch.
+
+    Call without arguments to persistently group currently processable reports
+    at the queue front in original order, then use native Steer when running
+    and capable, otherwise the existing Force/ordinary idle handoff route.
+    Jobs/channel notices are excluded. Locks, Illegal, stop reports, Pause,
+    readonly, edit leases and native ownership remain authoritative. Hidden
+    reports disclose no IDs/counts. No body, result, snippet or attachment text
+    is returned: inspect real handoff/history to know when context was entered.
+
+    Receipt contains only original IDs and handoff status. accepted means CLI
+    admission, never task completion. queued/pending/unconfirmed/unknown are
+    not success. Save itemId and call with that SAME item_id to inspect the
+    frozen batch receipt (query only: no CLI write or Session save, never resend). An unfinished batch is
+    never regrouped or automatically replayed after an uncertain write.
+    Bound local stdio own Session only. report_ack/report_next are not offered.
+    The spelling report_comsume refers to this tool; there is no alias.
+    完整编排流程见 /pan skill。
+    """
+    return _self_queue_api("report-consume", item_id)
+
 
 @mcp.tool()
 def report_subscribe(session_id: str) -> dict:
@@ -1370,18 +1842,20 @@ def agent_assign(session_id: str, text: str, task_id: str | None = None) -> dict
 
 @mcp.tool()
 def agent_send(session_id: str, text: str = "") -> dict:
-    """Send a message to an agent (multi-turn collaboration).
+    """Deferred follow-up: handle only after the agent's current task finishes.
 
-    **仅用于非即时发送**：消息入队排队，目标空闲（当前任务完成后）才处理，
-    不打断进行中的任务。
-    若消息需要立即响应或打断当前执行（如操作约束、方向变更、紧急指令）
-    → 必须用 `agent_send_force`（restart+send）。
+    仅用于明确允许当前任务结束后处理的独立后续事项，消息排队，不打断当前任务。
+    向正在执行任务的 TA 更新当前任务（需求补充、用户澄清、实现纠正、约束或
+    验收条件变化、影响当前工作的证据）必须使用 `agent_send_force`，不要使用
+    本工具；不以消息长短、语气或是否称为“补充”判断。
 
     无活 worker 时**不报错**——消息入该 agent 的持久队列（返回含
     pendingSpawn=true），由全局 watchdog 自动 spawn worker 后分发
     （「send = 写给 agent，进程是顺带的」）。
 
-    Pan 内 session 发送时自动加 ////by agent 身份前缀（立项 4.8）。
+    Pan 内 session 发送时自动加 ////by agent 身份前缀（立项 4.8）。若目标
+    Session 有持久活动 taskId，消息入队时继承它用于 report 配对；没有活动
+    任务时保持 taskId=null，连续 send 不会因共享 taskId 被幂等去重。
 
     Args:
         session_id: Agent（= session）ID
@@ -1391,10 +1865,10 @@ def agent_send(session_id: str, text: str = "") -> dict:
     完整编排流程见 /pan skill。
     """
     text = _agent_message_prefix(text)
-    denied = _check_access(session_id, claim=True)
+    caller = _caller_identity()
+    denied = _check_access(session_id, claim=True, caller=caller)
     if denied:
         return denied
-    caller = _caller_identity()
     body = {"sessionId": session_id, "text": text, "source": "agent"}
     if caller and caller.get("id"):
         body["sourceSessionId"] = caller["id"]
@@ -1402,43 +1876,61 @@ def agent_send(session_id: str, text: str = "") -> dict:
 
 
 @mcp.tool()
-def agent_send_force(session_id: str, text: str = "") -> dict:
-    """Force-push a message to an agent: restart the worker, then send.
+def agent_send_many(session_ids: list[str], text: str = "") -> dict:
+    """Send one message to several selected Sessions immediately.
 
-    强制推送 = restart + send：目标 worker 卡死 / 忙 / 连接异常导致普通
-    agent_send 消息无法送达时的兜底。先终止并重新 spawn worker 进程，
-    再发送消息，保证消息能送达。
-    需要打断或立即送达的时效性消息（操作约束、方向变更、紧急指令）直接用它；
-    仅补充信息、可排队等待的用 `agent_send`。
+    This is the backend fan-out counterpart to selecting Sessions in the
+    Dashboard.  Each target uses the ordinary ``agent_send`` queue semantics;
+    use ``agent_message_job_create`` with ``target_session_ids`` for a durable
+    scheduled fan-out.
 
-    无活 worker 时**不报错**——restart 无从谈起，消息入该 agent 的持久队列，
-    由全局 watchdog 自动 spawn 后分发。
+    完整编排流程见 /pan skill。
+    """
+    if not isinstance(session_ids, list) or not session_ids:
+        return {"ok": False, "error": {"code": "missing_session_ids",
+                                         "message": "session_ids must be non-empty"}}
+    for session_id in dict.fromkeys(session_ids):
+        denied = _check_access(session_id, claim=True)
+        if denied:
+            return denied
+    caller = _caller_identity()
+    body = {"sessionIds": list(dict.fromkeys(session_ids)),
+            "text": _agent_message_prefix(text), "source": "agent"}
+    if caller and caller.get("id"):
+        body["sourceSessionId"] = caller["id"]
+    return _api("POST", "/api/sessions/broadcast", body)
 
-    Pan 内 session 发送时自动加 ////by agent 身份前缀（立项 4.8）。
+
+@mcp.tool()
+def agent_send_force(session_id: str, text: str = "", client_message_id: str | None = None) -> dict:
+    """Default for sending updates to the agent's current task.
+
+    向正在执行任务的 TA 更新当前任务时默认用本工具：需求补充、用户澄清、
+    实现纠正、约束或验收条件变化、影响当前工作的证据，无须额外判断是否紧急。
+    只有明确留到当前任务结束后处理的独立后续事项才使用 `agent_send`。
+    Pan 自动处理投递方式；本工具不绕过暂停、锁或其他发送限制。
+    返回接受或入队不代表任务已完成。回执不明时不要重复发送；
+    client_message_id 标识同一发送事务，对账时保留原 ID。
+    自动附加 ////by agent，保留原 task 归属。
 
     Args:
         session_id: Agent（= session）ID
         text: Task text / prompt
-
-    调用链：隔离检查 → 有活 worker 时 restart 端点 + POST /api/task；无活
-    worker 时 POST /api/send 入队。restart 或 send 任一失败均返回含后端
-    error 信息的错误 dict，不吞错。
+        client_message_id: Stable transaction ID; reuse for reconciliation, never replay unknown input.
     完整编排流程见 /pan skill。
     """
     text = _agent_message_prefix(text)
     denied = _check_access(session_id, claim=True)
     if denied:
         return denied
-    # The session route atomically chooses restart vs start.  workerId is
-    # deliberately not resolved here; it is a backend runtime detail.
-    result = _api("POST", f"/api/sessions/{session_id}/worker/restart")
-    if not isinstance(result, dict) or result.get("error"):
-        return result
     caller = _caller_identity()
-    body = {"sessionId": session_id, "text": text, "source": "agent"}
+    body = {"sessionId": session_id, "text": text, "source": "agent",
+            "force": True}
+    if client_message_id is not None:
+        body["clientMessageId"] = client_message_id
     if caller and caller.get("id"):
         body["sourceSessionId"] = caller["id"]
-    return _api("POST", "/api/task", body)
+    return _api("POST", "/api/send", body)
 
 
 @mcp.tool()
@@ -1456,6 +1948,10 @@ def agent_notify(target_session_id: str, text: str = "") -> dict:
     它不是普通任务派发的替代品：普通任务继续使用 agent_assign 或
     agent_send。后台命令本身仍必须遵守权限、审批、安全和结果验证规则，不能
     通过 agent_notify 绕过审批或 managed 隔离。
+
+    与 agent_background_start 的分工：需要完成通知的长命令优先用
+    agent_background_start（独立 Runner 自带终态通知，启动后不轮询、idle 等
+    通知）；agent_notify 只做手动事后回报，不执行命令、不提供完成通知链路。
 
     仅限投递给自己或自己 managed 的 session，越权目标返回 permission_denied。
 
@@ -1476,6 +1972,169 @@ def agent_notify(target_session_id: str, text: str = "") -> dict:
         body["source"] = "agent"
         body["sourceSessionId"] = caller["id"]
     return _api("POST", "/api/notify", body)
+
+
+@mcp.tool()
+def reminding_card(operation: str, card_id: str = "", body: str = "", expected_revision: int | None = None) -> dict:
+    """User→Session cards (created by the user, answered by you). To ask the user, use `interaction_card`.
+
+    Read/answer user-created cards owned ONLY by this bound stdio Session.
+
+    list_pending returns id, kind (question/task), body, attachments, createdAt,
+    revision for every unanswered own card. answer requires card_id, body and
+    expected_revision. Questions require nonblank answers; tasks allow empty.
+    First answer is terminal; retries conflict, never overwrite. No reject,
+    managed-owner override, user authorization, Trigger or interaction response.
+
+    完整编排流程见 /pan skill。
+    """
+    if operation == "list_pending":
+        if card_id or body or expected_revision is not None:
+            return {"ok": False, "error": "list_pending accepts no parameters"}
+        payload = {}
+    elif operation == "answer":
+        payload = {"cardId": card_id, "body": body, "expectedRevision": expected_revision}
+    else:
+        return {"ok": False, "error": "invalid_operation"}
+    return _local_producer_api(f"/api/reminding-card-tools/{operation}", payload)
+
+
+@mcp.tool()
+def locker_message(operation: str, message: dict | None = None, message_id: str = "") -> dict:
+    """Create/get an ordinary Locker Message for this profile user, from own Session.
+
+    Local bound stdio only; no owner/source/recipient override and no Chat/Queue copy.
+    create requires the existing Message fields messageId, role, content, ts; parts
+    and unknown fields are preserved. Attachments must belong to this source.
+    Keep messageId AND the exact document stable: identical retries are idempotent,
+    changed content conflicts, deleted IDs stay tombstoned. On unknown, use get with
+    the original message_id to inspect persistence; never automatically resend.
+    Schema: GET /api/interaction-cards/schema ($defs.LockerMessageProducer).
+
+    完整编排流程见 /pan skill。
+    """
+    if operation not in {"create", "get"}:
+        return {"ok": False, "error": "invalid_operation"}
+    body = {"message": message} if operation == "create" else {"messageId": message_id}
+    return _local_producer_api(f"/api/locker-message-tools/{operation}", body)
+
+
+def _local_producer_api(path, body):
+    """Same-user loopback assertion, never forwarded from remote MCP transports."""
+    sid = os.environ.get("PAN_AGENT_SESSION_ID")
+    try:
+        url = urlsplit(_pan_api_url)
+        local = (url.scheme == "http" and url.hostname in {"127.0.0.1", "::1"}
+                 and not url.username and not url.password and url.path in {"", "/"}
+                 and not url.query and not url.fragment)
+        url.port
+    except ValueError:
+        local = False
+    if _terminal_transport != "stdio" or not local or not sid:
+        return {"ok": False, "error": "local_stdio_caller_required"}
+    caller, error = _require_caller()
+    if error or caller.get("id") != sid:
+        return error or {"ok": False, "error": "caller_unavailable"}
+    req = urllib.request.Request(
+        f"{_pan_api_url.rstrip('/')}{path}",
+        data=json.dumps(body).encode("utf-8"), method="POST",
+        headers={"Content-Type": "application/json", "X-Pan-Queue-Caller": sid})
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None
+    try:
+        with urllib.request.build_opener(NoRedirect).open(req, timeout=15) as response:
+            return json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        if exc.code in {403, 404, 409, 422}:
+            return {"ok": False, "status": "rejected", "error": json.loads(exc.read()).get("detail")}
+        return {"ok": False, "status": "unknown", "retryable": False}
+    except Exception:
+        return {"ok": False, "status": "unknown", "retryable": False}
+
+
+@mcp.tool()
+def interaction_card(operation: str, owner_session_id: str | None = None, card_id: str = "",
+                     recipient_id: str = "", request_key: str = "", card: dict | None = None,
+                     expected_revision: int | None = None, limit: int = 100, after: str | None = None) -> dict:
+    """Session→User cards (you create, the user answers). To answer user-created cards, use `reminding_card`.
+
+    Create/get/receipt/list_pending/no_answer_needed for user questions.
+
+    list_pending lists ONLY cards created by this bound stdio Session, with
+    card id/revision/status and nextAfter pagination (limit 1..500).
+    no_answer_needed closes an original card after a chat answer or when the
+    question is obsolete; requires card_id and expected_revision. It is terminal,
+    retained visibly in Locker, and permits only user deletion. It is NOT user
+    approval/rejection and does not execute choices or send response notices.
+    Neither operation accepts owner overrides or managed Session authority.
+    Unknown results: query the original card; never invent a response.
+
+    V2 card: schemaVersion=2, title, optional body, questions (1..20).
+    Each question has a stable id, prompt (<=500), type single_choice/multi_choice/text,
+    required (default true), and choices (<=20) for choice questions. Choice IDs
+    are scoped to question IDs. Users submit answers[id] as {choiceId}, {choiceIds},
+    {text} (<=10000), or {rejected:true, reason?}. Required questions must be
+    answered or rejected. One final submission, no drafts or later edits.
+    trustedChoices[questionId][choiceId] records trusted execution meaning;
+    selecting a question never bypasses whole-card user authorization.
+    Mixed answers/rejections are responded; all questions rejected is rejected.
+    Only whole-card rejection sends rejectionDelivery. get/receipt return answers.
+    Legacy cards are unchanged and are never migrated.
+
+    V1 card supports optional answerInput, choices with optional triggerRef, and
+    notification metadata. A recorded response is not Job/Trigger completion.
+
+    完整编排流程见 /pan skill。
+    """
+    if operation in {"list_pending", "no_answer_needed"}:
+        if owner_session_id is not None:
+            return {"error": "Own creator scope only; owner override is forbidden"}
+        body = ({"limit": limit, **({"after": after} if after is not None else {})}
+                if operation == "list_pending" else {"cardId": card_id, "expectedRevision": expected_revision})
+        return _local_producer_api(f"/api/interaction-card-tools/{operation}", body)
+    if operation == "create":
+        return _local_producer_api("/api/interaction-card-tools/create", {
+            **({"ownerSessionId": owner_session_id} if owner_session_id is not None else {}),
+            "recipientId": recipient_id, "requestKey": request_key, "card": card or {}})
+    if operation not in {"get", "receipt"}:
+        return {"error": "Only create/get/receipt/list_pending/no_answer_needed producer operations are available"}
+    caller, error = _require_caller()
+    if error:
+        return error
+    target = owner_session_id or caller["id"]
+    denied = _check_access(target, caller=caller)
+    if denied:
+        return denied
+    if operation in {"get", "receipt"}:
+        suffix = "/receipt" if operation == "receipt" else ""
+        return _api("GET", "/api/interaction-cards/" + quote(card_id, safe="") + suffix + "?" + urlencode({"ownerSessionId": target}))
+
+
+
+@mcp.tool()
+def agent_inbox(operation: str = "list", locker_id: str = "", message_ids: list[str] | None = None,
+                session_id: str | None = None, mode: str = "silent", limit: int = 100) -> dict:
+    """Shared Agent Inbox: list/read/consume/subscriptions/subscribe/mode/backlog/recover.
+
+    Full mode consumes after durable Session Queue acceptance. Subscriptions start
+    at new messages. backlog explicitly forwards old pending messages to the
+    fixed matching full subscribers. Notification never contains message bodies.
+
+    完整编排流程见 /pan skill。
+    """
+    if operation not in {"list", "read", "consume", "subscriptions", "subscribe", "mode", "backlog", "recover"}:
+        return {"error": "unsupported inbox operation"}
+    caller, error = _require_caller()
+    if error:
+        return error
+    target = session_id or caller["id"]
+    denied = _check_access(target)
+    if denied:
+        return denied
+    return _api("POST", "/api/agent-inbox/" + operation, {
+        "lockerId": locker_id, "messageIds": message_ids or [], "sessionId": target,
+        "mode": mode, "limit": limit})
 
 
 @mcp.tool()
@@ -1539,19 +2198,178 @@ def reminder_cancel(reminder_id: str, session_id: str | None = None) -> dict:
 
 @mcp.tool()
 def agent_background_start(argv: list[str], cwd: str, target_session_id: str | None = None,
-                           label: str | None = None) -> dict:
-    """Start a durable background process; target defaults to this Agent Session.
+                           label: str | None = None, hide_window: bool = True, *, name: str) -> dict:
+    """Start a durable background process; name is required (1-200 nonblank characters).
+
+    label is optional presentation metadata; target defaults to this Agent Session.
+
+    ``creatorSessionId`` is recorded from the calling Agent Session, while
+    ``targetSessionId`` is the only Session that receives the terminal Job
+    notice.  A Job may therefore be created by Agent A for Agent B without
+    copying the notice back to A.
+
+    Windows commands hide their initial window by default. Set
+    ``hide_window=False`` for an explicitly visible command console. This does
+    not give the caller an interactive stdin or suppress windows created by
+    the command itself.
+
+    使用政策：这类带终态通知的持久后台 Job 一般用于预计**超过 3 分钟**的
+    OS 命令（3 分钟是一般选择门槛，不是运行 timeout，也不硬性禁止短任务）。
+    启动后**不要轮询**：确认启动成功、通知目标和必要状态记录后，若没有其它
+    可独立推进的任务，立刻结束回合进入 idle，等终态通知唤醒再读取结果/日志
+    验收；不要循环 background_get/list、读日志/tail、sleep/watch/PID 等待。
+    需要实时观察进度就不要选后台 Job，改用前台/交互执行方式。
 
     完整编排流程见 /pan skill。
     """
-    target = target_session_id or ((_caller_identity() or {}).get("id"))
+    if not isinstance(name, str) or not name.strip() or len(name.strip()) > 200:
+        return {"ok": False, "error": {"code": "invalid_job", "message": "name must contain 1 to 200 characters"}}
+    caller = _caller_identity()
+    creator = (caller or {}).get("id")
+    target = target_session_id or creator
     if not target:
         return {"ok": False, "error": {"code": "target_session_required", "message": "no current Agent Session"}}
     denied = _check_access(target, claim=False)
     if denied:
         return denied
-    return _api("POST", "/api/background-jobs", {
-        "targetSessionId": target, "argv": argv, "cwd": cwd, "label": label})
+    body = {
+        "targetSessionId": target, "argv": argv, "cwd": cwd, "label": label, "name": name.strip(),
+        "hideWindow": hide_window,
+    }
+    if creator:
+        body["creatorSessionId"] = creator
+    return _api("POST", "/api/background-jobs", body)
+
+
+@mcp.tool()
+def agent_message_job_create(text: str, schedule: dict,
+                             target_session_id: str | None = None,
+                             description: str | None = None,
+                             target_session_ids: list[str] | None = None) -> dict:
+    """Create a durable time-based message Job for one or many Sessions.
+
+    ``schedule`` is one of: ``{"type":"once","at":ISO}``,
+    ``{"type":"once","delaySeconds":N}``,
+    ``{"type":"interval","intervalSeconds":N}``, or
+    ``{"type":"weekly","weekday":0..6,"time":"HH:MM"}``.
+    Set ``target_session_ids`` for a scheduled broadcast; IDs are deduplicated
+    in stable order. The text is sent through normal agent-send semantics,
+    never executed as an operating-system command. The caller identity and
+    Pan ``////by agent`` prefix are persisted for later delivery.
+
+    完整编排流程见 /pan skill。
+    """
+    caller = _caller_identity()
+    if target_session_id is not None and target_session_ids is not None:
+        return {"ok": False, "error": {"code": "invalid_job",
+                                         "message": "provide target_session_id or target_session_ids, not both"}}
+    targets = target_session_ids
+    if targets is None:
+        target = target_session_id or (caller or {}).get("id")
+        targets = [target] if target else None
+    if not targets:
+        return {"ok": False, "error": {"code": "target_session_required",
+                                         "message": "no current Agent Session"}}
+    for target in targets:
+        denied = _check_access(target, claim=True)
+        if denied:
+            return denied
+    body = {"text": _agent_message_prefix(text), "schedule": schedule, "source": "agent"}
+    if target_session_ids is None:
+        body["targetSessionId"] = targets[0]
+    else:
+        body["targetSessionIds"] = targets
+    if description is not None:
+        body["description"] = description
+    if caller and caller.get("id"):
+        body["sourceSessionId"] = caller["id"]
+        body["creatorSessionId"] = caller["id"]
+    return _api("POST", "/api/session-message-jobs", body)
+
+
+@mcp.tool()
+def agent_message_job_get(job_id: str) -> dict:
+    """Read one durable Session-message or scheduled broadcast Job.
+
+    完整编排流程见 /pan skill。
+    """
+    job = _api("GET", f"/api/background-jobs/{quote(job_id, safe='')}")
+    if (isinstance(job, dict) and not job.get("error")
+            and job.get("kind") not in {"session-message", "session-broadcast"}):
+        return {"ok": False, "error": {"code": "not_message_job",
+                                         "message": f"Job {job_id} is not a message Job"}}
+    targets = []
+    if isinstance(job, dict):
+        targets = list(job.get("targetSessionIds") or [])
+        if job.get("targetSessionId"):
+            targets.append(job["targetSessionId"])
+    for target in dict.fromkeys(targets):
+        denied = _check_access(target)
+        if denied:
+            return denied
+    return job
+
+
+@mcp.tool()
+def agent_message_job_list(target_session_id: str | None = None) -> dict:
+    """List durable Session-message Jobs for self or a managed Session.
+
+    完整编排流程见 /pan skill。
+    """
+    caller = _caller_identity()
+    target = target_session_id or (caller or {}).get("id")
+    if target:
+        denied = _check_access(target)
+        if denied:
+            return denied
+    path = "/api/background-jobs"
+    if target:
+        path += "?targetSessionId=" + quote(target, safe="")
+    result = _api("GET", path)
+    if isinstance(result, dict) and isinstance(result.get("jobs"), list):
+        result["jobs"] = [job for job in result["jobs"]
+                           if job.get("kind") in {"session-message", "session-broadcast"}]
+    return result
+
+
+@mcp.tool()
+def agent_message_job_update(job_id: str, schedule: dict | None = None,
+                             text: str | None = None,
+                             description: str | None = None,
+                             target_session_ids: list[str] | None = None) -> dict:
+    """Adjust a pending/recurring Session-message or broadcast Job.
+
+    完整编排流程见 /pan skill。
+    """
+    job = agent_message_job_get(job_id)
+    if not isinstance(job, dict) or job.get("error") or job.get("ok") is False:
+        return job
+    body = {}
+    if schedule is not None:
+        body["schedule"] = schedule
+    if text is not None:
+        body["text"] = _agent_message_prefix(text)
+    if description is not None:
+        body["description"] = description
+    if target_session_ids is not None:
+        for target in target_session_ids:
+            denied = _check_access(target, claim=True)
+            if denied:
+                return denied
+        body["targetSessionIds"] = target_session_ids
+    return _api("PATCH", f"/api/background-jobs/{quote(job_id, safe='')}", body)
+
+
+@mcp.tool()
+def agent_message_job_cancel(job_id: str) -> dict:
+    """Cancel a pending or recurring Session-message Job.
+
+    完整编排流程见 /pan skill。
+    """
+    job = agent_message_job_get(job_id)
+    if not isinstance(job, dict) or job.get("error") or job.get("ok") is False:
+        return job
+    return _api("POST", f"/api/background-jobs/{quote(job_id, safe='')}/cancel")
 
 
 @mcp.tool()
@@ -1561,6 +2379,10 @@ def agent_background_get(job_id: str) -> dict:
     Access is limited to a Job targeting the current Agent Session or one of
     its managed Sessions. This reads Runner state; it does not read or consume
     the target Session's queue_pending.
+
+    用途是终态通知后的结果核验，以及用户明确要求的一次性诊断/取消/异常修复；
+    不要循环调用本工具（或 background_list）等待运行进度——启动后台 Job 后
+    应结束回合进入 idle，等终态通知唤醒再验收。
 
     完整编排流程见 /pan skill。
     """
@@ -1576,6 +2398,8 @@ def agent_background_list(target_session_id: str | None = None) -> dict:
 
     An explicit target must be the current or a managed Session. Returned Jobs
     are Registry facts and may remain visible after the target Session is gone.
+    供盘点/诊断使用；不要循环调用等待某个 Job 的运行进度（见 background_start
+    使用政策）。
 
     完整编排流程见 /pan skill。
     """
@@ -1940,6 +2764,56 @@ def scheduler_runs(task_id: str, target_session_id: str | None = None,
 
 
 @mcp.tool()
+def agent_restart_delayed(session_id: str) -> dict:
+    """Request a delayed restart of the Session's existing live Worker.
+
+    Running work finishes terminal persistence, reports and queue cleanup first;
+    restart then takes priority over the next queued task at a valid idle boundary.
+    Idle Workers schedule restart immediately. This is not a timer in seconds.
+    No live Worker returns an error, except that a restart already retiring its
+    old Worker returns its existing receipt. Never starts an offline Session.
+    Settings and model are unchanged. Pending/restarting requests merge with the existing
+    intent (including settings restart); completed requests can request a new one.
+    Existing lifecycle gates (including held/Illegal/Pause) are not bypassed.
+    Self and managed access follow the normal agent tools; this does not claim.
+    The delayedRestart receipt is acceptance, not proof of completion: inspect
+    agent_restart_delayed_status after an uncertain response rather than replay.
+    Intent exists only within this Pan service process.
+
+    完整编排流程见 /pan skill。
+    """
+    denied = _check_access(session_id)
+    if denied:
+        return denied
+    result = _api("POST", f"/api/sessions/{quote(session_id, safe='')}/worker/delayed-restart?existing_worker_only=true")
+    if isinstance(result, dict):
+        result.setdefault("ok", "error" not in result)
+    return result
+
+
+@mcp.tool()
+def agent_restart_delayed_status(session_id: str) -> dict:
+    """Read delayed restart state without requesting, starting or restarting a Worker.
+
+    Returns delayedRestart=null if there is no intent; otherwise includes status
+    pending/restarting/completed/failed/cancelled, revision, Worker generation and
+    any error. Acceptance is not completion. Finished state remains observable
+    after the old Worker disappears, only within this Pan service process.
+    Unknown Session returns an error. Uses the same self/managed access as the
+    request tool, without claiming a Session or changing settings/model.
+
+    完整编排流程见 /pan skill。
+    """
+    denied = _check_access(session_id)
+    if denied:
+        return denied
+    result = _api("GET", f"/api/sessions/{quote(session_id, safe='')}/worker/delayed-restart")
+    if isinstance(result, dict):
+        result.setdefault("ok", "error" not in result)
+    return result
+
+
+@mcp.tool()
 def agent_kill(session_id: str) -> dict:
     """Kill an agent's worker process (the agent itself and its data persist).
 
@@ -2133,10 +3007,10 @@ def worker_send(worker_id: str | None = None, text: str = "",
         target_sid = _worker_session_id(worker_id)
         if target_sid is None:
             return _worker_unresolvable(worker_id)
-        denied = _check_access(target_sid, claim=True)
+        caller = _caller_identity()
+        denied = _check_access(target_sid, claim=True, caller=caller)
         if denied:
             return denied
-        caller = _caller_identity()
         body = {"workerId": worker_id, "text": text, "source": "agent"}
         if caller and caller.get("id"):
             body["sourceSessionId"] = caller["id"]
@@ -2151,11 +3025,11 @@ def worker_send(worker_id: str | None = None, text: str = "",
 
 @mcp.tool()
 def worker_send_force(worker_id: str | None = None, text: str = "",
-                      session_id: str | None = None) -> dict:
+                      session_id: str | None = None, client_message_id: str | None = None) -> dict:
     """DEPRECATED alias — prefer agent_send_force(session_id, text).
 
     Compat alias of `agent_send_force` for session_id calls (delegates to
-    the same implementation: restart + send; no live worker → pending
+    the same implementation: capability-routed Steer first; no live worker → pending
     queue). The legacy `worker_id` addressing path is kept here only.
     Identity prefix (////by agent) identical to `agent_send_force`.
 
@@ -2164,29 +3038,17 @@ def worker_send_force(worker_id: str | None = None, text: str = "",
         session_id: Session ID (delegates to agent_send_force)
         text: Task text / prompt
 
+        client_message_id: Stable force-send transaction ID; do not resend unknown outcomes.
+
     完整编排流程见 /pan skill。
     """
     if worker_id:
-        # 遗留路径：worker_id 寻址，行为不变
-        text = _agent_message_prefix(text)
         target_sid = _worker_session_id(worker_id)
         if target_sid is None:
             return _worker_unresolvable(worker_id)
-        denied = _check_access(target_sid, claim=True)
-        if denied:
-            return denied
-        # 1) 重启 worker 进程（失败直接返回后端错误）
-        result = _api("POST", f"/api/worker/{worker_id}/restart")
-        if not isinstance(result, dict) or result.get("error"):
-            return result
-        # 2) 发送消息（与 agent_send 相同）
-        caller = _caller_identity()
-        body = {"workerId": worker_id, "text": text, "source": "agent"}
-        if caller and caller.get("id"):
-            body["sourceSessionId"] = caller["id"]
-        return _api("POST", "/api/task", body)
+        return agent_send_force(target_sid, text, client_message_id)
     if session_id:
-        return agent_send_force(session_id=session_id, text=text)
+        return agent_send_force(session_id=session_id, text=text, client_message_id=client_message_id)
     return {"ok": False, "error": {
         "code": "missing_params",
         "message": "session_id or worker_id is required"}}
@@ -2277,6 +3139,44 @@ def _model_list_error(code: str, message: str, available: list[dict]) -> dict:
     else:
         result["callHint"] = "Call model_list(adapter='<registered adapter>') after an adapter is available."
     return result
+
+
+@mcp.tool()
+def model_catalog(adapter: str | None = None, session_id: str | None = None) -> dict:
+    """Read cached models and explicitly declared capabilities without discovery.
+
+    Recommended: model_catalog(adapter="codex"). Omit adapter for all registered
+    adapters. Optional session_id (otherwise PAN_AGENT_SESSION_ID) passes through
+    the existing managed access check before metadata is read. HTTP itself is a
+    trusted local admin interface, not a manager-authenticated API.
+
+    Model IDs come from existing service caches or literal adapter declarations;
+    cold dynamic sources remain unknown, with no CLI/provider request or refresh.
+    This is selectable model metadata, not proof of account/provider availability.
+    Per-model effort is reported only when declared for that model; generic
+    adapterEffortValues are not a per-model support guarantee. Missing booleans,
+    source dates, defaults, effort or multipliers are null/status=unknown, never
+    assumed supported or x1. Explicit false/empty declarations are preserved.
+
+    Fresh/stale model-list age refers only to the existing process cache TTL;
+    origin and provider sourceUpdatedAt stay unknown if not recorded. Dynamic
+    credit multiplier getters are not invoked, since they may read credentials;
+    an unsafe/unbound multiplier source remains unknown even if other APIs can
+    refresh it. No credential files, account aggregation, new polling, model
+    calls or cache invalidation. model_list retains its discovery compatibility.
+    Errors include permission_denied and unknown_adapter; individual adapter
+    failures degrade to explicit unknown without returning raw exception text.
+    完整编排流程见 /pan skill。
+    """
+    target = session_id or os.environ.get("PAN_AGENT_SESSION_ID")
+    if target:
+        denied = _check_access(target)
+        if denied:
+            return denied
+    if adapter is not None and not adapter.strip():
+        return {"ok": False, "error": {"code": "invalid_params", "message": "adapter must be nonempty when provided"}}
+    query = "?" + urlencode({"adapter": adapter.strip()}) if adapter is not None else ""
+    return _api("GET", "/api/model-catalog" + query)
 
 
 @mcp.tool()
@@ -2372,8 +3272,124 @@ def pan_handbook() -> dict:
 # Entry point
 # ---------------------------------------------------------------------------
 
+@mcp.tool()
+def action_drafts(operation: str = 'list', kind: str = 'actions', item: dict | None = None,
+                  item_id: str | None = None, expected_revision: int | None = None) -> dict:
+    """List Action/Group sources or put/delete a draft. kind is actions or groups.
+
+    Omit item.id to create with a server-generated stable ID; the response item
+    contains that ID. Supply the original item.id to update; renaming keeps it.
+    Explicit valid IDs remain supported. Do not replay an unconfirmed creation.
+    Action fields: optional id, name, description, enabled (forced false for agents),
+    effect (read/write_local/write_external/high_risk), output_format (json/text),
+    input_schema (object, additionalProperties false), execution.
+    API execution: {kind: api, method: GET, path: /api/sessions|/api/models|/api/workspaces}.
+    Command execution: {kind: command, executable: absolute file, cwd: absolute dir,
+    args: string array, timeout_sec: 1..30}. A scalar {field} occupies one whole argv.
+    Session Operation execution: {kind: session_operation, operation: pause_everything,
+    selector: {mode: explicit, ids: [...]}, {mode: event, path: payload.sessionIds}, or
+    {mode: query, query: Predicate}}. Predicate: {and: [...]}/{or: [...]}/{not: ...}
+    or {field, op, value}. Fields id/name/adapter (string), managedBy (string|null),
+    readonlySession/pinned (boolean), workspaceIds (string array). eq/ne exact;
+    scalar in uses a nonempty typed list; workspaceIds.contains exact element;
+    name.contains nonempty case-sensitive literal substring. No script/SQL/regex,
+    dotted fields or implicit match-all. Limits depth/nodes/candidates/results:
+    8/64/2048/256, operand arrays 128, text 512 code points; overflow fails.
+    Targets freeze at execution start. Draft cannot execute; user-enabled Trigger
+    automation uses this type; legacy Group build/provider rejects it. Backend
+    template/schema: GET /api/actions/session-operation-template.
+    Group fields: optional id, name, action_ids. IDs use lowercase letters/digits/underscores.
+    User enables Actions and builds Groups in the core Actions Panel. This tool
+    cannot build, unbuild, enable, or execute a draft. Built tools use generic plugins.
+
+    完整编排流程见 /pan skill。
+    """
+    if operation == 'list':
+        return _api('GET', '/api/actions')
+    if operation not in {'put', 'delete'} or kind not in {'actions', 'groups'}:
+        return {'error': 'Invalid draft operation or kind'}
+    return _api('POST', f'/api/action-drafts/{kind}/{operation}',
+                {**({'item': item} if item is not None else {}),
+                 **({'id': item_id} if item_id is not None else {}),
+                 **({'expectedRevision': expected_revision} if expected_revision is not None else {})})
+
+
+@mcp.tool()
+def job_config_drafts(operation: str = 'list', kind: str = 'job', config: dict | None = None,
+                      item_id: str | None = None, expected_revision: int | None = None,
+                      name: str | None = None) -> dict:
+    """Unified Action-reference Job/complete Template drafts (never execute or enable).
+
+    kind: job or template. operation: list, schema, put, runs.
+    config: complete {name, actionId, arguments, schedule, trigger, completion,
+    recovery, overlap, notification, enabled:false}. Arguments are only declared
+    Action fields; empty schema accepts only {}. Templates have no parameter holes.
+    trigger kinds immediate/once/interval/cron/event/schedule; event uses bounded
+    typed Session query. Recovery defaults off and requires monitoring declaration.
+    Overlap forbid/queue/parallel, parallelLimit 1..32 (default3).
+    Template instantiate/enable/repair, cancellation and uncertain recovery are
+    protected user operations. No Bearer, permission or managed bypass here.
+    Unknown creation outcome: list before retry; do not blindly create again.
+
+    完整编排流程见 /pan skill。
+    """
+    if kind not in ('job', 'template'):
+        return {'error': 'kind must be job or template'}
+    path = '/api/jobs/action-jobs' if kind == 'job' else '/api/jobs/job-templates'
+    if operation == 'list': return _api('GET', path)
+    if operation == 'schema': return _api('GET', '/api/jobs/action-jobs/schema')
+    if operation == 'runs' and kind == 'job' and isinstance(item_id, str):
+        from urllib.parse import quote
+        return _api('GET', path + '/' + quote(item_id, safe='') + '/runs')
+    if operation != 'put' or not isinstance(config, dict):
+        return {'error': 'put requires complete config'}
+    if config.get('enabled', False) is not False:
+        return {'error': 'Agent may submit disabled drafts only; enabled must be false'}
+    import copy
+    draft = copy.deepcopy(config); draft['enabled'] = False
+    from urllib.parse import quote
+    if kind == 'job':
+        body = {'config': draft}
+        if item_id:
+            body['expectedRevision'] = expected_revision
+            return _api('PUT', path + '/' + quote(item_id, safe=''), body)
+        return _api('POST', path, body)
+    item = {'name': name or draft.get('name'), 'config': draft}
+    if item_id: item['id'] = item_id
+    return _api('PUT' if item_id else 'POST', path + ('/' + quote(item_id, safe='') if item_id else ''),
+                {'item': item, 'expectedRevision': expected_revision if item_id else 0})
+
+
+@mcp.tool()
+def authorization_objects(kind: str, operation: str, item: dict | None = None,
+                          item_id: str | None = None, expected_revision: int | None = None,
+                          idempotency_key: str | None = None) -> dict:
+    """Profile-wide delegated Trigger/Action/Job Template/Action-reference Job operations.
+
+    Uses trusted local IPC and the user's Agent grant, never a user password or Bearer.
+    kind: trigger/action/jobTemplate/job. Operations: read/create/updateConfig/delete;
+    trigger/action/job also enable/disable; job also pause/resume/cancel/execute/retry/
+    confirmRecovery; jobTemplate only use (copies a passive fixed configuration).
+    item is the complete Trigger/Action/Template or Job config. Updates and lifecycle
+    require current expected_revision; use also requires stable idempotency_key.
+    Template has no enabled/lifecycle/execute. System definitions cannot be edited or
+    deleted; only their separate enable/disable state is configurable with the explicit
+    manageSystemActions grant. Trigger matches never grant effects; delegated effects
+    also require job.execute. Creation outcome unknown: inspect before retry, never replay.
+
+    完整编排流程见 /pan skill。
+    """
+    from packages.automation.authorization import object_request
+    try:
+        method, path, body = object_request(kind, operation, item, item_id,
+                                            expected_revision, idempotency_key)
+    except ValueError:
+        return {'ok': False, 'error': {'code': 'invalid_operation', 'message': 'Invalid four-object operation'}}
+    return _api(method, path, body)
+
+
 def main():
-    global _pan_api_url  # module-level override; __main__ attr would be a no-op when imported (#41)
+    global _pan_api_url, _terminal_transport
     parser = argparse.ArgumentParser(description="Pan MCP Server")
     parser.add_argument("--transport", default="stdio",
                         choices=["stdio", "sse", "streamable-http"])
@@ -2387,6 +3403,7 @@ def main():
 
     # Update module-level API URL so tools use the CLI override
     _pan_api_url = args.pan_url.rstrip("/")
+    _terminal_transport = args.transport
 
     mcp.settings.host = args.host
     mcp.settings.port = args.port

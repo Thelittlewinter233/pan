@@ -2,7 +2,9 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render, fireEvent, cleanup, waitFor, act, screen } from '@testing-library/react';
 import { AppSettingsModal } from './AppSettingsModal';
+import { SETTINGS_CATEGORY_ORDER, SETTINGS_TABS } from './settingsCategories';
 import { useAppSettingsStore, DEFAULT_SETTINGS } from '@/stores/appSettingsStore';
+import { usePlatformStore } from '@/stores/platformStore';
 
 const {
   fetchCodexModelsMock,
@@ -20,6 +22,8 @@ const {
   updateDataRetentionMock,
   fetchCompletedJobRetentionSettingsMock,
   updateCompletedJobRetentionSettingsMock,
+  fetchRemoteStatusMock,
+  restartRemoteTunnelMock,
 } = vi.hoisted(() => ({
   fetchCodexModelsMock: vi.fn(),
   refreshCodexOfficialModelsMock: vi.fn(),
@@ -36,22 +40,22 @@ const {
   updateDataRetentionMock: vi.fn(),
   fetchCompletedJobRetentionSettingsMock: vi.fn(),
   updateCompletedJobRetentionSettingsMock: vi.fn(),
+  fetchRemoteStatusMock: vi.fn(),
+  restartRemoteTunnelMock: vi.fn(),
 }));
 vi.mock('@/services/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/services/api')>();
   return {
     ...actual,
+    fetchPluginMessageSources: vi.fn().mockResolvedValue({ sources: [] }),
     updateUiSettings: updateUiSettingsMock,
     fetchDataCatalog: fetchDataCatalogMock,
     fetchDataRetention: fetchDataRetentionMock,
     updateDataRetention: updateDataRetentionMock,
     fetchCompletedJobRetentionSettings: fetchCompletedJobRetentionSettingsMock,
     updateCompletedJobRetentionSettings: updateCompletedJobRetentionSettingsMock,
-    fetchRemoteStatus: vi.fn().mockResolvedValue({
-      available: false,
-      enabled: false,
-      running: false,
-    }),
+    fetchRemoteStatus: fetchRemoteStatusMock,
+    restartRemoteTunnel: restartRemoteTunnelMock,
     fetchMainRestartStatus: fetchMainRestartStatusMock,
     restartMainService: restartMainServiceMock,
     fetchMainExitStatus: fetchMainExitStatusMock,
@@ -111,13 +115,73 @@ function jobRetentionResponse(rules = defaultJobRetentionRules) {
   };
 }
 
+const scrollIntoViewMock = vi.fn();
+
 afterEach(() => {
   cleanup();
+  vi.unstubAllGlobals();
   document.body.innerHTML = '';
+  usePlatformStore.setState({ platform: null, capabilities: null, loaded: false });
 });
+
+function clickTab(tab: string) {
+  const element = document.getElementById(`app-settings-tab-${tab}`);
+  expect(element).toBeTruthy();
+  fireEvent.click(element!);
+}
+
+function tabLabels(): string[] {
+  return Array.from(document.body.querySelectorAll<HTMLButtonElement>('[role="tab"]')).map(
+    (tab) => tab.textContent?.replace(/\s+/g, ' ').trim() ?? '',
+  );
+}
 
 describe('AppSettingsModal', () => {
   beforeEach(() => {
+    scrollIntoViewMock.mockClear();
+    fetchRemoteStatusMock.mockReset();
+    fetchRemoteStatusMock.mockResolvedValue({ available: false, enabled: false, running: false });
+    restartRemoteTunnelMock.mockReset();
+    Element.prototype.scrollIntoView = scrollIntoViewMock;
+    // McpRemoteSettings uses fetch directly rather than the mocked API module.
+    // Keep the real panel mounted without adding an unrelated network-error alert.
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (input === '/api/notifications/error-types') {
+        return { ok: true, json: async () => ({ types: [] }) };
+      }
+      if (input === '/api/reminding-cards/settings') {
+        const body = JSON.parse(String(init?.body ?? '{}'));
+        return {ok: true, json: async () => ({minutes: body.minutes ?? 10})};
+      }
+      if (input === '/api/settings/login-startup') {
+        return { ok: true, json: async () => ({ enabled: false, registered: false, available: true, conflict: false, blocked: false, revision: 'off', targetRoot: '/test/Pan', dataDirectory: '/test/Pan/data', entry: 'owned test entry', reason: '', registration: null }) };
+      }
+      if (input === '/api/remote/lan' && init?.method === 'GET') {
+        return new Response(JSON.stringify({ config: { startupEnabled: false, host: '', port: 8780 },
+          activeConfig: null, running: false, addresses: [], urls: [], error: '' }));
+      }
+      if (input === '/api/remote/tailscale' && init?.method === 'GET') {
+        return new Response(JSON.stringify({ config: { startupEnabled: false, protocol: 'http', port: 18080 },
+          running: false, url: '', target: '', error: '', pendingCleanup: false }));
+      }
+      if (input !== '/api/remote/mcp' || init?.method !== 'GET') {
+        throw new Error(`Unexpected settings fetch: ${init?.method} ${String(input)}`);
+      }
+      return new Response(JSON.stringify({
+        config: {
+          enabled: false,
+          port: 8769,
+          public_hostname: '',
+          access_issuer: '',
+          access_audience: '',
+          config_path: '',
+          binary_path: '',
+        },
+        publicUrl: '',
+        gateway: { listening: false },
+        tunnel: { running: false },
+      }), { headers: { 'Content-Type': 'application/json' } });
+    }));
     localStorage.clear();
     useAppSettingsStore.setState({ ...DEFAULT_SETTINGS });
     fetchCodexModelsMock.mockResolvedValue({
@@ -150,6 +214,7 @@ describe('AppSettingsModal', () => {
     fetchSessionLifecyclePreferencesMock.mockResolvedValue({
       exitStrategy: 'ask',
       startupPreference: 'ask',
+      wakeMessage: '继续',
     });
     updateSessionLifecyclePreferencesMock.mockReset();
     updateSessionLifecyclePreferencesMock.mockImplementation(async (preferences) => preferences);
@@ -258,24 +323,38 @@ describe('AppSettingsModal', () => {
     expect(document.body.querySelector('.app-settings-overlay')).toBeNull();
   });
 
-  it('renders the settings sections plus Reset', () => {
+  it('defaults to Lifecycle and keeps Reset on Appearance', () => {
     render(<AppSettingsModal open onClose={() => {}} />);
     const card = cardEl();
+    expect(document.getElementById('app-settings-tab-lifecycle')?.getAttribute('aria-selected'))
+      .toBe('true');
+    expect(card.textContent).toContain('Restart Pan main service');
+    expect(card.querySelector('[aria-label="Login startup"]')).not.toBeNull();
+    clickTab('behavior');
+    expect(card.querySelector('[aria-label="Login startup"]')).toBeNull();
+    clickTab('lifecycle');
+    expect(card.textContent).not.toContain('Default group by');
+    expect(card.textContent).not.toContain('Reset saved UI preferences');
+    expect(document.getElementById('app-settings-tab-general')).toBeNull();
+    expect(document.getElementById('app-settings-tab-preferences')).toBeNull();
+
+    clickTab('appearance');
     expect(card.textContent).toContain('Default group by');
-    expect(document.getElementById('app-settings-tab-preferences')?.textContent)
-      .toContain('Preferences');
-    expect(card.textContent).toContain('Reset to defaults');
-    fireEvent.click(document.getElementById('app-settings-tab-appearance')!);
-    expect(card.querySelectorAll('[role="switch"]')).toHaveLength(7);
-    expect(card.textContent).toContain('Notification');
+    expect(card.textContent).toContain('Show sidebar collapse handle');
+    expect(card.querySelectorAll('[role="switch"]')).toHaveLength(10);
+    expect(card.textContent).toContain('Enable Session and global history search');
+    expect(card.textContent).toContain('Reset saved UI preferences');
+    expect(tabLabels()).toContain('Notifications');
   });
 
   it('loads lifecycle preferences from config with ask defaults and saves updates', async () => {
     fetchSessionLifecyclePreferencesMock.mockResolvedValueOnce({
       exitStrategy: 'ask',
       startupPreference: 'ask',
+      wakeMessage: '继续',
     });
     render(<AppSettingsModal open onClose={() => {}} />);
+    clickTab('behavior');
 
     const exitStrategy = await waitFor(() => {
       const select = document.body.querySelector<HTMLSelectElement>('#session-exit-strategy');
@@ -287,24 +366,41 @@ describe('AppSettingsModal', () => {
     )!;
     expect(exitStrategy.value).toBe('ask');
     expect(startupPreference.value).toBe('ask');
+    expect(startupPreference.querySelector('option[value="sync-actual"]')).toBeNull();
+    expect(startupPreference.querySelector('option[value="clear-illegal"]')?.textContent)
+      .toBe('Clear Illegal status for all Sessions and treat them as safely offline');
 
     fireEvent.change(exitStrategy, { target: { value: 'offline' } });
     await waitFor(() => expect(updateSessionLifecyclePreferencesMock).toHaveBeenCalledWith({
       exitStrategy: 'offline',
       startupPreference: 'ask',
+      wakeMessage: '继续',
     }));
     expect(exitStrategy.value).toBe('offline');
 
-    fireEvent.change(startupPreference, { target: { value: 'sync-actual' } });
+    fireEvent.change(startupPreference, { target: { value: 'clear-illegal' } });
     await waitFor(() => expect(updateSessionLifecyclePreferencesMock).toHaveBeenLastCalledWith({
       exitStrategy: 'offline',
-      startupPreference: 'sync-actual',
+      startupPreference: 'clear-illegal',
+      wakeMessage: '继续',
     }));
+  });
+
+  it('persists a custom wake message from Behavior', async () => {
+    render(<AppSettingsModal open onClose={() => {}} />);
+    clickTab('behavior');
+    const field = await screen.findByRole('textbox', { name: 'Wake message' });
+    fireEvent.change(field, { target: { value: 'Resume my review' } });
+    fireEvent.blur(field);
+    await waitFor(() => expect(updateSessionLifecyclePreferencesMock).toHaveBeenCalledWith(
+      expect.objectContaining({ wakeMessage: 'Resume my review' }),
+    ));
   });
 
   it('shows lifecycle preference save errors and keeps the last saved value', async () => {
     updateSessionLifecyclePreferencesMock.mockRejectedValueOnce(new Error('config is read-only'));
     render(<AppSettingsModal open onClose={() => {}} />);
+    clickTab('behavior');
 
     const startupPreference = await waitFor(() => {
       const select = document.body.querySelector<HTMLSelectElement>(
@@ -323,6 +419,7 @@ describe('AppSettingsModal', () => {
   it('shows a preference load error and retries the server read', async () => {
     fetchSessionLifecyclePreferencesMock.mockRejectedValueOnce(new Error('settings unavailable'));
     render(<AppSettingsModal open onClose={() => {}} />);
+    clickTab('behavior');
 
     expect(await screen.findByRole('alert')).toBeTruthy();
     expect(screen.getByRole('alert').textContent).toContain('settings unavailable');
@@ -335,14 +432,15 @@ describe('AppSettingsModal', () => {
   });
 
   it.each([
-    ['offline', 'stop all Workers and mark legal running Sessions offline.'],
-    ['preserve-running', 'stop all Workers and preserve legal running state.'],
+    ['offline', 'stop all Workers and safely retire stopped execution.'],
+    ['preserve-running', 'stop all Workers and preserve unfinished execution as Illegal.'],
   ] as const)(
     'confirms Exit using the saved %s policy without asking again',
     async (exitStrategy, expectedSummary) => {
       fetchSessionLifecyclePreferencesMock.mockResolvedValueOnce({
         exitStrategy,
         startupPreference: 'ask',
+      wakeMessage: '继续',
       });
       render(<AppSettingsModal open onClose={() => {}} />);
       const exitButton = await waitFor(() => {
@@ -365,6 +463,194 @@ describe('AppSettingsModal', () => {
     },
   );
 
+  it.each([
+    ['offline', 'safely retire stopped execution'],
+    ['preserve-running', 'preserve unfinished execution as Illegal'],
+  ] as const)(
+    'confirms Restart using the saved %s policy without asking again',
+    async (exitStrategy, expectedSummary) => {
+      fetchSessionLifecyclePreferencesMock.mockResolvedValueOnce({
+        exitStrategy,
+        startupPreference: 'preserve-running',
+      });
+      render(<AppSettingsModal open onClose={() => {}} />);
+      const restartButton = await waitFor(() => {
+        const button = Array.from(document.body.querySelectorAll<HTMLButtonElement>('button'))
+          .find((candidate) => candidate.textContent?.includes('Restart Pan main service'));
+        expect(button).toBeTruthy();
+        expect(button!.disabled).toBe(false);
+        return button!;
+      });
+
+      fireEvent.click(restartButton);
+      expect(cardEl().textContent).toContain(expectedSummary);
+      expect(document.body.querySelectorAll(
+        'input[name="main-restart-running-session-state"]',
+      )).toHaveLength(0);
+      fireEvent.click(Array.from(document.body.querySelectorAll<HTMLButtonElement>('button'))
+        .find((button) => button.textContent?.includes('Confirm restart'))!);
+
+      await waitFor(() => expect(restartMainServiceMock).toHaveBeenCalledTimes(1));
+      expect(restartMainServiceMock).toHaveBeenCalledWith(undefined);
+    },
+  );
+
+  it('refreshes both lifecycle statuses on every modal open and clears stale Exit state', async () => {
+    fetchMainExitStatusMock
+      .mockResolvedValueOnce({
+        available: true,
+        pending: true,
+        platform: 'nt',
+        operation: 'exit',
+        phase: 'stopping_workers',
+        stage: 'stopping_workers',
+      })
+      .mockResolvedValue({
+        available: true,
+        pending: false,
+        platform: 'nt',
+        stage: 'offline',
+        phase: 'offline',
+      });
+    const { rerender } = render(<AppSettingsModal open onClose={() => {}} />);
+    await waitFor(() => expect(cardEl().textContent).toContain('Stopping Workers and Pan'));
+    expect(fetchMainRestartStatusMock).toHaveBeenCalledTimes(1);
+    expect(fetchMainExitStatusMock).toHaveBeenCalledTimes(1);
+
+    rerender(<AppSettingsModal open={false} onClose={() => {}} />);
+    rerender(<AppSettingsModal open onClose={() => {}} />);
+    const exitButton = await waitFor(() => {
+      const button = Array.from(document.body.querySelectorAll<HTMLButtonElement>('button'))
+        .find((candidate) => candidate.textContent?.includes('Exit Pan main service'));
+      expect(button).toBeTruthy();
+      expect(button!.disabled).toBe(false);
+      return button!;
+    });
+
+    expect(fetchMainRestartStatusMock).toHaveBeenCalledTimes(2);
+    expect(fetchMainExitStatusMock).toHaveBeenCalledTimes(2);
+    expect(exitButton.disabled).toBe(false);
+    expect(cardEl().textContent).not.toContain('Exit scheduled; this service will go offline');
+    expect(fetchHealthMock).not.toHaveBeenCalled();
+    expect(restartMainServiceMock).not.toHaveBeenCalled();
+    expect(exitMainServiceMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps lifecycle actions disabled after a status fetch error until Retry succeeds', async () => {
+    fetchMainRestartStatusMock.mockRejectedValueOnce(new Error('status API unavailable'));
+    render(<AppSettingsModal open onClose={() => {}} />);
+
+    const refreshButton = await screen.findByRole('button', { name: 'Refresh status' });
+    expect(screen.getByRole('alert').textContent).toContain('status API unavailable');
+    const restartButton = Array.from(
+      document.body.querySelectorAll<HTMLButtonElement>('button'),
+    ).find((button) => button.textContent?.includes('Restart Pan main service'))!;
+    const exitButton = Array.from(
+      document.body.querySelectorAll<HTMLButtonElement>('button'),
+    ).find((button) => button.textContent?.includes('Exit Pan main service'))!;
+    expect(restartButton.disabled).toBe(true);
+    expect(exitButton.disabled).toBe(true);
+
+    fireEvent.click(refreshButton);
+    await waitFor(() => {
+      expect(Array.from(document.body.querySelectorAll<HTMLButtonElement>('button'))
+        .find((button) => button.textContent?.includes('Restart Pan main service'))?.disabled)
+        .toBe(false);
+    });
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(fetchMainRestartStatusMock).toHaveBeenCalledTimes(2);
+    expect(fetchMainExitStatusMock).toHaveBeenCalledTimes(2);
+    expect(fetchHealthMock).not.toHaveBeenCalled();
+  });
+
+  it('ignores status responses from an earlier modal-open cycle', async () => {
+    let resolveOldRestart!: (value: {
+      available: boolean;
+      pending: boolean;
+      platform: string;
+    }) => void;
+    let resolveOldExit!: (value: {
+      available: boolean;
+      pending: boolean;
+      platform: string;
+      stage: string;
+    }) => void;
+    fetchMainRestartStatusMock.mockReturnValueOnce(new Promise((resolve) => {
+      resolveOldRestart = resolve;
+    }));
+    fetchMainExitStatusMock.mockReturnValueOnce(new Promise((resolve) => {
+      resolveOldExit = resolve;
+    }));
+    const { rerender } = render(<AppSettingsModal open onClose={() => {}} />);
+    rerender(<AppSettingsModal open={false} onClose={() => {}} />);
+    rerender(<AppSettingsModal open onClose={() => {}} />);
+
+    const exitButton = await waitFor(() => {
+      const button = Array.from(document.body.querySelectorAll<HTMLButtonElement>('button'))
+        .find((candidate) => candidate.textContent?.includes('Exit Pan main service'));
+      expect(button).toBeTruthy();
+      expect(button!.disabled).toBe(false);
+      return button!;
+    });
+    resolveOldRestart({ available: true, pending: true, platform: 'nt' });
+    resolveOldExit({
+      available: true, pending: true, platform: 'nt', stage: 'stopping_workers',
+    });
+    await act(async () => { await Promise.resolve(); });
+
+    expect(exitButton.disabled).toBe(false);
+    expect(cardEl().textContent).not.toContain('Stopping Workers and Pan');
+    expect(fetchMainRestartStatusMock).toHaveBeenCalledTimes(2);
+    expect(fetchMainExitStatusMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not let a lifecycle action response from an earlier open overwrite the new status', async () => {
+    let resolveRestartAction!: (value: {
+      ok: boolean;
+      status: 'scheduled';
+      requestId: string;
+    }) => void;
+    restartMainServiceMock.mockReturnValueOnce(new Promise((resolve) => {
+      resolveRestartAction = resolve;
+    }));
+    fetchMainRestartStatusMock
+      .mockResolvedValueOnce({ available: true, pending: false, platform: 'nt' })
+      .mockResolvedValue({
+        available: true,
+        pending: true,
+        platform: 'nt',
+        operation: 'restart',
+        phase: 'stopping_workers',
+      });
+    const { rerender } = render(<AppSettingsModal open onClose={() => {}} />);
+    const restartButton = await waitFor(() => {
+      const button = Array.from(document.body.querySelectorAll<HTMLButtonElement>('button'))
+        .find((candidate) => candidate.textContent?.includes('Restart Pan main service'));
+      expect(button).toBeTruthy();
+      expect(button!.disabled).toBe(false);
+      return button!;
+    });
+    fireEvent.click(restartButton);
+    fireEvent.click(Array.from(
+      document.body.querySelectorAll<HTMLInputElement>(
+        'input[name="main-restart-running-session-state"]',
+      ),
+    ).find((input) => input.parentElement?.textContent?.includes('preserve unfinished execution as Illegal'))!);
+    fireEvent.click(Array.from(document.body.querySelectorAll<HTMLButtonElement>('button'))
+      .find((button) => button.textContent?.includes('Confirm restart'))!);
+    await waitFor(() => expect(restartMainServiceMock).toHaveBeenCalledTimes(1));
+
+    rerender(<AppSettingsModal open={false} onClose={() => {}} />);
+    rerender(<AppSettingsModal open onClose={() => {}} />);
+    await waitFor(() => expect(cardEl().textContent).toContain('Pan restart is in progress'));
+
+    resolveRestartAction({ ok: true, status: 'scheduled', requestId: 'restart-old-open' });
+    await act(async () => { await Promise.resolve(); });
+    await waitFor(() => expect(fetchMainRestartStatusMock).toHaveBeenCalledTimes(3));
+    expect(cardEl().textContent).toContain('Pan restart is in progress');
+    expect(fetchHealthMock).not.toHaveBeenCalled();
+  });
+
   it('keeps all settings tabs reachable in a horizontal-only scroller', () => {
     render(<AppSettingsModal open onClose={() => {}} />);
 
@@ -372,12 +658,16 @@ describe('AppSettingsModal', () => {
     const tabs = Array.from(document.body.querySelectorAll<HTMLButtonElement>('[role="tab"]'));
     const panel = document.getElementById('app-settings-tabpanel')!;
     expect(tabs.map((tab) => tab.textContent?.replace(/\s+/g, ' ').trim())).toEqual([
-      'General',
-      'Preferences',
+      'Lifecycle',
+      'Behavior',
+      'Remote',
       'Appearance',
-      'Notification',
-      'Adapter',
+      'Notifications',
+      'Shortcuts',
+      'Adapters',
+      'Plugins',
       'Data',
+      'Authorization',
     ]);
     expect(tabList.className).toContain('overflow-x-auto');
     expect(tabList.className).toContain('overscroll-x-contain');
@@ -389,14 +679,263 @@ describe('AppSettingsModal', () => {
     expect(panel.className).not.toContain('overflow-x-auto');
 
     fireEvent.keyDown(tabs[0]!, { key: 'End' });
-    expect(tabs[5]!.getAttribute('aria-selected')).toBe('true');
-    expect(tabs[5]!.tabIndex).toBe(0);
-    expect(tabs.slice(0, 5).every((tab) => tab.tabIndex === -1)).toBe(true);
-    fireEvent.keyDown(tabs[5]!, { key: 'ArrowLeft' });
-    expect(tabs[4]!.getAttribute('aria-selected')).toBe('true');
-    fireEvent.keyDown(tabs[4]!, { key: 'Home' });
+    expect(tabs[9]!.getAttribute('aria-selected')).toBe('true');
+    expect(tabs[9]!.tabIndex).toBe(0);
+    expect(tabs.slice(0, 9).every((tab) => tab.tabIndex === -1)).toBe(true);
+    fireEvent.keyDown(tabs[9]!, { key: 'ArrowLeft' });
+    expect(tabs[8]!.getAttribute('aria-selected')).toBe('true');
+    fireEvent.keyDown(tabs[8]!, { key: 'Home' });
     expect(tabs[0]!.getAttribute('aria-selected')).toBe('true');
-    expect(panel.getAttribute('aria-labelledby')).toBe('app-settings-tab-general');
+    expect(panel.getAttribute('aria-labelledby')).toBe('app-settings-tab-lifecycle');
+  });
+
+  it('keeps the canonical category order with the integrated Shortcuts page', () => {
+    expect(SETTINGS_CATEGORY_ORDER).toEqual([
+      'lifecycle',
+      'behavior',
+      'remote',
+      'appearance',
+      'notifications',
+      'shortcuts',
+      'adapters',
+      'plugins',
+      'data',
+      'authorization',
+    ]);
+    expect(SETTINGS_CATEGORY_ORDER.indexOf('shortcuts')).toBe(5);
+    expect(SETTINGS_TABS).toEqual([
+      'lifecycle',
+      'behavior',
+      'remote',
+      'appearance',
+      'notifications',
+      'shortcuts',
+      'adapters',
+      'plugins',
+      'data',
+      'authorization',
+    ]);
+    render(<AppSettingsModal open onClose={() => {}} />);
+    expect(document.getElementById('app-settings-tab-shortcuts')).not.toBeNull();
+    expect(tabLabels()).toEqual([
+      'Lifecycle',
+      'Behavior',
+      'Remote',
+      'Appearance',
+      'Notifications',
+      'Shortcuts',
+      'Adapters',
+      'Plugins',
+      'Data',
+      'Authorization',
+    ]);
+  });
+
+  it('places each setting on exactly its category page', async () => {
+    render(<AppSettingsModal open onClose={() => {}} />);
+    const contains = (needle: string) => (cardEl().textContent ?? '').includes(needle);
+    const occurrences = (needle: string) => (cardEl().textContent ?? '').split(needle).length - 1;
+
+    expect(contains('Pan service')).toBe(true);
+    expect(contains('Restart Pan main service')).toBe(true);
+    expect(contains('Exit Pan main service')).toBe(true);
+    expect(contains('退出/重启时的Session策略')).toBe(true);
+    expect(contains('启动后的Session恢复策略')).toBe(true);
+    expect(contains('Session legal-state lifecycle')).toBe(false);
+    expect(contains('Reset saved UI preferences')).toBe(false);
+
+    clickTab('behavior');
+    for (const heading of [
+      'Session legal-state lifecycle',
+      'Worker configuration',
+      'Worker stop reports',
+      'New Sessions',
+      'Confirmations',
+      'Memory advanced',
+    ]) {
+      expect(occurrences(heading)).toBe(1);
+    }
+    expect(contains('Restart Pan main service')).toBe(false);
+    expect(contains('Exit Pan main service')).toBe(false);
+    expect(contains('Reset saved UI preferences')).toBe(false);
+
+    clickTab('remote');
+    expect(contains('MCP 远程连接')).toBe(true);
+    expect(contains('Tailscale 备用访问')).toBe(true);
+    expect(contains('普通局域网访问（LAN）')).toBe(true);
+    expect(contains('Session legal-state lifecycle')).toBe(false);
+
+    clickTab('appearance');
+    expect(contains('Chat view')).toBe(true);
+    expect(contains('Reset saved UI preferences')).toBe(true);
+    expect(contains('Session legal-state lifecycle')).toBe(false);
+
+    clickTab('notifications');
+    expect(contains('Completion bell defaults')).toBe(true);
+    expect(contains('Unread recording')).toBe(true);
+    expect(contains('Codex warnings via Toast')).toBe(true);
+    expect(contains('修改 agent/系统队列消息前确认')).toBe(false);
+    expect(contains('Confirm management changes across workspaces')).toBe(false);
+
+    clickTab('adapters');
+    expect(contains('Codex')).toBe(true);
+    expect(contains('Adapter reload')).toBe(true);
+    expect(contains('Plugin manifests')).toBe(false);
+
+    clickTab('plugins');
+    expect(contains('QQ plugins')).toBe(true);
+    expect(contains('Plugin manifests')).toBe(true);
+    expect(contains('Adapter reload')).toBe(false);
+
+    clickTab('data');
+    await waitFor(() => expect(cardEl().textContent).toContain('Sessions 元数据与 history'));
+    expect(contains('Session legal-state lifecycle')).toBe(false);
+    expect(contains('Reset saved UI preferences')).toBe(false);
+  });
+
+  it('renders the Remote capabilities as ordered collapsible sections and keeps tunnel restart intact', async () => {
+    fetchRemoteStatusMock.mockResolvedValue({
+      available: true,
+      enabled: true,
+      running: true,
+      protocol: 'http',
+      port: 8787,
+    });
+    restartRemoteTunnelMock.mockResolvedValue({ ok: true, restarted: true });
+    render(<AppSettingsModal open onClose={() => {}} />);
+    clickTab('remote');
+
+    await waitFor(() =>
+      expect(cardEl().textContent).toContain('cloudflared · running · http · :8787'),
+    );
+    const sections = Array.from(
+      cardEl().querySelectorAll<HTMLElement>('[data-testid$="-section"]'),
+    );
+    expect(sections.map((element) => element.dataset.testid)).toEqual([
+      'remote-tunnel-section',
+      'remote-mcp-section',
+      'remote-tailscale-section',
+      'remote-lan-section',
+    ]);
+    for (const element of sections) {
+      const header = element.querySelector<HTMLButtonElement>('button[aria-expanded]')!;
+      expect(header.getAttribute('aria-expanded')).toBe('true');
+      expect(document.getElementById(header.getAttribute('aria-controls')!)?.hidden).toBe(false);
+    }
+
+    const tunnel = sections[0]!;
+    const tunnelHeader = tunnel.querySelector<HTMLButtonElement>('button[aria-expanded]')!;
+    fireEvent.click(tunnelHeader);
+    expect(tunnelHeader.getAttribute('aria-expanded')).toBe('false');
+    expect(document.getElementById(tunnelHeader.getAttribute('aria-controls')!)?.hidden).toBe(true);
+    expect(tunnel.textContent).toContain('running');
+    fireEvent.click(tunnelHeader);
+    expect(tunnelHeader.getAttribute('aria-expanded')).toBe('true');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Restart tunnel' }));
+    await waitFor(() => expect(restartRemoteTunnelMock).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(
+        (screen.getByRole('button', { name: 'Restart tunnel' }) as HTMLButtonElement).disabled,
+      ).toBe(false),
+    );
+
+    const otherTitles = ['MCP 远程连接', 'Tailscale 备用访问', '普通局域网访问（LAN）'];
+    for (const title of otherTitles) {
+      expect(cardEl().textContent).toContain(title);
+    }
+  });
+
+  it('navigates from Lifecycle to the exact Behavior policy without writing or acting', async () => {
+    render(<AppSettingsModal open onClose={() => {}} />);
+    await waitFor(() => {
+      const button = Array.from(document.body.querySelectorAll<HTMLButtonElement>('button')).find(
+        (candidate) => candidate.textContent?.includes('Restart Pan main service'),
+      );
+      expect(button?.disabled).toBe(false);
+    });
+
+    const exitShortcut = screen.getByTestId('open-exit-session-policy') as HTMLButtonElement;
+    expect(exitShortcut.tagName).toBe('BUTTON');
+    expect(exitShortcut.tabIndex).toBe(0);
+    fireEvent.click(exitShortcut);
+
+    expect(document.getElementById('app-settings-tab-behavior')?.getAttribute('aria-selected'))
+      .toBe('true');
+    const exitSelect = await waitFor(() => {
+      const element = document.getElementById('session-exit-strategy');
+      expect(element).toBeTruthy();
+      return element as HTMLSelectElement;
+    });
+    expect(document.activeElement).toBe(exitSelect);
+    expect(exitSelect.value).toBe('ask');
+    expect(scrollIntoViewMock).toHaveBeenCalled();
+    expect(scrollIntoViewMock.mock.instances.at(-1)).toBe(exitSelect);
+
+    clickTab('lifecycle');
+    fireEvent.click(screen.getByTestId('open-startup-session-policy'));
+    const startupSelect = await waitFor(() => {
+      const element = document.getElementById('session-startup-preference');
+      expect(element).toBeTruthy();
+      return element as HTMLSelectElement;
+    });
+    expect(document.activeElement).toBe(startupSelect);
+    expect(startupSelect.value).toBe('ask');
+    expect(scrollIntoViewMock.mock.instances.at(-1)).toBe(startupSelect);
+
+    expect(updateUiSettingsMock).not.toHaveBeenCalled();
+    expect(updateSessionLifecyclePreferencesMock).not.toHaveBeenCalled();
+    expect(restartMainServiceMock).not.toHaveBeenCalled();
+    expect(exitMainServiceMock).not.toHaveBeenCalled();
+    expect(fetchHealthMock).not.toHaveBeenCalled();
+  });
+
+  it('focuses the Behavior policy after preferences finish loading, then reopens on Lifecycle', async () => {
+    let resolvePreferences!: (value: {
+      exitStrategy: 'ask';
+      startupPreference: 'ask';
+    }) => void;
+    fetchSessionLifecyclePreferencesMock.mockReturnValueOnce(new Promise((resolve) => {
+      resolvePreferences = resolve;
+    }));
+    const onClose = vi.fn();
+    const { rerender } = render(<AppSettingsModal open onClose={onClose} />);
+
+    fireEvent.click(screen.getByTestId('open-startup-session-policy'));
+    expect(document.getElementById('app-settings-tab-behavior')?.getAttribute('aria-selected'))
+      .toBe('true');
+    expect(document.getElementById('session-startup-preference')).toBeNull();
+
+    await act(async () => {
+      resolvePreferences({ exitStrategy: 'ask', startupPreference: 'ask' });
+    });
+    const startupSelect = await waitFor(() => {
+      const element = document.getElementById('session-startup-preference');
+      expect(element).toBeTruthy();
+      return element as HTMLSelectElement;
+    });
+    expect(document.activeElement).toBe(startupSelect);
+
+    rerender(<AppSettingsModal open={false} onClose={onClose} />);
+    rerender(<AppSettingsModal open onClose={onClose} />);
+    expect(document.getElementById('app-settings-tab-lifecycle')?.getAttribute('aria-selected'))
+      .toBe('true');
+  });
+
+  it('keeps lifecycle load errors available across tab switches and focuses the section on jump', async () => {
+    fetchSessionLifecyclePreferencesMock.mockRejectedValueOnce(new Error('settings unavailable'));
+    render(<AppSettingsModal open onClose={() => {}} />);
+
+    fireEvent.click(screen.getByTestId('open-exit-session-policy'));
+    expect((await screen.findByRole('alert')).textContent).toContain('settings unavailable');
+    expect(document.activeElement).toBe(screen.getByTestId('behavior-session-section'));
+
+    clickTab('appearance');
+    expect(screen.queryByRole('alert')).toBeNull();
+    clickTab('behavior');
+    expect((await screen.findByRole('alert')).textContent).toContain('settings unavailable');
+    expect(updateUiSettingsMock).not.toHaveBeenCalled();
+    expect(updateSessionLifecyclePreferencesMock).not.toHaveBeenCalled();
   });
 
   it('loads the Data catalog on demand and keeps long paths usable in a narrow panel', async () => {
@@ -424,7 +963,7 @@ describe('AppSettingsModal', () => {
     await waitFor(() => expect(panel.querySelector(
       '[aria-label="Keep Completed Jobs for days"]',
     )).not.toBeNull());
-    expect(document.querySelectorAll('[role="tab"]')).toHaveLength(6);
+    expect(document.querySelectorAll('[role="tab"]')).toHaveLength(10);
     expect(updateUiSettingsMock).not.toHaveBeenCalled();
   });
 
@@ -456,14 +995,14 @@ describe('AppSettingsModal', () => {
     await waitFor(() => expect(cardEl().textContent).toContain('登记路径'));
 
     fetchDataCatalogMock.mockRejectedValueOnce(new Error('catalog unavailable'));
-    fireEvent.click(document.getElementById('app-settings-tab-general')!);
+    fireEvent.click(document.getElementById('app-settings-tab-lifecycle')!);
     fireEvent.click(document.getElementById('app-settings-tab-data')!);
     await waitFor(() =>
       expect(document.querySelector('[role="alert"]')?.textContent)
         .toContain('catalog unavailable'),
     );
-    fireEvent.click(document.getElementById('app-settings-tab-general')!);
-    expect(cardEl().textContent).toContain('Default group by');
+    fireEvent.click(document.getElementById('app-settings-tab-behavior')!);
+    expect(cardEl().textContent).toContain('Worker configuration');
   });
 
   it('loads disabled retention policies, edits days, saves, and shows recent scan counts', async () => {
@@ -512,7 +1051,7 @@ describe('AppSettingsModal', () => {
     fireEvent.change(document.querySelector<HTMLInputElement>(
       '[aria-label="Sessions 与 history 保留天数"]',
     )!, { target: { value: '14' } });
-    fireEvent.click(document.getElementById('app-settings-tab-general')!);
+    fireEvent.click(document.getElementById('app-settings-tab-lifecycle')!);
     fireEvent.click(document.getElementById('app-settings-tab-data')!);
     await waitFor(() => expect(document.querySelector<HTMLButtonElement>(
       '[aria-label="Sessions 与 history 自动清理"]',
@@ -536,6 +1075,22 @@ describe('AppSettingsModal', () => {
         sessions: { enabled: true, days: null },
       },
     }));
+  });
+
+  it('persists independent orphan workdir settings and warns in English', async () => {
+    render(<AppSettingsModal open onClose={() => {}} />);
+    fireEvent.click(document.getElementById('app-settings-tab-data')!);
+    await waitFor(() => expect(document.querySelector('[aria-label="Orphan workdirs automatic cleanup"]')).not.toBeNull());
+    const toggle = document.querySelector<HTMLButtonElement>('[aria-label="Orphan workdirs automatic cleanup"]')!;
+    expect(toggle.getAttribute('aria-checked')).toBe('false');
+    expect(cardEl().textContent).toContain('manual cleanup is recommended');
+    fireEvent.change(document.querySelector('[aria-label="Orphan workdirs days without changes"]')!, { target: { value: '21' } });
+    fireEvent.click(toggle);
+    const save = Array.from(document.querySelectorAll<HTMLButtonElement>('button')).find(button => button.textContent?.includes('保存清理策略'))!;
+    fireEvent.click(save);
+    await waitFor(() => expect(updateDataRetentionMock).toHaveBeenCalledWith(expect.objectContaining({
+      policies: expect.objectContaining({ workdirs: { enabled: true, days: 21 } }),
+    })));
   });
 
   it('projects the shared Jobs retention editor in Data and saves via its canonical API', async () => {
@@ -585,20 +1140,27 @@ describe('AppSettingsModal', () => {
     render(<AppSettingsModal open onClose={() => {}} />);
 
     const tabs = document.body.querySelectorAll<HTMLButtonElement>('[role="tab"]');
-    const generalTab = document.getElementById('app-settings-tab-general') as HTMLButtonElement;
+    const lifecycleTab = document.getElementById(
+      'app-settings-tab-lifecycle',
+    ) as HTMLButtonElement;
     const appearanceTab = document.getElementById(
       'app-settings-tab-appearance',
     ) as HTMLButtonElement;
 
-    expect(tabs).toHaveLength(6);
+    expect(tabs).toHaveLength(10);
     expect(appearanceTab.getAttribute('aria-selected')).toBe('false');
     expect(cardEl().textContent).not.toContain('Message visibility');
     expect(cardEl().textContent).not.toContain('Show meta-agent info');
 
-    fireEvent.keyDown(generalTab, { key: 'ArrowRight' });
-    expect(document.getElementById('app-settings-tab-preferences')?.getAttribute('aria-selected'))
+    fireEvent.keyDown(lifecycleTab, { key: 'ArrowRight' });
+    expect(document.getElementById('app-settings-tab-behavior')?.getAttribute('aria-selected'))
       .toBe('true');
-    fireEvent.keyDown(document.getElementById('app-settings-tab-preferences')!, {
+    fireEvent.keyDown(document.getElementById('app-settings-tab-behavior')!, {
+      key: 'ArrowRight',
+    });
+    expect(document.getElementById('app-settings-tab-remote')?.getAttribute('aria-selected'))
+      .toBe('true');
+    fireEvent.keyDown(document.getElementById('app-settings-tab-remote')!, {
       key: 'ArrowRight',
     });
 
@@ -625,7 +1187,7 @@ describe('AppSettingsModal', () => {
     expect(useAppSettingsStore.getState().showMetaAgent).toBe(true);
     expect(updateUiSettingsMock).toHaveBeenCalledWith({ showMetaAgent: true });
 
-    fireEvent.click(generalTab);
+    fireEvent.click(lifecycleTab);
     expect(cardEl().textContent).not.toContain('Message visibility');
     fireEvent.click(appearanceTab);
     expect(
@@ -635,30 +1197,45 @@ describe('AppSettingsModal', () => {
     ).toBe('true');
   });
 
-  it('switches Bubble view on and off from Appearance and persists the selected style', () => {
+  it('selects TUI, Bubble or Raw chat view from Appearance and persists the chosen style', () => {
     render(<AppSettingsModal open onClose={() => {}} />);
     fireEvent.click(document.getElementById('app-settings-tab-appearance')!);
 
     expect(cardEl().textContent).toContain('Chat view');
-    const bubbleSwitch = Array.from(
-      document.body.querySelectorAll<HTMLElement>('[role="switch"]'),
-    ).find((element) => element.textContent?.includes('Use Bubble chat view'))!;
-    expect(bubbleSwitch.getAttribute('aria-checked')).toBe('false');
+    const chatViewGroup = document.body.querySelector<HTMLElement>(
+      '[role="radiogroup"][aria-label="Chat view"]',
+    );
+    expect(chatViewGroup).toBeTruthy();
+    const option = (label: string) =>
+      Array.from(chatViewGroup!.querySelectorAll<HTMLElement>('[role="radio"]')).find(
+        (element) => element.textContent?.trim() === label,
+      )!;
 
-    fireEvent.click(bubbleSwitch);
+    expect(option('TUI').getAttribute('aria-checked')).toBe('true');
+    expect(option('Bubble').getAttribute('aria-checked')).toBe('false');
+    expect(option('Raw').getAttribute('aria-checked')).toBe('false');
+
+    fireEvent.click(option('Bubble'));
     expect(useAppSettingsStore.getState().chatViewStyle).toBe('bubble');
     expect(updateUiSettingsMock).toHaveBeenCalledWith({ chatViewStyle: 'bubble' });
-    expect(bubbleSwitch.getAttribute('aria-checked')).toBe('true');
+    expect(option('Bubble').getAttribute('aria-checked')).toBe('true');
+    expect(option('TUI').getAttribute('aria-checked')).toBe('false');
 
-    fireEvent.click(bubbleSwitch);
+    fireEvent.click(option('Raw'));
+    expect(useAppSettingsStore.getState().chatViewStyle).toBe('raw');
+    expect(updateUiSettingsMock).toHaveBeenLastCalledWith({ chatViewStyle: 'raw' });
+    expect(option('Raw').getAttribute('aria-checked')).toBe('true');
+    expect(option('Bubble').getAttribute('aria-checked')).toBe('false');
+
+    fireEvent.click(option('TUI'));
     expect(useAppSettingsStore.getState().chatViewStyle).toBe('tui');
     expect(updateUiSettingsMock).toHaveBeenLastCalledWith({ chatViewStyle: 'tui' });
-    expect(bubbleSwitch.getAttribute('aria-checked')).toBe('false');
+    expect(option('TUI').getAttribute('aria-checked')).toBe('true');
   });
 
   it('toggles the default new Session Workspace preference and persists it', () => {
     render(<AppSettingsModal open onClose={() => {}} />);
-    fireEvent.click(document.getElementById('app-settings-tab-preferences')!);
+    clickTab('behavior');
 
     expect(cardEl().textContent).toContain('New Sessions');
     const workspaceSwitch = Array.from(
@@ -675,6 +1252,104 @@ describe('AppSettingsModal', () => {
       defaultNewSessionToCurrentWorkspace: false,
     });
     expect(workspaceSwitch.getAttribute('aria-checked')).toBe('false');
+  });
+
+  it('toggles the Behavior worker-kill report switch off by default and persists it', async () => {
+    updateUiSettingsMock.mockResolvedValue({ reportWorkerKillErrors: true });
+    render(<AppSettingsModal open onClose={() => {}} />);
+    fireEvent.click(document.getElementById('app-settings-tab-behavior')!);
+
+    expect(cardEl().textContent).toContain('Report errors when stopping a running worker');
+    const killReportSwitch = Array.from(
+      document.body.querySelectorAll<HTMLElement>('[role="switch"]'),
+    ).find((element) =>
+      element.textContent?.includes('Report errors when stopping a running worker'),
+    )!;
+    expect(killReportSwitch.getAttribute('aria-checked')).toBe('false');
+
+    fireEvent.click(killReportSwitch);
+
+    await waitFor(() =>
+      expect(useAppSettingsStore.getState().reportWorkerKillErrors).toBe(true),
+    );
+    expect(updateUiSettingsMock).toHaveBeenCalledWith({ reportWorkerKillErrors: true });
+    expect(killReportSwitch.getAttribute('aria-checked')).toBe('true');
+  });
+
+  it('shows Behavior save errors and keeps the last saved value', async () => {
+    updateUiSettingsMock.mockRejectedValueOnce(new Error('config is read-only'));
+    render(<AppSettingsModal open onClose={() => {}} />);
+    fireEvent.click(document.getElementById('app-settings-tab-behavior')!);
+
+    const killReportSwitch = Array.from(
+      document.body.querySelectorAll<HTMLElement>('[role="switch"]'),
+    ).find((element) =>
+      element.textContent?.includes('Report errors when stopping a running worker'),
+    )!;
+    fireEvent.click(killReportSwitch);
+
+    expect(await screen.findByRole('alert')).toBeTruthy();
+    expect(screen.getByRole('alert').textContent).toContain('config is read-only');
+    expect(useAppSettingsStore.getState().reportWorkerKillErrors).toBe(false);
+    expect(killReportSwitch.getAttribute('aria-checked')).toBe('false');
+  });
+
+  it('shows three independent auto Force switches, all off by default', () => {
+    render(<AppSettingsModal open onClose={() => {}} />);
+    clickTab('behavior');
+
+    expect(cardEl().textContent).toContain('Message auto force send');
+    const switches = Array.from(
+      document.body.querySelectorAll<HTMLElement>('[data-testid="auto-force-send-section"] [role="switch"]'),
+    );
+    expect(switches).toHaveLength(3);
+    expect(switches.map((element) => element.getAttribute('aria-checked'))).toEqual([
+      'false', 'false', 'false',
+    ]);
+    expect(switches.map((element) => element.textContent)).toEqual([
+      expect.stringContaining('Job terminal notifications'),
+      expect.stringContaining('Meta-agent (MA) messages'),
+      expect.stringContaining('Completion reports'),
+    ]);
+  });
+
+  it('persists one auto Force switch without changing the others', async () => {
+    updateUiSettingsMock.mockResolvedValue({
+      autoForceSend: { system: false, ma: true, report: false },
+    });
+    render(<AppSettingsModal open onClose={() => {}} />);
+    clickTab('behavior');
+
+    const maSwitch = Array.from(
+      document.body.querySelectorAll<HTMLElement>('[data-testid="auto-force-send-section"] [role="switch"]'),
+    ).find((element) => element.textContent?.includes('Meta-agent (MA) messages'))!;
+    fireEvent.click(maSwitch);
+
+    await waitFor(() =>
+      expect(useAppSettingsStore.getState().autoForceSend).toEqual({
+        system: false, ma: true, report: false,
+      }),
+    );
+    expect(updateUiSettingsMock).toHaveBeenCalledWith({
+      autoForceSend: { system: false, ma: true, report: false },
+    });
+    expect(maSwitch.getAttribute('aria-checked')).toBe('true');
+  });
+
+  it('shows auto Force save failures and keeps the last saved switch position', async () => {
+    updateUiSettingsMock.mockRejectedValueOnce(new Error('auto force config is read-only'));
+    render(<AppSettingsModal open onClose={() => {}} />);
+    clickTab('behavior');
+
+    const reportSwitch = Array.from(
+      document.body.querySelectorAll<HTMLElement>('[data-testid="auto-force-send-section"] [role="switch"]'),
+    ).find((element) => element.textContent?.includes('Completion reports'))!;
+    fireEvent.click(reportSwitch);
+
+    expect(await screen.findByRole('alert')).toBeTruthy();
+    expect(screen.getByRole('alert').textContent).toContain('auto force config is read-only');
+    expect(useAppSettingsStore.getState().autoForceSend.report).toBe(false);
+    expect(reportSwitch.getAttribute('aria-checked')).toBe('false');
   });
 
   it('toggles merged tool/thinking groups on the Appearance tab and persists the setting', () => {
@@ -724,13 +1399,7 @@ describe('AppSettingsModal', () => {
       document.body.querySelectorAll<HTMLElement>('[role="switch"]'),
     ).find((element) => element.textContent?.includes('Show message navigation rail'))!;
     expect(railSwitch).toBeDefined();
-    // Off by default: the rail is an opt-in strip.
-    expect(railSwitch.getAttribute('aria-checked')).toBe('false');
-
-    fireEvent.click(railSwitch);
-
-    expect(useAppSettingsStore.getState().showMessageNavigationRail).toBe(true);
-    expect(updateUiSettingsMock).toHaveBeenCalledWith({ showMessageNavigationRail: true });
+    // On by default: the rail ships enabled; turning it off is opt-out.
     expect(railSwitch.getAttribute('aria-checked')).toBe('true');
 
     // It remains the master enable: turning it off persists false so ChatView
@@ -739,29 +1408,118 @@ describe('AppSettingsModal', () => {
     expect(useAppSettingsStore.getState().showMessageNavigationRail).toBe(false);
     expect(updateUiSettingsMock).toHaveBeenLastCalledWith({ showMessageNavigationRail: false });
     expect(railSwitch.getAttribute('aria-checked')).toBe('false');
+
+    fireEvent.click(railSwitch);
+    expect(useAppSettingsStore.getState().showMessageNavigationRail).toBe(true);
+    expect(updateUiSettingsMock).toHaveBeenLastCalledWith({ showMessageNavigationRail: true });
+    expect(railSwitch.getAttribute('aria-checked')).toBe('true');
   });
 
-  it('shows the Codex warning Toast option on the Notification tab', () => {
+  it('toggles only the Chat view switcher on the Appearance tab and persists it', () => {
     render(<AppSettingsModal open onClose={() => {}} />);
-    const notificationTab = Array.from(
-      document.body.querySelectorAll<HTMLButtonElement>('button'),
-    ).find((button) => button.textContent?.includes('Notification'))!;
-    fireEvent.click(notificationTab);
+    fireEvent.click(document.getElementById('app-settings-tab-appearance')!);
+
+    const switcher = Array.from(
+      document.body.querySelectorAll<HTMLElement>('[role="switch"]'),
+    ).find((element) => element.textContent?.includes('Show chat view switcher'))!;
+    expect(switcher).toBeDefined();
+    // On by default: turning it off is opt-out.
+    expect(switcher.getAttribute('aria-checked')).toBe('true');
+    // The hint names the scope: Terminal TUI / Upgrades is unaffected.
+    expect(switcher.textContent).toContain('Terminal TUI / Upgrades stays available');
+
+    fireEvent.click(switcher);
+    expect(useAppSettingsStore.getState().showChatViewSwitcher).toBe(false);
+    expect(updateUiSettingsMock).toHaveBeenLastCalledWith({ showChatViewSwitcher: false });
+    expect(switcher.getAttribute('aria-checked')).toBe('false');
+
+    fireEvent.click(switcher);
+    expect(useAppSettingsStore.getState().showChatViewSwitcher).toBe(true);
+    expect(updateUiSettingsMock).toHaveBeenLastCalledWith({ showChatViewSwitcher: true });
+    expect(switcher.getAttribute('aria-checked')).toBe('true');
+  });
+
+  it('shows the Codex warning Toast option on the Notifications tab', () => {
+    render(<AppSettingsModal open onClose={() => {}} />);
+    clickTab('notifications');
     expect(cardEl().textContent).toContain('Codex warnings via Toast');
     expect(cardEl().textContent).toContain('CBC warnings via Toast');
     expect(cardEl().querySelectorAll('[role="switch"]')).toHaveLength(2);
+    expect(cardEl().textContent).not.toContain('修改 agent/系统队列消息前确认');
+    expect(cardEl().textContent).not.toContain('Confirm management changes across workspaces');
     const codexWarningSwitch = Array.from(cardEl().querySelectorAll<HTMLElement>('[role="switch"]'))
       .find((element) => element.textContent?.includes('Codex warnings via Toast'))!;
     fireEvent.click(codexWarningSwitch);
     expect(useAppSettingsStore.getState().notifications.codexWarningToast).toBe(false);
   });
 
-  it('loads and replaces the Codex whitelist on the Adapter tab', async () => {
+  it('shows the Locker switch off by default and asks for permission when enabled', async () => {
+    const requestPermission = vi.fn(async () => 'granted' as const);
+    const NotificationMock = vi.fn();
+    Object.defineProperty(NotificationMock, 'permission', { value: 'default', configurable: true });
+    Object.defineProperty(NotificationMock, 'requestPermission', {
+      value: requestPermission,
+      configurable: true,
+    });
+    vi.stubGlobal('Notification', NotificationMock);
+
     render(<AppSettingsModal open onClose={() => {}} />);
-    const adapterTab = Array.from(document.body.querySelectorAll<HTMLButtonElement>('button')).find(
-      (button) => button.textContent?.includes('Adapter'),
-    )!;
-    fireEvent.click(adapterTab);
+    clickTab('notifications');
+    const lockerSwitch = () => Array.from(cardEl().querySelectorAll<HTMLElement>('[role="switch"]'))
+      .find((element) => element.textContent?.includes('Locker new messages'))!;
+    expect(lockerSwitch().getAttribute('aria-checked')).toBe('false');
+    expect(lockerSwitch().hasAttribute('disabled')).toBe(false);
+
+    await act(async () => {
+      fireEvent.click(lockerSwitch());
+    });
+    expect(requestPermission).toHaveBeenCalledTimes(1);
+    expect(useAppSettingsStore.getState().notifications.lockerDesktop).toBe(true);
+    expect(lockerSwitch().getAttribute('aria-checked')).toBe('true');
+    expect(updateUiSettingsMock).toHaveBeenLastCalledWith({
+      notifications: { lockerDesktop: true },
+    });
+  });
+
+  it('keeps the Locker switch on and explains a denied notification permission', async () => {
+    const NotificationMock = vi.fn();
+    Object.defineProperty(NotificationMock, 'permission', { value: 'default', configurable: true });
+    Object.defineProperty(NotificationMock, 'requestPermission', {
+      value: vi.fn(async () => 'denied' as const),
+      configurable: true,
+    });
+    vi.stubGlobal('Notification', NotificationMock);
+
+    render(<AppSettingsModal open onClose={() => {}} />);
+    clickTab('notifications');
+    const lockerSwitch = Array.from(cardEl().querySelectorAll<HTMLElement>('[role="switch"]'))
+      .find((element) => element.textContent?.includes('Locker new messages'))!;
+
+    await act(async () => {
+      fireEvent.click(lockerSwitch);
+    });
+    // The stored preference is kept; only the runtime alerts stay silent.
+    expect(useAppSettingsStore.getState().notifications.lockerDesktop).toBe(true);
+    expect(lockerSwitch.getAttribute('aria-checked')).toBe('true');
+    expect(cardEl().textContent).toContain(
+      'Browser notification permission is denied for this site',
+    );
+  });
+
+  it('disables the Locker switch and explains the missing Notification API', () => {
+    vi.stubGlobal('Notification', undefined);
+    render(<AppSettingsModal open onClose={() => {}} />);
+    clickTab('notifications');
+    const lockerSwitch = Array.from(cardEl().querySelectorAll<HTMLElement>('[role="switch"]'))
+      .find((element) => element.textContent?.includes('Locker new messages'))!;
+
+    expect(lockerSwitch.hasAttribute('disabled')).toBe(true);
+    expect(cardEl().textContent).toContain('This browser does not support system notifications');
+  });
+
+  it('loads and replaces the Codex whitelist on the Adapters tab', async () => {
+    render(<AppSettingsModal open onClose={() => {}} />);
+    clickTab('adapters');
 
     await waitFor(() => expect(cardEl().textContent).toContain('gpt-5-codex, gpt-5-mini'));
     fireEvent.click(
@@ -773,15 +1531,11 @@ describe('AppSettingsModal', () => {
     expect(refreshCodexOfficialModelsMock).toHaveBeenCalledTimes(1);
   });
 
-  it('shows a readable Codex refresh error in the Adapter tab', async () => {
+  it('shows a readable Codex refresh error in the Adapters tab', async () => {
     const message = 'HTTP 502: codex debug models failed: authentication required';
     refreshCodexOfficialModelsMock.mockRejectedValueOnce(new Error(message));
     render(<AppSettingsModal open onClose={() => {}} />);
-    fireEvent.click(
-      Array.from(document.body.querySelectorAll<HTMLButtonElement>('button')).find((button) =>
-        button.textContent?.includes('Adapter'),
-      )!,
-    );
+    clickTab('adapters');
 
     await waitFor(() => expect(cardEl().textContent).toContain('替换为官方模型目录'));
     fireEvent.click(
@@ -794,11 +1548,7 @@ describe('AppSettingsModal', () => {
 
   it('toggles the Codex terminal input popup option and persists it', () => {
     render(<AppSettingsModal open onClose={() => {}} />);
-    fireEvent.click(
-      Array.from(document.body.querySelectorAll<HTMLButtonElement>('button')).find((button) =>
-        button.textContent?.includes('Adapter'),
-      )!,
-    );
+    clickTab('adapters');
     const terminalSwitch = Array.from(
       document.body.querySelectorAll<HTMLElement>('[role="switch"]'),
     ).find((element) => element.textContent?.includes('Show Codex terminal input popup'))!;
@@ -844,7 +1594,7 @@ describe('AppSettingsModal', () => {
     render(<AppSettingsModal open onClose={() => {}} />);
     fireEvent.click(document.getElementById('app-settings-tab-appearance')!);
     const switches = Array.from(document.body.querySelectorAll<HTMLElement>('[role="switch"]'));
-    expect(switches).toHaveLength(7);
+    expect(switches).toHaveLength(10);
     // meta-agent is on by default; toggle it off.
     const metaSwitch = switches.find((element) => element.textContent?.includes('Show meta-agent info'))!;
     expect(metaSwitch.getAttribute('aria-checked')).toBe('true');
@@ -853,36 +1603,141 @@ describe('AppSettingsModal', () => {
     expect(metaSwitch.getAttribute('aria-checked')).toBe('false');
   });
 
-  it('changes default group by via the select', () => {
+  it('persists the Session history search setting when its switch changes', () => {
     render(<AppSettingsModal open onClose={() => {}} />);
-    const select = document.body.querySelector<HTMLSelectElement>('select')!;
-    fireEvent.change(select, { target: { value: 'workdir' } });
-    expect(useAppSettingsStore.getState().defaultGroupBy).toBe('workdir');
+    fireEvent.click(document.getElementById('app-settings-tab-appearance')!);
+    const findSearchSwitch = () => Array.from(document.body.querySelectorAll<HTMLElement>('[role="switch"]'))
+      .find((element) => element.textContent?.includes('Enable Session and global history search'))!;
+    const searchSwitch = findSearchSwitch();
+
+    expect(useAppSettingsStore.getState().showHistorySearch).toBe(true);
+    expect(searchSwitch.getAttribute('aria-checked')).toBe('true');
+
+    fireEvent.click(searchSwitch);
+    expect(useAppSettingsStore.getState().showHistorySearch).toBe(false);
+    expect(findSearchSwitch().getAttribute('aria-checked')).toBe('false');
+    expect(updateUiSettingsMock).toHaveBeenLastCalledWith({ showHistorySearch: false });
+
+    fireEvent.click(findSearchSwitch());
+    expect(useAppSettingsStore.getState().showHistorySearch).toBe(true);
+    expect(findSearchSwitch().getAttribute('aria-checked')).toBe('true');
+    expect(updateUiSettingsMock).toHaveBeenLastCalledWith({ showHistorySearch: true });
   });
 
-  it('resets all settings to defaults', () => {
+  it('exposes the group-by settings only on the Appearance tab without duplicates', () => {
+    render(<AppSettingsModal open onClose={() => {}} />);
+
+    // Lifecycle tab: Default group by moved out.
+    expect(cardEl().textContent).not.toContain('Default group by');
+    expect(document.getElementById('app-settings-default-group-by')).toBeNull();
+
+    // Behavior tab: Show Group by moved out.
+    clickTab('behavior');
+    expect(cardEl().textContent).not.toContain('Show Group by');
+    expect(cardEl().textContent).not.toContain('Default group by');
+    expect(document.getElementById('app-settings-default-group-by')).toBeNull();
+
+    // Appearance tab: both controls present, each exactly once.
+    fireEvent.click(document.getElementById('app-settings-tab-appearance')!);
+    expect(cardEl().textContent).toContain('Show Group by');
+    expect(cardEl().textContent).toContain('Default group by');
+    const groupBySwitches = Array.from(
+      document.body.querySelectorAll<HTMLElement>('[role="switch"]'),
+    ).filter((element) => element.textContent?.includes('Show Group by'));
+    expect(groupBySwitches).toHaveLength(1);
+    expect(document.body.querySelectorAll('#app-settings-default-group-by')).toHaveLength(1);
+  });
+
+  it('toggles Show Group by on the Appearance tab and persists it', () => {
+    render(<AppSettingsModal open onClose={() => {}} />);
+    fireEvent.click(document.getElementById('app-settings-tab-appearance')!);
+    const groupSwitch = Array.from(document.body.querySelectorAll<HTMLElement>('[role="switch"]'))
+      .find((element) => element.textContent?.includes('Show Group by'))!;
+    expect(groupSwitch.getAttribute('aria-checked')).toBe('false');
+
+    fireEvent.click(groupSwitch);
+    expect(useAppSettingsStore.getState().showGroupBy).toBe(true);
+    expect(updateUiSettingsMock).toHaveBeenCalledWith({ showGroupBy: true });
+    expect(groupSwitch.getAttribute('aria-checked')).toBe('true');
+
+    fireEvent.click(groupSwitch);
+    expect(useAppSettingsStore.getState().showGroupBy).toBe(false);
+    expect(updateUiSettingsMock).toHaveBeenLastCalledWith({ showGroupBy: false });
+    expect(groupSwitch.getAttribute('aria-checked')).toBe('false');
+  });
+
+  it('toggles the desktop sidebar collapse handle on the Appearance tab and persists it', () => {
+    render(<AppSettingsModal open onClose={() => {}} />);
+    fireEvent.click(document.getElementById('app-settings-tab-appearance')!);
+    const handleSwitch = Array.from(document.body.querySelectorAll<HTMLElement>('[role="switch"]'))
+      .find((element) => element.textContent?.includes('Show sidebar collapse handle'))!;
+    expect(handleSwitch.getAttribute('aria-checked')).toBe('true');
+
+    fireEvent.click(handleSwitch);
+    expect(useAppSettingsStore.getState().showSidebarCollapseHandle).toBe(false);
+    expect(updateUiSettingsMock).toHaveBeenLastCalledWith({ showSidebarCollapseHandle: false });
+    expect(handleSwitch.getAttribute('aria-checked')).toBe('false');
+
+    fireEvent.click(handleSwitch);
+    expect(useAppSettingsStore.getState().showSidebarCollapseHandle).toBe(true);
+    expect(updateUiSettingsMock).toHaveBeenLastCalledWith({ showSidebarCollapseHandle: true });
+    expect(handleSwitch.getAttribute('aria-checked')).toBe('true');
+  });
+
+  it('changes Default group by on the Appearance tab and persists the selection', () => {
+    render(<AppSettingsModal open onClose={() => {}} />);
+    fireEvent.click(document.getElementById('app-settings-tab-appearance')!);
+    const select = document.body.querySelector<HTMLSelectElement>(
+      '#app-settings-default-group-by',
+    )!;
+    expect(select).toBeTruthy();
+    fireEvent.change(select, { target: { value: 'workdir' } });
+    expect(useAppSettingsStore.getState().defaultGroupBy).toBe('workdir');
+    expect(updateUiSettingsMock).toHaveBeenCalledWith({ defaultGroupBy: 'workdir' });
+    expect(select.value).toBe('workdir');
+  });
+
+  it('scopes Reset to saved UI preferences and keeps lifecycle/worker/remote untouched', () => {
     useAppSettingsStore.setState({
       ...DEFAULT_SETTINGS,
       defaultGroupBy: 'manager',
       showMetaAgent: false,
       showTaskAgent: false,
       showQQ: false,
-      notifications: { codexWarningToast: false, confirmCrossWorkspaceManagement: true },
+      reportWorkerKillErrors: true,
+      showCodexTerminalInput: true,
+      notifications: { codexWarningToast: false, lockerDesktop: false, unreadRecording: ['all'], confirmCrossWorkspaceManagement: true, confirmAgentSystemQueueEdit: true },
     });
     render(<AppSettingsModal open onClose={() => {}} />);
+    expect(
+      Array.from(document.body.querySelectorAll('button'))
+        .some((button) => button.textContent?.includes('Reset saved UI preferences')),
+    ).toBe(false);
+
+    clickTab('appearance');
+    const scope = cardEl().textContent ?? '';
+    expect(scope).toContain('It does not reset Pan lifecycle policies, worker timeouts');
+    expect(scope).toContain('Data retention, Remote settings, adapter model lists, or plugins');
     const resetBtn = Array.from(document.body.querySelectorAll<HTMLElement>('button')).find((b) =>
-      b.textContent?.includes('Reset to defaults'),
+      b.textContent?.includes('Reset saved UI preferences'),
     )!;
     fireEvent.click(resetBtn);
+
     const s = useAppSettingsStore.getState();
     expect(s.defaultGroupBy).toBe(DEFAULT_SETTINGS.defaultGroupBy);
     expect(s.showMetaAgent).toBe(true);
     expect(s.showTaskAgent).toBe(true);
     expect(s.showQQ).toBe(true);
+    expect(s.reportWorkerKillErrors).toBe(DEFAULT_SETTINGS.reportWorkerKillErrors);
+    expect(s.showCodexTerminalInput).toBe(DEFAULT_SETTINGS.showCodexTerminalInput);
     expect(s.notifications.codexWarningToast).toBe(true);
     expect(s.notifications.confirmCrossWorkspaceManagement).toBe(true);
     expect(s.keepScrollOnSessionSwitch).toBe(DEFAULT_SETTINGS.keepScrollOnSessionSwitch);
     expect(s.showMessageNavigationRail).toBe(DEFAULT_SETTINGS.showMessageNavigationRail);
+    expect(updateUiSettingsMock).toHaveBeenCalledTimes(1);
+    expect(updateSessionLifecyclePreferencesMock).not.toHaveBeenCalled();
+    expect(restartMainServiceMock).not.toHaveBeenCalled();
+    expect(exitMainServiceMock).not.toHaveBeenCalled();
   });
 
   it('requires confirmation and reports successful main-service recovery', async () => {
@@ -892,18 +1747,26 @@ describe('AppSettingsModal', () => {
         (b) => b.textContent?.includes('Restart Pan main service'),
       );
       expect(button).toBeTruthy();
+      expect(button!.disabled).toBe(false);
       return button!;
     });
 
     fireEvent.click(restartButton);
     expect(cardEl().textContent).toContain('Confirm restart');
+    const restartConfirmButton = Array.from(
+      document.body.querySelectorAll<HTMLButtonElement>('button'),
+    ).find((button) => button.textContent?.includes('Confirm restart'))!;
+    expect(restartConfirmButton.disabled).toBe(true);
+    const preserveRunningChoice = Array.from(
+      document.body.querySelectorAll<HTMLInputElement>('input[name="main-restart-running-session-state"]'),
+    ).find((input) => input.parentElement?.textContent?.includes('preserve unfinished execution as Illegal'))!;
+    fireEvent.click(preserveRunningChoice);
     fireEvent.click(
-      Array.from(document.body.querySelectorAll<HTMLButtonElement>('button')).find((b) =>
-        b.textContent?.includes('Confirm restart'),
-      )!,
+      restartConfirmButton,
     );
-    expect(restartMainServiceMock).toHaveBeenCalledTimes(1);
-    expect(cardEl().textContent).toContain('Waiting for /api/health');
+    await waitFor(() => expect(restartMainServiceMock).toHaveBeenCalledTimes(1));
+    expect(restartMainServiceMock).toHaveBeenCalledWith({ markRunningSessionsOffline: false });
+    await waitFor(() => expect(cardEl().textContent).toContain('Waiting for /api/health'));
 
     // The first probe is delayed so a still-live old process cannot be
     // mistaken for the replacement.  Health resolves on the first probe.
@@ -921,6 +1784,7 @@ describe('AppSettingsModal', () => {
         (b) => b.textContent?.includes('Exit Pan main service'),
       );
       expect(button).toBeTruthy();
+      expect(button!.disabled).toBe(false);
       return button!;
     });
 
@@ -978,16 +1842,25 @@ describe('AppSettingsModal', () => {
           b.textContent?.includes('Restart Pan main service'),
         )!,
       );
+      fireEvent.click(Array.from(
+        document.body.querySelectorAll<HTMLInputElement>(
+          'input[name="main-restart-running-session-state"]',
+        ),
+      ).find((input) => input.parentElement?.textContent?.includes('preserve unfinished execution as Illegal'))!);
       fireEvent.click(
         Array.from(document.body.querySelectorAll<HTMLButtonElement>('button')).find((b) =>
           b.textContent?.includes('Confirm restart'),
         )!,
       );
-      fireEvent.click(
-        Array.from(document.body.querySelectorAll<HTMLButtonElement>('button')).find((b) =>
-          b.textContent?.includes('Stop checking'),
-        )!,
-      );
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      const stopCheckingButton = Array.from(
+        document.body.querySelectorAll<HTMLButtonElement>('button'),
+      ).find((candidate) => candidate.textContent?.includes('Stop checking'));
+      expect(stopCheckingButton).toBeTruthy();
+      fireEvent.click(stopCheckingButton!);
       expect(cardEl().textContent).toContain('Health checking stopped');
       await act(async () => {
         await vi.runAllTimersAsync();
@@ -1031,6 +1904,11 @@ describe('AppSettingsModal', () => {
           b.textContent?.includes('Restart Pan main service'),
         )!,
       );
+      fireEvent.click(Array.from(
+        document.body.querySelectorAll<HTMLInputElement>(
+          'input[name="main-restart-running-session-state"]',
+        ),
+      ).find((input) => input.parentElement?.textContent?.includes('preserve unfinished execution as Illegal'))!);
       fireEvent.click(
         Array.from(document.body.querySelectorAll<HTMLButtonElement>('button')).find((b) =>
           b.textContent?.includes('Confirm restart'),
@@ -1044,5 +1922,72 @@ describe('AppSettingsModal', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('requires an explicit lifecycle status refresh when the final restart status read fails', async () => {
+    vi.useFakeTimers();
+    try {
+      fetchHealthMock.mockRejectedValue(new Error('connection refused'));
+      render(<AppSettingsModal open onClose={() => {}} />);
+      await act(async () => {
+        await vi.runOnlyPendingTimersAsync();
+      });
+      fetchMainRestartStatusMock.mockRejectedValueOnce(new Error('status API unavailable'));
+      fireEvent.click(
+        Array.from(document.body.querySelectorAll<HTMLButtonElement>('button')).find((b) =>
+          b.textContent?.includes('Restart Pan main service'),
+        )!,
+      );
+      fireEvent.click(Array.from(
+        document.body.querySelectorAll<HTMLInputElement>(
+          'input[name="main-restart-running-session-state"]',
+        ),
+      ).find((input) => input.parentElement?.textContent?.includes('preserve unfinished execution as Illegal'))!);
+      fireEvent.click(
+        Array.from(document.body.querySelectorAll<HTMLButtonElement>('button')).find((b) =>
+          b.textContent?.includes('Confirm restart'),
+        )!,
+      );
+      await act(async () => {
+        await vi.runAllTimersAsync();
+      });
+
+      expect(screen.getByRole('alert').textContent).toContain('status API unavailable');
+      expect(screen.getByRole('button', { name: 'Refresh status' })).toBeTruthy();
+      expect(Array.from(document.body.querySelectorAll<HTMLButtonElement>('button'))
+        .find((button) => button.textContent?.includes('Restart Pan main service'))?.disabled)
+        .toBe(true);
+      expect(Array.from(document.body.querySelectorAll<HTMLButtonElement>('button'))
+        .find((button) => button.textContent?.includes('Exit Pan main service'))?.disabled)
+        .toBe(true);
+
+      fireEvent.click(screen.getByRole('button', { name: 'Refresh status' }));
+      await act(async () => { await Promise.resolve(); });
+      expect(screen.queryByRole('alert')).toBeNull();
+      expect(Array.from(document.body.querySelectorAll<HTMLButtonElement>('button'))
+        .find((button) => button.textContent?.includes('Exit Pan main service'))?.disabled)
+        .toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('disables restart and exit when the platform denies service.lifecycle', async () => {
+    usePlatformStore.setState({ platform: 'darwin', capabilities: { 'service.lifecycle': false } });
+    render(<AppSettingsModal open onClose={() => {}} />);
+    await waitFor(() => {
+      expect(Array.from(document.body.querySelectorAll<HTMLButtonElement>('button'))
+        .find((button) => button.textContent?.includes('Restart Pan main service'))?.disabled)
+        .toBe(true);
+    });
+    const restartButton = Array.from(document.body.querySelectorAll<HTMLButtonElement>('button'))
+      .find((button) => button.textContent?.includes('Restart Pan main service'))!;
+    const exitButton = Array.from(document.body.querySelectorAll<HTMLButtonElement>('button'))
+      .find((button) => button.textContent?.includes('Exit Pan main service'))!;
+    expect(restartButton.textContent).toContain('Not available on this platform (macOS)');
+    expect(exitButton.disabled).toBe(true);
+    expect(exitButton.textContent).toContain('Not available on this platform (macOS)');
+    expect(restartMainServiceMock).not.toHaveBeenCalled();
+    expect(exitMainServiceMock).not.toHaveBeenCalled();
   });
 });

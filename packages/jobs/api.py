@@ -6,6 +6,7 @@
 - ``POST /api/jobs``           创建可创建的 kind（按 kind 严格校验字段）
 - ``GET  /api/jobs/{id}``       详情（结构化 source/target 视图）
 - ``PATCH /api/jobs/{id}``      按 kind 更新其允许字段
+- ``PUT /api/jobs/{id}/pin``    持久化 Pan 展示置顶元数据
 - ``DELETE /api/jobs/{id}``     删除
 - ``GET  /api/jobs/{id}/runs``  执行历史（runs.jsonl，最新在前）
 - ``POST /api/jobs/{id}/run-now`` 手动触发 scheduled-task action（含 shell）
@@ -27,12 +28,15 @@ import inspect
 import math
 from datetime import datetime
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
+from packages.automation.authorization import may_read_jobs, require_job
 
 from packages.core import background_jobs
 from packages.core import config as _config
+from packages.jobs.actions import normalize_scheduled_qq_action
 from packages.jobs import cron as _job_cron
 from packages.jobs import templates as _job_templates
+from packages.jobs import pan_bridge, pins
 
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 
@@ -58,7 +62,14 @@ def _err(code: str, message: str):
 
 
 def _view(job: dict) -> dict:
-    return background_jobs.job_public_view(job)
+    from packages.jobs.action_runtime import for_root, is_action_job
+    runtime=for_root(_job_root())
+    if is_action_job(job) and runtime:
+        job=runtime.view(job)
+    value, status = pins.snapshot(_job_root())
+    from packages.jobs.unified import project
+    return {**background_jobs.job_public_view(job),'unified':job.get('unified') or project(job),
+            **pins.presentation(job["jobId"], value, status)}
 
 
 def _job_root():
@@ -80,7 +91,8 @@ def _find_job(job_id: str) -> dict | None:
     for candidate in background_jobs.list_jobs(registry_root=_job_root()):
         if candidate.get("taskId") == job_id:
             return candidate
-    return None
+    remote = pan_bridge.request("get", job_id)
+    return pan_bridge.public_job(remote) if remote is not None else None
 
 
 def _emit(event: dict) -> None:
@@ -117,20 +129,38 @@ async def _drain(awaitable) -> None:
 @router.get("")
 @router.get("/")
 async def list_jobs(kind: str | None = None, status: str | None = None,
-                    includeCompleted: bool = True):
+                    includeCompleted: bool = True, request: Request = None):
     """全部 kind 的 job 列表；active-first 排序，可按 kind/status 过滤。"""
     jobs = [background_jobs.job_public_view(j)
             for j in background_jobs.list_jobs(registry_root=_job_root())
             if not j.get("scheduledParentJobId")]
+    remote = pan_bridge.request("list")
+    if remote is not None:
+        if not isinstance(remote, dict) or not isinstance(remote.get("jobs"), list):
+            raise pan_bridge.JobServiceUnavailable("invalid independent Job service response")
+        local_ids = {job["jobId"] for job in jobs}
+        for item in remote["jobs"]:
+            job = pan_bridge.public_job(item)
+            if job["jobId"] not in local_ids:
+                jobs.append(background_jobs.job_public_view(job))
+    from packages.jobs.action_runtime import for_root, is_action_job
+    if not await may_read_jobs(request):
+        jobs=[j for j in jobs if not is_action_job(j)]
+    runtime=for_root(_job_root())
+    if runtime:
+        jobs=[await asyncio.to_thread(runtime.view,j) if is_action_job(j) else j for j in jobs]
+    pinned, pin_status = pins.snapshot(_job_root())
+    from packages.jobs.unified import project
+    jobs = [{**job, 'unified':job.get('unified') or project(job), **pins.presentation(job["jobId"], pinned, pin_status)} for job in jobs]
     if kind:
         jobs = [j for j in jobs if j.get("kind") == kind]
     if status:
         jobs = [j for j in jobs if j.get("status") == status]
     if not includeCompleted:
         jobs = [j for j in jobs if j.get("status") != "completed"]
-    jobs.sort(key=lambda j: (_KIND_ORDER.get(str(j.get("status")), 9),
+    jobs.sort(key=lambda j: (not j.get("pinned", False), _KIND_ORDER.get(str(j.get("status")), 9),
                              str(j.get("updatedAt") or "")), reverse=False)
-    return _ok(jobs=jobs)
+    return _ok(jobs=jobs, pinMetadataStatus=pin_status)
 
 
 def _all_retention_settings() -> tuple[dict, dict[str, bool]]:
@@ -260,23 +290,28 @@ def _normalize_scheduled_action(action: object):
     if api == background_jobs.RESUME_LEGAL_RUNNING_ACTION:
         error = _unknown_fields(action, {"api"}, "resume legal running action")
         return ({"api": api}, None) if not error else (None, error)
+    if api == "send_qq":
+        return normalize_scheduled_qq_action(action)
     if api != "shell":
         return None, ("action.api must be assign, send_session, "
-                      "resume_legal_running, or shell")
+                      "resume_legal_running, send_qq, or shell")
     error = _unknown_fields(action, {"api", "args"}, "shell action")
     args = action.get("args")
     if not isinstance(args, dict):
         return None, "shell action requires an args object"
-    error = error or _unknown_fields(args, {"command", "cwd"}, "shell action args")
+    error = error or _unknown_fields(args, {"command", "cwd", "hideWindow"}, "shell action args")
     if error:
         return None, error
     try:
         command, cwd = background_jobs.validate_shell_action(
             args.get("command"), args.get("cwd"))
+        from packages.jobs.window import validate_hide_window
+        validate_hide_window(args.get("hideWindow", True))
     except ValueError as exc:
         return None, str(exc)
     return {"api": "shell", "args": {
-        "command": command, "cwd": str(cwd)}}, None
+        "command": command, "cwd": str(cwd),
+        **({"hideWindow": args["hideWindow"]} if "hideWindow" in args else {})}}, None
 
 
 def _unknown_fields(value: dict, allowed: set[str], scope: str) -> str | None:
@@ -287,6 +322,8 @@ def _unknown_fields(value: dict, allowed: set[str], scope: str) -> str | None:
 def _name_description_error(data: dict) -> str | None:
     if "name" in data and not isinstance(data["name"], str):
         return "name must be a string"
+    if isinstance(data.get("name"), str) and len(data["name"].strip()) > 200:
+        return "name must be at most 200 characters"
     if "description" in data and not isinstance(data["description"], str):
         return "description must be a string"
     return None
@@ -485,6 +522,15 @@ async def create_job(data: dict):
             if not isinstance(text, str) or not text.strip():
                 return _err("invalid_argument", f"text is required for {action_api}")
             scheduled_text = text
+        elif action_api == "send_qq":
+            action, action_error = normalize_scheduled_qq_action(action)
+            if action_error:
+                return _err("invalid_argument", action_error)
+            required_target = False
+            text = data.get("text")
+            if not isinstance(text, str) or not text.strip():
+                return _err("invalid_argument", "text is required for send_qq")
+            scheduled_text = text
         elif action_api == background_jobs.RESUME_LEGAL_RUNNING_ACTION:
             action_error = _unknown_fields(
                 action, {"api"}, "resume legal running action")
@@ -500,14 +546,17 @@ async def create_job(data: dict):
             if not isinstance(args, dict):
                 return _err("invalid_argument", "shell action requires an args object")
             action_error = action_error or _unknown_fields(
-                args, {"command", "cwd"}, "shell action args")
+                args, {"command", "cwd", "hideWindow"}, "shell action args")
             try:
                 command, cwd = background_jobs.validate_shell_action(
                     args.get("command"), args.get("cwd"))
+                from packages.jobs.window import validate_hide_window
+                validate_hide_window(args.get("hideWindow", True))
             except ValueError as exc:
                 return _err("invalid_argument", str(exc))
             action = {"api": "shell", "args": {
-                "command": command, "cwd": str(cwd)}}
+                "command": command, "cwd": str(cwd),
+                **({"hideWindow": args["hideWindow"]} if "hideWindow" in args else {})}}
             required_target = False
             scheduled_text = ""
             if "text" in data:
@@ -515,13 +564,21 @@ async def create_job(data: dict):
         else:
             return _err("invalid_argument",
                         "action.api must be assign, send_session, "
-                        "resume_legal_running, or shell")
+                        "resume_legal_running, send_qq, or shell")
         if action_error:
             return _err("invalid_argument", action_error)
-        target, target_error = _session_target(data, required=required_target)
-        if target_error:
-            return _err("invalid_argument", target_error)
-        sid = target.get("sessionId") if target else None
+        if action_api == "send_qq":
+            target, target_error = _session_target(data, required=False)
+            if target_error:
+                return _err("invalid_argument", target_error)
+            if target and target.get("sessionId"):
+                return _err("invalid_argument", "send_qq does not accept a Session target")
+            sid = None
+        else:
+            target, target_error = _session_target(data, required=required_target)
+            if target_error:
+                return _err("invalid_argument", target_error)
+            sid = target.get("sessionId") if target else None
         if action_api == background_jobs.RESUME_LEGAL_RUNNING_ACTION and sid:
             return _err("invalid_argument",
                         "resume_legal_running does not accept a fixed target Session")
@@ -562,10 +619,10 @@ async def create_job(data: dict):
         except ValueError as exc:
             return _err("invalid_schedule", str(exc))
         job = _find_job(task["id"]) or {}
-        view = background_jobs.job_public_view(job) if job else None
+        view = _view(job) if job else None
     elif kind == background_jobs.BACKGROUND_PROCESS_KIND:
         unknown = _unknown_fields(
-            data, {"kind", "name", "description", "label", "target", "argv", "cwd"},
+            data, {"kind", "name", "description", "label", "target", "argv", "cwd", "hideWindow"},
             kind)
         if unknown:
             return _err("invalid_argument", unknown)
@@ -581,16 +638,17 @@ async def create_job(data: dict):
             job = background_jobs.start(
                 sid, data.get("argv"), data.get("cwd"),
                 label=data.get("label"),
-                name=data.get("name"),
+                hide_window=data.get("hideWindow", True),
+                name=background_jobs.normalize_name(data.get("name")) or background_jobs.default_job_name(root),
                 description=data.get("description"),
                 creator_session_id=None,
-                registry_root=root,
+                registry_root=None if pan_bridge.configured_client() is not None else root,
             )
         except ValueError as exc:
             return _err("invalid_argument", str(exc))
         except OSError as exc:
             return _err("runner_spawn_failed", str(exc))
-        view = background_jobs.job_public_view(job)
+        view = _view(job)
     elif kind in {background_jobs.SESSION_MESSAGE_KIND,
                   background_jobs.SESSION_BROADCAST_KIND}:
         unknown = _unknown_fields(
@@ -632,7 +690,7 @@ async def create_job(data: dict):
                     registry_root=root)
         except ValueError as exc:
             return _err("invalid_argument", str(exc))
-        view = background_jobs.job_public_view(job)
+        view = _view(job)
     else:
         message = ("main-lifecycle is system-managed and cannot be created from Jobs"
                    if kind == background_jobs.SERVICE_LIFECYCLE_KIND
@@ -667,6 +725,7 @@ async def job_kinds():
          "hasSchedule": True, "hasProcess": False, "creatable": True,
          "createMode": "scheduled", "createFields": ["name", "description",
              "action.api", "action.args.command", "action.args.cwd",
+             "action.args.targetType", "action.args.targetId", "action.args.botUin",
              "target.sessionId", "text", "schedule[].kind", "schedule[].at",
              "schedule[].intervalSec", "schedule[].anchor", "schedule[].cron",
              "schedule[].timezone", "schedule[].enabled",
@@ -705,7 +764,7 @@ async def delete_template(template_id: str):
 
 
 @router.get("/next")
-async def next_preview(count: int = 5):
+async def next_preview(count: int = 5, request: Request = None):
     """全 kind 下一次触发点预览（scheduled-task entries + message nextRunAt）。"""
     try:
         count = max(1, min(int(count), _job_cron.MAX_PREVIEW))
@@ -713,7 +772,10 @@ async def next_preview(count: int = 5):
         count = 5
     now = datetime.now().replace(microsecond=0)
     items: list[dict] = []
+    from packages.jobs.action_runtime import is_action_job
+    permitted=await may_read_jobs(request)
     for job in background_jobs.list_jobs(registry_root=_job_root()):
+        if is_action_job(job) and not permitted:continue
         kind = job.get("kind")
         if kind == background_jobs.SCHEDULED_TASK_KIND:
             spec_entries = [entry for entry in (job.get("schedule") or [])
@@ -743,14 +805,36 @@ async def next_preview(count: int = 5):
 
 
 @router.get("/{job_id}")
-async def get_job(job_id: str):
+async def get_job(job_id: str, request: Request = None):
     job = _find_job(job_id)
     if job is None:
         return _err("not_found", f"job {job_id} not found")
-    return _ok(job=_view(job))
+    await require_job(request, job)
+    return _ok(job=await asyncio.to_thread(_view,job))
 
 
 # ── 管理 ──
+
+
+@router.put("/{job_id}/pin")
+async def pin_job(job_id: str, data: dict, request: Request = None):
+    if set(data) != {"pinned"} or type(data.get("pinned")) is not bool:
+        return _err("invalid_argument", "pinned must be a boolean and the only field")
+    job = _find_job(job_id)
+    if job is None:
+        return _err("not_found", f"job {job_id} not found")
+    await require_job(request, job, 'updateConfig')
+    # Cancelling this await cannot stop the writer thread or roll back its commit.
+    # Clients with an interrupted response must GET the Job/list to read durable state.
+    try:
+        await asyncio.to_thread(pins.set_pin, _job_root(), job["jobId"], data["pinned"])
+        view = _view(job)
+    except pins.PinMetadataUnavailable:
+        return _err("pin_metadata_unavailable", "Job pin metadata unavailable; restore it before editing pins")
+    except (OSError, ValueError, UnicodeError):
+        return _err("persistence_failed", "Could not persist Job pin metadata; read the Job to confirm current state")
+    _emit({"type": "job.updated", "jobId": job["jobId"], "job": view})
+    return _ok(job=view)
 
 
 @router.patch("/{job_id}")
@@ -759,8 +843,13 @@ async def patch_job(job_id: str, data: dict):
     if not isinstance(data, dict):
         return _err("invalid_argument", "request body must be a JSON object")
     job = _find_job(job_id)
+    from packages.jobs.action_runtime import is_protected_job as is_action_job
+    if is_action_job(job):
+        return _err('user_confirmation_required','Use protected /api/jobs/action-jobs endpoints')
     if job is None:
         return _err("not_found", f"job {job_id} not found")
+    if job.get("executionOwner") == "independent-job-service":
+        return _err("unsupported_operation", "independent Job metadata editing is not available in this phase")
 
     kind = job.get("kind")
     editable_fields = {
@@ -820,7 +909,7 @@ async def patch_job(job_id: str, data: dict):
         except ValueError as exc:
             code = "not_found" if "not found" in str(exc) else "invalid_argument"
             return _err(code, str(exc))
-        view = background_jobs.job_public_view(updated)
+        view = _view(updated)
         _emit({"type": "job.updated", "jobId": job["jobId"], "job": view})
         return _ok(job=view)
 
@@ -872,6 +961,11 @@ async def patch_job(job_id: str, data: dict):
                 and "action" not in data and sid):
             return _err("invalid_argument",
                         "resume_legal_running does not accept a fixed target Session")
+        if (kind == background_jobs.SCHEDULED_TASK_KIND
+                and isinstance(job.get("action"), dict)
+                and job["action"].get("api") == "send_qq"
+                and "action" not in data and sid):
+            return _err("invalid_argument", "send_qq does not accept a Session target")
         if sid:
             if not _session_exists(sid):
                 return _err("session_not_found", f"Session {sid} not found")
@@ -897,7 +991,11 @@ async def patch_job(job_id: str, data: dict):
             "target", {"sessionId": job.get("targetSessionId")})
         target_sid = (proposed_target.get("sessionId")
                       if isinstance(proposed_target, dict) else None)
-        if action_api in {"assign", "send_session"}:
+        if action_api == "send_qq":
+            if "target" in data and target_sid:
+                return _err("invalid_argument", "send_qq does not accept a Session target")
+            changes["target"] = {"sessionId": None}
+        elif action_api in {"assign", "send_session"}:
             if not isinstance(target_sid, str) or not target_sid.strip():
                 return _err("invalid_argument",
                             f"target.sessionId is required for {action_api}")
@@ -914,6 +1012,10 @@ async def patch_job(job_id: str, data: dict):
         if action_api in {"assign", "send_session"}:
             if not isinstance(merged_text, str) or not merged_text.strip():
                 return _err("invalid_argument", f"text is required for {action_api}")
+        elif action_api == "send_qq":
+            if not isinstance(merged_text, str) or not merged_text.strip():
+                return _err("invalid_argument", "text is required for send_qq")
+            changes["text"] = merged_text
         elif action_api == background_jobs.RESUME_LEGAL_RUNNING_ACTION:
             if ("text" in data and merged_text !=
                     background_jobs.RESUME_LEGAL_RUNNING_TEXT):
@@ -963,7 +1065,7 @@ async def patch_job(job_id: str, data: dict):
         if replaced is None:
             return _err("invalid_argument", "no updatable fields in request body")
         # 仅 schedule 替换：已生效，直接返回
-        view = background_jobs.job_public_view(replaced)
+        view = _view(replaced)
         _emit({"type": "job.updated", "jobId": job["jobId"], "job": view})
         return _ok(job=view)
 
@@ -981,24 +1083,29 @@ async def patch_job(job_id: str, data: dict):
     except ValueError as exc:
         return _err("not_found", str(exc))
     _emit({"type": "job.updated", "jobId": job["jobId"],
-           "job": background_jobs.job_public_view(updated)})
-    return _ok(job=background_jobs.job_public_view(updated))
+           "job": _view(updated)})
+    return _ok(job=_view(updated))
 
 
 @router.delete("/{job_id}")
 async def delete_job(job_id: str):
     job = _find_job(job_id)
+    from packages.jobs.action_runtime import is_protected_job as is_action_job
+    if is_action_job(job):
+        return _err('user_confirmation_required','Use protected /api/jobs/action-jobs endpoints')
     if job is None:
         return _err("not_found", f"job {job_id} not found")
+    if job.get("executionOwner") == "independent-job-service":
+        return _err("unsupported_operation", "independent Job record deletion is not available in this phase")
     try:
         if job.get("kind") == background_jobs.SCHEDULED_TASK_KIND:
             from packages.scheduler import store as scheduler_store
             task_id = job.get("taskId") or job["jobId"]
-            ok = scheduler_store.delete_task(task_id)
+            ok = await asyncio.to_thread(scheduler_store.delete_task, task_id)
             if not ok:
-                ok = background_jobs.delete_job(job["jobId"], registry_root=_job_root())
+                ok = await asyncio.to_thread(background_jobs.delete_job, job["jobId"], registry_root=_job_root())
         else:
-            ok = background_jobs.delete_job(job["jobId"], registry_root=_job_root())
+            ok = await asyncio.to_thread(background_jobs.delete_job, job["jobId"], registry_root=_job_root())
     except ValueError as exc:
         return _err("job_busy", str(exc))
     if not ok:
@@ -1008,13 +1115,14 @@ async def delete_job(job_id: str):
 
 
 @router.get("/{job_id}/runs")
-async def job_runs(job_id: str, limit: int = 100):
+async def job_runs(job_id: str, limit: int = 100, request: Request = None):
     job = _find_job(job_id)
     if job is None:
         return _err("not_found", f"job {job_id} not found")
     if not isinstance(limit, int) or limit < 1 or limit > 500:
         return _err("invalid_argument", "limit must be between 1 and 500")
     task_key = job.get("taskId") or job["jobId"]
+    await require_job(request, job)
     runs = background_jobs.list_run_records(
         task_id=task_key, limit=limit, registry_root=_job_root())
     return _ok(runs=runs)
@@ -1024,6 +1132,9 @@ async def job_runs(job_id: str, limit: int = 100):
 async def run_job_now(job_id: str):
     """手动触发一次：scheduled-task 走兼容层 run_now；message 类到点重投。"""
     job = _find_job(job_id)
+    from packages.jobs.action_runtime import is_protected_job as is_action_job
+    if is_action_job(job):
+        return _err('user_confirmation_required','Use protected /api/jobs/action-jobs endpoints')
     if job is None:
         return _err("not_found", f"job {job_id} not found")
     if job.get("kind") != background_jobs.SCHEDULED_TASK_KIND:

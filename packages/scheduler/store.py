@@ -32,6 +32,7 @@ from pathlib import Path
 
 from packages.core import background_jobs
 from packages.jobs import cron
+from packages.jobs.actions import normalize_scheduled_qq_action
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -385,10 +386,11 @@ def create_task(payload: dict) -> dict:
 
     action = payload.get("action") or {"api": "assign"}
     action_api = action.get("api") if isinstance(action, dict) else None
-    if action_api not in {"assign", "send_session", "shell",
-                          background_jobs.RESUME_LEGAL_RUNNING_ACTION}:
+    if not isinstance(action_api, str) or action_api not in {
+            "assign", "send_session", "send_qq", "shell",
+            background_jobs.RESUME_LEGAL_RUNNING_ACTION}:
         raise ValueError(
-            "action.api must be assign, send_session, resume_legal_running, or shell")
+            "action.api must be assign, send_session, resume_legal_running, send_qq, or shell")
     if action_api == "shell":
         from packages.core.background_jobs import validate_shell_action
 
@@ -405,6 +407,15 @@ def create_task(payload: dict) -> dict:
         if text != background_jobs.RESUME_LEGAL_RUNNING_TEXT:
             raise ValueError("resume_legal_running always sends the message 继续")
         action = {"api": background_jobs.RESUME_LEGAL_RUNNING_ACTION}
+    elif action_api == "send_qq":
+        action, error = normalize_scheduled_qq_action(action)
+        if error:
+            raise ValueError(error)
+        text = payload.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("text is required for send_qq")
+        if payload.get("target_session_id") is not None:
+            raise ValueError("send_qq does not accept a Session target")
     else:
         if not isinstance(action, dict) or set(action) - {"api"}:
             raise ValueError("action only accepts the api field for session actions")
@@ -420,6 +431,8 @@ def create_task(payload: dict) -> dict:
     if action_api == "shell" and isinstance(action, dict) and set(action) - {"api", "args"}:
         raise ValueError("shell action only accepts api and args")
     target = payload.get("target_session_id")
+    if action_api == "send_qq":
+        target = None
     if target is not None:
         if not isinstance(target, str) or not target.strip():
             raise ValueError("target_session_id must be a non-empty string or null")
@@ -485,6 +498,8 @@ def update_task(task_id: str, patch: dict) -> dict | None:
     :func:`replace_task_schedule`（/api/jobs PATCH 的底层）。
     """
     job = _job_for_task(task_id)
+    from packages.jobs.action_runtime import is_protected_job as is_action_job
+    if is_action_job(job):raise ValueError('Use protected Action Job configuration API')
     if job is None:
         return None
     if not isinstance(patch, dict):
@@ -608,6 +623,8 @@ def update_task(task_id: str, patch: dict) -> dict | None:
 
 def delete_task(task_id: str) -> bool:
     job = _job_for_task(task_id)
+    from packages.jobs.action_runtime import is_protected_job as is_action_job
+    if is_action_job(job):raise ValueError('Use protected Action Job configuration API')
     if job is None:
         return False
     return background_jobs.delete_job(job["jobId"], registry_root=data_root())
@@ -628,6 +645,8 @@ def replace_task_schedule(task_id: str, specs,
         ValueError: specs 非法（空/非列表/单项校验失败）。
     """
     job = _job_for_task(task_id, registry_root)
+    from packages.jobs.action_runtime import is_protected_job as is_action_job
+    if is_action_job(job):raise ValueError('Use protected Action Job configuration API')
     if job is None:
         return None
     if not isinstance(specs, list) or not specs:
@@ -661,6 +680,8 @@ def set_task_misfire_policy(task_id: str, policy: str) -> dict | None:
     if policy not in MISFIRE_POLICIES:
         raise ValueError("misfire_policy 必须是 fire_now / skip")
     job = _job_for_task(task_id)
+    from packages.jobs.action_runtime import is_protected_job as is_action_job
+    if is_action_job(job):raise ValueError('Use protected Action Job configuration API')
     if job is None:
         return None
     root = data_root()

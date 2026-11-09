@@ -132,7 +132,7 @@ def test_send_session_accepts_future_external_sources(monkeypatch):
         target.id, "task", source="meta-agent", source_session_id=caller.id))
 
     assert result["status"] == "queued"
-    assert target.queue_pending[0]["source"] == "meta-agent"
+    assert target.queue_pending[0]["source"] == "agent"  # Persisted ancestry classifies unrelated agent input.
     assert target.queue_pending[0]["sourceSessionId"] == "caller"
 
 
@@ -367,8 +367,8 @@ def test_task_history_receipt_retains_source_metadata(monkeypatch):
         "task-1", "record me", source="agent", sourceSessionId=source.id)]
     w = _worker(target.id)
 
-    async def fake_stream(_worker, _text, _source, _session):
-        return None
+    async def fake_stream(_worker, _text, _source, _session, *, on_handoff):
+        await on_handoff()
 
     monkeypatch.setattr(worker, "_consumer_stream", fake_stream)
     monkeypatch.setattr(worker, "_maybe_inject_memory",

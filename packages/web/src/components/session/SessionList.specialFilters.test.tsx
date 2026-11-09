@@ -146,6 +146,214 @@ describe('special session filters (has subagent / is MetaAgent)', () => {
   });
 });
 
+describe('special session filter (idle state)', () => {
+  beforeEach(() => {
+    resetStores();
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  it('filters by "idle state" and keeps only idle sessions', () => {
+    useSessionStore.setState({
+      sessions: [
+        mk('idle-1', 'Idle one', { workerStatus: 'idle' }),
+        mk('run-1', 'Run one', { workerStatus: 'running' }),
+        mk('none-1', 'No status'),
+      ],
+    });
+    useUIStore.setState({ specialFilters: new Set(['idle']) });
+
+    const { container } = render(<SessionList />);
+    expect(container.textContent).toContain('Idle one');
+    expect(container.textContent).not.toContain('Run one');
+    expect(container.textContent).not.toContain('No status');
+  });
+
+  it('combines the idle filter with another special filter (AND)', () => {
+    useSessionStore.setState({
+      sessions: [
+        mk('both', 'Both', { workerStatus: 'idle', queuePendingCount: 2 }),
+        mk('idleOnly', 'Idle only', { workerStatus: 'idle' }),
+        mk('queueOnly', 'Queue only', { queuePendingCount: 2 }),
+      ],
+    });
+    useUIStore.setState({ specialFilters: new Set(['idle', 'queue']) });
+
+    const { container } = render(<SessionList />);
+    expect(container.textContent).toContain('Both');
+    expect(container.textContent).not.toContain('Idle only');
+    expect(container.textContent).not.toContain('Queue only');
+  });
+
+  it('clearing the idle filter restores the full list', () => {
+    useSessionStore.setState({
+      sessions: [
+        mk('idle-1', 'Idle one', { workerStatus: 'idle' }),
+        mk('run-1', 'Run one', { workerStatus: 'running' }),
+      ],
+    });
+    useUIStore.setState({ specialFilters: new Set(['idle']) });
+
+    const { container } = render(<SessionList />);
+    expect(container.textContent).not.toContain('Run one');
+
+    act(() => {
+      useUIStore.setState({ specialFilters: new Set() });
+    });
+    expect(container.textContent).toContain('Run one');
+    expect(container.textContent).toContain('Idle one');
+  });
+
+  it('re-evaluates when a session worker status changes', () => {
+    useSessionStore.setState({
+      sessions: [
+        mk('run-1', 'Run one', { workerStatus: 'running' }),
+        mk('idle-1', 'Idle one', { workerStatus: 'idle' }),
+      ],
+    });
+    useUIStore.setState({ specialFilters: new Set(['idle']) });
+
+    const { container } = render(<SessionList />);
+    expect(container.textContent).toContain('Idle one');
+    expect(container.textContent).not.toContain('Run one');
+
+    // Status flip: run-1 goes idle, idle-1 goes running — the list follows live.
+    act(() => {
+      useSessionStore.setState({
+        sessions: [
+          mk('run-1', 'Run one', { workerStatus: 'idle' }),
+          mk('idle-1', 'Idle one', { workerStatus: 'running' }),
+        ],
+      });
+    });
+    expect(container.textContent).toContain('Run one');
+    expect(container.textContent).not.toContain('Idle one');
+  });
+
+  it('shows the empty state when no session is idle', () => {
+    useSessionStore.setState({
+      sessions: [mk('run-1', 'Run one', { workerStatus: 'running' }), mk('none-1', 'No status')],
+    });
+    useUIStore.setState({ specialFilters: new Set(['idle']) });
+
+    const { container } = render(<SessionList />);
+    expect(container.textContent).toContain('No matching sessions');
+  });
+});
+
+describe('special session filters (held / offline state)', () => {
+  beforeEach(() => {
+    resetStores();
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  it('filters by "held state" strictly on the actual worker status', () => {
+    useSessionStore.setState({
+      sessions: [
+        mk('held', 'Held one', { workerStatus: 'held', workerId: 'w1' }),
+        mk('idle', 'Idle one', { workerStatus: 'idle', workerId: 'w2' }),
+        mk('none', 'No status'),
+      ],
+    });
+    useUIStore.setState({ specialFilters: new Set(['held']) });
+
+    const { container } = render(<SessionList />);
+    expect(container.textContent).toContain('Held one');
+    expect(container.textContent).not.toContain('Idle one');
+    expect(container.textContent).not.toContain('No status');
+  });
+
+  it('filters by "offline state": absent worker or the offline status, never an unknown status', () => {
+    useSessionStore.setState({
+      sessions: [
+        mk('gone', 'Gone one', { workerStatus: null, workerId: null }),
+        mk('never', 'Never one'),
+        mk('offline', 'Offline one', { workerStatus: 'offline', workerId: null }),
+        mk('future', 'Future one', { workerStatus: 'future-state', workerId: 'w9' }),
+        mk('running', 'Run one', { workerStatus: 'running', workerId: 'w8' }),
+      ],
+    });
+    useUIStore.setState({ specialFilters: new Set(['offline']) });
+
+    const { container } = render(<SessionList />);
+    expect(container.textContent).toContain('Gone one');
+    expect(container.textContent).toContain('Never one');
+    expect(container.textContent).toContain('Offline one');
+    expect(container.textContent).not.toContain('Future one');
+    expect(container.textContent).not.toContain('Run one');
+  });
+
+  it('does not treat a null status next to a live worker id as offline', () => {
+    // Defensive: the projection emits workerStatus/workerId as a pair, so a
+    // null status with a live worker id must not be swept into offline.
+    useSessionStore.setState({
+      sessions: [
+        mk('half', 'Half one', { workerStatus: null, workerId: 'w-live' }),
+        mk('gone', 'Gone one', { workerStatus: null, workerId: null }),
+      ],
+    });
+    useUIStore.setState({ specialFilters: new Set(['offline']) });
+
+    const { container } = render(<SessionList />);
+    expect(container.textContent).toContain('Gone one');
+    expect(container.textContent).not.toContain('Half one');
+  });
+
+  it('combines offline with another special filter (AND) and clears', () => {
+    useSessionStore.setState({
+      sessions: [
+        mk('both', 'Both one', { workerStatus: null, workerId: null, queuePendingCount: 3 }),
+        mk('offlineOnly', 'Offline only', { workerStatus: null, workerId: null }),
+        mk('queueOnly', 'Queue only', { workerStatus: 'running', workerId: 'w7', queuePendingCount: 3 }),
+      ],
+    });
+    useUIStore.setState({ specialFilters: new Set(['offline', 'queue']) });
+
+    const { container } = render(<SessionList />);
+    expect(container.textContent).toContain('Both one');
+    expect(container.textContent).not.toContain('Offline only');
+    expect(container.textContent).not.toContain('Queue only');
+
+    act(() => {
+      useUIStore.setState({ specialFilters: new Set() });
+    });
+    expect(container.textContent).toContain('Offline only');
+    expect(container.textContent).toContain('Queue only');
+  });
+
+  it('re-evaluates when a worker is released or dies', () => {
+    useSessionStore.setState({
+      sessions: [
+        mk('a', 'Alpha', { workerStatus: 'running', workerId: 'w1' }),
+        mk('b', 'Bravo', { workerStatus: 'held', workerId: 'w2' }),
+      ],
+    });
+    useUIStore.setState({ specialFilters: new Set(['offline']) });
+
+    const { container } = render(<SessionList />);
+    expect(container.textContent).not.toContain('Alpha');
+    expect(container.textContent).not.toContain('Bravo');
+
+    // Alpha's worker dies (status+id cleared) → offline; the held worker is
+    // released to idle → no longer offline.
+    act(() => {
+      useSessionStore.setState({
+        sessions: [
+          mk('a', 'Alpha', { workerStatus: null, workerId: null }),
+          mk('b', 'Bravo', { workerStatus: 'idle', workerId: 'w2' }),
+        ],
+      });
+    });
+    expect(container.textContent).toContain('Alpha');
+    expect(container.textContent).not.toContain('Bravo');
+  });
+});
+
 describe('select-mode hide/show sessions', () => {
   beforeEach(() => {
     resetStores();

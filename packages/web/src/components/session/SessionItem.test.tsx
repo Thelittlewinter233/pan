@@ -1,9 +1,12 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it } from 'vitest';
-import { cleanup, render, screen } from '@testing-library/react';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { SessionItem } from './SessionItem';
 import { useUIStore } from '@/stores/uiStore';
+import { useAdapterStore } from '@/stores/adapterStore';
 import { useWorkspaceStore } from '@/stores/workspaceStore';
+import { useJobStore } from '@/stores/jobStore';
+import type { Job } from '@/types/jobs';
 import type { Session } from '@/types';
 
 function session(
@@ -24,6 +27,26 @@ function session(
     ...extra,
   };
 }
+
+const job = (overrides: Partial<Job> = {}): Job => ({
+  jobId: 'job-1',
+  kind: 'session-message',
+  status: 'pending',
+  name: 'Job',
+  description: '',
+  source: { type: 'agent' },
+  target: { sessionId: 'session-1' },
+  paused: false,
+  runCount: 0,
+  createdAt: 1,
+  updatedAt: 1,
+  ...overrides,
+}) as Job;
+
+const resetJobStore = () => useJobStore.setState({
+  jobs: [], loaded: false, loading: false, error: null, pinMetadataUnavailable: false,
+  loadSeq: 0, mutationSeq: 0,
+});
 
 /**
  * A string-like value whose first `.replace()` call is counted. `stripMarkdown`
@@ -47,6 +70,19 @@ function countingText(value: string): { source: string; calls: () => number } {
 }
 
 describe('SessionItem streaming preview', () => {
+  it('honors an empty authoritative preview instead of showing the last local tool row', () => {
+    render(<SessionItem session={session('', 'idle', { lastDisplayPreview: '',
+      history: [{ role: 'tool', content: 'private tool output' }] })} isActive />);
+    expect(screen.getByTestId('session-preview-line').textContent).toBe('');
+  });
+
+  it('keeps the legacy user fallback through auxiliary and empty rows', () => {
+    render(<SessionItem session={session('', 'idle', { history: [
+      { role: 'user', content: 'question fallback' }, { role: 'assistant', content: ' \n' },
+      { role: 'thinking', content: 'internal' }, { role: 'tool', content: 'output' },
+    ] })} isActive />);
+    expect(screen.getByTestId('session-preview-line').textContent).toBe('question fallback');
+  });
   afterEach(() => cleanup());
 
   it('shows the last message for a selected completed session', () => {
@@ -57,7 +93,7 @@ describe('SessionItem streaming preview', () => {
     expect(screen.getByText('Answer body')).toBeTruthy();
   });
 
-  it('hides adapter and Workspace badges at mobile widths to leave room for session titles', () => {
+  it('places the adapter in the quick action rail and hides the Workspace badge at mobile widths', () => {
     useWorkspaceStore.setState({
       workspaces: [{ id: 'ws-mobile', name: 'Mobile Space', order: null }],
     });
@@ -69,7 +105,8 @@ describe('SessionItem streaming preview', () => {
       />,
     );
 
-    expect(container.querySelector('[data-testid="session-adapter-badge"]')?.className).toContain('max-md:hidden');
+    expect(container.querySelector('[data-testid="session-adapter-badge"]')?.className).toContain('session-quick-action-adapter');
+    expect(container.querySelector('[data-testid="session-adapter-badge"]')?.closest('[data-testid="session-quick-action-rail"]')).toBeTruthy();
     expect(container.querySelector('[data-testid="session-workspace-badge"]')?.className).toContain('max-md:hidden');
   });
 
@@ -157,5 +194,348 @@ describe('SessionItem streaming preview', () => {
     const next = countingText('## Next');
     rerender(<SessionItem session={{ ...parent, lastMessage: next.source }} isActive />);
     expect(next.calls()).toBeGreaterThan(0);
+  });
+});
+
+describe('SessionItem preview row reservation', () => {
+  afterEach(() => cleanup());
+
+  const previewLine = (container: HTMLElement) =>
+    container.querySelector('[data-testid="session-preview-line"]');
+
+  it('reserves one preview row for missing, null, empty, and whitespace sources', () => {
+    const variants: Array<{ label: string; extra: Partial<Session> }> = [
+      { label: 'missing', extra: { lastMessage: undefined } },
+      { label: 'null', extra: { lastMessage: null as unknown as string } },
+      { label: 'empty', extra: { lastMessage: '' } },
+      { label: 'whitespace', extra: { lastMessage: '  \n\t  ' } },
+    ];
+
+    for (const { label, extra } of variants) {
+      const { container, unmount } = render(
+        <SessionItem
+          session={session('', 'idle', { historyTotal: 1, history: [], ...extra })}
+          isActive={false}
+        />,
+      );
+
+      const line = previewLine(container);
+      expect(line, label).toBeTruthy();
+      expect(line!.textContent, label).toBe('');
+      expect(line!.className, label).toContain('min-h-[1.25em]');
+      expect(line!.className, label).toContain('truncate');
+      unmount();
+    }
+  });
+
+  it('keeps the long-preview truncation on the same reserved row', () => {
+    const long = 'x'.repeat(80);
+    const { container } = render(
+      <SessionItem session={session(long)} isActive={false} />,
+    );
+
+    const line = previewLine(container);
+    expect(line).toBeTruthy();
+    expect(line!.textContent).toBe(`${'x'.repeat(50)}...`);
+    expect(line!.className).toContain('min-h-[1.25em]');
+    expect(line!.className).toContain('truncate');
+  });
+});
+
+describe('SessionItem Job indicator (J)', () => {
+  afterEach(() => {
+    cleanup();
+    resetJobStore();
+  });
+
+  const jobBadge = (container: HTMLElement) =>
+    container.querySelector('[data-testid="session-job-badge"]');
+
+  it('shows a single blue J for a running job targeting the session', () => {
+    useJobStore.setState({
+      jobs: [job({ jobId: 'r1', kind: 'background-process', status: 'running' })],
+    });
+    const { container } = render(<SessionItem session={session('preview')} isActive={false} />);
+
+    const badge = jobBadge(container);
+    expect(badge).toBeTruthy();
+    expect(badge!.textContent).toBe('J');
+    expect(badge!.getAttribute('data-job-state')).toBe('running');
+    expect(badge!.className).toContain('session-job-badge');
+    // Same info-area row as the numeric badges; J is the leftmost in-flow item
+    // so it yields first under crowding, and the row stays right-anchored.
+    // Only the always-mounted hidden measurement probe is out of flow.
+    const row = badge!.closest('.session-quick-action-adapter-row');
+    expect(row).toBeTruthy();
+    const firstInFlow = Array.from(row!.children)
+      .find((child) => child.getAttribute('data-session-job-metric') !== 'probe');
+    expect(firstInFlow).toBe(badge);
+    expect(row!.className).toContain('session-quick-action-adapter-row');
+    expect(container.querySelectorAll('[data-testid="session-job-badge"]')).toHaveLength(1);
+  });
+
+  it('shows a yellow J (scheduled) for an armed scheduled/message job', () => {
+    useJobStore.setState({
+      jobs: [job({ jobId: 's1', kind: 'session-message', status: 'pending' })],
+    });
+    const { container } = render(<SessionItem session={session('preview')} isActive={false} />);
+
+    const badge = jobBadge(container);
+    expect(badge!.getAttribute('data-job-state')).toBe('scheduled');
+  });
+
+  it('keeps J out of viewport-based hiding (width decides, see SessionJobBadge)', () => {
+    useJobStore.setState({
+      jobs: [job({ jobId: 'm1', kind: 'background-process', status: 'running' })],
+    });
+    const { container } = render(<SessionItem session={session('preview')} isActive={false} />);
+    const badge = jobBadge(container)!;
+    // No max-md class: hiding is decided by the info-area width, not the
+    // viewport breakpoint (SessionJobBadge.test.tsx covers the width ladder).
+    expect(badge.className).not.toContain('max-md:hidden');
+    expect(badge.className).toContain('session-job-badge');
+    expect(badge.closest('[data-testid="session-quick-action-rail"]')).toBeTruthy();
+  });
+
+  it('aggregates multiple jobs into one J with running priority', () => {
+    useJobStore.setState({
+      jobs: [
+        job({ jobId: 'a1', kind: 'session-message', status: 'scheduled' }),
+        job({ jobId: 'a2', kind: 'session-message', status: 'pending' }),
+      ],
+    });
+    const { container, rerender } = render(<SessionItem session={session('preview')} isActive={false} />);
+    expect(jobBadge(container)!.getAttribute('data-job-state')).toBe('scheduled');
+    expect(container.querySelectorAll('[data-testid="session-job-badge"]')).toHaveLength(1);
+
+    useJobStore.setState({
+      jobs: [
+        job({ jobId: 'a1', kind: 'session-message', status: 'scheduled' }),
+        job({ jobId: 'a2', kind: 'session-message', status: 'pending' }),
+        job({ jobId: 'a3', kind: 'background-process', status: 'running' }),
+      ],
+    });
+    rerender(<SessionItem session={session('preview')} isActive={false} />);
+    expect(jobBadge(container)!.getAttribute('data-job-state')).toBe('running');
+    expect(container.querySelectorAll('[data-testid="session-job-badge"]')).toHaveLength(1);
+  });
+
+  it('shows no J for a job targeting another session', () => {
+    useJobStore.setState({
+      jobs: [job({ jobId: 'o1', status: 'running', target: { sessionId: 'other-session' } })],
+    });
+    const { container } = render(<SessionItem session={session('preview')} isActive={false} />);
+    expect(jobBadge(container)).toBeNull();
+  });
+
+  it('removes J when the last targeted job reaches a terminal state', () => {
+    useJobStore.setState({
+      jobs: [job({ jobId: 't1', kind: 'background-process', status: 'running' })],
+    });
+    const { container, rerender } = render(<SessionItem session={session('preview')} isActive={false} />);
+    expect(jobBadge(container)).toBeTruthy();
+
+    useJobStore.getState().upsertJob(
+      job({ jobId: 't1', kind: 'background-process', status: 'completed' }),
+    );
+    rerender(<SessionItem session={session('preview')} isActive={false} />);
+    expect(jobBadge(container)).toBeNull();
+  });
+
+  it('shows no J while the process job is only starting, paused, or disabled', () => {
+    useJobStore.setState({
+      jobs: [
+        job({ jobId: 'st', kind: 'background-process', status: 'starting' }),
+        job({ jobId: 'pa', kind: 'scheduled-task', status: 'scheduled', paused: true }),
+        job({ jobId: 'pb', kind: 'scheduled-task', status: 'scheduled', enabled: false }),
+        job({ jobId: 'pc', kind: 'scheduled-task', status: 'pending' }),
+      ],
+    });
+    const { container } = render(<SessionItem session={session('preview')} isActive={false} />);
+    expect(jobBadge(container)).toBeNull();
+  });
+
+  it('appears from a cold mount when the WS-created job lands, and clears on delete', () => {
+    const { container, rerender } = render(<SessionItem session={session('preview')} isActive={false} />);
+    expect(jobBadge(container)).toBeNull();
+
+    // job.created (WS) after the card mounted.
+    useJobStore.setState({
+      jobs: [job({ jobId: 'w1', kind: 'session-message', status: 'scheduled' })],
+    });
+    rerender(<SessionItem session={session('preview')} isActive={false} />);
+    expect(jobBadge(container)!.getAttribute('data-job-state')).toBe('scheduled');
+
+    // job.deleted (WS).
+    useJobStore.getState().removeJob('w1');
+    rerender(<SessionItem session={session('preview')} isActive={false} />);
+    expect(jobBadge(container)).toBeNull();
+  });
+
+  it('keeps numeric badges right-aligned and intact next to J', () => {
+    useJobStore.setState({
+      jobs: [job({ jobId: 'n1', kind: 'background-process', status: 'running' })],
+    });
+    const { container } = render(
+      <SessionItem
+        session={session('preview', 'idle', { queuePendingCount: 12, unreadDoneCount: 3 })}
+        isActive={false}
+      />,
+    );
+
+    const row = container.querySelector('.session-quick-action-adapter-row')!;
+    // In-flow items only: the hidden measurement probe (metric=probe) is out
+    // of flow; the badge (metric=badge) stays as the left-most visible item.
+    const children = Array.from(row.children)
+      .filter((child) => child.getAttribute('data-session-job-metric') !== 'probe');
+    expect(children[0]!.getAttribute('data-testid')).toBe('session-job-badge');
+    expect(children[1]!.getAttribute('data-testid')).toBe('session-queue-badge');
+    expect(children[2]!.getAttribute('data-testid')).toBe('session-unread-done-badge');
+    // The adapter chip stays the right-most item: the whole row (J included)
+    // is anchored to the rail's bottom-right, so numbers stay right-aligned.
+    expect(children[3]!.getAttribute('data-testid')).toBe('session-adapter-badge');
+    expect(container.querySelector('[data-testid="session-queue-badge"]')!.textContent).toBe('12');
+    expect(container.querySelector('[data-testid="session-unread-done-badge"]')!.textContent).toBe('3');
+  });
+
+  it('renders the info-area row for a job-only session (no adapter counts needed)', () => {
+    useJobStore.setState({
+      jobs: [job({ jobId: 'only', kind: 'session-message', status: 'scheduled' })],
+    });
+    const { container } = render(
+      <SessionItem
+        session={session('preview', 'idle', {
+          adapter: undefined as unknown as string,
+          queuePendingCount: 0,
+          unreadDoneCount: 0,
+        })}
+        isActive={false}
+      />,
+    );
+    expect(jobBadge(container)).toBeTruthy();
+    expect(container.querySelector('.session-quick-action-adapter-row')).toBeTruthy();
+  });
+
+  it('does not select the card when the read-only J is clicked', () => {
+    useJobStore.setState({
+      jobs: [job({ jobId: 'c1', kind: 'background-process', status: 'running' })],
+    });
+    const onSelect = vi.fn();
+    const { container } = render(
+      <SessionItem session={session('preview')} isActive={false} onSelect={onSelect} />,
+    );
+    fireEvent.click(jobBadge(container)!);
+    fireEvent.doubleClick(jobBadge(container)!);
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+});
+
+describe('SessionItem model multiplier suffix', () => {
+  afterEach(() => cleanup());
+
+  it('appends the multiplier suffix from the session adapter config', () => {
+    useAdapterStore.setState({
+      currentAdapter: 'cbc',
+      adapterConfigs: {
+        cbc: {
+          models: ['step-5-preview'],
+          defaultModel: 'step-5-preview',
+          effortValues: [],
+          permissionModes: [],
+          defaultPermissionMode: '',
+          supportedSettings: ['model'],
+          modelCreditMultipliers: { 'step-5-preview': 0 },
+        },
+      },
+    });
+    render(
+      <SessionItem
+        session={session('preview', 'idle', { adapter: 'cbc', model: 'step-5-preview' })}
+        isActive={false}
+      />,
+    );
+    // 0 是有效倍率（免费模型），显示 x0 而不是当作未知
+    expect(screen.getByText('step-5-preview (x0)')).toBeTruthy();
+  });
+
+  it('shows the raw model name when the adapter config has no multipliers', () => {
+    useAdapterStore.setState({ currentAdapter: 'cbc', adapterConfigs: {} });
+    render(
+      <SessionItem
+        session={session('preview', 'idle', { adapter: 'cbc', model: 'glm-5.3-flash' })}
+        isActive={false}
+      />,
+    );
+    expect(screen.getByText('glm-5.3-flash')).toBeTruthy();
+  });
+
+  it('uses the session adapter config, not the current adapter, for the suffix', () => {
+    useAdapterStore.setState({
+      currentAdapter: 'cbc',
+      adapterConfigs: {
+        cbc: {
+          models: ['step-5-preview'],
+          defaultModel: 'step-5-preview',
+          effortValues: [],
+          permissionModes: [],
+          defaultPermissionMode: '',
+          supportedSettings: ['model'],
+          modelCreditMultipliers: { 'step-5-preview': 0.08 },
+        },
+      },
+    });
+    // Session 属于 kimi（无倍率配置）：即使当前 adapter 是 cbc 也只显原名
+    render(
+      <SessionItem
+        session={session('preview', 'idle', { adapter: 'kimi', model: 'step-5-preview' })}
+        isActive={false}
+      />,
+    );
+    expect(screen.getByText('step-5-preview')).toBeTruthy();
+  });
+});
+
+describe('SessionItem workdir display', () => {
+  afterEach(() => cleanup());
+
+  const workdir = 'D:/project/pan-worktrees/session-card-workdir-20261025';
+
+  it('does not render the workdir on the card', () => {
+    const { container } = render(
+      <SessionItem
+        session={session('preview', 'idle', { workdir })}
+        isActive={false}
+      />,
+    );
+
+    // Neither the full path nor any shortened segment may appear in the card.
+    expect(container.textContent).not.toContain(workdir);
+    expect(container.textContent).not.toContain('session-card-workdir-20261025');
+    // The old folder span also exposed the full path as a title tooltip.
+    const titles = Array.from(container.querySelectorAll('[title]'))
+      .map((el) => el.getAttribute('title') ?? '');
+    expect(titles.some((title) => title.includes(workdir))).toBe(false);
+  });
+
+  it('keeps title, preview, message count, model, and credit without the workdir', () => {
+    useAdapterStore.setState({ currentAdapter: 'codex', adapterConfigs: {} });
+    render(
+      <SessionItem
+        session={session('## Answer\n\n**body**', 'idle', {
+          workdir,
+          model: 'step-5-preview',
+          totalUsage: { credit: 1.5 },
+        })}
+        isActive={false}
+      />,
+    );
+
+    expect(screen.getByText('Codex')).toBeTruthy();
+    expect(screen.getByText('Answer body')).toBeTruthy();
+    expect(screen.getByText('1')).toBeTruthy(); // historyTotal
+    expect(screen.getByText('step-5-preview')).toBeTruthy();
+    expect(screen.getByText('1.50 cr')).toBeTruthy();
+    // Sanity: the workdir is gone while every other field above still renders.
+    expect(screen.queryByText(/workdir-20261025/)).toBeNull();
   });
 });

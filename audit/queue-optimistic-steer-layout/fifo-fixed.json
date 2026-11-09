@@ -1,0 +1,389 @@
+[
+  {
+    "outcome": "write-failed",
+    "reserved": {
+      "history": [],
+      "queue": [
+        {
+          "id": "q_write-failed",
+          "queueItemId": "q_write-failed",
+          "type": "task",
+          "source": "agent",
+          "sourceSessionId": "ses_1234567890abcdef",
+          "taskId": "T-fifo",
+          "taskIdSource": "active",
+          "text": "FIFO body",
+          "revision": 1,
+          "deliveryState": "writing",
+          "parts": [
+            {
+              "type": "text",
+              "text": "FIFO body"
+            },
+            {
+              "type": "attachment",
+              "__serverPath": "D:\\project\\pan-worktrees\\queue-optimistic-steer-layout-20261007\\audit\\queue-optimistic-steer-layout\\runtime\\fifo\\attachment.txt",
+              "displayName": "attachment.txt"
+            }
+          ],
+          "reservedBy": "w",
+          "reservedGeneration": 0,
+          "reservedAt": 1791377221.545928
+        }
+      ]
+    },
+    "finalHistory": [],
+    "finalQueue": [
+      {
+        "id": "q_write-failed",
+        "queueItemId": "q_write-failed",
+        "type": "task",
+        "source": "agent",
+        "sourceSessionId": "ses_1234567890abcdef",
+        "taskId": "T-fifo",
+        "taskIdSource": "active",
+        "text": "FIFO body",
+        "revision": 1,
+        "deliveryState": "queued",
+        "parts": [
+          {
+            "type": "text",
+            "text": "FIFO body"
+          },
+          {
+            "type": "attachment",
+            "__serverPath": "D:\\project\\pan-worktrees\\queue-optimistic-steer-layout-20261007\\audit\\queue-optimistic-steer-layout\\runtime\\fifo\\attachment.txt",
+            "displayName": "attachment.txt"
+          }
+        ],
+        "deliveryAttempts": 1,
+        "nextAttemptAt": 1791377222.5480857,
+        "lastDeliveryError": "simulated stdin failure"
+      }
+    ],
+    "acked": false,
+    "events": []
+  },
+  {
+    "outcome": "handed-off",
+    "reserved": {
+      "history": [],
+      "queue": [
+        {
+          "id": "q_handed-off",
+          "queueItemId": "q_handed-off",
+          "type": "task",
+          "source": "agent",
+          "sourceSessionId": "ses_1234567890abcdef",
+          "taskId": "T-fifo",
+          "taskIdSource": "active",
+          "text": "FIFO body",
+          "revision": 1,
+          "deliveryState": "writing",
+          "parts": [
+            {
+              "type": "text",
+              "text": "FIFO body"
+            },
+            {
+              "type": "attachment",
+              "__serverPath": "D:\\project\\pan-worktrees\\queue-optimistic-steer-layout-20261007\\audit\\queue-optimistic-steer-layout\\runtime\\fifo\\attachment.txt",
+              "displayName": "attachment.txt"
+            }
+          ],
+          "reservedBy": "w",
+          "reservedGeneration": 0,
+          "reservedAt": 1791377221.5525208
+        }
+      ]
+    },
+    "finalHistory": [
+      {
+        "role": "user",
+        "content": "FIFO body",
+        "queueItemIds": [
+          "q_handed-off"
+        ],
+        "delivered_keys": [
+          "task:q_handed-off"
+        ],
+        "kind": "task",
+        "queueEnvelopes": [
+          {
+            "id": "q_handed-off",
+            "queueItemId": "q_handed-off",
+            "type": "task",
+            "source": "agent",
+            "sourceSessionId": "ses_1234567890abcdef",
+            "taskId": "T-fifo",
+            "taskIdSource": "active",
+            "text": "FIFO body",
+            "revision": 1,
+            "deliveryState": "writing",
+            "parts": [
+              {
+                "type": "text",
+                "text": "FIFO body"
+              },
+              {
+                "type": "attachment",
+                "displayName": "attachment.txt"
+              }
+            ]
+          }
+        ],
+        "source": "agent",
+        "sourceSessionId": "ses_1234567890abcdef",
+        "taskId": "T-fifo",
+        "taskIdSource": "active",
+        "parts": [
+          {
+            "type": "text",
+            "text": "FIFO body"
+          },
+          {
+            "type": "attachment",
+            "__serverPath": "D:\\project\\pan-worktrees\\queue-optimistic-steer-layout-20261007\\audit\\queue-optimistic-steer-layout\\runtime\\fifo\\attachment.txt",
+            "displayName": "attachment.txt"
+          }
+        ],
+        "messageId": "pan:2db63a6850104886b15184c6d09235d4",
+        "ts": "2026-10-07T20:47:01.553989"
+      }
+    ],
+    "finalQueue": [],
+    "acked": true,
+    "events": [
+      {
+        "type": "queue.item_delivered",
+        "sessionId": "ses_da686bfdc3c1989d",
+        "queueItemIds": [
+          "q_handed-off"
+        ],
+        "queueRevision": 2,
+        "messages": [
+          {
+            "role": "user",
+            "content": "FIFO body",
+            "queueItemIds": [
+              "q_handed-off"
+            ],
+            "deliveryKeys": [
+              "task:q_handed-off"
+            ],
+            "source": "agent",
+            "sourceSessionId": "ses_1234567890abcdef",
+            "taskId": "T-fifo",
+            "taskIdSource": "active",
+            "parts": [
+              {
+                "type": "text",
+                "text": "FIFO body"
+              },
+              {
+                "type": "attachment",
+                "displayName": "attachment.txt"
+              }
+            ],
+            "kind": "task",
+            "queueEnvelopes": [
+              {
+                "id": "q_handed-off",
+                "queueItemId": "q_handed-off",
+                "type": "task",
+                "source": "agent",
+                "sourceSessionId": "ses_1234567890abcdef",
+                "taskId": "T-fifo",
+                "taskIdSource": "active",
+                "text": "FIFO body",
+                "revision": 1,
+                "deliveryState": "sent_to_cli",
+                "parts": [
+                  {
+                    "type": "text",
+                    "text": "FIFO body"
+                  },
+                  {
+                    "type": "attachment",
+                    "displayName": "attachment.txt"
+                  }
+                ],
+                "dispatchState": "sent_to_cli",
+                "receiptAt": 1791377221.5539992,
+                "deliveredAt": 1791377221.5539992
+              }
+            ],
+            "messageId": "pan:2db63a6850104886b15184c6d09235d4",
+            "ts": "2026-10-07T20:47:01.553989"
+          }
+        ]
+      },
+      {
+        "type": "queue.snapshot",
+        "sessionId": "ses_da686bfdc3c1989d",
+        "queueRevision": 2
+      }
+    ]
+  },
+  {
+    "outcome": "receipt-save-failed",
+    "reserved": {
+      "history": [],
+      "queue": [
+        {
+          "id": "q_receipt-save-failed",
+          "queueItemId": "q_receipt-save-failed",
+          "type": "task",
+          "source": "agent",
+          "sourceSessionId": "ses_1234567890abcdef",
+          "taskId": "T-fifo",
+          "taskIdSource": "active",
+          "text": "FIFO body",
+          "revision": 1,
+          "deliveryState": "writing",
+          "parts": [
+            {
+              "type": "text",
+              "text": "FIFO body"
+            },
+            {
+              "type": "attachment",
+              "__serverPath": "D:\\project\\pan-worktrees\\queue-optimistic-steer-layout-20261007\\audit\\queue-optimistic-steer-layout\\runtime\\fifo\\attachment.txt",
+              "displayName": "attachment.txt"
+            }
+          ],
+          "reservedBy": "w",
+          "reservedGeneration": 0,
+          "reservedAt": 1791377221.5598323
+        }
+      ]
+    },
+    "finalHistory": [
+      {
+        "role": "user",
+        "content": "FIFO body",
+        "queueItemIds": [
+          "q_receipt-save-failed"
+        ],
+        "delivered_keys": [
+          "task:q_receipt-save-failed"
+        ],
+        "kind": "task",
+        "queueEnvelopes": [
+          {
+            "id": "q_receipt-save-failed",
+            "queueItemId": "q_receipt-save-failed",
+            "type": "task",
+            "source": "agent",
+            "sourceSessionId": "ses_1234567890abcdef",
+            "taskId": "T-fifo",
+            "taskIdSource": "active",
+            "text": "FIFO body",
+            "revision": 1,
+            "deliveryState": "writing",
+            "parts": [
+              {
+                "type": "text",
+                "text": "FIFO body"
+              },
+              {
+                "type": "attachment",
+                "displayName": "attachment.txt"
+              }
+            ]
+          }
+        ],
+        "source": "agent",
+        "sourceSessionId": "ses_1234567890abcdef",
+        "taskId": "T-fifo",
+        "taskIdSource": "active",
+        "parts": [
+          {
+            "type": "text",
+            "text": "FIFO body"
+          },
+          {
+            "type": "attachment",
+            "__serverPath": "D:\\project\\pan-worktrees\\queue-optimistic-steer-layout-20261007\\audit\\queue-optimistic-steer-layout\\runtime\\fifo\\attachment.txt",
+            "displayName": "attachment.txt"
+          }
+        ],
+        "messageId": "pan:f7a61d488ae1417baf1ba30ccb435ea5",
+        "ts": "2026-10-07T20:47:01.561306"
+      }
+    ],
+    "finalQueue": [],
+    "acked": true,
+    "events": [
+      {
+        "type": "queue.item_delivered",
+        "sessionId": "ses_1e485df9f3879eae",
+        "queueItemIds": [
+          "q_receipt-save-failed"
+        ],
+        "queueRevision": 2,
+        "messages": [
+          {
+            "role": "user",
+            "content": "FIFO body",
+            "queueItemIds": [
+              "q_receipt-save-failed"
+            ],
+            "deliveryKeys": [
+              "task:q_receipt-save-failed"
+            ],
+            "source": "agent",
+            "sourceSessionId": "ses_1234567890abcdef",
+            "taskId": "T-fifo",
+            "taskIdSource": "active",
+            "parts": [
+              {
+                "type": "text",
+                "text": "FIFO body"
+              },
+              {
+                "type": "attachment",
+                "displayName": "attachment.txt"
+              }
+            ],
+            "kind": "task",
+            "queueEnvelopes": [
+              {
+                "id": "q_receipt-save-failed",
+                "queueItemId": "q_receipt-save-failed",
+                "type": "task",
+                "source": "agent",
+                "sourceSessionId": "ses_1234567890abcdef",
+                "taskId": "T-fifo",
+                "taskIdSource": "active",
+                "text": "FIFO body",
+                "revision": 1,
+                "deliveryState": "sent_to_cli",
+                "parts": [
+                  {
+                    "type": "text",
+                    "text": "FIFO body"
+                  },
+                  {
+                    "type": "attachment",
+                    "displayName": "attachment.txt"
+                  }
+                ],
+                "dispatchState": "sent_to_cli",
+                "receiptAt": 1791377221.561317,
+                "deliveredAt": 1791377221.561317
+              }
+            ],
+            "messageId": "pan:f7a61d488ae1417baf1ba30ccb435ea5",
+            "ts": "2026-10-07T20:47:01.561306"
+          }
+        ]
+      },
+      {
+        "type": "queue.snapshot",
+        "sessionId": "ses_1e485df9f3879eae",
+        "queueRevision": 2
+      }
+    ]
+  }
+]

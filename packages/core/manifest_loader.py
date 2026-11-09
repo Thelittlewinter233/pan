@@ -70,6 +70,7 @@ class SessionTemplate:
     # Self-explanatory capability flags (replaces the opaque `role` enum),
     # nested under ``pan_access``; readable via the flat properties below.
     pan_access: dict = field(default_factory=dict)
+    plugin_bindings: list[dict] | None = None
 
     @property
     def mcp_locked(self) -> bool:
@@ -157,6 +158,7 @@ class ManifestConfig:
     character_templates: list[CharacterTemplate] = field(default_factory=list)
     mcp_servers: list[McpServer] = field(default_factory=list)
     command_routes: list[CommandRoute] = field(default_factory=list)
+    plugins: list[dict] = field(default_factory=list)
 
     def get_session_template(self, name: str) -> SessionTemplate | None:
         for t in self.session_templates:
@@ -240,8 +242,13 @@ def load_manifests(plugin_paths: list[str]) -> ManifestConfig:
 def _merge_manifest(config: ManifestConfig, data: dict, plugin_dir: str) -> None:
     """Merge a single manifest's data into *config* with dedup."""
     # Session templates — dedup by name. ``profiles`` is the legacy key kept
-    # for backward compatibility (pre-refactor manifests used it).
-    for raw in data.get("session_templates", data.get("profiles", [])):
+    # for backward compatibility (pre-refactor manifests used it). Read both
+    # when present so a save can append to ``session_templates`` without
+    # dropping legacy entries still stored under ``profiles``.
+    for raw in data.get("session_templates", []):
+        template = _parse_session_template(raw, plugin_dir)
+        _dedup_append(config.session_templates, template, key=lambda t: t.name)
+    for raw in data.get("profiles", []):
         template = _parse_session_template(raw, plugin_dir)
         _dedup_append(config.session_templates, template, key=lambda t: t.name)
 
@@ -254,6 +261,35 @@ def _merge_manifest(config: ManifestConfig, data: dict, plugin_dir: str) -> None
     for raw in data.get("mcp_servers", []):
         srv = _parse_mcp_server(raw, plugin_dir)
         _dedup_append(config.mcp_servers, srv, key=lambda s: s.name)
+
+    for raw in data.get("plugins", []):
+        def resolve(value):
+            if isinstance(value, str):
+                return _resolve_plugin_var(value, plugin_dir)
+            if isinstance(value, list):
+                return [resolve(v) for v in value]
+            if isinstance(value, dict):
+                return {k: resolve(v) for k, v in value.items()}
+            return value
+        plugin = resolve(raw)
+        source = plugin.get("source", {})
+        if source.get("server_ref") == "pan-qq":
+            source["server_ref"] = "qq"
+        if source.get("capabilities_file"):
+            source["capabilities_file"] = str(Path(plugin_dir, source["capabilities_file"]).resolve())
+        for panel in plugin.get("panels", []):
+            if panel.get("renderer") != "web-app/v1":
+                continue
+            build = panel.get("build")
+            if not isinstance(build, dict) or not isinstance(build.get("output"), str):
+                continue  # Schema validation reports the missing build contract.
+            # Build output and cwd are resolved against the declaring manifest,
+            # never the process CWD. Escaping the plugin directory is a manifest
+            # error: it would make the host copy unrelated local files.
+            build["cwd"] = _resolve_manifest_path(build.get("cwd") or ".", plugin_dir, "build.cwd")
+            build["output"] = _resolve_manifest_path(build["output"], plugin_dir, "build.output")
+            panel["build"] = build
+        _dedup_append(config.plugins, plugin, key=lambda p: p.get("id"))
 
     # Command routes — append all (no dedup needed; prefixes may overlap intentionally)
     for raw in data.get("command_routes", []):
@@ -293,6 +329,7 @@ def _parse_session_template(raw: dict, plugin_dir: str) -> SessionTemplate:
         mcp_servers=list(raw.get("mcp_servers", [])),
         source_manifest=plugin_dir,
         pan_access=pa,
+        plugin_bindings=raw.get("plugin_bindings"),
     )
 
 
@@ -309,6 +346,16 @@ def _parse_character_template(raw: dict, plugin_dir: str) -> CharacterTemplate:
         assets_dir=_resolve_plugin_dir(raw.get("assets_dir"), plugin_dir),
         source_manifest=plugin_dir,
     )
+
+
+def _resolve_manifest_path(value: str, plugin_dir: str, label: str) -> str:
+    """Resolve a build path against the manifest directory and fence it there."""
+    resolved = Path(plugin_dir, value).resolve()
+    try:
+        resolved.relative_to(Path(plugin_dir).resolve())
+    except ValueError as exc:
+        raise ValueError(f"Panel {label} escapes the plugin directory: {value!r}") from exc
+    return str(resolved)
 
 
 def _resolve_plugin_dir(value, plugin_dir: str) -> str | None:
@@ -364,7 +411,10 @@ def _resolve_pan_python_argv() -> list[str]:
 
 def _parse_mcp_server(raw: dict, plugin_dir: str) -> McpServer:
     """Parse an MCP server entry, resolving ${PLUGIN_DIR}."""
-    srv = McpServer(name=raw.get("name", ""))
+    name = raw.get("name", "")
+    # Normalize before dedup, so a later old-name QQ override still wins over
+    # the new built-in declaration (including its custom env/URL/command).
+    srv = McpServer(name="qq" if name == "pan-qq" else name)
     raw_args = raw.get("args", [])
     args = [
         _resolve_plugin_var(arg, plugin_dir) if isinstance(arg, str) else str(arg)

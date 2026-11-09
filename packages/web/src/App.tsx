@@ -1,21 +1,47 @@
-import { useState, useEffect, useRef } from 'react';
+import { lazy, Suspense, useState, useEffect, useRef } from 'react';
 import { ErrorBoundary } from './components/ErrorBoundary';
+import { SidebarPanelContext } from './components/layout/SidebarPanelContext';
 import { Sidebar } from './components/layout/Sidebar';
 import { WorkspaceRail } from './components/layout/WorkspaceRail';
 import { ToastContainer } from './components/ui/Toast';
 import { CommandPalette } from './components/CommandPalette';
 import { EditorConfirmationModal } from './components/editor/EditorConfirmationModal';
+import { ReimportConfirmationModal } from './components/session/ReimportConfirmationModal';
 import { StartupRecoveryPrompt } from './components/layout/StartupRecoveryPrompt';
-import { DetailPanel } from './components/detail/DetailPanel';
 import { CliStatusBanner } from './components/layout/CliStatusBanner';
 import { DemoBadge } from './demo/DemoBadge';
 import { isMockMode } from './demo/mockBackend';
 import { useMediaQuery } from './hooks/useMediaQuery';
 import { useUIStore } from './stores/uiStore';
+import { useSessionStore } from './stores/sessionStore';
+import { useDetailStore } from './stores/detailStore';
 import { useWebSocket } from './hooks/useWebSocket';
+import { usePluginPanelStore } from './stores/pluginPanelStore';
+import { usePlatformStore } from './stores/platformStore';
+import { useGlobalShortcuts } from './shortcuts/useGlobalShortcuts';
 import { Outlet, useNavigate } from 'react-router-dom';
 
+// The normally closed detail pane imports Markdown; keep it outside the
+// shell's static dependency graph, alongside the deferred chat route.
+const DetailPanel = lazy(() => import('./components/detail/DetailPanel').then(
+  (module) => ({ default: module.DetailPanel }),
+));
+
 export function Layout() {
+  const sidebarPanel = useState<HTMLElement | null>(null);
+  useEffect(() => { void usePluginPanelStore.getState().load(); }, []);
+  // One capability probe for the whole shell. It never blocks rendering:
+  // entries stay available until the server explicitly reports otherwise.
+  useEffect(() => { void usePlatformStore.getState().load(); }, []);
+  // Event-driven catalog refresh: a plugin may be installed/removed while Pan
+  // is in the background. Returning focus re-reads the real registry so new
+  // panel actions appear and removed ones stop matching, without polling.
+  useEffect(() => {
+    const refresh = () => { void usePluginPanelStore.getState().load(true); };
+    window.addEventListener('focus', refresh);
+    return () => window.removeEventListener('focus', refresh);
+  }, []);
+  const detailOpen = useDetailStore((s) => s.detailTarget !== null);
   // The dashboard connection is route-independent. Keeping this singleton
   // consumer above <Outlet> lets editor/manage continue receiving Session,
   // worker, queue and reconnect events while ChatView is unmounted.
@@ -25,6 +51,37 @@ export function Layout() {
   const setMobileSidebarOpen = useUIStore((s) => s.setMobileSidebarOpen);
   const theme = useUIStore((s) => s.theme);
   const navigate = useNavigate();
+
+  // 选中即读：当前选中的 Session 一出现未读 done（例如正在阅读时它又完成
+  // 一轮），立即按“已观察的 done generation”推进已读游标。ack 只推进游标，
+  // 重复/延迟/重试的同一游标幂等，竞态落下的新 generation 永远保留并由下一次
+  // 状态变化再次收敛；服务端游标未变时不广播，因此 WS 回放最多再多一次 ack，
+  // 不会无限循环。
+  const selectedSessionId = useSessionStore((s) => s.currentSessionId);
+  const selectedUnreadDone = useSessionStore((s) => {
+    const current = selectedSessionId
+      ? s.sessions.find((item) => item.id === selectedSessionId)
+      : undefined;
+    const value = current?.unreadDoneCount;
+    return typeof value === 'number' && Number.isFinite(value)
+      ? Math.max(0, Math.floor(value))
+      : 0;
+  });
+  const selectedUnreadGeneration = useSessionStore((s) => {
+    const current = selectedSessionId
+      ? s.sessions.find((item) => item.id === selectedSessionId)
+      : undefined;
+    const value = current?.unreadDoneGeneration;
+    return typeof value === 'number' && Number.isFinite(value)
+      ? Math.max(0, Math.floor(value))
+      : 0;
+  });
+  useEffect(() => {
+    if (selectedSessionId && selectedUnreadDone > 0 && selectedUnreadGeneration > 0) {
+      void useSessionStore.getState()
+        .ackSessionUnread(selectedSessionId, selectedUnreadGeneration);
+    }
+  }, [selectedSessionId, selectedUnreadDone, selectedUnreadGeneration]);
   const [mobileRailExpanded, setMobileRailExpanded] = useState(false);
   const mobileDrawerOpenedForDrop = useRef(false);
 
@@ -104,27 +161,13 @@ export function Layout() {
     document.documentElement.dataset.theme = theme;
   }, [theme]);
 
-  // Global keyboard shortcuts
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (e.ctrlKey || e.metaKey) {
-        if (e.key === 'b') {
-          e.preventDefault();
-          useUIStore.getState().toggleSidebar();
-        } else if (e.key === '1') {
-          e.preventDefault();
-          navigate('/');
-        } else if (e.key === '2') {
-          e.preventDefault();
-          navigate('/editor');
-        }
-      }
-    };
-    document.addEventListener('keydown', handler);
-    return () => document.removeEventListener('keydown', handler);
-  }, [navigate]);
+  // One centralized listener for every configurable app shortcut.  The old
+  // per-component document listeners (Ctrl+B/1/2 here, Ctrl+K in the palette,
+  // Ctrl+F in history search) were removed to avoid double-firing.
+  useGlobalShortcuts(navigate);
 
   return (
+    <SidebarPanelContext.Provider value={sidebarPanel}>
     <div
       className="h-screen supports-[height:100dvh]:h-dvh bg-bg-primary text-text-primary overflow-hidden"
       style={{
@@ -139,7 +182,7 @@ export function Layout() {
       {isMobile && !mobileSidebarOpen && (
         <button
           onClick={() => setMobileSidebarOpen(!mobileSidebarOpen)}
-          className="fixed top-[calc(env(safe-area-inset-top)+0.5rem)] left-2 z-50 rounded bg-bg-tertiary border border-border-default p-1.5 text-text-primary"
+          className="fixed top-[calc(env(safe-area-inset-top)+0.5rem)] left-1 z-50 rounded bg-bg-tertiary border border-border-default p-1.5 text-text-primary"
           aria-label="打开侧边栏"
           title="Toggle sidebar"
         >
@@ -206,10 +249,14 @@ export function Layout() {
       <ToastContainer />
       <StartupRecoveryPrompt />
       {isMockMode() && <DemoBadge />}
-      <DetailPanel />
+      <Suspense fallback={<aside className="w-0 overflow-hidden border-l-0" />}>
+        {detailOpen ? <DetailPanel /> : <aside className="w-0 overflow-hidden border-l-0" />}
+      </Suspense>
       <CommandPalette />
       <EditorConfirmationModal />
+      <ReimportConfirmationModal />
     </div>
+    </SidebarPanelContext.Provider>
   );
 }
 

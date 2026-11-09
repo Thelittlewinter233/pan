@@ -1,5 +1,7 @@
 interface WorkerDotProps {
   status?: string | null;
+  legalState?: string | null; // legacy display callers; never used to infer Illegal
+  illegalOffline?: boolean;
   className?: string;
 }
 
@@ -22,12 +24,20 @@ const statusColors: Record<string, string> = {
   offline: 'bg-text-tertiary',
 };
 
-export function WorkerDot({ status, className = '' }: WorkerDotProps) {
-  const color = statusColors[status || 'offline'] || statusColors.offline;
+export function WorkerDot({ status, illegalOffline, className = '' }: WorkerDotProps) {
+  const legalRunningMismatch = illegalOffline === true;
+  const color = legalRunningMismatch
+    ? 'bg-danger'
+    : statusColors[status || 'offline'] || statusColors.offline;
   return (
     <span
       className={`inline-block w-2 h-2 rounded-full ${color} ${className}`}
-      title={status || 'offline'}
+      title={legalRunningMismatch
+        ? 'Previous execution ended without safe finalization'
+        : status || 'offline'}
+      aria-label={legalRunningMismatch
+        ? 'Illegal offline: previous execution did not finalize safely'
+        : undefined}
     />
   );
 }

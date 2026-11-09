@@ -15,6 +15,31 @@ def _new_session(name="summary"):
     return sess.create(name=name, adapter="cbc", model="stored-model")
 
 
+def test_auxiliary_only_history_does_not_supply_a_card_body():
+    target = _new_session()
+    sess.append_history(target, {"role": "thinking", "content": "private"})
+    sess.append_history(target, {"role": "tool", "content": "output"})
+    projection = server._session_summary(target)
+    assert projection["lastMessage"] == ""
+    assert projection["historyTotal"] == 2
+
+
+@pytest.mark.parametrize("role", ["assistant", "user", "system"])
+def test_empty_body_does_not_erase_displayable_assistant_on_cold_reload(role):
+    target = _new_session()
+    sess.append_history(target, {"role": "user", "content": "question"})
+    sess.append_history(target, {"role": "assistant", "content": "answer"})
+    sess.append_history(target, {"role": role, "content": "   \n"})
+    sess.append_history(target, {"role": "thinking", "content": "internal"})
+    sess.append_history(target, {"role": "tool", "content": "output"})
+    sess.save(target)
+    sess._cache.clear()
+    sess._all_loaded = False
+    cold = next(row for row in asyncio.run(server.api_list_sessions(summary=1))["sessions"] if row["id"] == target.id)
+    assert cold["lastMessage"] == "answer"
+    assert cold["historyTotal"] == 5
+
+
 def test_summary_cold_list_does_not_load_history_config_or_attachment_io(
     monkeypatch,
 ):
@@ -50,6 +75,42 @@ def test_summary_cold_list_does_not_load_history_config_or_attachment_io(
     assert summary["lastAssistantPreview"].startswith("See [doc]")
     assert "docs/999.md" in summary["lastDisplayPreview"]
     assert summary["summaryRevision"] >= 1000
+
+
+def test_cold_managed_summary_uses_metadata_and_one_worker_snapshot(monkeypatch):
+    manager = _new_session("manager")
+    manager.workspace_ids = ["ws-existing"]
+    for index in range(200):
+        sess.append_history(manager, {"role": "assistant", "content": str(index)})
+    sess.save(manager)
+    child = _new_session("child")
+    child.managed_by = manager.id
+    sess.save(child)
+
+    sess._cache.clear()
+    sess._all_loaded = False
+    monkeypatch.setattr(sess, "_read_jsonl", lambda *_args: (_ for _ in ()).throw(
+        AssertionError("a summary relationship lookup hydrated history")
+    ))
+    snapshots = 0
+    original = server.worker.find_alive_workers_by_session
+
+    def snapshot_once():
+        nonlocal snapshots
+        snapshots += 1
+        return original()
+
+    monkeypatch.setattr(server.worker, "find_alive_workers_by_session", snapshot_once)
+    monkeypatch.setattr(server.worker, "find_alive_worker_by_session", lambda *_args: (_ for _ in ()).throw(
+        AssertionError("summary scanned the worker registry per Session")
+    ))
+
+    response = asyncio.run(server.api_list_sessions(summary=1))
+    summary = next(item for item in response["sessions"] if item["id"] == child.id)
+    assert summary["workspaceIds"] == ["ws-existing"]
+    assert summary["agentLevel"] == 2
+    assert snapshots == 1
+    assert not sess._cache[manager.id]._history_loaded
 
 
 def test_full_session_list_loads_dynamic_config_once_per_response(monkeypatch):
@@ -671,3 +732,63 @@ def test_metadata_and_full_views_keep_summary_fields_without_changing_history_co
     assert metadata["lastUserPreview"] == "keep me"
     assert "history" not in metadata
     assert full["history"][-1]["content"] == "keep me"
+
+
+@pytest.mark.parametrize("source", ["agent", "report", "automation", "system_prompt", "user"])
+def test_completed_stream_publishes_current_summary_after_injected_input(source):
+    target = _new_session("background-live")
+    sess.append_history(target, {"role": "user", "source": source,
+                                 "content": "////by agent : sender"})
+    sess.append_history(target, {"role": "assistant", "content": "current answer"})
+    event = {"type": "worker.stream", "sessionId": target.id,
+             "event": {"type": "assistant", "content": "current answer"}}
+    patch = server._attach_session_summary_patch(event)["session"]
+    assert patch["lastMessage"] == patch["lastDisplayPreview"] == "current answer"
+    assert patch["lastAssistantPreview"] == "current answer"
+    assert patch["historyRevision"] == target.history_revision
+    assert patch["historyTotal"] == 2
+    # High-frequency deltas remain transient, without duplicating full metadata.
+    delta = {**event, "event": {"type": "assistant", "delta": True, "stream_text": "partial"}}
+    assert "session" not in server._attach_session_summary_patch(delta)
+
+
+@pytest.mark.parametrize("source", ["agent", "report", "automation", "system_prompt", "user"])
+def test_input_answer_projection_survives_cold_summary_and_detail_hydration(source):
+    target = _new_session("summary-regression")
+    sess.append_history(target, {"role": "user", "source": source, "content": "MA input"})
+    input_summary = server._session_summary(target)
+    sess.append_history(target, {"role": "assistant", "content": "latest answer"})
+    sess.save(target)
+    expected = server._session_summary(target)
+    assert expected["summaryRevision"] > input_summary["summaryRevision"]
+    assert expected["historyRevision"] > input_summary["historyRevision"]
+    sess._cache.clear()
+    sess._all_loaded = False
+    cold = next(row for row in asyncio.run(server.api_list_sessions(summary=1))["sessions"]
+                if row["id"] == target.id)
+    detail = asyncio.run(server.api_get_session(target.id, view="full"))
+    for snapshot in (cold, detail):
+        assert snapshot["lastUserPreview"] == "MA input"
+        assert snapshot["lastAssistantPreview"] == "latest answer"
+        assert snapshot["lastDisplayPreview"] == "latest answer"
+        assert snapshot["summaryRevision"] >= expected["summaryRevision"]
+    assert cold["lastMessage"] == "latest answer"
+
+
+def test_paused_agent_send_does_not_project_queued_body_as_history(monkeypatch):
+    from packages.core import worker
+    target = _new_session("queued-summary")
+    target.queue_paused = True
+    sess.append_history(target, {"role": "assistant", "content": "latest answer"})
+    sess.save(target)
+    before = server._session_summary(target)
+    monkeypatch.setattr(worker, "_schedule_session_recovery", lambda _sid: None)
+    response = asyncio.run(server.api_send({
+        "sessionId": target.id, "source": "agent", "text": "not yet handed off",
+    }))
+    assert response["status"] == "queued"
+    after = server._session_summary(target)
+    assert after["lastMessage"] == before["lastMessage"] == "latest answer"
+    assert after["historyRevision"] == before["historyRevision"]
+    assert after["historyTotal"] == before["historyTotal"]
+    assert target.queue_pending[0]["text"] == "not yet handed off"

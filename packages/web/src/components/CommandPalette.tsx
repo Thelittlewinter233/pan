@@ -2,7 +2,9 @@ import { useState, useEffect, useRef, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useSessionStore } from '@/stores/sessionStore';
 import { useUIStore } from '@/stores/uiStore';
-import { nextSessionDefaultName } from '@/utils/sessionName';
+import { useAdapterStore } from '@/stores/adapterStore';
+import { createQuickNewSession } from '@/utils/quickNewSession';
+import { formatModelLabel } from '@/utils/modelLabel';
 import { Search } from 'lucide-react';
 
 interface PaletteAction {
@@ -22,7 +24,6 @@ export function CommandPalette() {
   const navigate = useNavigate();
   const sessions = useSessionStore((s) => s.sessions);
   const selectSession = useSessionStore((s) => s.selectSession);
-  const createNewSession = useSessionStore((s) => s.createNewSession);
   const {
     toggleTheme,
     showToast,
@@ -41,7 +42,7 @@ export function CommandPalette() {
     // Session
     result.push(
       { id: 'sess-new', label: 'New Session', detail: 'Create a new session', group: 'Session', action: () => {
-        createNewSession(nextSessionDefaultName(sessions))
+        createQuickNewSession()
           .then(() => showToast('Session created'))
           .catch((e) => showToast(e.message || 'Creation failed', 'error'));
       }},
@@ -54,10 +55,13 @@ export function CommandPalette() {
     // Jump to session
     for (const s of sessions.slice(0, 20)) {
       if (s.id.startsWith('__pending_')) continue;
+      // 模型名仅在无 workdir/adapter 时作为 detail 展示，同样附加倍率后缀。
+      const store = useAdapterStore.getState();
+      const multipliers = store.adapterConfigs[s.adapter ?? store.currentAdapter]?.modelCreditMultipliers;
       result.push({
         id: `sess-${s.id}`,
         label: s.name || 'Untitled',
-        detail: s.workdir || s.adapter || s.model || '',
+        detail: s.workdir || s.adapter || (s.model ? formatModelLabel(s.model, multipliers) : '') || '',
         group: 'Sessions',
         action: () => {
           selectSession(s.id);
@@ -75,7 +79,7 @@ export function CommandPalette() {
     );
 
     return result;
-  }, [sessions, navigate, selectSession, createNewSession, toggleTheme, showToast]);
+  }, [sessions, navigate, selectSession, toggleTheme, showToast]);
 
   // Filter by query
   const filtered = useMemo(() => {
@@ -109,16 +113,20 @@ export function CommandPalette() {
     }
   }, [open]);
 
-  // Keyboard listener
+  // The shell owns the configurable keydown; this component only reacts to the
+  // dispatched action so there is exactly one global listener.
   useEffect(() => {
+    const toggle = () => setOpen((prev) => !prev);
+    window.addEventListener('pan:shortcut:command-palette', toggle);
+    return () => window.removeEventListener('pan:shortcut:command-palette', toggle);
+  }, []);
+
+  // Escape is contextual to the open overlay and stays outside the registry.
+  useEffect(() => {
+    if (!open) return;
     const handler = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
-        e.preventDefault();
-        setOpen((prev) => !prev);
-      }
-      if (e.key === 'Escape' && open) {
-        setOpen(false);
-      }
+      if (e.isComposing || e.keyCode === 229) return;
+      if (e.key === 'Escape') setOpen(false);
     };
     document.addEventListener('keydown', handler);
     return () => document.removeEventListener('keydown', handler);

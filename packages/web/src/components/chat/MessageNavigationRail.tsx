@@ -1,6 +1,8 @@
+import { jumpToMessage } from './jumpToMessage';
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -9,21 +11,28 @@ import {
   type RefObject,
 } from 'react';
 import { createPortal } from 'react-dom';
-import { Bot, Loader2, UserRound } from 'lucide-react';
+import { Loader2, UserRound, Bookmark, Check, SlidersHorizontal } from 'lucide-react';
 import { useAppSettingsStore } from '@/stores/appSettingsStore';
 import { useSessionStore } from '@/stores/sessionStore';
-import { fetchSessionHistory } from '@/services/api';
+import { useBookmarkStore } from '@/stores/bookmarkStore';
+import { canonicalRowsWithOffsets, type CanonicalRow } from '@/stores/messageOrdering';
+import { fetchSessionNavigation } from '@/services/api';
 import {
-  getQuickJumpIndexItems,
-  type QuickJumpIndexItem,
-  type QuickJumpKind,
+    type NavigationKind,
 } from './messageFilter';
+import type { Message } from '@/types';
+import { NavigationIndex, NAVIGATION_PAGE_SIZE, nearestNavigationTarget, type NavigationRange, type NavigationTarget } from './navigationIndex';
 import type { ChatMessagesHandle } from './ChatMessages';
 
 interface MessageNavigationRailProps {
   chatRef: RefObject<ChatMessagesHandle | null>;
+  expanded?: boolean;
   isMobile?: boolean;
   mobileExpanded?: boolean;
+  /** Reports the tag-filter menu lifetime to a host that folds around the
+   *  rail. The menu is body-portaled, so a host kept open by pointer presence
+   *  would fold while the menu is still on screen. */
+  onFilterOpenChange?: (open: boolean) => void;
 }
 
 type IndexStatus = 'idle' | 'loading' | 'ready' | 'error';
@@ -31,7 +40,6 @@ type IndexStatus = 'idle' | 'loading' | 'ready' | 'error';
 const USER_LABEL = '\u7528\u6237';
 const RAIL_LABEL = '\u5feb\u901f\u5b9a\u4f4d';
 const PREVIEW_FALLBACK = '\u65e0\u9884\u89c8\u5185\u5bb9';
-const INDEX_PAGE_SIZE = 200;
 const LONG_PRESS_MS = 450;
 const PRE_LONG_PRESS_MOVE_PX = 10;
 
@@ -47,32 +55,89 @@ interface ScrubGesture {
 
 type PreviewMode = 'hover' | 'scrub';
 
-const FILTERS: Array<{ kind: QuickJumpKind; label: string }> = [
-  { kind: 'user', label: USER_LABEL },
-  { kind: 'worker', label: 'Worker' },
-];
+/**
+ * The single rail column shows every navigable kind in the session's original
+ * message order. Classification belongs to the shared `./messageFilter`
+ * module; the two MA ids below are the Rail-side consumption proposal
+ * (reported for coordination) and light up unchanged once the classifier
+ * emits them — the Rail never classifies by itself.
+ */
+type RailNavigationKind = NavigationKind;
 
-function MarkerIcon({ kind }: { kind: QuickJumpKind }) {
-  return kind === 'user' ? <UserRound size={13} strokeWidth={2.4} /> : <Bot size={13} strokeWidth={2.4} />;
+interface NavigationKindMeta {
+  /** Tooltip heading and marker aria label for this kind. */
+  label: string;
+  /** Compact text glyph used when the kind has no dedicated icon. */
+  tag?: string;
+  /** Marker style suffix: `message-navigation-marker-<slug>`. */
+  slug: string;
 }
 
-function nextPaint(): Promise<void> {
-  return new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+const KIND_META: Record<RailNavigationKind, NavigationKindMeta> = {
+  user: { label: USER_LABEL, slug: 'user' },
+  worker: { label: 'TA report', tag: 'Re', slug: 'worker' },
+  system: { label: 'System', tag: 'Sys', slug: 'system' },
+  maAssign: { label: 'MA assign', tag: 'MA', slug: 'ma-assign' },
+  maMsg: { label: 'MA msg', tag: 'MA', slug: 'ma-msg' },
+  bookmark: { label: 'Bookmark', slug: 'bookmark' },
+};
+
+function MarkerGlyph({ kind }: { kind: RailNavigationKind }) {
+  const { tag } = KIND_META[kind];
+  return tag
+    ? <span className="message-navigation-marker-tag" aria-hidden="true">{tag}</span>
+    : <UserRound size={13} strokeWidth={2.4} />;
+}
+
+/** A bookmarked tag keeps its own kind color and composites the bookmark
+ *  badge over its glyph at the bottom-right corner; a bookmark-kind marker
+ *  (a block without its own nav tag) is just the bookmark icon. */
+function MarkerIcon({ kind, bookmarked }: { kind: RailNavigationKind; bookmarked: boolean }) {
+  if (kind === 'bookmark') return <Bookmark size={13} strokeWidth={2.4} />;
+  if (!bookmarked) return <MarkerGlyph kind={kind} />;
+  return (
+    <span className="message-navigation-marker-composite">
+      <MarkerGlyph kind={kind} />
+      <span className="message-navigation-marker-bookmark-badge" aria-hidden="true">
+        <Bookmark size={8} strokeWidth={3} />
+      </span>
+    </span>
+  );
+}
+
+/** The tooltip/aria label: a bookmarked existing tag appends the suffix.
+ *  The suffix follows the English UI convention of the other kinds
+ *  (`User (Bookmark)`, not `用户 (Bookmark)`); the mock annotates that this
+ *  corresponds to 用户（书签）.  An undecorated tag keeps its label. */
+function markerLabel(kind: RailNavigationKind, bookmarked: boolean): string {
+  if (kind === 'bookmark') return KIND_META.bookmark.label;
+  const base = kind === 'user' ? 'User' : KIND_META[kind].label;
+  return bookmarked ? `${base} (Bookmark)` : KIND_META[kind].label;
+}
+
+/** Apply the freshest PROVEN bookmark state to one row.  `undefined` means
+ *  the store has no evidence yet and the row keeps its projection; a proven
+ *  absent mark (false) must override a stale projected `true`. */
+function withBookmark(message: Message, mark: boolean | undefined): Message {
+  if (!message.messageId || mark === undefined || mark === Boolean(message.bookmarked)) return message;
+  return { ...message, bookmarked: mark };
 }
 
 export function MessageNavigationRail({
   chatRef,
+  expanded = true,
   isMobile = false,
   mobileExpanded = false,
+  onFilterOpenChange,
 }: MessageNavigationRailProps) {
   const currentSessionId = useSessionStore((s) => s.currentSessionId);
-  const currentMessages = useSessionStore((s) => s.currentMessages);
+  const currentHistoryEpoch = useSessionStore((s) => s.currentSessionId
+    ? s.sessionTranscripts[s.currentSessionId]?.window.epoch ?? null : null);
   const historyLoadEnd = useSessionStore((s) => s.historyLoadEnd);
   const currentHistoryTotal = useSessionStore((s) => {
     const session = s.sessions.find((item) => item.id === s.currentSessionId);
-    return session?.historyTotal ?? (s.historyLoadEnd + s.currentMessages.length);
+    return session?.historyTotal ?? null;
   });
-  const ensureMessageLoaded = useSessionStore((s) => s.ensureMessageLoaded);
   const showMetaAgent = useAppSettingsStore((s) => s.showMetaAgent);
   const showTaskAgent = useAppSettingsStore((s) => s.showTaskAgent);
   const showQQ = useAppSettingsStore((s) => s.showQQ);
@@ -80,12 +145,11 @@ export function MessageNavigationRail({
     () => ({ showMetaAgent, showTaskAgent, showQQ }),
     [showMetaAgent, showTaskAgent, showQQ],
   );
-  const [activeKind, setActiveKind] = useState<QuickJumpKind>('user');
-  const [activeFromEnd, setActiveFromEnd] = useState<number | null>(null);
-  const [jumpingFromEnd, setJumpingFromEnd] = useState<number | null>(null);
+  const [activeOffset, setActiveOffset] = useState<number | null>(null);
+  const [jumpingOffset, setJumpingOffset] = useState<number | null>(null);
   const [jumpError, setJumpError] = useState<string | null>(null);
   const [hovered, setHovered] = useState<{
-    target: QuickJumpIndexItem;
+    target: NavigationTarget;
     top: number;
     left: number;
     mode: PreviewMode;
@@ -93,166 +157,313 @@ export function MessageNavigationRail({
   const listRef = useRef<HTMLDivElement>(null);
   const scrubGestureRef = useRef<ScrubGesture | null>(null);
   const suppressNextClickRef = useRef(false);
-  const [fullIndex, setFullIndex] = useState<QuickJumpIndexItem[]>([]);
-  const [indexStatus, setIndexStatus] = useState<IndexStatus>('idle');
-  const [indexTotal, setIndexTotal] = useState(0);
+  const loadedCanonicalTotal = currentHistoryTotal ?? historyLoadEnd;
+  const context = useMemo(() => {
+    const state = useSessionStore.getState();
+    const total = state.sessions.find(session => session.id === currentSessionId)?.historyTotal;
+    return { sessionId: currentSessionId, historyEpoch: currentHistoryEpoch, settings,
+      responseEpoch: (currentHistoryEpoch ?? undefined) as string | null | undefined,
+      knownTotal: total !== undefined && total !== null, completedTotal: 0, index: new NavigationIndex(total ?? state.historyLoadEnd, settings) };
+  }, [currentSessionId, currentHistoryEpoch, settings]);
+  const contextRef = useRef(context);
+  contextRef.current = context;
+  const [indexView, setIndexView] = useState<{ context: typeof context; targets: NavigationTarget[] } | null>(null);
+  const targets = useMemo(() => indexView?.context === context ? indexView.targets : [], [indexView,context]);
+  const [indexState, setIndexState] = useState<{ context: typeof context; status: IndexStatus; error: string | null } | null>(null);
+  const indexStatus = indexState?.context === context ? indexState.status : 'idle';
+  const indexError = indexState?.context === context ? indexState.error : null;
   const [indexMetrics, setIndexMetrics] = useState({ requests: 0, durationMs: 0 });
-
+  const indexTotal = context.index.total;
+  const targetsByFromEnd = useMemo(() => new Map(targets.map(target => [target.fromEnd, target])), [targets]);
+  // The freshest known bookmark marks for the selected Session.  The rail
+  // decorates from the projection AND this overlay, so a mutation made in
+  // this tab (or broadcast from another) is visible before the next
+  // navigation fetch.
+  const bookmarkedMarks = useBookmarkStore((state) =>
+    (currentSessionId ? state.sessions[currentSessionId]?.marks : undefined));
+  const bookmarksLoaded = useBookmarkStore((state) =>
+    Boolean(currentSessionId && state.sessions[currentSessionId]?.loaded));
+  const bookmarkTouched = useBookmarkStore((state) =>
+    (currentSessionId ? state.sessions[currentSessionId]?.authoritativeTouched : undefined));
+  // Tri-state lookup: a value means proven (transaction intent or
+  // authoritative evidence), `undefined` means this client does not know yet.
+  // Once an envelope is loaded (or a delta touched the id), ABSENCE is
+  // evidence and must beat a stale projected `bookmarked: true`.
+  const bookmarkMark = useCallback((messageId: string | undefined): boolean | undefined => {
+    if (!messageId) return undefined;
+    if (bookmarkedMarks && messageId in bookmarkedMarks) return Boolean(bookmarkedMarks[messageId]);
+    if (bookmarksLoaded || (bookmarkTouched && messageId in bookmarkTouched)) return false;
+    return undefined;
+  }, [bookmarkedMarks, bookmarksLoaded, bookmarkTouched]);
+  // Navigation pages carry NO bookmark projection, so every index ingestion
+  // must classify from the freshest overlay: a page that predates a local
+  // mutation would otherwise delete the overlay's entry (and a page that
+  // predates a removal would resurrect it).  The ref keeps the long-lived
+  // indexing loop on the latest marks without resubscribing or refetching.
+  const bookmarkMarkRef = useRef(bookmarkMark);
+  bookmarkMarkRef.current = bookmarkMark;
+  const withBookmarkOverlay = useCallback((rows: readonly CanonicalRow[]): CanonicalRow[] =>
+    rows.map((row) => ({ ...row, message: withBookmark(row.message, bookmarkMarkRef.current(row.message.messageId)) })), []);
+  // Rail tag-type filter: checked kinds are shown; multi-select is OR; an
+  // empty selection means no filter.  View preference only — never persisted,
+  // never sent anywhere, and the referenced offsets stay canonical.
+  const [kindFilter, setKindFilter] = useState<ReadonlySet<NavigationKind>>(() => new Set());
+  const [filterOpen, setFilterOpen] = useState(false);
+  const [filterPos, setFilterPos] = useState<{ top: number; left: number } | null>(null);
+  const visibleTargets = useMemo(
+    () => (kindFilter.size === 0 ? targets : targets.filter((target) => kindFilter.has(target.kind))),
+    [targets, kindFilter]);
+  const openEpochRef = useRef(0);
+  const operationRef = useRef<{ controller: AbortController; context: typeof context } | null>(null);
+  const pendingOpenRef = useRef<{ epoch: number; context: typeof context; range: NavigationRange | null } | null>(null);
+  const observerCleanupRef = useRef<(() => void) | null>(null);
+  const [viewportTarget, setViewportTarget] = useState<{ context: typeof context; epoch: number; offset: number } | null>(null);
+  // True while viewportTarget was set by a completed jump rather than by the
+  // nearest-tag location.  Both reuse the same marker state and CSS; the
+  // origin only decides whether real user input releases the highlight
+  // (jump: "you just jumped here") or leaves it to the location rules
+  // (nearest: the existing one-shot-per-expansion tracking).
+  const viewportFromJumpRef = useRef(false);
+  const [retryEpoch, setRetryEpoch] = useState(0);
+  const [listScroll, setListScroll] = useState(0);
+  const rowHeight = isMobile ? 45 : 27;
+  const previousListRef = useRef<{ context: typeof context; targets: NavigationTarget[] }>({context,targets:[]});
+  const targetsRef = useRef(targets); targetsRef.current = targets;
+  const continuingRef = useRef(false);
+  const pendingWantedRef = useRef(true);
+  const locationRef = useRef<{ context: typeof context; range: NavigationRange } | null>(null);
+  const appendRef = useRef({ context, total: loadedCanonicalTotal });
   const clearScrub = useCallback((suppressClick = false) => {
     const gesture = scrubGestureRef.current;
-    if (gesture?.timer !== null && gesture?.timer !== undefined) {
-      window.clearTimeout(gesture.timer);
-    }
+    if (gesture?.timer !== null && gesture?.timer !== undefined) window.clearTimeout(gesture.timer);
     scrubGestureRef.current = null;
-    if (suppressClick && gesture && (gesture.active || gesture.moved)) {
-      suppressNextClickRef.current = true;
-    }
+    if (suppressClick && gesture && (gesture.active || gesture.moved)) suppressNextClickRef.current = true;
     setHovered(null);
   }, []);
 
-  useEffect(() => {
-    clearScrub(false);
-    setHovered(null);
-    setJumpError(null);
-    setActiveFromEnd(null);
-    // The jump lock is single-flight per session: a jump that started in the
-    // previous session must not keep every marker disabled here. `jumpTo`'s
-    // finally deliberately does not touch state after a session switch, so
-    // this reset is the only thing that releases the lock.
-    setJumpingFromEnd(null);
-    setFullIndex([]);
-    setIndexTotal(0);
-    setIndexMetrics({ requests: 0, durationMs: 0 });
-    if (!currentSessionId) {
-      setIndexStatus('idle');
-      return;
+  const cancelOpenLocation = useCallback(() => {
+    pendingOpenRef.current = null;
+    observerCleanupRef.current?.(); observerCleanupRef.current = null;
+  }, []);
+
+  useLayoutEffect(() => {
+    if (loadedCanonicalTotal > context.index.total) context.index.total = loadedCanonicalTotal;
+    const previous=appendRef.current;
+    appendRef.current={context,total:loadedCanonicalTotal};
+    if(previous.context===context&&loadedCanonicalTotal>previous.total) {
+      setIndexView(value=>(value===null||value.context===context)?{context,targets:context.index.targets()}:value);
+      // Continue compact coverage for an append, preserving the open snapshot.
+      continuingRef.current=true;setRetryEpoch(value=>value+1);
     }
+  },[loadedCanonicalTotal,context]);
+  useLayoutEffect(()=>{
+    clearScrub(false); setJumpError(null);setActiveOffset(null);setJumpingOffset(null);
+  },[context,clearScrub]);
+  useLayoutEffect(() => {
+    // Bookmark overlay: re-merge the loaded rows with the freshest proven
+    // marks so a bookmarked plain block gains its own rail tag (and a removed
+    // one loses it) without waiting for the next navigation fetch.  The same
+    // evidence is then applied to EVERY indexed target, not just the loaded
+    // window: a removal for a row pagination has not loaded must still drop
+    // its marker now.  With no evidence at all the projections stay untouched.
+    if (!context.sessionId) return;
+    if (bookmarkedMarks === undefined && !bookmarksLoaded && bookmarkTouched === undefined) return;
+    const state = useSessionStore.getState();
+    const transcript = state.sessionTranscripts[context.sessionId];
+    const rows: CanonicalRow[] = transcript
+      ? [...transcript.window.rows.entries()].map(([offset, message]) => ({ offset, message }))
+      : canonicalRowsWithOffsets(state.currentMessages).map((row) => ({ ...row }));
+    if (rows.length) context.index.addRows(withBookmarkOverlay(rows));
+    context.index.applyBookmarkMarks(bookmarkMarkRef.current);
+    // Publish when nothing has been published yet as well: an overlay change
+    // that lands before the first navigation page must initialise the view,
+    // not be dropped (only another context's view outranks this one).
+    setIndexView((value) => (value === null || value.context === context)
+      ? { context, targets: context.index.targets() } : value);
+  }, [context, bookmarkedMarks, bookmarksLoaded, bookmarkTouched, withBookmarkOverlay]);
 
-    const controller = new AbortController();
-    let disposed = false;
-    const startedAt = performance.now();
-    setIndexStatus('loading');
-
-    void (async () => {
-      let before = 0;
-      let requests = 0;
-      let indexed: QuickJumpIndexItem[] = [];
-      let historyTotal = 0;
-      try {
-        do {
-          const page = await fetchSessionHistory(
-            currentSessionId,
-            before,
-            INDEX_PAGE_SIZE,
-            controller.signal,
-          );
-          requests += 1;
-          historyTotal = page.total;
-          if (disposed) return;
-          const pageItems = getQuickJumpIndexItems(
-            page.history || [],
-            page.total,
-            page.start,
-            settings,
-          );
-          indexed = [...pageItems, ...indexed];
-          setFullIndex(indexed);
-          setIndexTotal(page.total);
-          setIndexMetrics({ requests, durationMs: performance.now() - startedAt });
-          before = page.start;
-        } while (before > 0);
-        if (disposed) return;
-        const durationMs = performance.now() - startedAt;
-        setIndexStatus('ready');
-        setIndexMetrics({ requests, durationMs });
-        console.info('[message-navigation] full index ready', {
-          sessionId: currentSessionId,
-          total: historyTotal,
-          targets: indexed.length,
-          requests,
-          durationMs: Math.round(durationMs),
-        });
-      } catch (error) {
-        if (disposed || controller.signal.aborted) return;
-        console.warn('[message-navigation] full index failed; using loaded window', error);
-        setIndexStatus('error');
-        setIndexMetrics({ requests, durationMs: performance.now() - startedAt });
-      }
-    })();
-
-    return () => {
-      disposed = true;
-      controller.abort();
-      clearScrub(true);
+  useLayoutEffect(() => {
+    const wanted=pendingWantedRef.current;
+    cancelOpenLocation();
+    const epoch=++openEpochRef.current;
+    operationRef.current?.controller.abort(); operationRef.current=null;
+    if(!expanded||!context.sessionId)return;
+    const controller=new AbortController();
+    const operation={controller,context};operationRef.current=operation;
+    const pending={epoch,context,range:null as NavigationRange|null};
+    pendingOpenRef.current=pending;
+    // Retrying/append continues the same snapshot. Actual reopen re-snapshots.
+    const retrying=continuingRef.current&&locationRef.current?.context===context;continuingRef.current=false;
+    pendingWantedRef.current=retrying?wanted:true;
+    if(!pendingWantedRef.current)pendingOpenRef.current=null;
+    const current=()=>!controller.signal.aborted&&contextRef.current===context
+      &&operationRef.current===operation&&useSessionStore.getState().currentSessionId===context.sessionId;
+    let requests=0;
+    const startedAt=performance.now();
+    const publish=()=>{if(current())setIndexView({context,targets:context.index.targets()});};
+    const locate=()=>{
+      if(pendingOpenRef.current!==pending||!pending.range||!current()||!context.index.proven(pending.range))return;
+      const best=nearestNavigationTarget(context.index.targets(),pending.range);
+      pendingOpenRef.current=null;pendingWantedRef.current=false;
+      if(best){viewportFromJumpRef.current=false;setViewportTarget({context,epoch,offset:best.offset});}
     };
-  }, [clearScrub, currentSessionId, settings]);
-
-  const loadedWindowTargets = useMemo(
-    () => getQuickJumpIndexItems(
-      currentMessages,
-      currentHistoryTotal,
-      historyLoadEnd,
-      settings,
-    ),
-    [currentMessages, currentHistoryTotal, historyLoadEnd, settings],
-  );
-
-  const allTargets = fullIndex.length > 0 && indexStatus !== 'error'
-    ? fullIndex
-    : loadedWindowTargets;
-  const targets = useMemo(
-    () => allTargets.filter((target) => target.kind === activeKind),
-    [allTargets, activeKind],
-  );
-  const targetsByFromEnd = useMemo(
-    () => new Map(targets.map((target) => [target.fromEnd, target])),
-    [targets],
-  );
-  const counts = useMemo(() => ({
-    user: allTargets.filter((item) => item.kind === 'user').length,
-    worker: allTargets.filter((item) => item.kind === 'worker').length,
-  }), [allTargets]);
-
-  const jumpTo = async (target: QuickJumpIndexItem) => {
-    if (!currentSessionId || jumpingFromEnd !== null) return;
-    const sessionAtClick = currentSessionId;
-    setJumpError(null);
-    setJumpingFromEnd(target.fromEnd);
-    try {
-      const total = indexTotal || currentHistoryTotal;
-      const message = await ensureMessageLoaded(target.fromEnd, total);
-      if (!message || useSessionStore.getState().currentSessionId !== sessionAtClick) {
-        if (useSessionStore.getState().currentSessionId === sessionAtClick) {
-          setJumpError('Unable to load this message.');
+    const acceptRange=(range:NavigationRange)=>{
+      if(!current()||pendingOpenRef.current!==pending||pending.range!==null)return;
+      if(!Number.isSafeInteger(range.start)||!Number.isSafeInteger(range.end)||range.start<0||range.end<range.start)return;
+      pending.range=range;locationRef.current={context,range};
+      observerCleanupRef.current?.();observerCleanupRef.current=null;
+      const state=useSessionStore.getState();
+      const transcript=state.sessionTranscripts[context.sessionId!];
+      const center=(range.start+range.end)/2;
+      const rows=[];
+      if(transcript){
+        for(let offset=Math.max(0,Math.floor(center-1000));offset<=Math.min(context.index.total-1,Math.ceil(center+1000));offset++){
+          const message=transcript.window.rows.get(offset);if(message)rows.push({offset,message});
         }
-        return;
+      }else rows.push(...canonicalRowsWithOffsets(state.currentMessages).filter(row=>Math.abs(row.offset-center)<=1000));
+      context.index.addRows(withBookmarkOverlay(rows));publish();locate();
+    };
+    // A fresh open re-locates from the current viewport; a previous highlight
+    // (including one a completed jump set) is superseded there.  An append
+    // continuation (retrying) keeps it.
+    if(!retrying)viewportFromJumpRef.current=false;
+    setViewportTarget(value=>retrying&&value?.context===context?value:null);
+    const range=retrying?locationRef.current!.range:chatRef.current?.getViewportHistoryRange?.();
+    if(range)acceptRange(range);
+    else if(chatRef.current?.observeViewportHistoryRange)observerCleanupRef.current=chatRef.current.observeViewportHistoryRange(acceptRange);
+    const pause=(ms:number)=>new Promise<void>((resolve,reject)=>{
+      const abort=()=>{clearTimeout(timer);reject(new DOMException('Aborted','AbortError'));};
+      const timer=window.setTimeout(()=>{controller.signal.removeEventListener('abort',abort);resolve();},ms);
+      controller.signal.addEventListener('abort',abort,{once:true});
+    });
+    const run=async()=>{
+      if(context.knownTotal&&context.index.complete()){
+        context.completedTotal=context.index.total;
+        publish();locate();setIndexState({context,status:'ready',error:null});return;
       }
-      await nextPaint();
-      const historyIndex = total - 1 - target.fromEnd;
-      let didJump = chatRef.current?.scrollToMessage(message, historyIndex) ?? false;
-      if (!didJump) {
-        await nextPaint();
-        didJump = chatRef.current?.scrollToMessage(message, historyIndex) ?? false;
+      setIndexState({context,status:'loading',error:null});
+      try{
+        while(current()){
+          const missing=context.knownTotal?context.index.nextMissing(pendingOpenRef.current===pending?pending.range??undefined:undefined):0;
+          if(missing===null)break;
+          // A completed canonical prefix needs only its new tail on append.
+          // Keep the frontier context-bound; never infer coverage from targets.
+          const appended=context.completedTotal>0&&missing>=context.completedTotal;
+          const pageSize=appended?Math.min(500,missing+1-context.completedTotal)
+            :pendingOpenRef.current===pending&&pending.range?NAVIGATION_PAGE_SIZE:500;
+          const before=appended?missing+1:context.knownTotal?Math.min(context.index.total,(Math.floor(missing/pageSize)+1)*pageSize):0;
+          let page:Awaited<ReturnType<typeof fetchSessionNavigation>>|undefined;
+          for(let attempt=0;attempt<3&&current();attempt++){
+            try{requests++;page=await fetchSessionNavigation(context.sessionId!,before,pageSize,controller.signal);break;}
+            catch(error){
+              if(!current())return;
+              const code=error instanceof Error&&'status' in error?Number(error.status):0;
+              if(attempt===2||(code>=400&&code<500&&code!==408&&code!==429))throw error;
+              await pause(attempt===0?150:450);
+            }
+          }
+          if(!current()||!page)return;
+          const responseEpoch=page.historyEpoch??null;
+          if(context.responseEpoch===undefined)context.responseEpoch=responseEpoch;
+          if(responseEpoch!==context.responseEpoch)throw new Error('Navigation history identity changed. Refresh the chat before retrying.');
+          if(context.knownTotal&&page.total<context.index.total)throw new Error('Navigation history total regressed. Refresh the chat.');
+          context.index.total=page.total;context.knownTotal=true;
+          const end=before===0?page.total:before;
+          if(page.start!==Math.max(0,end-pageSize)||page.history.length!==end-page.start)throw new Error('Navigation canonical coverage is incomplete.');
+          // Classify the page through the overlay: the page itself carries no
+          // bookmark projection, and a page that predates a local mutation must
+          // neither drop the overlay's tag nor resurrect a removed one.
+          context.index.addRows(withBookmarkOverlay(page.history.map((message,index)=>({message,offset:page.start+index}))));publish();locate();
+          setIndexMetrics({requests,durationMs:performance.now()-startedAt});
+          // Yield between compact batches; no fixed startup delay or polling.
+          if(!context.index.complete())await new Promise<void>(resolve=>requestAnimationFrame(()=>resolve()));
+        }
+        if(current()){
+          context.completedTotal=context.index.total;
+          setIndexState({context,status:'ready',error:null});
+        }
+      }catch(error){
+        if(current()){
+          const message=error instanceof Error?error.message:String(error);
+          console.warn('[message-navigation] compact index failed',{sessionId:context.sessionId,requests,error:message});
+          setIndexState({context,status:'error',error:message});
+        }
+      }finally{if(current())setIndexMetrics({requests,durationMs:performance.now()-startedAt});}
+    };
+    void run();
+    const input=(event:Event)=>{
+      if(event.target instanceof Element&&event.target.closest('[data-navigation-load]'))return;
+      // Reading cancels only the one-shot location. Complete indexing continues
+      // and preserves the user's list anchor, with no scroll-driven requests.
+      pendingWantedRef.current=false;cancelOpenLocation();
+      // A highlight a completed jump set stays active only until the reader
+      // takes over: real input releases it, and the next expansion locates
+      // the nearest again.  A nearest-located highlight keeps the existing
+      // semantics and is left untouched here.
+      if(viewportFromJumpRef.current){
+        viewportFromJumpRef.current=false;
+        setViewportTarget(value=>value&&value.context===context&&value.epoch===openEpochRef.current?null:value);
       }
-      if (!didJump) {
-        setJumpError('Message loaded, but its rendered row could not be located.');
-        return;
-      }
-      setActiveFromEnd(target.fromEnd);
-      window.setTimeout(() => setActiveFromEnd(null), 1200);
-    } finally {
-      if (useSessionStore.getState().currentSessionId === sessionAtClick) {
-        setJumpingFromEnd(null);
-      }
-    }
+    };
+    for(const type of ['pointerdown','wheel','keydown','touchmove'])window.addEventListener(type,input,true);
+    return()=>{
+      cancelOpenLocation();controller.abort();
+      if(operationRef.current===operation)operationRef.current=null;
+      for(const type of ['pointerdown','wheel','keydown','touchmove'])window.removeEventListener(type,input,true);
+    };
+  },[expanded,context,chatRef,retryEpoch,cancelOpenLocation,withBookmarkOverlay]);
+
+  useLayoutEffect(()=>{
+    const list=listRef.current;
+    const previous=previousListRef.current;
+    previousListRef.current={context,targets};
+    if(!list||previous.context!==context||previous.targets===targets||!previous.targets.length)return;
+    const ordinal=Math.min(previous.targets.length-1,Math.floor(Math.max(0,list.scrollTop-8)/rowHeight));
+    const anchor=previous.targets[ordinal];
+    const next=targets.findIndex(target=>target.offset===anchor?.offset);
+    if(next>=0){list.scrollTop+=(next-ordinal)*rowHeight;setListScroll(list.scrollTop);}
+  },[targets,context,rowHeight]);
+  useLayoutEffect(()=>{
+    if(!viewportTarget||viewportTarget.context!==context||viewportTarget.epoch!==openEpochRef.current||!expanded)return;
+    const list=listRef.current;
+    const ordinal=targetsRef.current.findIndex(target=>target.offset===viewportTarget.offset);
+    if(!list||ordinal<0)return;
+    list.scrollTop=Math.max(0,8+(ordinal+0.5)*rowHeight-list.clientHeight/2);setListScroll(list.scrollTop);
+    // targets changes preserve anchors above; they must never repeat location.
+  },[viewportTarget,context,expanded,rowHeight]);
+  const retryIndex=()=>{
+    if(!expanded||indexStatus==='loading')return;
+    continuingRef.current=true;setRetryEpoch(value=>value+1);
   };
 
-  const setMarkerPreview = useCallback((element: HTMLElement, target: QuickJumpIndexItem, mode: PreviewMode) => {
+  const jumpTo = async (target: NavigationTarget) => {
+    if (!currentSessionId || jumpingOffset !== null) return;
+    const contextAtClick = context;
+    pendingWantedRef.current=false;cancelOpenLocation(); setViewportTarget(null); setJumpError(null); setJumpingOffset(target.offset);
+    const current = () => contextRef.current === contextAtClick
+      && useSessionStore.getState().currentSessionId === contextAtClick.sessionId;
+    try {
+      if (!await jumpToMessage(chatRef, { ...target, total: context.index.total }, current)) return;
+      setActiveOffset(target.offset);
+      // The clicked tag becomes the active tag, reusing the exact nearest-tag
+      // highlight state and CSS (inverted color + enlarged) instead of a
+      // second style.  The rail's list-centering effect treats it like any
+      // located target.  Real user input releases it and the next expansion
+      // re-locates, so the clicked marker is never locked in place.
+      viewportFromJumpRef.current = true;
+      setViewportTarget({ context: contextAtClick, epoch: openEpochRef.current, offset: target.offset });
+      const epochAtJump = openEpochRef.current;
+      window.setTimeout(() => { if (current() && epochAtJump === openEpochRef.current) setActiveOffset(null); }, 1200);
+    } catch (error) { if (current()) setJumpError(String(error)); }
+    finally { if (current()) setJumpingOffset(null); }
+  };
+
+  const setMarkerPreview = useCallback((element: HTMLElement, target: NavigationTarget, mode: PreviewMode) => {
     const marker = element.getBoundingClientRect();
     setHovered({ target, top: marker.top + marker.height / 2, left: marker.left - 9, mode });
   }, []);
 
-  const showPreview = (event: MouseEvent<HTMLButtonElement>, target: QuickJumpIndexItem) => {
+  const showPreview = (event: MouseEvent<HTMLButtonElement>, target: NavigationTarget) => {
     setMarkerPreview(event.currentTarget, target, 'hover');
   };
 
@@ -286,7 +497,7 @@ export function MessageNavigationRail({
     setMarkerPreview(marker, target, 'scrub');
   }, [clearScrub, setMarkerPreview, targetsByFromEnd]);
 
-  const beginScrub = (event: ReactPointerEvent<HTMLButtonElement>, target: QuickJumpIndexItem) => {
+  const beginScrub = (event: ReactPointerEvent<HTMLButtonElement>, target: NavigationTarget) => {
     if (
       !isMobile || !mobileExpanded ||
       (event.pointerType && event.pointerType !== 'touch')
@@ -335,7 +546,7 @@ export function MessageNavigationRail({
     clearScrub(!cancelled && (gesture.active || gesture.moved));
   };
 
-  const handleMarkerClick = (event: MouseEvent<HTMLButtonElement>, target: QuickJumpIndexItem) => {
+  const handleMarkerClick = (event: MouseEvent<HTMLButtonElement>, target: NavigationTarget) => {
     if (suppressNextClickRef.current && event.detail !== 0) {
       suppressNextClickRef.current = false;
       event.preventDefault();
@@ -368,37 +579,63 @@ export function MessageNavigationRail({
     };
   }, [clearScrub, isMobile, mobileExpanded, updateScrubPreview]);
 
+  const virtualStart=Math.max(0,Math.floor(Math.max(0,listScroll-8)/rowHeight)-12);
+  const virtualEnd=Math.min(visibleTargets.length,virtualStart+Math.max(60,Math.ceil((listRef.current?.clientHeight??700)/rowHeight)+24));
+  const displayTargets=visibleTargets.slice(virtualStart,virtualEnd);
+  const toggleKindFilter = (kind: NavigationKind) => setKindFilter((previous) => {
+    const next = new Set(previous);
+    if (next.has(kind)) next.delete(kind);
+    else next.add(kind);
+    return next;
+  });
+  // The filter menu is portaled to <body>, so a host that folds on pointer
+  // leave cannot see it. Report its lifetime (only real changes) and release
+  // on unmount, which covers closing the menu by toggle, Escape, an outside
+  // pointer or the rail going away.
+  const filterOpenChangeRef = useRef(onFilterOpenChange);
+  filterOpenChangeRef.current = onFilterOpenChange;
+  const filterReportedOpenRef = useRef(false);
+  useEffect(() => {
+    if (filterReportedOpenRef.current === filterOpen) return;
+    filterReportedOpenRef.current = filterOpen;
+    filterOpenChangeRef.current?.(filterOpen);
+  }, [filterOpen]);
+  useEffect(() => () => {
+    if (!filterReportedOpenRef.current) return;
+    filterReportedOpenRef.current = false;
+    filterOpenChangeRef.current?.(false);
+  }, []);
+  useEffect(() => {
+    if (!filterOpen) return;
+    const onKey = (event: KeyboardEvent) => { if (event.key === 'Escape') setFilterOpen(false); };
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target;
+      if (target instanceof Element
+          && (target.closest('[data-navigation-filter-menu]') || target.closest('[data-navigation-filter-toggle]'))) return;
+      setFilterOpen(false);
+    };
+    // Capture: the hosting dock handles Escape itself and stops propagation
+    // when the focus is inside it, which must not leave this menu on screen.
+    window.addEventListener('keydown', onKey, true);
+    window.addEventListener('pointerdown', onPointerDown, true);
+    return () => {
+      window.removeEventListener('keydown', onKey, true);
+      window.removeEventListener('pointerdown', onPointerDown, true);
+    };
+  }, [filterOpen]);
   return (
     <aside
       className="message-navigation-rail"
       aria-label={RAIL_LABEL}
       data-index-status={indexStatus}
-      data-indexed-targets={allTargets.length}
-      data-history-total={indexTotal || currentHistoryTotal}
+      data-location-status={viewportTarget?.context === context ? 'located' : pendingOpenRef.current ? 'pending' : 'inactive'}
+      data-indexed-targets={targets.length}
+      data-visible-targets={visibleTargets.length}
+      data-rendered-targets={displayTargets.length}
+      data-history-total={indexTotal || loadedCanonicalTotal}
       data-index-requests={indexMetrics.requests}
       data-index-duration-ms={Math.round(indexMetrics.durationMs)}
     >
-      <div className="message-navigation-filters" role="tablist" aria-label={RAIL_LABEL}>
-        {FILTERS.map(({ kind, label }) => (
-          <button
-            key={kind}
-            type="button"
-            role="tab"
-            aria-selected={activeKind === kind}
-            className={`message-navigation-filter message-navigation-filter-${kind}${activeKind === kind ? ' is-active' : ''}`}
-            onClick={() => {
-              clearScrub(false);
-              setActiveKind(kind);
-            }}
-            title={`${RAIL_LABEL}: ${label}`}
-          >
-            <MarkerIcon kind={kind} />
-            <span className="sr-only">{label}</span>
-            <span className="message-navigation-count">{counts[kind]}</span>
-          </button>
-        ))}
-      </div>
-
       {hovered && createPortal(
         <div
           className="message-navigation-tooltip message-navigation-tooltip-floating"
@@ -412,27 +649,97 @@ export function MessageNavigationRail({
             left: hovered.left,
           }}
         >
-          <strong>{hovered.target.kind === 'user' ? USER_LABEL : 'Worker report'}</strong>
+          <strong>{markerLabel(hovered.target.kind, Boolean(hovered.target.bookmarked))}</strong>
           <span>{hovered.target.preview || PREVIEW_FALLBACK}</span>
         </div>,
         document.body,
       )}
 
+      {filterOpen && filterPos && createPortal(
+        <div
+          className="message-navigation-filter-menu"
+          data-navigation-filter-menu
+          role="menu"
+          aria-label="Filter navigation tags by type"
+          style={{ top: filterPos.top, left: filterPos.left }}
+        >
+          {(Object.keys(KIND_META) as NavigationKind[]).map((kind) => {
+            const selected = kindFilter.has(kind);
+            return (
+              <button
+                key={kind}
+                type="button"
+                role="menuitemcheckbox"
+                data-navigation-filter-kind={kind}
+                aria-checked={selected}
+                onClick={() => toggleKindFilter(kind)}
+              >
+                <span className={`message-navigation-filter-box${selected ? ' is-on' : ''}`} aria-hidden="true">
+                  {selected ? <Check size={11} /> : null}
+                </span>
+                <span className={`message-navigation-filter-glyph message-navigation-filter-glyph-${KIND_META[kind].slug}`}>
+                  <MarkerGlyph kind={kind} />
+                </span>
+                <span>{KIND_META[kind].label}</span>
+              </button>
+            );
+          })}
+          <div className="message-navigation-filter-divider" role="separator" />
+          <button
+            type="button"
+            role="menuitem"
+            data-navigation-filter-clear
+            disabled={kindFilter.size === 0}
+            onClick={() => setKindFilter(new Set())}
+          >
+            清除筛选
+          </button>
+          <p className="message-navigation-filter-hint">
+            勾选即显示该类型（多选 OR）；全部取消 = 不筛选
+          </p>
+        </div>,
+        document.body,
+      )}
+
+      <button
+        type="button"
+        className={`message-navigation-filter-toggle${kindFilter.size > 0 ? ' is-active' : ''}`}
+        data-navigation-filter-toggle
+        aria-expanded={filterOpen}
+        aria-label="Filter navigation tags by type"
+        title="按 tag 类型筛选（多选为 OR）"
+        onClick={(event) => {
+          const rect = event.currentTarget.getBoundingClientRect();
+          setFilterPos({
+            top: Math.min(rect.bottom + 4, Math.max(8, window.innerHeight - 268)),
+            left: Math.max(8, Math.min(rect.left - 4, window.innerWidth - 190)),
+          });
+          setFilterOpen((open) => !open);
+        }}
+      >
+        <SlidersHorizontal size={12} />
+        {kindFilter.size > 0 ? <span className="message-navigation-filter-count">{kindFilter.size}</span> : null}
+      </button>
+
       <div
         ref={listRef}
         className="message-navigation-list"
+        onScroll={event=>setListScroll(event.currentTarget.scrollTop)}
         onPointerMove={moveScrub}
         onPointerUp={(event) => finishScrub(event, false)}
         onPointerCancel={(event) => finishScrub(event, true)}
         onLostPointerCapture={(event) => finishScrub(event, true)}
       >
-        {targets.map((target) => {
-          const label = target.kind === 'user' ? USER_LABEL : 'Worker report';
+        <div aria-hidden="true" style={{height:virtualStart*rowHeight,flex:'0 0 auto'}} />
+        {displayTargets.map((target) => {
+          const meta = KIND_META[target.kind];
+          const bookmarked = Boolean(target.bookmarked);
+          const label = markerLabel(target.kind, bookmarked);
           return (
-            <div className="message-navigation-marker-wrap" key={`${target.kind}-${target.fromEnd}`}>
+            <div className="message-navigation-marker-wrap" style={{height:rowHeight,display:'flex',alignItems:'center'}} key={`${target.kind}-${target.offset}`}>
               <button
                 type="button"
-                className={`message-navigation-marker message-navigation-marker-${target.kind}${activeFromEnd === target.fromEnd ? ' is-jumped' : ''}`}
+                className={`message-navigation-marker message-navigation-marker-${meta.slug}${bookmarked ? ' is-bookmarked' : ''}${activeOffset === target.offset ? ' is-jumped' : ''}${viewportTarget?.context === context && viewportTarget.offset === target.offset ? ' is-viewport-target' : ''}`}
                 onClick={(event) => handleMarkerClick(event, target)}
                 onPointerDown={(event) => beginScrub(event, target)}
                 onMouseEnter={(event) => showPreview(event, target)}
@@ -440,31 +747,36 @@ export function MessageNavigationRail({
                   if (!scrubGestureRef.current?.active) setHovered(null);
                 }}
                 aria-label={`${label}: ${target.preview || PREVIEW_FALLBACK}`}
-                title={target.preview || PREVIEW_FALLBACK}
+                title={`${label}: ${target.preview || PREVIEW_FALLBACK}`}
                 data-from-end={target.fromEnd}
-                disabled={jumpingFromEnd !== null}
+                data-canonical-offset={target.offset}
+                data-message-id={target.messageId}
+                aria-current={viewportTarget?.context === context && viewportTarget.offset === target.offset ? 'location' : undefined}
+                data-kind={target.kind}
+                data-bookmarked={bookmarked ? 'true' : 'false'}
+                disabled={jumpingOffset !== null}
               >
-                {jumpingFromEnd === target.fromEnd
+                {jumpingOffset === target.offset
                   ? <Loader2 size={13} className="animate-spin" />
-                  : <MarkerIcon kind={target.kind} />}
+                  : <MarkerIcon kind={target.kind} bookmarked={bookmarked} />}
               </button>
             </div>
           );
         })}
-        {targets.length === 0 && <span className="message-navigation-empty">{'\u00b7'}</span>}
+        <div aria-hidden="true" style={{height:(visibleTargets.length-virtualEnd)*rowHeight,flex:'0 0 auto'}} />
+        {visibleTargets.length === 0 && <span className="message-navigation-empty">{'\u00b7'}</span>}
       </div>
 
-      {indexStatus === 'loading' && (
-        <div className="message-navigation-status" title={`Indexing full history (${indexMetrics.requests} requests)`}>
-          <Loader2 size={11} className="animate-spin" />
-          <span className="sr-only">Indexing full history</span>
-        </div>
+      {(indexStatus === 'loading' || indexStatus === 'error') && (
+        <button type="button" data-navigation-load disabled={indexStatus === 'loading'}
+          className={`message-navigation-status${indexStatus === 'loading' ? '' : ' message-navigation-status-error'}`}
+          aria-label={indexStatus === 'loading' ? 'Loading message navigation' : 'Retry message navigation'}
+          title={indexError ?? 'Loading complete message navigation'}
+          onClick={retryIndex}>
+          {indexStatus === 'loading' ? <Loader2 size={11} className="animate-spin" /> : indexStatus === 'error' ? '!' : '…'}
+        </button>
       )}
-      {indexStatus === 'error' && (
-        <div className="message-navigation-status message-navigation-status-error" title="Full-history index failed; showing only loaded messages.">
-          !
-        </div>
-      )}
+      {indexError && <span className="sr-only" role="status">{indexError}</span>}
       {jumpError && <div className="message-navigation-jump-error" role="status">{jumpError}</div>}
     </aside>
   );

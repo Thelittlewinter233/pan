@@ -103,7 +103,8 @@ def test_managed_workspace_inheritance_claim_detach_and_list(monkeypatch, tmp_pa
     monkeypatch.setattr(workspace, "WORKSPACE_DIR", tmp_path / "workspaces")
     workspace.clear_cache()
     parent = sess.Session(id="ses_parent", name="parent")
-    child = sess.Session(id="ses_child", name="child", workspace_ids=["ws_stale"])
+    child = sess.Session(id="ses_child", name="child", managed=["ses_grandchild"],
+                         workspace_ids=["ws_stale"])
     grandchild = sess.Session(id="ses_grandchild", name="grandchild", managed_by=child.id,
                               workspace_ids=["ws_stale"])
     one = workspace.create("One")
@@ -268,3 +269,28 @@ def test_workspace_dirs_visible_to_managed_descendants(monkeypatch, tmp_path):
     assert sess.effective_workspace_ids(child) == [w.id]
     view = asyncio.run(server.api_get_workspace(w.id))["workspace"]
     assert view["dirs"] == [str(shared.resolve())]
+
+
+def test_delete_workspace_keeps_managed_tree_together_and_sessions_alive(monkeypatch, tmp_path):
+    monkeypatch.setattr(workspace, "WORKSPACE_DIR", tmp_path / "workspaces")
+    workspace.clear_cache()
+    parent = sess.Session(id="ses_root", name="root")
+    child = sess.Session(id="ses_child", name="child", managed_by=parent.id)
+    grandchild = sess.Session(id="ses_grand", name="grand", managed_by=child.id)
+    parent.managed = [child.id]
+    child.managed = [grandchild.id]
+    sess._cache.update({parent.id: parent, child.id: child, grandchild.id: grandchild})
+    w = workspace.create("Team")
+    parent.workspace_ids = [w.id]
+    sess.save(parent)
+    assert sess.effective_workspace_ids(grandchild) == [w.id]
+
+    assert asyncio.run(server.api_delete_workspace(w.id))["ok"]
+
+    # Sessions survive; the whole management tree returns to ungrouped together,
+    # leaving no dangling workspace id and no cross-workspace managed link.
+    assert sess.get(parent.id) is not None
+    assert sess.effective_workspace_ids(parent) == []
+    assert sess.effective_workspace_ids(child) == []
+    assert sess.effective_workspace_ids(grandchild) == []
+    assert workspace.get(w.id) is None

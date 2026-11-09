@@ -13,6 +13,13 @@ import { ModelSelect } from '@/components/ui/ModelSelect';
 import { fetchSession } from '@/services/api';
 import type { AdapterConfig, PermissionMode, Session } from '@/types';
 import { FreshnessStatus } from '@/components/session/FreshnessStatus';
+import { useNativeControlStore } from '@/stores/nativeControlStore';
+import { usePlatformStore } from '@/stores/platformStore';
+import { platformLabel } from '@/utils/platformCapabilities';
+import { useMediaQuery } from '@/hooks/useMediaQuery';
+import { useTakeoverReadiness } from '@/hooks/useTakeoverReadiness';
+import { useTerminalTuiEntry, terminalTuiTitle } from '@/hooks/useTerminalTuiEntry';
+import { ArrowUp, Loader2, TerminalSquare } from 'lucide-react';
 
 interface SettingsPopoverProps {
   open: boolean;
@@ -55,9 +62,28 @@ function pickSettings(session: Session): SessionSettingPatch {
  */
 export function SettingsPopover({ open, onClose, anchorRef }: SettingsPopoverProps) {
   const session = useCurrentSession();
+  const takeoverReadiness = useTakeoverReadiness(session);
+  const { isMobile } = useMediaQuery();
+  // Mobile-only Terminal TUI entry (the mobile top bar no longer shows it).
+  // poll:false — the always-mounted TopBar drives the shared refresh/auto-enter
+  // loop; this consumer only renders state and dispatches actions.
+  const terminalEntry = useTerminalTuiEntry(session, { poll: false });
+  const platform = usePlatformStore((s) => s.platform);
   const currentWorker = useWorkerStore((s) => s.currentWorker);
   const showToast = useUIStore((s) => s.showToast);
   const { restart, killCurrent, interrupt, takeover } = useWorkerStore();
+  const delayedRestart = useWorkerStore((s) =>
+    session?.id ? s.delayedRestarts[session.id] : undefined,
+  );
+  const [delayedRequesting, setDelayedRequesting] = useState(false);
+  const [converting, setConverting] = useState(false);
+  const nativeState = useNativeControlStore((state) => session?.id ? state.sessions[session.id] : undefined);
+  useEffect(() => {
+    if (open && session?.id) {
+      useWorkerStore.getState().refreshDelayedRestart(session.id)
+        .catch((e: Error) => showToast(e.message, 'error'));
+    }
+  }, [open, session?.id, showToast]);
   const config = useAdapterStore((s) => s.getConfig());
   const applySettings = useAdapterStore((s) => s.applySettings);
   const loadSessions = useSessionStore((s) => s.loadSessions);
@@ -317,14 +343,21 @@ export function SettingsPopover({ open, onClose, anchorRef }: SettingsPopoverPro
   // Output Mode selector is shown only when the adapter exposes more than one
   // execution mode (e.g. cbc: ["stream","oneshot"]). Single-mode adapters
   // (kimi/opencode: ["stream"]) never render it — they cannot switch.
-  const execModes = config.executionModes || ['stream'];
-  const showOutputMode = execModes.length > 1;
+  const execModes = (config.executionModes || ['stream']).filter(mode => mode !== 'oneshot');
+  const showOutputMode = execModes.length > 1 && !(s.adapter === 'cbc' && s.nativeControl);
   const currentOutputMode =
     s.outputMode ?? (execModes.includes('stream') ? 'stream' : execModes[0]);
   const showCodexContext =
     s.adapter === 'codex' &&
     supportsSetting(config, 'modelContextWindow') &&
     supportsSetting(config, 'modelAutoCompactTokenLimit');
+  // The mobile top bar no longer hosts the Terminal TUI / Upgrades entry; the
+  // same contract (upgrade confirm, pending idle, enter TUI, error retry) is
+  // reachable here inside the More disclosure. Desktop keeps its top-bar entry.
+  const nativeTuiCapable =
+    s.nativeControlCapable ?? (s.adapter === 'codex' || s.adapter === 'cbc');
+  const mobileTerminalEntry = isMobile && nativeTuiCapable;
+  const terminalAdapterLabel = s.adapter === 'cbc' ? 'CBC' : s.adapter === 'kimi' ? 'Kimi' : 'Codex';
   const hasCodexOverrides = s.modelContextWindow != null || s.modelAutoCompactTokenLimit != null;
 
   if (!popoverPosition) return null;
@@ -358,6 +391,7 @@ export function SettingsPopover({ open, onClose, anchorRef }: SettingsPopoverPro
         <ModelSelect
           value={currentModel}
           options={modelOptions}
+          multipliers={config.modelCreditMultipliers}
           onChange={(v) => applySetting('model', v)}
         />
       </div>
@@ -380,8 +414,14 @@ export function SettingsPopover({ open, onClose, anchorRef }: SettingsPopoverPro
         </div>
       )}
 
-      {/* Codex context controls stay behind a compact More disclosure. */}
-      {showCodexContext && (
+      {/* Codex context controls and (on mobile) the Terminal TUI entry stay
+          behind a compact More disclosure. */}
+      {s.adapter === 'codex' && nativeState?.settingsUncertain && (
+        <p role="status" className="text-[11px] leading-4 text-warning">
+          Pan Session 设置可能与事实不符；成功重启 Worker 后重新确认。
+        </p>
+      )}
+      {(showCodexContext || mobileTerminalEntry) && (
         <div className="border-t border-border-muted pt-2">
           <button
             type="button"
@@ -396,77 +436,117 @@ export function SettingsPopover({ open, onClose, anchorRef }: SettingsPopoverPro
           </button>
           {moreOpen && (
             <div className="mt-2 space-y-2">
-              <p className="text-[11px] leading-4 text-text-muted">
-                修改后需 Worker 自动 respawn/restart 后生效；当前 turn 不热更新。
-              </p>
-              <label className="block text-xs text-text-secondary">
-                <span className="mb-1 block">Context window</span>
-                <input
-                  type="number"
-                  min={1}
-                  step={1}
-                  inputMode="numeric"
-                  value={contextWindowInput}
-                  aria-label="model_context_window"
-                  onChange={(e) => {
-                    setContextWindowInput(e.target.value);
-                    if (e.target.value === '' || /^[1-9]\d*$/.test(e.target.value)) {
-                      setContextWindowError('');
-                    } else {
-                      setContextWindowError('请输入正整数');
-                    }
-                  }}
-                  onBlur={() =>
-                    updateCodexNumber(
-                      'modelContextWindow',
-                      contextWindowInput,
-                      setContextWindowError,
-                    )
-                  }
-                  className="w-full rounded border border-border-default bg-bg-tertiary px-2 py-1 text-xs text-text-primary"
-                />
-                {contextWindowError && (
-                  <span className="mt-1 block text-[11px] text-danger">{contextWindowError}</span>
-                )}
-              </label>
-              <label className="block text-xs text-text-secondary">
-                <span className="mb-1 block">Auto-compact token limit</span>
-                <input
-                  type="number"
-                  min={1}
-                  step={1}
-                  inputMode="numeric"
-                  value={autoCompactInput}
-                  aria-label="model_auto_compact_token_limit"
-                  onChange={(e) => {
-                    setAutoCompactInput(e.target.value);
-                    if (e.target.value === '' || /^[1-9]\d*$/.test(e.target.value)) {
-                      setAutoCompactError('');
-                    } else {
-                      setAutoCompactError('请输入正整数');
-                    }
-                  }}
-                  onBlur={() =>
-                    updateCodexNumber(
-                      'modelAutoCompactTokenLimit',
-                      autoCompactInput,
-                      setAutoCompactError,
-                    )
-                  }
-                  className="w-full rounded border border-border-default bg-bg-tertiary px-2 py-1 text-xs text-text-primary"
-                />
-                {autoCompactError && (
-                  <span className="mt-1 block text-[11px] text-danger">{autoCompactError}</span>
-                )}
-              </label>
-              <Button
-                variant="secondary"
-                size="sm"
-                disabled={!hasCodexOverrides || restoringCodexDefaults}
-                onClick={restoreCodexDefaults}
-              >
-                {restoringCodexDefaults ? 'Restoring…' : 'Restore defaults'}
-              </Button>
+              {mobileTerminalEntry && (
+                <div data-testid="settings-terminal-tui-entry">
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    className="terminal-tui-entry w-full"
+                    data-terminal-status={terminalEntry.status}
+                    aria-label="Terminal TUI"
+                    aria-pressed={terminalEntry.active}
+                    disabled={terminalEntry.busy}
+                    title={terminalTuiTitle(terminalEntry.status)}
+                    onClick={() => void terminalEntry.enterNative()}
+                  >
+                    <span className="relative inline-flex shrink-0" aria-hidden="true">
+                      <TerminalSquare size={14} />
+                      {terminalEntry.status === 'upgrade' && <ArrowUp size={9} className="absolute -right-1 -top-1 rounded-sm bg-bg-primary" />}
+                      {terminalEntry.status === 'upgrading' && <Loader2 size={9} className="absolute -right-1 -top-1 animate-spin rounded-sm bg-bg-primary" />}
+                    </span>
+                    <span>
+                      {terminalEntry.label}
+                      {terminalEntry.pendingIdle ? ' · pending idle' : ''}
+                    </span>
+                  </Button>
+                  <p className="text-[11px] leading-4 text-text-muted">
+                    {terminalEntry.status === 'unsupported'
+                      ? `当前平台（${platformLabel(platform)}）暂不支持 Terminal TUI（terminal.native）；Session 的其它功能不受影响。`
+                      : terminalEntry.status === 'error'
+                        ? 'Control ownership unconfirmed — click to retry the switch.'
+                        : terminalEntry.pendingIdle
+                          ? 'Upgrade scheduled: control switches at the next idle boundary.'
+                          : terminalEntry.status === 'upgrade'
+                            ? `Upgrade this ${terminalAdapterLabel} Session to Terminal TUI control; the switch happens at the next idle boundary.`
+                            : 'Opens the native Terminal TUI control view.'}
+                  </p>
+                </div>
+              )}
+              {showCodexContext && (
+                <>
+                  <p className="text-[11px] leading-4 text-text-muted">
+                    修改后需 Worker 自动 respawn/restart 后生效；当前 turn 不热更新。
+                  </p>
+                  <label className="block text-xs text-text-secondary">
+                    <span className="mb-1 block">Context window</span>
+                    <input
+                      type="number"
+                      min={1}
+                      step={1}
+                      inputMode="numeric"
+                      value={contextWindowInput}
+                      aria-label="model_context_window"
+                      onChange={(e) => {
+                        setContextWindowInput(e.target.value);
+                        if (e.target.value === '' || /^[1-9]\d*$/.test(e.target.value)) {
+                          setContextWindowError('');
+                        } else {
+                          setContextWindowError('请输入正整数');
+                        }
+                      }}
+                      onBlur={() =>
+                        updateCodexNumber(
+                          'modelContextWindow',
+                          contextWindowInput,
+                          setContextWindowError,
+                        )
+                      }
+                      className="w-full rounded border border-border-default bg-bg-tertiary px-2 py-1 text-xs text-text-primary"
+                    />
+                    {contextWindowError && (
+                      <span className="mt-1 block text-[11px] text-danger">{contextWindowError}</span>
+                    )}
+                  </label>
+                  <label className="block text-xs text-text-secondary">
+                    <span className="mb-1 block">Auto-compact token limit</span>
+                    <input
+                      type="number"
+                      min={1}
+                      step={1}
+                      inputMode="numeric"
+                      value={autoCompactInput}
+                      aria-label="model_auto_compact_token_limit"
+                      onChange={(e) => {
+                        setAutoCompactInput(e.target.value);
+                        if (e.target.value === '' || /^[1-9]\d*$/.test(e.target.value)) {
+                          setAutoCompactError('');
+                        } else {
+                          setAutoCompactError('请输入正整数');
+                        }
+                      }}
+                      onBlur={() =>
+                        updateCodexNumber(
+                          'modelAutoCompactTokenLimit',
+                          autoCompactInput,
+                          setAutoCompactError,
+                        )
+                      }
+                      className="w-full rounded border border-border-default bg-bg-tertiary px-2 py-1 text-xs text-text-primary"
+                    />
+                    {autoCompactError && (
+                      <span className="mt-1 block text-[11px] text-danger">{autoCompactError}</span>
+                    )}
+                  </label>
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    disabled={!hasCodexOverrides || restoringCodexDefaults}
+                    onClick={restoreCodexDefaults}
+                  >
+                    {restoringCodexDefaults ? 'Restoring…' : 'Restore defaults'}
+                  </Button>
+                </>
+              )}
             </div>
           )}
         </div>
@@ -524,6 +604,26 @@ export function SettingsPopover({ open, onClose, anchorRef }: SettingsPopoverPro
 
       <div className="border-t border-border-muted" />
 
+      {nativeTuiCapable && session.nativeControl && (
+        <div>
+          <h4 className="text-xs font-semibold text-text-secondary mb-2">Session control mode</h4>
+          <Button variant="secondary" size="sm" disabled={converting || typeof nativeState?.pendingEnabled === 'boolean'}
+            onClick={() => {
+              if (!window.confirm('Downgrade this Session to standard Pan control? The current task will finish first, then the Worker restarts at idle. The same thread, history and queue are retained.')) return;
+              setConverting(true);
+              useNativeControlStore.getState().configureSession(session.id, false)
+                .then((result) => showToast(result.pendingEnabled === false
+                  ? 'Session downgrade scheduled for the next idle boundary'
+                  : 'Session downgraded to standard Pan control', 'info'))
+                .catch((error: Error) => showToast(error.message, 'error'))
+                .finally(() => setConverting(false));
+            }}>
+            Downgrade Session to standard Pan control
+          </Button>
+          <p className="text-xs text-text-secondary mt-1">Session setting; does not interrupt the current task.</p>
+        </div>
+      )}
+
       {/* Worker actions */}
       <div>
         <h4 className="text-xs font-semibold text-text-secondary mb-2">Worker</h4>
@@ -543,6 +643,40 @@ export function SettingsPopover({ open, onClose, anchorRef }: SettingsPopoverPro
           >
             ⟳ Restart
           </Button>
+          <Button
+            variant="secondary"
+            size="sm"
+            disabled={delayedRequesting || delayedRestart?.status === 'pending'
+              || delayedRestart?.status === 'restarting'}
+            title={delayedRestart?.status === 'pending'
+              ? 'Delayed restart pending: waiting for task completion'
+              : delayedRestart?.status === 'restarting' ? 'Restarting worker'
+                : 'Finish the current task, then restart before queued work. Starts a worker if offline.'}
+            onClick={() => {
+              if (!session?.id) return;
+              setDelayedRequesting(true);
+              useWorkerStore.getState().delayedRestart(session.id)
+                .then((intent) => showToast(intent?.action === 'start'
+                  ? 'Worker start scheduled'
+                  : 'Worker will restart after the current task completes'))
+                .catch((e: Error) => showToast(e.message, 'error'))
+                .finally(() => setDelayedRequesting(false));
+            }}
+          >
+            {delayedRestart?.status === 'pending' ? '◷ Delayed restart pending'
+              : delayedRestart?.status === 'restarting' ? '◷ Restarting worker…'
+                : '◷ Delayed restart'}
+          </Button>
+          {delayedRestart && (
+            <p role="status" className={`text-xs ${delayedRestart.status === 'failed'
+              ? 'text-status-error' : 'text-text-secondary'}`}>
+              {delayedRestart.status === 'pending' ? 'Restart pending: waiting for task completion'
+                : delayedRestart.status === 'restarting' ? `${delayedRestart.action === 'start' ? 'Starting' : 'Restarting'} worker…`
+                : delayedRestart.status === 'completed' ? 'Worker restart/start completed'
+                : delayedRestart.status === 'cancelled' ? 'Delayed restart cancelled'
+                : `Delayed restart failed: ${delayedRestart.error || 'Unknown error'}`}
+            </p>
+          )}
           {effectiveWorkerId && (
             <>
               <Button
@@ -564,6 +698,8 @@ export function SettingsPopover({ open, onClose, anchorRef }: SettingsPopoverPro
                     .then(() => showToast('PowerShell opened for takeover'))
                     .catch((e) => showToast(e.message, 'error'))
                 }
+                disabled={!takeoverReadiness.ready}
+                title={takeoverReadiness.reason || 'Takeover'}
               >
                 ⤓ Takeover
               </Button>
@@ -573,7 +709,7 @@ export function SettingsPopover({ open, onClose, anchorRef }: SettingsPopoverPro
                 onClick={() => {
                   if (!confirm(`Kill worker ${effectiveWorkerId}?`)) return;
                   killCurrent(session.id)
-                    .then(() => showToast('Kill sent'))
+                    .then(() => showToast('Worker stopped'))
                     .catch((e) => showToast(e.message, 'error'));
                 }}
               >

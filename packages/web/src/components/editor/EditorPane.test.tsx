@@ -1,14 +1,15 @@
 // @vitest-environment jsdom
-import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { beforeAll, beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { EditorPane } from './EditorPane';
 import { useEditorStore } from '@/stores/editorStore';
 import { useSessionStore } from '@/stores/sessionStore';
 import { useUIStore } from '@/stores/uiStore';
+import { openFileExternally, revealFileExternally } from '@/services/api';
 
 vi.mock('./CodeEditor', () => ({
-  CodeEditor: () => null,
+  CodeEditor: () => <div data-testid="code-editor" />,
 }));
 
 vi.mock('@/services/api', () => ({
@@ -17,7 +18,14 @@ vi.mock('@/services/api', () => ({
   writeFile: vi.fn(async () => undefined),
   renameFs: vi.fn(async () => undefined),
   deleteFs: vi.fn(async () => undefined),
+  openFileExternally: vi.fn(async () => undefined),
+  revealFileExternally: vi.fn(async () => undefined),
 }));
+
+// Load the real dependency graph during setup; UI assertions keep their budget.
+beforeAll(async () => {
+  await import('@/components/chat/MarkdownRenderer');
+});
 
 function mockMatchMedia(matches: boolean) {
   vi.stubGlobal('matchMedia', vi.fn().mockImplementation((query: string) => ({
@@ -54,6 +62,7 @@ beforeEach(() => {
     dirty: new Set(),
     mdViewMode: {},
     imagePreviews: {},
+    previewErrors: {},
     downloadFile: vi.fn(),
   });
   useUIStore.setState({ toastQueue: [], chatAttachmentRequests: [] });
@@ -69,6 +78,28 @@ afterEach(() => {
 });
 
 describe('EditorPane editor action wiring', () => {
+  it('loads Markdown preview on demand and retains preview/edit/split mode switching', async () => {
+    useEditorStore.setState({
+      openPaths: ['README.md'], activePath: 'README.md',
+      contents: { 'README.md': '# Preview content' },
+    });
+    render(<MemoryRouter><EditorPane /></MemoryRouter>);
+    await act(async () => {
+      // Await Vite's real deferred module graph before checking rendered UI.
+      await vi.dynamicImportSettled();
+    });
+    expect(await screen.findByRole('heading', { name: 'Preview content' })).toBeTruthy();
+    expect(screen.queryByTestId('code-editor')).toBeNull();
+    fireEvent.click(screen.getByTitle('Edit'));
+    expect(await screen.findByTestId('code-editor')).toBeTruthy();
+    expect(screen.queryByRole('heading', { name: 'Preview content' })).toBeNull();
+    fireEvent.click(screen.getByTitle('Split'));
+    expect(await screen.findByRole('heading', { name: 'Preview content' })).toBeTruthy();
+    expect(screen.getByTestId('code-editor')).toBeTruthy();
+    fireEvent.click(screen.getByTitle('Preview'));
+    expect(screen.queryByTestId('code-editor')).toBeNull();
+    expect(screen.getByRole('heading', { name: 'Preview content' })).toBeTruthy();
+  });
   it('keeps relative operation paths while displaying and copying the workdir path', async () => {
     render(
       <MemoryRouter initialEntries={['/editor']}>
@@ -157,3 +188,34 @@ describe('EditorPane editor action wiring', () => {
     expect(screen.getByRole('img', { name: 'photo.png' }).getAttribute('src')).toBe(attachmentBSrc);
   });
 });
+
+ it('renders failed previews read-only with desktop download and no Markdown controls', async () => {
+   mockMatchMedia(false);
+   useEditorStore.setState({openPaths: ['huge.md'], activePath: 'huge.md', contents: {},
+     previewErrors: {'huge.md': 'File too large (max 5 MiB)'}});
+   render(<MemoryRouter><EditorPane /></MemoryRouter>);
+   expect(screen.getByRole('alert').textContent).toContain('File too large');
+   expect(screen.queryByTestId('code-editor')).toBeNull();
+   expect(screen.queryByTitle('Edit')).toBeNull();
+   expect((screen.getByRole('button', {name: '保存文件'}) as HTMLButtonElement).disabled).toBe(true);
+   fireEvent.click(screen.getByRole('button', {name: '下载当前文件'}));
+   expect(useEditorStore.getState().downloadFile).toHaveBeenCalledWith('huge.md');
+ });
+
+ it('keeps both OS actions for a failed read-only preview', async () => {
+   mockMatchMedia(false);
+   useEditorStore.setState({openPaths: ['binary.bin'], activePath: 'binary.bin', contents: {},
+     previewErrors: {'binary.bin': 'Cannot read binary file'}});
+   render(<MemoryRouter><EditorPane /></MemoryRouter>);
+
+   expect(screen.getByRole('alert').textContent).toContain('Cannot read binary file');
+   const open = screen.getByRole('button', {name: '用系统默认方式打开'}) as HTMLButtonElement;
+   const reveal = screen.getByRole('button', {name: '在系统资源管理器中定位'}) as HTMLButtonElement;
+   expect(open.disabled).toBe(false);
+   expect(reveal.disabled).toBe(false);
+
+   fireEvent.click(open);
+   await waitFor(() => expect(openFileExternally).toHaveBeenCalledWith('s1', 'binary.bin'));
+   fireEvent.click(reveal);
+   await waitFor(() => expect(revealFileExternally).toHaveBeenCalledWith('s1', 'binary.bin'));
+ });

@@ -1,14 +1,19 @@
+import { useIdleHistoryPrefetch } from '@/hooks/useIdleHistoryPrefetch';
 import { forwardRef, useRef, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useState } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { useSessionStore } from '@/stores/sessionStore';
 import { useAppSettingsStore } from '@/stores/appSettingsStore';
 import { groupMessages, MessageDisplayItem, getItemRole } from './MessageBubble';
 import { RewindConfirmModal } from './RewindConfirmModal';
+import { durableOffsetOf } from '@/stores/messageOrdering';
 import { filterVisibleMessages } from './messageFilter';
+import { findManualReportTargets, type HistoryBoundaryProof, type ManualReportTarget } from './manualTaskReport';
 import { getDisplayItemKey, getMessageIdentity } from '@/utils/messageIdentity';
 import { isValidMessageTs } from '@/utils/messageTimestamp';
 import type { Message } from '@/types';
 import { ArrowDown, Loader2 } from 'lucide-react';
+import { SearchTextContext } from './searchText';
+import { registerChatScrollToBottomHandler } from '@/shortcuts/chatScrollBridge';
 
 // Keep the follow zone small enough that scrolling up to read older content
 // opts out, while absorbing normal wheel/touch settling and sub-pixel layout
@@ -72,20 +77,28 @@ function measuredRowKey(
   return `${sessionId ?? 'no-session'}:${getDisplayItemKey(item, index)}`;
 }
 
-// Content-aware pre-measurement estimate, used only for keys the measured-height
-// cache does not hold. The stock flat estimate underestimates long assistant
-// rows by hundreds of px, and every such row pays that error back as a
-// synchronous size compensation the moment it is first measured — which is the
-// per-frame content shift this file fights. This is a *pure* function of the
-// display item, so it returns the same value on every render (a stable estimate
-// is required: an estimate that changes per render would itself re-measure the
-// row and create more churn than it removes).
-//
-// It is deliberately coarse. Rendered height is dominated by markdown structure
-// (tables, code fences) that no cheap text metric can see, so this must not
-// pretend to precision — it only has to be closer than a flat 100 for the common
-// long-text row. Empirical row metrics (bubble mode, 1120px viewport): a body
-// line is ~22.75px, an assistant row carries ~20px of vertical padding. Clamp to
+/** Disclosure rows remount folded, so their previous expanded heights are stale. */
+function invalidateDisclosureHeights(sessionId: string, items: DisplayItem[]): void {
+  const heights = measuredHeights.get(sessionId);
+  if (!heights) return;
+  items.forEach((item, index) => {
+    if ('type' in item && (
+      item.type === 'thinking_group' ||
+      item.type === 'tool_group' ||
+      item.type === 'non_body_group'
+    )) {
+      heights.delete(measuredRowKey(sessionId, item, index));
+    }
+  });
+}
+
+type DisplayItem = ReturnType<typeof groupMessages>[number];
+
+// Content-aware first-paint estimate for an unmeasured row. A flat 100px guess
+// is wrong by hundreds of px on long assistant rows, and the error is repaid
+// at measure time as a synchronous content shift (the scroll-flicker source).
+// Defaults measured from the TUI-style rows: a wrapped content line is
+// ~22.75px, an assistant row carries ~20px of vertical padding. Clamp to
 // a ceiling so a pathological row cannot reserve a screenful before it is
 // measured.
 const ESTIMATE_PADDING = 24;
@@ -108,23 +121,6 @@ function estimateRowHeight(item: DisplayItem | undefined): number {
   return Math.min(ESTIMATE_MAX, ESTIMATE_PADDING + lines * ESTIMATE_LINE_HEIGHT);
 }
 
-/** Disclosure rows remount folded, so their previous expanded heights are stale. */
-function invalidateDisclosureHeights(sessionId: string, items: DisplayItem[]): void {
-  const heights = measuredHeights.get(sessionId);
-  if (!heights) return;
-  items.forEach((item, index) => {
-    if ('type' in item && (
-      item.type === 'thinking_group' ||
-      item.type === 'tool_group' ||
-      item.type === 'non_body_group'
-    )) {
-      heights.delete(measuredRowKey(sessionId, item, index));
-    }
-  });
-}
-
-type DisplayItem = ReturnType<typeof groupMessages>[number];
-
 function getDisplayItemMessageIdentity(item: DisplayItem | undefined): string | undefined {
   if (!item) return undefined;
   if ('type' in item) {
@@ -132,6 +128,17 @@ function getDisplayItemMessageIdentity(item: DisplayItem | undefined): string | 
     return firstMessage ? getMessageIdentity(firstMessage) : undefined;
   }
   return getMessageIdentity(item as Message);
+}
+
+/** Per-row binding lookup: only a message row can carry the manual action. */
+function manualReportTargetForItem(
+  item: DisplayItem,
+  targets: ReadonlyMap<string, ManualReportTarget>,
+): ManualReportTarget | null {
+  if ('type' in item) return null;
+  const messageId = (item as Message).messageId;
+  if (!messageId) return null;
+  return targets.get(messageId) ?? null;
 }
 
 function findDisplayItemIndexByMessageIdentity(items: DisplayItem[], identity: string): number {
@@ -164,26 +171,61 @@ function findRenderedRowByMessageIdentity(
 }
 
 export interface ChatMessagesHandle {
+  /** Snapshot visible canonical indices without scrolling, fetching or scheduling work. */
+  getViewportHistoryRange?: () => { start: number; end: number } | null;
+  /** Event-driven convergence for an opening made before visible rows mount. */
+  observeViewportHistoryRange?: (listener: (range: { start: number; end: number }) => void) => () => void;
   /** Scroll to a currently loaded message and briefly highlight its row. */
   scrollToMessage: (message: import('@/types').Message, historyIndex?: number) => boolean;
 }
 
-export const ChatMessages = forwardRef<ChatMessagesHandle, { hideScrollToBottom?: boolean }>(function ChatMessages(
-  { hideScrollToBottom = false },
+export interface ChatMessagesProps {
+  hideScrollToBottom?: boolean;
+  /** Persistent block-level marker for the selected history-search result. */
+  searchTargetMessageId?: string | null;
+  /** Session-scoped search target; ignored whenever the target belongs elsewhere. */
+  searchTarget?: { sessionId: string; messageId: string; query?: string; occurrence?: number } | null;
+}
+
+export const ChatMessages = forwardRef<ChatMessagesHandle, ChatMessagesProps>(function ChatMessages(
+  {
+    hideScrollToBottom = false,
+    searchTargetMessageId: unscopedSearchTargetMessageId = null,
+    searchTarget = null,
+  },
   ref,
 ) {
   const parentRef = useRef<HTMLDivElement>(null);
   const currentMessages = useSessionStore((s) => s.currentMessages);
+  useIdleHistoryPrefetch();
   const hasMoreMessages = useSessionStore((s) => s.hasMoreMessages);
   const historyLoading = useSessionStore((s) => s.historyLoading);
   const initialLoading = useSessionStore((s) => s.initialLoading);
   const loadOlderMessages = useSessionStore((s) => s.loadOlderMessages);
   const currentSessionId = useSessionStore((s) => s.currentSessionId);
-  // Two chat presentations share this component. TUI (the default) lays out
-  // full-width role-bar rows; Bubble adds `.bubble-mode` on the scroll
-  // container, which is what the shrink-to-fit bubble rules are scoped to.
-  const tuiViewEnabled = useAppSettingsStore((s) => s.chatViewStyle === 'tui');
-  const lastTuiViewEnabledRef = useRef(tuiViewEnabled);
+  // Subscribe only to report authority. Preview/status updates recreate the
+  // Session object frequently, but do not change these bindings.
+  const reportManagedBy = useSessionStore((s) => (
+    s.sessions.find((session) => session.id === s.currentSessionId)?.managedBy
+  ));
+  const reportTerminals = useSessionStore((s) => (
+    s.sessions.find((session) => session.id === s.currentSessionId)?.terminalResults
+  ));
+  const reportSession = useMemo(() => currentSessionId ? {
+    id: currentSessionId, managedBy: reportManagedBy, terminalResults: reportTerminals,
+  } : undefined, [currentSessionId, reportManagedBy, reportTerminals]);
+  const searchTargetMessageId = searchTarget?.sessionId === currentSessionId
+    ? searchTarget.messageId
+    : unscopedSearchTargetMessageId;
+  // Three chat presentations share this component. TUI (the default) and the
+  // Raw view both lay out full-width role-bar rows and differ only in the
+  // message body; Bubble only adds `.bubble-mode` on the scroll container,
+  // which is what the shrink-to-fit bubble rules are scoped to. Keying this on
+  // `=== 'bubble'` (rather than `!== 'tui'`) is what keeps Raw on the TUI rows
+  // instead of leaking the bubble geometry onto it.
+  const chatViewStyle = useAppSettingsStore((s) => s.chatViewStyle);
+  const bubbleViewEnabled = chatViewStyle === 'bubble';
+  const lastChatViewStyleRef = useRef(chatViewStyle);
   const showMetaAgent = useAppSettingsStore((s) => s.showMetaAgent);
   const showTaskAgent = useAppSettingsStore((s) => s.showTaskAgent);
   const showQQ = useAppSettingsStore((s) => s.showQQ);
@@ -271,24 +313,71 @@ export const ChatMessages = forwardRef<ChatMessagesHandle, { hideScrollToBottom?
 
   // Frontend-only display filter — currentMessages in the store is never
   // mutated; hidden messages reappear when their toggle is switched back on.
-  const visibleMessages = useMemo(
-    () =>
-      filterVisibleMessages(currentMessages, {
-        showMetaAgent,
-        showTaskAgent,
-        showQQ,
-      }),
-    [currentMessages, showMetaAgent, showTaskAgent, showQQ],
-  );
+  const visibleMessages = useMemo(() => {
+    const filtered = filterVisibleMessages(currentMessages, {
+      showMetaAgent,
+      showTaskAgent,
+      showQQ,
+    });
+    if (!searchTargetMessageId) return filtered;
+
+    // Search is intentionally broader than the display-prefix filters. Keep
+    // its selected result mounted long enough to navigate and highlight it,
+    // while preserving the normal visibility preference for every other row.
+    const visible = new Set(filtered);
+    const target = currentMessages.find(
+      (message) => message.messageId === searchTargetMessageId &&
+        ['user', 'assistant', 'tool', 'thinking'].includes(message.role),
+    );
+    if (!target || visible.has(target)) return filtered;
+    return currentMessages.filter((message) => visible.has(message) || message === target);
+  }, [currentMessages, searchTargetMessageId, showMetaAgent, showTaskAgent, showQQ]);
 
   // Preserve the existing separate tool/thinking rows unless the user opts in
   // to one parent disclosure for each adjacent non-body run.
   const grouped = useMemo(
-    () => groupMessages(visibleMessages, mergeConsecutiveNonBodyBlocks, timestampFlashMessages),
-    [visibleMessages, mergeConsecutiveNonBodyBlocks, timestampFlashMessages],
+    () => groupMessages(visibleMessages, mergeConsecutiveNonBodyBlocks, timestampFlashMessages, searchTargetMessageId),
+    [visibleMessages, mergeConsecutiveNonBodyBlocks, timestampFlashMessages, searchTargetMessageId],
   );
 
-  const [highlightedTarget, setHighlightedTarget] = useState<{ identity: string; historyIndex?: number } | null>(null);
+  // Explicit report bindings: one per completed task, on that task's tail text
+  // block (not only the newest task).  Computed from the unfiltered transcript
+  // so a hidden tail row can never re-bind the action to another block; if a
+  // bound row is filtered out it is simply not rendered and no action appears.
+  // Identity is captured here (never re-read at click time), so a late update
+  // or Session switch cannot re-target a pending click at another task.
+  // The block proof needs the loaded window's canonical epoch/revision/total
+  // and each row's absolute offset, exactly the inputs the server validates
+  // against; rows the window does not own resolve to no offset and stay
+  // unbound until their canonical rows converge.
+  const reportWindow = useSessionStore((s) => (
+    s.currentSessionId ? s.sessionTranscripts[s.currentSessionId]?.window : undefined
+  ));
+  const manualReportProof = useMemo<HistoryBoundaryProof | undefined>(() => {
+    if (!reportWindow) return undefined;
+    const window = reportWindow;
+    return {
+      epoch: window.epoch,
+      revision: window.revision,
+      total: window.total,
+      offsetOf: (message: Message) => {
+        const offset = durableOffsetOf(message);
+        if (offset === undefined) return undefined;
+        const owner = window.rows.get(offset);
+        return owner && getMessageIdentity(owner) === getMessageIdentity(message)
+          ? offset : undefined;
+      },
+    };
+  }, [reportWindow]);
+  const manualReportTargets = useMemo(
+    () => findManualReportTargets(currentMessages, reportSession, manualReportProof),
+    [currentMessages, reportSession, manualReportProof],
+  );
+
+  const [highlightedTarget, setHighlightedTarget] = useState<{ identity: string; historyIndex?: number; search?: boolean } | null>(null);
+  useLayoutEffect(() => {
+    if (!searchTargetMessageId && highlightedTarget?.search) setHighlightedTarget(null);
+  }, [searchTargetMessageId, highlightedTarget]);
 
   // Latest render value the module-level helper below needs. It must hold a
   // stable identity because the scroll effects depend on that helper.
@@ -360,26 +449,9 @@ export const ChatMessages = forwardRef<ChatMessagesHandle, { hideScrollToBottom?
   // of estimated rows: scrolling up remeasures them, the content above the
   // viewport grows, and the default refuses to correct.
   //
-  // Measured finding: the library DOES run this correction and its write lands
-  // (verified: the predicted offset equals the achieved `scrollTop`, never
-  // clamped), yet the frame still jumps. The competing restores in this
-  // component (`sessionAnchorRef` and `paginationAnchorRef`) then pin the same
-  // row back to the offset they remembered *before* the growth — the same
-  // magnitude with the opposite sign, cancelling the library exactly and, during
-  // an up-scroll through a run of estimated rows, compounding into an
-  // overshoot-then-snap loop (measured: S2 single-frame jumps up to ~4.6k px).
-  // The hook below therefore must stay, and every other writer must stand down
-  // for a row the virtualizer already corrected this frame (see the guards near
-  // `restoreSessionViewportAnchor` and `restorePaginationAnchor`). One writer per
-  // frame is the invariant; a genuine prepend (no compensation) still restores
-  // immediately, so prepend accuracy is preserved.
-  //
   // Rows the virtualizer compensated during the current frame, with the summed
-  // delta it applied. Every competing restore consults this so it stands down
-  // for a row the virtualizer already moved this frame. Cleared on the next
-  // animation frame: one frame is exactly the window in which the competing
-  // correction runs.
-  //
+  // delta it applied. Cleared on the next animation frame: one frame is
+  // exactly the window in which a competing correction may run.
   const sizeCompensatedThisFrameRef = useRef<Map<number, number> | null>(null);
   // The option is honoured by the virtualizer's `setOptions` (it copies every
   // key into `this.options` before `resizeItem` reads it) but is missing from
@@ -419,29 +491,25 @@ export const ChatMessages = forwardRef<ChatMessagesHandle, { hideScrollToBottom?
   const virtualItems = virtualizer.getVirtualItems();
   const virtualizerRef = useRef(virtualizer);
   virtualizerRef.current = virtualizer;
-  // Keep this Session's measured-height cache warm *during* the mount, not only
-  // at unmount. `estimateSize` reads this map for a row the virtualizer has not
-  // measured in the current window: the more keys it already holds, the closer
-  // the pre-measurement estimate is to the committed height, so the synchronous
-  // size compensation on a row's first paint is smaller and the content above
-  // the reader's line shifts less. Writing from the live `measurementsCache`
-  // (keyed by the same `measuredRowKey` the estimate reads, which `getItemKey`
-  // also produces) is what makes a row measured once — in any earlier scroll
-  // within this mount — stay measured when it re-enters the window. Entries
-  // whose `size` is not a positive number are skipped so the estimate stays a
-  // pure function of identity; a value that changed every render would itself
-  // re-measure the row and create more churn than it removes.
-  if (currentSessionId) {
-    const cache = virtualizer.measurementsCache;
-    if (Array.isArray(cache)) {
-      let heights = measuredHeights.get(currentSessionId);
-      for (const measurement of cache) {
-        if (typeof measurement.size !== 'number' || measurement.size <= 0) continue;
-        if (!heights) { heights = new Map(); measuredHeights.set(currentSessionId, heights); }
-        heights.set(String(measurement.key), measurement.size);
+  // Rows use normal document flow to prevent overlap during streaming. While
+  // scrolling, TanStack defers a new row's first measurement to ResizeObserver.
+  // Its actual DOM height can therefore move later rows before the estimated
+  // prefix/scroll compensation catches up. Measure only these newly mounted
+  // rows in the layout phase, so both changes settle before the first paint.
+  // Previously measured rows retain the library's normal resize policy (in
+  // particular, growth below the reading point in a tall row does not scroll).
+  useLayoutEffect(() => {
+    const instance = virtualizerRef.current;
+    if (!instance.itemSizeCache || !parentRef.current) return;
+    for (const node of parentRef.current.querySelectorAll<HTMLElement>('[data-scroll-anchor-key][data-index]')) {
+      const index = Number(node.dataset.index);
+      const key = instance.options.getItemKey(index);
+      if (!instance.itemSizeCache.has(key)) {
+        const height = instance.options.measureElement(node, undefined, instance);
+        if (height > 0) instance.resizeItem(index, height);
       }
     }
-  }
+  }, [virtualItems, currentSessionId]);
   const [isUnderfilled, setIsUnderfilled] = useState(false);
   const refreshUnderfilled = useCallback(() => {
     const el = parentRef.current;
@@ -519,30 +587,6 @@ export const ChatMessages = forwardRef<ChatMessagesHandle, { hideScrollToBottom?
     // cleanup that captures the final position no longer re-runs on every
     // session switch (where it used to write a snapshot for the wrong session).
   }, []);
-
-  const scrollToMessage = useCallback((message: import('@/types').Message, historyIndex?: number): boolean => {
-    const identity = getMessageIdentity(message);
-    const itemIndex = grouped.findIndex((item) => {
-      if ('type' in item && item.type === 'tool_group') return false;
-      return getMessageIdentity(item as import('@/types').Message) === identity;
-    });
-    if (itemIndex < 0) return false;
-    virtualizer.scrollToIndex(itemIndex, { align: 'center', behavior: 'auto' });
-    setHighlightedTarget({ identity, historyIndex });
-    // A jump moves the viewport without touching the scroll listener (and may
-    // not even change totalSize), so refresh the round-trip anchor once the
-    // targeted row has landed. Otherwise leaving right after a jump would
-    // remember the position from before it.
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        const el = parentRef.current;
-        if (el) rememberScrollPosition(el);
-      });
-    });
-    return true;
-  }, [grouped, virtualizer, rememberScrollPosition]);
-
-  useImperativeHandle(ref, () => ({ scrollToMessage }), [scrollToMessage]);
 
   useEffect(() => {
     if (!highlightedTarget) return;
@@ -668,6 +712,9 @@ export const ChatMessages = forwardRef<ChatMessagesHandle, { hideScrollToBottom?
     generation: number;
     timer: ReturnType<typeof setTimeout> | null;
   }>({ active: false, generation: 0, timer: null });
+  // A queued anchoring scroll can arrive before the wheel's actual movement.
+  // Until that upward movement arrives, bottom geometry is not renewed intent.
+  const pendingOlderScrollRef = useRef(false);
   const upwardPaginationArmedRef = useRef(false);
   const lastScrollTopRef = useRef<number | null>(null);
   const lastTouchYRef = useRef<number | null>(null);
@@ -675,6 +722,9 @@ export const ChatMessages = forwardRef<ChatMessagesHandle, { hideScrollToBottom?
   const sessionAnchorRestoreRafRef = useRef<number | null>(null);
   const sessionBottomRafRef = useRef<number | null>(null);
   const paginationRequestInFlightRef = useRef(false);
+  const paginationRequestSequenceRef = useRef(0);
+  const paginationConsumedInputRef = useRef(0);
+  const paginationCheckDueRef = useRef<number | null>(null);
   const historyLoadingRef = useRef(historyLoading);
   historyLoadingRef.current = historyLoading;
 
@@ -740,12 +790,124 @@ export const ChatMessages = forwardRef<ChatMessagesHandle, { hideScrollToBottom?
   }, [clearProgrammaticSuppression]);
 
   const clearUserScrollActivity = useCallback(() => {
+    paginationCheckDueRef.current = null;
+    pendingOlderScrollRef.current = false;
     const state = userScrollStateRef.current;
     if (state.timer !== null) clearTimeout(state.timer);
     state.timer = null;
     state.active = false;
     upwardPaginationArmedRef.current = false;
   }, []);
+
+  const scrollToMessage = useCallback((message: import('@/types').Message, historyIndex?: number): boolean => {
+    const identity = getMessageIdentity(message);
+    const itemIndex = findDisplayItemIndexByMessageIdentity(groupedRef.current, identity);
+    if (itemIndex < 0) return false;
+
+    // Navigation owns this position. A cold jump measures new rows and changes
+    // totalSize; bottom-follow and a previous reading/pagination anchor must
+    // not undo the virtualizer's first positioning/reconciliation.
+    clearUserScrollActivity();
+    shouldFollowBottomRef.current = false;
+    initialScrollPendingRef.current = false;
+    restoreRef.current = null;
+    isRestoringRef.current = false;
+    sessionAnchorRef.current = null;
+    paginationAnchorRef.current = null;
+    for (const pending of [sessionBottomRafRef, sessionAnchorRestoreRafRef, paginationRestoreRafRef]) {
+      if (pending.current !== null) cancelAnimationFrame(pending.current);
+      pending.current = null;
+    }
+    markProgrammaticChange();
+    setIsNearBottom(false);
+    const sessionAtJump = currentSessionIdRef.current;
+    virtualizerRef.current.scrollToIndex(itemIndex, { align: 'center', behavior: 'auto' });
+    setHighlightedTarget({ identity, historyIndex, search: message.messageId === searchTargetMessageId });
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        const el = parentRef.current;
+        if (el && currentSessionIdRef.current === sessionAtJump) {
+          const target = el.querySelector<HTMLElement>('[data-search-target]');
+          const activeWord = target?.querySelector<HTMLElement>('.history-search-word-active');
+          if (activeWord && target?.getAttribute('data-index') === String(historyIndex)) {
+            const viewport = el.getBoundingClientRect();
+            const word = activeWord.getBoundingClientRect();
+            // Never scroll the whole page/composer. Reconcile only this chat
+            // viewport after the virtual row and selected occurrence mount.
+            if (viewport.height > 0 && (word.top < viewport.top || word.bottom > viewport.bottom)) {
+              markProgrammaticChange();
+              el.scrollTop += word.top-viewport.top-viewport.height/2;
+            }
+          }
+          rememberScrollPosition(el);
+        }
+      });
+    });
+    return true;
+  }, [clearUserScrollActivity, markProgrammaticChange, rememberScrollPosition, searchTargetMessageId]);
+
+  const getViewportHistoryRange = useCallback(() => {
+    const element = parentRef.current;
+    const state = useSessionStore.getState();
+    const transcript = state.currentSessionId ? state.sessionTranscripts[state.currentSessionId] : undefined;
+    if (!element || !transcript || state.currentSessionId !== currentSessionId) return null;
+    const viewport = element.getBoundingClientRect();
+    if (viewport.height <= 0 || viewport.width <= 0) return null;
+    let start = Infinity, end = -1;
+    let runtimeVisible = false;
+    for (const row of element.querySelectorAll<HTMLElement>('[data-scroll-anchor-key][data-index]')) {
+      const rectangle = row.getBoundingClientRect();
+      if (rectangle.bottom <= viewport.top || rectangle.top >= viewport.bottom) continue;
+      const item = groupedRef.current[Number(row.dataset.index)];
+      if (!item || row.dataset.scrollAnchorKey !== measuredRowKey(currentSessionId, item, Number(row.dataset.index))) continue;
+      const canonicalOffset = (message: Message) => {
+        const offset = durableOffsetOf(message);
+        const owner = offset === undefined ? undefined : transcript.window.rows.get(offset);
+        return offset !== undefined && owner && getMessageIdentity(owner) === getMessageIdentity(message) ? offset : undefined;
+      };
+      if ('type' in item) {
+        // Group order is canonical order. Its endpoints define the semantic
+        // interval even while folded; never inspect every child in a huge
+        // disclosure. Unproven endpoints degrade to no reliable group range.
+        const first = item.items.slice(0, 32).map(canonicalOffset).find(offset => offset !== undefined);
+        const last = item.items.slice(-32).reverse().map(canonicalOffset).find(offset => offset !== undefined);
+        if (first !== undefined && last !== undefined && first <= last) {
+          start = Math.min(start, first); end = Math.max(end, last);
+        }
+      } else {
+        const message = item as Message;
+        const offset = canonicalOffset(message);
+        if (offset !== undefined) { start = Math.min(start, offset); end = Math.max(end, offset); }
+        else if (transcript.runtime.includes(message)) runtimeVisible = true;
+      }
+    }
+    if (end < 0 && runtimeVisible) return { start: transcript.anchorOffset, end: transcript.anchorOffset };
+    return end >= 0 ? { start, end } : null;
+  }, [currentSessionId]);
+  const observeViewportHistoryRange = useCallback((listener: (range: { start: number; end: number }) => void) => {
+    const element = parentRef.current;
+    if (!element) return () => {};
+    let frame: number | null = null;
+    const notify = () => {
+      if (frame !== null) return;
+      frame = requestAnimationFrame(() => {
+        frame = null;
+        const range = getViewportHistoryRange();
+        if (range) listener(range);
+      });
+    };
+    const mutation = new MutationObserver(notify);
+    const resize = new ResizeObserver(notify);
+    mutation.observe(element, { childList: true, subtree: true, attributes: true, attributeFilter: ['data-scroll-anchor-key', 'style'] });
+    resize.observe(element);
+    notify();
+    return () => {
+      mutation.disconnect(); resize.disconnect();
+      if (frame !== null) cancelAnimationFrame(frame);
+    };
+  }, [getViewportHistoryRange]);
+  useImperativeHandle(ref, () => ({ scrollToMessage, getViewportHistoryRange, observeViewportHistoryRange }),
+    [scrollToMessage, getViewportHistoryRange, observeViewportHistoryRange]);
 
   const scheduleUserScrollExpiry = useCallback((delay = USER_SCROLL_QUIET_MS) => {
     const state = userScrollStateRef.current;
@@ -756,9 +918,16 @@ export const ChatMessages = forwardRef<ChatMessagesHandle, { hideScrollToBottom?
       if (current.generation === generation) {
         current.timer = null;
         current.active = false;
+        paginationCheckDueRef.current = null;
+        // A layout scroll can consume suppression before the real gesture's
+        // scroll event is attributed. Capture the settled position rather than
+        // reviving an anchor from before the user's input.
+        if (!sessionAnchorRef.current && parentRef.current) {
+          rememberScrollPosition(parentRef.current);
+        }
       }
     }, delay);
-  }, []);
+  }, [rememberScrollPosition]);
 
   const markUserScrollInput = useCallback((event?: Event, direction?: 'older' | 'newer') => {
     ignoreUnattributedScrollRef.current = false;
@@ -800,13 +969,24 @@ export const ChatMessages = forwardRef<ChatMessagesHandle, { hideScrollToBottom?
       sessionAnchorRestoreRafRef.current = null;
     }
     paginationAnchorRef.current = null;
+    sessionAnchorRef.current = null;
+    if (currentSessionIdRef.current) scrollSnapshots.delete(currentSessionIdRef.current);
     restoreRef.current = null;
     isRestoringRef.current = false;
-    if (direction === 'older') upwardPaginationArmedRef.current = true;
-    else if (direction === 'newer') upwardPaginationArmedRef.current = false;
+    if (direction === 'older') {
+      // Streaming can rerender before the browser dispatches the wheel's scroll
+      // event. Stop following on the input itself so that rerender cannot pin
+      // the viewport back to the bottom and erase the reader's movement.
+      shouldFollowBottomRef.current = false;
+      upwardPaginationArmedRef.current = true;
+    } else if (direction === 'newer') {
+      upwardPaginationArmedRef.current = false;
+      paginationCheckDueRef.current = null;
+    }
     const state = userScrollStateRef.current;
     state.generation += 1;
     state.active = true;
+    pendingOlderScrollRef.current = direction === 'older';
     scheduleUserScrollExpiry();
   }, [clearProgrammaticSuppression, scheduleUserScrollExpiry]);
 
@@ -835,6 +1015,25 @@ export const ChatMessages = forwardRef<ChatMessagesHandle, { hideScrollToBottom?
     scrollToBottom();
   }, [clearUserScrollActivity, scrollToBottom]);
 
+  // Keyboard entry point for the same explicit recovery the button runs. The
+  // bridge stores the Session that mounted this list, so a request can never
+  // retarget a successor Session or an unmounted/route-hidden list. With no
+  // rendered row (empty chat, filtered tail) nothing is registered and the
+  // dispatcher leaves the chord alone.
+  useEffect(() => {
+    if (!currentSessionId || grouped.length === 0) return;
+    const registeredSessionId = currentSessionId;
+    return registerChatScrollToBottomHandler(registeredSessionId, () => {
+      if (currentSessionIdRef.current !== registeredSessionId) return false;
+      const el = parentRef.current;
+      if (!el) return false;
+      // Already at the true bottom: no scroll, no follow/suppression churn.
+      if (el.scrollHeight - el.scrollTop - el.clientHeight <= 1) return true;
+      recoverToBottom();
+      return true;
+    });
+  }, [currentSessionId, grouped.length, recoverToBottom]);
+
   const markLayoutChange = useCallback(() => {
     layoutChangePendingRef.current = true;
     markProgrammaticChange();
@@ -851,30 +1050,6 @@ export const ChatMessages = forwardRef<ChatMessagesHandle, { hideScrollToBottom?
     const el = parentRef.current;
     const anchor = paginationAnchorRef.current;
     if (!el || !anchor) return;
-
-    // Single-writer discipline. `shouldAdjustScrollPositionOnItemSizeChange`
-    // may already have applied this frame's size delta to `scrollOffset` for a
-    // row above the reader's line. If that row is the one this anchor pins, the
-    // correction below would cancel the virtualizer's write exactly (opposite
-    // sign, same magnitude) — the overshoot-then-snap loop this restore leaks
-    // while a run of estimated rows above the fold keeps re-measuring during an
-    // up-scroll. Stand down for this frame only; the loop re-runs next frame
-    // from the settled layout, and a genuine prepend (no compensation) still
-    // corrects immediately, so prepend accuracy is preserved.
-    // Resolve the anchored row to its current display index through the same
-    // stable identity the virtualizer keys on (`rowKey` first, then the message
-    // identity it groups into), so the set membership check is exact.
-    const compensated = sizeCompensatedThisFrameRef.current;
-    if (compensated) {
-      const anchorIndex = anchor.rowKey
-        ? groupedRef.current.findIndex((item, itemIndex) =>
-            measuredRowKey(currentSessionIdRef.current, item, itemIndex) === anchor.rowKey,
-          )
-        : anchor.identity
-          ? findDisplayItemIndexByMessageIdentity(groupedRef.current, anchor.identity)
-          : -1;
-      if (anchorIndex >= 0 && compensated.has(anchorIndex)) return;
-    }
 
     // Re-resolve stable identities on every correction instead of trusting a
     // connected DOM node: a virtualizer may recycle that node for another row.
@@ -950,21 +1125,9 @@ export const ChatMessages = forwardRef<ChatMessagesHandle, { hideScrollToBottom?
       !anchor ||
       anchor.sessionId !== currentSessionIdRef.current ||
       sessionSwitchWaitingForSettingsRef.current ||
-      shouldFollowBottomRef.current
+      shouldFollowBottomRef.current ||
+      (userScrollStateRef.current.active && !paginationAnchorRef.current && !restoreRef.current)
     ) return false;
-
-    // The virtualizer already compensated a size change for a row above the
-    // reader's line in this frame. If that row is the one this restore anchors
-    // to, applying the correction again would undo it exactly (opposite sign,
-    // same magnitude) and leave the jump on screen. Stand down for this frame
-    // only; the recorded anchor is refreshed from the settled layout afterwards.
-    const compensated = sizeCompensatedThisFrameRef.current;
-    if (compensated && anchor.rowKey) {
-      const anchorIndex = groupedRef.current.findIndex((item, itemIndex) =>
-        measuredRowKey(currentSessionIdRef.current, item, itemIndex) === anchor.rowKey,
-      );
-      if (anchorIndex >= 0 && compensated.has(anchorIndex)) return false;
-    }
 
     let row = anchor.identity
       ? findRenderedRowByMessageIdentity(
@@ -1011,6 +1174,10 @@ export const ChatMessages = forwardRef<ChatMessagesHandle, { hideScrollToBottom?
   }, [markProgrammaticChange]);
 
   const scheduleSessionAnchorRestore = useCallback(() => {
+    // A measurement-triggered render must not re-arm the restore that explicit
+    // wheel/touch input just cancelled. Genuine prepend/route restores retain
+    // their own anchor until the requested content has landed.
+    if (userScrollStateRef.current.active && !paginationAnchorRef.current && !restoreRef.current) return;
     if (sessionAnchorRestoreRafRef.current !== null) return;
     let frameCount = 0;
     let stableFrames = 0;
@@ -1088,19 +1255,6 @@ export const ChatMessages = forwardRef<ChatMessagesHandle, { hideScrollToBottom?
       if (resolved && !historyLoadingRef.current && stableFrames >= quietLimit) {
         paginationAnchorRef.current = null;
         if (routeRestore) restoreRef.current = null;
-        return;
-      }
-      // Active-input handover. Once the prepend has landed (the anchored row is
-      // rendered and measurable) and no further page is in flight, a live wheel
-      // or touch gesture owns `scrollTop`: `shouldAdjustScrollPositionOnItemSizeChange`
-      // is the single writer for the rows it re-measures this frame, and keeping
-      // this restore alive would revert its compensation (the residual
-      // overshoot-then-snap pair measured after the first guard). Release the
-      // anchor instead of re-pinning it under the reader's finger — the anchor is
-      // only re-armed by a later genuine prepend. Route restores are excluded:
-      // they must pin through the whole multi-page jump regardless of input.
-      if (resolved && !routeRestore && !historyLoadingRef.current && userScrollStateRef.current.active) {
-        paginationAnchorRef.current = null;
         return;
       }
       if (resolved && !routeRestore && frameCount >= 30) {
@@ -1250,12 +1404,12 @@ export const ChatMessages = forwardRef<ChatMessagesHandle, { hideScrollToBottom?
 
   useLayoutEffect(() => {
     if (sessionSwitchWaitingForSettingsRef.current) return;
-    const presentationChanged = lastTuiViewEnabledRef.current !== tuiViewEnabled;
-    lastTuiViewEnabledRef.current = tuiViewEnabled;
+    const presentationChanged = lastChatViewStyleRef.current !== chatViewStyle;
+    lastChatViewStyleRef.current = chatViewStyle;
     if (presentationChanged) {
-      // Row measurements are presentation-specific. Do not seed Bubble from
-      // TUI heights (or vice versa); measure the committed DOM before the
-      // session anchor correction loop settles.
+      // Row measurements are presentation-specific. Do not seed one view from
+      // another's heights (Bubble ≠ TUI ≠ Raw); measure the committed DOM
+      // before the session anchor correction loop settles.
       if (currentSessionId) measuredHeights.delete(currentSessionId);
       virtualizerRef.current.measure();
     }
@@ -1272,7 +1426,7 @@ export const ChatMessages = forwardRef<ChatMessagesHandle, { hideScrollToBottom?
     restoreSessionViewportAnchor,
     scheduleSessionAnchorRestore,
     settingsLoaded,
-    tuiViewEnabled,
+    chatViewStyle,
   ]);
 
   // Prepending first commits estimated rows, then the virtualizer measures
@@ -1315,9 +1469,9 @@ export const ChatMessages = forwardRef<ChatMessagesHandle, { hideScrollToBottom?
       historyLoadingRef.current ||
       paginationRequestInFlightRef.current ||
       sessionSwitchWaitingForSettingsRef.current ||
-      (requireUpwardGesture && !upwardPaginationArmedRef.current)
+      (requireUpwardGesture && (!upwardPaginationArmedRef.current ||
+        userScrollStateRef.current.generation <= paginationConsumedInputRef.current))
     ) {
-      upwardPaginationArmedRef.current = false;
       return;
     }
 
@@ -1355,17 +1509,33 @@ export const ChatMessages = forwardRef<ChatMessagesHandle, { hideScrollToBottom?
     }
 
     upwardPaginationArmedRef.current = false;
+    const inputGeneration = userScrollStateRef.current.generation;
+    paginationConsumedInputRef.current = inputGeneration;
+    paginationCheckDueRef.current = null;
+    const sid = useSessionStore.getState().currentSessionId;
+    const selection = sid ? useSessionStore.getState()._selectionSeq[sid] : undefined;
+    const stillSelected = () => useSessionStore.getState().currentSessionId === sid &&
+      (!sid || useSessionStore.getState()._selectionSeq[sid] === selection);
     paginationRequestInFlightRef.current = true;
+    const requestSequence = ++paginationRequestSequenceRef.current;
     void loadOlderMessages().then(
       () => {
+        if (paginationRequestSequenceRef.current !== requestSequence) return;
         paginationRequestInFlightRef.current = false;
-        upwardPaginationArmedRef.current = false;
-        markProgrammaticChange();
+        if (!stillSelected()) return;
+        // A wheel received while this page was pending belongs to the next
+        // request. Do not consume it or suppress its actual scroll on completion.
+        if (userScrollStateRef.current.generation === inputGeneration) {
+          upwardPaginationArmedRef.current = false;
+          markProgrammaticChange();
+        }
         restorePaginationAnchor();
         schedulePaginationRestore();
       },
       () => {
+        if (paginationRequestSequenceRef.current !== requestSequence) return;
         paginationRequestInFlightRef.current = false;
+        if (!stillSelected()) return;
         paginationAnchorRef.current = null;
       },
     );
@@ -1383,6 +1553,26 @@ export const ChatMessages = forwardRef<ChatMessagesHandle, { hideScrollToBottom?
     if (!el) return;
     lastScrollTopRef.current = el.scrollTop;
     let timer: ReturnType<typeof setTimeout> | null = null;
+    const checkPagination = () => {
+      timer = null;
+      paginationCheckDueRef.current = null;
+      if (el.scrollTop > 200 || !hasMoreMessages || historyLoading ||
+          !userScrollStateRef.current.active || !upwardPaginationArmedRef.current ||
+          userScrollStateRef.current.generation <= paginationConsumedInputRef.current) return;
+      // An unconsumed explicit gesture proves this is user demand. Layout
+      // suppression still classifies scroll events, but must not block this
+      // request: streaming can keep renewing that suppression indefinitely.
+      loadOlderFromViewport(true);
+    };
+    const schedulePaginationCheck = () => {
+      if (timer) return;
+      const delay = useSessionStore.getState().hasPrefetchedOlderMessages() ? 16 : 150;
+      const now = Date.now();
+      // Effect cleanup replaces the callback, not this demand's deadline.
+      // Streaming row updates must not keep restarting the entire wait.
+      paginationCheckDueRef.current = Math.min(paginationCheckDueRef.current ?? Infinity, now + delay);
+      timer = setTimeout(checkPagination, Math.max(0, paginationCheckDueRef.current - now));
+    };
 
     const markUserScrollKey = (event: KeyboardEvent) => {
       if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)) {
@@ -1397,10 +1587,25 @@ export const ChatMessages = forwardRef<ChatMessagesHandle, { hideScrollToBottom?
         markUserScrollInput();
       }
     };
+    const markScrollbarInput = (event: MouseEvent) => {
+      if (event.button !== 0 || event.target !== el) return;
+      const rect = el.getBoundingClientRect();
+      // Native thumb drags emit scroll events but can suppress pointermove.
+      // Claim only the scrollbar gutter, never an ordinary message/body click.
+      const gutter = el.offsetWidth - el.clientWidth;
+      if (gutter > 0 && (
+        event.clientX >= rect.left + el.clientLeft + el.clientWidth ||
+        event.clientX < rect.left + el.clientLeft
+      )) {
+        markUserScrollInput(event, 'older');
+      }
+    };
     const handler = () => {
       const previousTop = lastScrollTopRef.current;
       const movedOlder = previousTop !== null && el.scrollTop < previousTop;
       const movedNewer = previousTop !== null && el.scrollTop > previousTop;
+      const pendingOlderScroll = pendingOlderScrollRef.current;
+      if (movedOlder) pendingOlderScrollRef.current = false;
       lastScrollTopRef.current = el.scrollTop;
       const nearBottom = isNearBottomPosition();
       if (ignoreUnattributedScrollRef.current) {
@@ -1415,32 +1620,22 @@ export const ChatMessages = forwardRef<ChatMessagesHandle, { hideScrollToBottom?
         // wheel/touch/pointer/key input cancels this suppression first, so a
         // later genuine gesture can never be permanently ignored.
         clearProgrammaticSuppression();
-      } else if (userDrivenScroll) {
+      } else if (userDrivenScroll && (!pendingOlderScroll || movedOlder)) {
         shouldFollowBottomRef.current = nearBottom;
         if (movedOlder) upwardPaginationArmedRef.current = true;
         else if (movedNewer) upwardPaginationArmedRef.current = false;
-      } else if (nearBottom) {
+      } else if (nearBottom && !pendingOlderScroll) {
         // Returning to the bottom is an explicit recovery path even when the
         // browser emits the final scroll without another input event.
         shouldFollowBottomRef.current = nearBottom;
       }
       setIsNearBottom(nearBottom);
-      captureScrollMetrics(userDrivenScroll);
+      // Layout can emit a scroll at the old bottom between wheel input and
+      // actual upward movement. Recording it would revive the stale anchor;
+      // a later streaming suppression could then swallow the real position.
+      captureScrollMetrics(userDrivenScroll && (!pendingOlderScroll || movedOlder));
 
-      if (timer) return;
-      timer = setTimeout(() => {
-        timer = null;
-        if (
-          el.scrollTop <= 200 &&
-          hasMoreMessages &&
-          !historyLoading &&
-          userScrollStateRef.current.active &&
-          upwardPaginationArmedRef.current &&
-          programmaticSuppressionRef.current === null
-        ) {
-          loadOlderFromViewport(true);
-        }
-      }, 150);
+      schedulePaginationCheck();
     };
 
     const handleScrollEnd = () => {
@@ -1454,22 +1649,31 @@ export const ChatMessages = forwardRef<ChatMessagesHandle, { hideScrollToBottom?
     };
 
     const handleWheel = (event: WheelEvent) => {
-      markUserScrollInput();
+      markUserScrollInput(event);
+      const innerWindow = event.target instanceof Element &&
+        event.target.closest('[data-testid="non-body-group-window"]');
       if (
         event.deltaY < 0 &&
-        el.scrollTop <= 0 &&
-        el.scrollHeight <= el.clientHeight + 1 &&
+        el.scrollTop <= 200 &&
         hasMoreMessages &&
-        !useSessionStore.getState().historyLoading &&
-        !(event.target instanceof Element && event.target.closest('[data-testid="non-body-group-window"]'))
+        !innerWindow
       ) {
-        void loadOlderMessages();
+        // At the top, further wheel input need not produce a scroll event.
+        // Keep the same bounded scheduler for both moving and clamped input.
+        if (el.scrollHeight <= el.clientHeight + 1) loadOlderFromViewport(true);
+        else schedulePaginationCheck();
       }
     };
+    // Loading/measurement rerenders replace these listeners and their timer.
+    // Re-arm only an unconsumed explicit gesture, never a prepend's scroll.
+    if (el.scrollTop <= 200 && userScrollStateRef.current.active &&
+        upwardPaginationArmedRef.current &&
+        userScrollStateRef.current.generation > paginationConsumedInputRef.current) schedulePaginationCheck();
     el.addEventListener('wheel', handleWheel, { passive: true });
     el.addEventListener('touchstart', markUserScrollInput, { passive: true });
     el.addEventListener('touchmove', markUserScrollInput, { passive: true });
     el.addEventListener('pointermove', markPointerScrollInput, { passive: true });
+    el.addEventListener('mousedown', markScrollbarInput, { passive: true });
     el.addEventListener('keydown', markUserScrollKey);
     el.addEventListener('scroll', handler);
     el.addEventListener('scrollend', handleScrollEnd);
@@ -1477,7 +1681,8 @@ export const ChatMessages = forwardRef<ChatMessagesHandle, { hideScrollToBottom?
       el.removeEventListener('wheel', handleWheel);
       el.removeEventListener('touchstart', markUserScrollInput);
       el.removeEventListener('touchmove', markUserScrollInput);
-      el.removeEventListener('pointermove', markPointerScrollInput);
+    el.removeEventListener('pointermove', markPointerScrollInput);
+    el.removeEventListener('mousedown', markScrollbarInput);
       el.removeEventListener('keydown', markUserScrollKey);
       el.removeEventListener('scroll', handler);
       el.removeEventListener('scrollend', handleScrollEnd);
@@ -1541,6 +1746,7 @@ export const ChatMessages = forwardRef<ChatMessagesHandle, { hideScrollToBottom?
       clearProgrammaticSuppression();
       paginationAnchorRef.current = null;
       paginationRequestInFlightRef.current = false;
+      paginationRequestSequenceRef.current += 1;
       if (paginationRestoreRafRef.current !== null) {
         cancelAnimationFrame(paginationRestoreRafRef.current);
         paginationRestoreRafRef.current = null;
@@ -1680,7 +1886,7 @@ export const ChatMessages = forwardRef<ChatMessagesHandle, { hideScrollToBottom?
     <div className="flex-1 flex flex-col min-h-0 min-w-0 relative">
       <div
         ref={parentRef}
-        className={`flex-1 min-h-0 overflow-auto ${!tuiViewEnabled ? 'bubble-mode' : ''}`}
+        className={`flex-1 min-h-0 overflow-auto ${bubbleViewEnabled ? 'bubble-mode' : ''}`}
         style={{ overflowAnchor: 'none' }}
       >
         <div
@@ -1723,23 +1929,38 @@ export const ChatMessages = forwardRef<ChatMessagesHandle, { hideScrollToBottom?
                   display: 'flow-root',
                 }}
               >
-                {!('type' in item && item.type === 'tool_group') &&
-                highlightedTarget?.identity === getMessageIdentity(item as import('@/types').Message) ? (
+                {!('type' in item && item.type === 'tool_group') && (
+                  (item as import('@/types').Message).messageId === searchTargetMessageId ||
+                  highlightedTarget?.identity === getMessageIdentity(item as import('@/types').Message)
+                ) ? (
                   <div
-                    className="chat-message-jump-highlight"
-                    data-index={highlightedTarget.historyIndex ?? vItem.index}
+                    className={(item as import('@/types').Message).messageId === searchTargetMessageId
+                      ? 'chat-message-search-target'
+                      : 'chat-message-jump-highlight'}
+                    data-index={highlightedTarget?.identity === getMessageIdentity(item as import('@/types').Message)
+                      ? highlightedTarget.historyIndex ?? vItem.index
+                      : vItem.index}
+                    data-search-target={(item as import('@/types').Message).messageId === searchTargetMessageId || undefined}
                   >
-                    <MessageDisplayItem
-                      item={item}
-                      prevRole={prevRole}
-                      onTimestampFlashConsumed={clearTimestampFlash}
-                    />
+                    <SearchTextContext.Provider value={searchTarget?.sessionId === currentSessionId && (item as Message).messageId === searchTargetMessageId
+                      ? { query: searchTarget.query ?? '', occurrence: searchTarget.occurrence ?? 0 }
+                      : { query: '', occurrence: 0 }}>
+                      <MessageDisplayItem
+                        item={item}
+                        prevRole={prevRole}
+                        onTimestampFlashConsumed={clearTimestampFlash}
+                        searchTargetMessageId={searchTargetMessageId}
+                        manualReportTarget={manualReportTargetForItem(item, manualReportTargets)}
+                      />
+                    </SearchTextContext.Provider>
                   </div>
                 ) : (
                   <MessageDisplayItem
                     item={item}
                     prevRole={prevRole}
                     onTimestampFlashConsumed={clearTimestampFlash}
+                    searchTargetMessageId={searchTargetMessageId}
+                    manualReportTarget={manualReportTargetForItem(item, manualReportTargets)}
                   />
                 )}
               </div>

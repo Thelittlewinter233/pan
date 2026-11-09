@@ -9,7 +9,9 @@ Each session is stored as data/sessions/<id>.json.
 The ID format is ses_<16-hex-chars> (e.g. ses_a1b2c3d4e5f67890).
 
 Prompt schema: JSON persists original_prompt and handoff_prompt. system_prompt
-is a computed compatibility property and to_dict() export alias. Constructors
+is a compatibility property and to_dict() export alias. Existing-target handoff
+also persists frozen_system_prompt so metadata can never change CLI instructions.
+Constructors
 still accept the legacy keyword. If original_prompt is absent, legacy text is
 preserved verbatim as the baseline, even if it already contains old handoffs;
 there is no reliable way to recover its author-intended original by splitting
@@ -21,8 +23,11 @@ unknown Session fields cannot read it. No lossy downgrade is attempted.
 
 from __future__ import annotations
 
+from .workdir_retention import reference_commit, reference_transaction
+
 import asyncio
 import copy
+import contextvars
 import json
 import os
 import re
@@ -30,11 +35,13 @@ import secrets
 import threading
 import time
 import uuid
-from collections import deque
+from collections import Counter, defaultdict, deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
+from typing import Callable
 
 from packages.core.notifications import normalize_notification_settings
 
@@ -49,7 +56,13 @@ _MAIN_HISTORY_TAIL = 20          # 主文件内保留的尾部 history 条数（
 # compatibility-preserving bounds: pending/uncertain queue rows are never
 # evicted, while completed receipt metadata may expire after this window.
 HISTORY_PAGE_MAX = 200
+# Search jumps opt in to larger bounded pages; ordinary history callers stay at 200.
+HISTORY_SEARCH_JUMP_PAGE_MAX = 1000
 ACCEPTED_INPUT_ID_MAX = 256
+# One durable receipt per explicitly reported (session, task, message) triple
+# on the manager side.  Small on purpose: it only has to outlive the window in
+# which a browser retry can arrive after an unconfirmed delivery.
+MANUAL_REPORT_RECEIPT_MAX = 64
 QUEUE_RECEIPT_MAX_ENTRIES = 2048
 QUEUE_RECEIPT_TTL_SEC = 7 * 24 * 60 * 60
 QUEUE_IDEMPOTENCY_INDEX_MAX_ENTRIES = 4096
@@ -68,7 +81,13 @@ RESULT_REPLAY_MAX_ENTRIES = 64
 #   In particular, a slow history/metadata flush for Session A does not hold
 #   the store lock and cannot delay Session B's flush.
 _STORE_LOCK = threading.RLock()
+_PIN_LOCK = threading.RLock()
+_PIN_STATE_CACHE: tuple[Path, int, tuple[str, ...]] | None = None
+_PIN_STATE_CACHE_STAMP: tuple[int, int, int] | None = None
 _SAVE_STATES: dict[str, "_SessionSaveState"] = {}
+# Only runnable writes enter this pool.  Pending writes for a busy Session
+# stay in its ticket gate instead of occupying executor threads with wait().
+_SAVE_EXECUTOR = ThreadPoolExecutor(thread_name_prefix="pan-session-save")
 _MAX_SAVE_DIAGNOSTIC_SESSIONS = 128
 _newline_terminated_jsonl: set[str] = set()  # 进程内已知以 \n 结尾的 jsonl 路径（热路径跳过探测）
 
@@ -78,14 +97,15 @@ class _SessionSaveState:
     """Ordered, per-Session persistence gate and bounded counters.
 
     ``save_async`` requests receive a ticket before entering the executor.
-    This gives one Session FIFO ordering even when the default executor starts
-    later requests first, while allowing different Session IDs to use separate
-    executor threads.  The ticket is always retired in a ``finally`` block;
+    Only the serving async ticket is submitted to the write executor.  Its
+    completion submits the next runnable ticket directly from the writer
+    thread, without needing the event loop or a waiting executor thread.
+    Synchronous callers use the same gate.  A ticket is retired in ``finally``;
     cancellation of the awaiting coroutine is shielded until the underlying
     filesystem operation releases this state.
 
-    Only counters/timestamps are retained here.  No history, queue text, or
-    exception message is kept in diagnostics.
+    Pending operations are released when submitted; diagnostics expose only
+    counters/timestamps, never history, queue text or exception messages.
     """
 
     condition: threading.Condition = field(default_factory=threading.Condition)
@@ -94,6 +114,7 @@ class _SessionSaveState:
     pending: int = 0
     active: bool = False
     cancelled: set[int] = field(default_factory=set)
+    async_jobs: dict[int, tuple[Callable, Future]] = field(default_factory=dict, repr=False)
     last_wait_ms: float = 0.0
     last_flush_ms: float = 0.0
     last_pending_age_ms: float = 0.0
@@ -117,6 +138,42 @@ class _SessionSaveState:
             self.cancelled.remove(self.serving_ticket)
             self.serving_ticket += 1
 
+    def submit_async(self, ticket: int, operation) -> Future:
+        """Queue an operation without blocking an executor thread on its turn."""
+        result = Future()
+
+        def run():
+            try:
+                value = operation()
+            except BaseException as exc:
+                result.set_exception(exc)
+            else:
+                result.set_result(value)
+
+        with self.condition:
+            self.async_jobs[ticket] = (run, result)
+            self._submit_ready_locked()
+        return result
+
+    def _submit_ready_locked(self) -> None:
+        # Called both by the event loop and by synchronous/asynchronous writer
+        # threads.  Never defer this submission to an event-loop callback:
+        # a legacy sync API save may be blocking that loop on a later ticket.
+        while self.serving_ticket in self.async_jobs:
+            ticket = self.serving_ticket
+            run, result = self.async_jobs.pop(ticket)
+            try:
+                _SAVE_EXECUTOR.submit(run)
+            except BaseException as exc:
+                self.pending = max(0, self.pending - 1)
+                self.cancelled.add(ticket)
+                self._skip_cancelled_locked()
+                self.last_activity = time.monotonic()
+                self.condition.notify_all()
+                result.set_exception(exc)
+            else:
+                break
+
     def begin(self, ticket: int, enqueued_at: float) -> float:
         with self.condition:
             while ticket != self.serving_ticket:
@@ -138,6 +195,7 @@ class _SessionSaveState:
             self._skip_cancelled_locked()
             self.last_activity = time.monotonic()
             self.condition.notify_all()
+            self._submit_ready_locked()
 
     def finish(self, *, flush_ms: float, error_type: str | None) -> None:
         with self.condition:
@@ -154,6 +212,7 @@ class _SessionSaveState:
             self.last_completed_at = datetime.now().isoformat()
             self.last_activity = time.monotonic()
             self.condition.notify_all()
+            self._submit_ready_locked()
 
     def snapshot(self) -> dict:
         with self.condition:
@@ -238,11 +297,19 @@ def save_diagnostics(session_id: str | None = None, *, limit: int = 32) -> dict:
     visible = snapshots[:bounded_limit]
     for item in visible:
         item.pop("_lastActivity", None)
+    from packages.core import console_logs, session_error_log
     return {
         "sessions": visible,
         "totalTracked": len(snapshots),
         "totalQueued": sum(item["queueDepth"] for item in snapshots),
         "activeSessions": sum(1 for item in snapshots if item["active"]),
+        # Process-local counters for the append-only error sample log.  A
+        # write failure is visible here and in pan.log without affecting tasks.
+        "sessionErrorLog": session_error_log.stats(),
+        # Console stdout/stderr relay and whole-file rotation state.  A file
+        # another process still holds open shows `degraded`/`overLimit` here
+        # instead of being truncated or silently abandoned.
+        "consoleLogs": console_logs.status(),
     }
 
 # Session-list previews are a persisted projection, not a second history
@@ -425,7 +492,11 @@ def _apply_summary_message(projection: dict, message: object, *, bump: bool = Tr
     projection["history_total"] = (total + 1) if isinstance(total, int) else None
 
     changed = True
-    if role == "user":
+    if not preview.strip():
+        # Empty provider blocks still advance the history cursor, but have no
+        # displayable body with which to replace an established preview.
+        changed = False
+    elif role == "user":
         projection["last_user_preview"] = preview
         projection["last_display_preview"] = preview
         projection["last_main_role"] = role
@@ -439,15 +510,10 @@ def _apply_summary_message(projection: dict, message: object, *, bump: bool = Tr
         projection["last_main_role"] = role
     elif role == "thinking":
         projection["last_thinking_preview"] = preview
-        # Thinking/tool rows are auxiliary. They may be used only before any
-        # user/assistant/system preview exists and must never overwrite the
-        # established assistant (or other main-role) preview.
-        if not projection.get("last_main_role"):
-            projection["last_display_preview"] = preview
+        # Auxiliary previews remain available separately; they are not bodies
+        # for the Session card, even before the first main-role message.
     elif role == "tool":
         projection["last_tool_preview"] = preview
-        if not projection.get("last_main_role"):
-            projection["last_display_preview"] = preview
     else:
         # Unknown roles still count toward historyTotal, but cannot become a
         # user-visible summary preview.
@@ -459,9 +525,293 @@ def _apply_summary_message(projection: dict, message: object, *, bump: bool = Tr
     return True
 
 
+_PAN_MESSAGE_ID_PATTERN = re.compile(
+    r"pan:(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
+)
+
+
+def is_pan_message_id(value: object) -> bool:
+    """Return whether ``value`` is one of Pan's durable message identities."""
+    # Same canonical formats as UUID(...).hex/str, without constructing three
+    # UUID/string objects for every history row visited by a cold search.
+    return isinstance(value, str) and _PAN_MESSAGE_ID_PATTERN.fullmatch(value) is not None
+
+
+def _is_searchable_history_body(message: object) -> bool:
+    """Give persisted searchable text blocks an identity, not transport metadata."""
+    if not isinstance(message, dict):
+        return False
+    if message.get("role") not in ("user", "assistant", "tool", "thinking"):
+        return False
+    content = message.get("content")
+    if not isinstance(content, str) or not content.strip():
+        return False
+    # A fresh stream Session may inject this queue item as a user message.
+    # It is system context, not a user-authored searchable body.
+    return message.get("source") != "system_prompt"
+
+
+def _native_item_identity(message: dict) -> tuple[str, str] | None:
+    value = message.get("nativeItemId")
+    if isinstance(value, str) and value:
+        native_id = value
+    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+        native_id = str(value)
+    else:
+        return None
+    return str(message.get("role") or ""), native_id
+
+
+def _history_body_fingerprint(message: dict) -> tuple[str, str]:
+    # Exact role/content matching preserves text as provider data; order and
+    # neighboring stable rows below decide which duplicate occurrence is safe.
+    content = message["content"]
+    parts = message.get("parts")
+    if message.get("queueEnvelopes") and isinstance(parts, list) and parts:
+        # The durable UI body uses safe Markdown links; Codex receives the
+        # canonical path projection. Reconstruct only from retained parts,
+        # never from native text or an attachment name guessed from a link.
+        # Reimport is historical: files may have been deleted since delivery.
+        from .attachment_projection import project_message_parts
+        if all(isinstance(part, dict) and (
+            (part.get("type") == "text" and
+             isinstance(part.get("text", part.get("value")), str)) or
+            (part.get("type") == "attachment" and
+             isinstance(part.get("__serverPath"), str) and
+             Path(part["__serverPath"]).is_absolute())
+        ) for part in parts):
+            content = project_message_parts(parts, content, require_files=False)
+    return str(message.get("role") or ""), content
+
+
+def _remember_steer_client_identity(message: dict) -> None:
+    prior_id = message.get("messageId")
+    if (isinstance(prior_id, str) and prior_id.startswith("steer:")
+            and prior_id and not message.get("clientMessageId")):
+        # The browser uses steer:<caller token> only while its optimistic row
+        # is in flight. Keep it as an alias while assigning the durable Pan id.
+        message["clientMessageId"] = prior_id
+
+
+def _new_pan_message_id() -> str:
+    return f"pan:{uuid.uuid4().hex}"
+
+
+def assign_pan_message_ids(
+    history: list[dict], *, previous_history: list[dict] | None = None,
+) -> list[dict]:
+    """Copy imported/forked history and give searchable text blocks Pan IDs.
+
+    Existing Pan IDs survive a native reimport. Stable provider item IDs are
+    the first match key; exact role/content is used only when the match is
+    unique or when duplicate occurrences retain the same ordered sequence
+    between unambiguous neighbors. Ambiguous rows get fresh IDs. Provider
+    ``nativeItemId`` remains evidence and is never promoted to ``messageId``.
+
+    This helper is intentionally called only by import/fork boundaries. It
+    does not migrate ordinary legacy history while loading or saving it.
+    """
+    rows = [dict(row) if isinstance(row, dict) else row for row in (history or [])]
+    previous = previous_history or []
+    new_body = [index for index, row in enumerate(rows)
+                if _is_searchable_history_body(row)]
+    old_body = [index for index, row in enumerate(previous)
+                if _is_searchable_history_body(row)]
+    if not new_body:
+        return _retain_history_terminals(rows, previous)
+
+    old_unmatched = set(old_body)
+    new_unmatched = set(new_body)
+    pairs: list[tuple[int, int]] = []
+
+    def pair_unique_by(key_for):
+        old_keys: dict[object, list[int]] = defaultdict(list)
+        new_keys: dict[object, list[int]] = defaultdict(list)
+        for index in old_unmatched:
+            key = key_for(previous[index])
+            if key is not None:
+                old_keys[key].append(index)
+        for index in new_unmatched:
+            key = key_for(rows[index])
+            if key is not None:
+                new_keys[key].append(index)
+        matches = []
+        for key, old_indexes in old_keys.items():
+            new_indexes = new_keys.get(key, [])
+            if len(old_indexes) == len(new_indexes) == 1:
+                if (previous[old_indexes[0]].get("queueEnvelopes") and
+                        _history_body_fingerprint(previous[old_indexes[0]]) !=
+                        _history_body_fingerprint(rows[new_indexes[0]])):
+                    # A stable provider ID does not prove an edited origin's
+                    # body still exists. Keep the lossless refusal meaningful.
+                    continue
+                matches.append((old_indexes[0], new_indexes[0]))
+        for old_index, new_index in matches:
+            pairs.append((old_index, new_index))
+            old_unmatched.discard(old_index)
+            new_unmatched.discard(new_index)
+
+    pair_unique_by(_native_item_identity)
+
+    def content_key_compatible(old_index: int, new_index: int) -> bool:
+        old_native = _native_item_identity(previous[old_index])
+        new_native = _native_item_identity(rows[new_index])
+        return not (old_native and new_native and old_native != new_native)
+
+    old_content: dict[object, list[int]] = defaultdict(list)
+    new_content: dict[object, list[int]] = defaultdict(list)
+    for index in old_unmatched:
+        old_content[_history_body_fingerprint(previous[index])].append(index)
+    for index in new_unmatched:
+        new_content[_history_body_fingerprint(rows[index])].append(index)
+    unique_content_pairs = []
+    for key, old_indexes in old_content.items():
+        new_indexes = new_content.get(key, [])
+        if (len(old_indexes) == len(new_indexes) == 1
+                and content_key_compatible(old_indexes[0], new_indexes[0])):
+            unique_content_pairs.append((old_indexes[0], new_indexes[0]))
+    for old_index, new_index in unique_content_pairs:
+        pairs.append((old_index, new_index))
+        old_unmatched.discard(old_index)
+        new_unmatched.discard(new_index)
+
+    # Match repeated text by appearance order only inside stable, monotonic
+    # neighbors. If the unique anchors cross, their surrounding duplicate
+    # occurrences cannot be assigned conservatively.
+    anchors = sorted(pairs, key=lambda pair: pair[1])
+    monotonic = all(
+        anchors[index - 1][0] < anchors[index][0]
+        for index in range(1, len(anchors))
+    )
+    if monotonic:
+        boundaries = [(-1, -1), *anchors, (len(previous), len(rows))]
+        for (old_left, new_left), (old_right, new_right) in zip(
+            boundaries, boundaries[1:],
+        ):
+            old_gap = sorted(index for index in old_unmatched
+                             if old_left < index < old_right)
+            new_gap = sorted(index for index in new_unmatched
+                             if new_left < index < new_right)
+            old_counts = Counter(
+                _history_body_fingerprint(previous[index]) for index in old_gap
+            )
+            new_counts = Counter(
+                _history_body_fingerprint(rows[index]) for index in new_gap
+            )
+            common = {
+                key for key, count in old_counts.items()
+                if count > 0 and new_counts.get(key) == count
+            }
+            old_order = [index for index in old_gap
+                         if _history_body_fingerprint(previous[index]) in common]
+            new_order = [index for index in new_gap
+                         if _history_body_fingerprint(rows[index]) in common]
+            old_keys = [_history_body_fingerprint(previous[index])
+                        for index in old_order]
+            new_keys = [_history_body_fingerprint(rows[index])
+                        for index in new_order]
+            if old_keys != new_keys:
+                continue
+            for old_index, new_index in zip(old_order, new_order):
+                if content_key_compatible(old_index, new_index):
+                    pairs.append((old_index, new_index))
+                    old_unmatched.discard(old_index)
+                    new_unmatched.discard(new_index)
+
+    old_id_counts = Counter()
+    for index in old_body:
+        row = previous[index]
+        if isinstance(row, dict) and is_pan_message_id(row.get("messageId")):
+            old_id_counts[row["messageId"]] += 1
+    new_id_counts = Counter()
+    for index in new_body:
+        row = rows[index]
+        if isinstance(row, dict) and is_pan_message_id(row.get("messageId")):
+            new_id_counts[row["messageId"]] += 1
+    assigned: dict[int, str] = {}
+    used_ids: set[str] = set()
+    for old_index, new_index in pairs:
+        old_row = previous[old_index]
+        if not isinstance(old_row, dict):
+            continue
+        old_id = old_row.get("messageId")
+        if (is_pan_message_id(old_id) and old_id_counts[old_id] == 1
+                and old_id not in used_ids):
+            assigned[new_index] = old_id
+            used_ids.add(old_id)
+            # Native transcripts describe provider roles, not Pan origins.
+            # Carry metadata only across this already-established identity
+            # match; never infer an Agent/report origin from transcript text.
+            for key in ("source", "kind", "sourceSessionId", "sourceSessionIds",
+                        "taskId", "taskIdSource", "queueItemIds", "deliveryKeys",
+                        "delivered_keys", "clientMessageId", "queueEnvelopes",
+                        "eventId", "channel", "envelope", "noticeKind", "jobId", "parts"):
+                if key in old_row:
+                    rows[new_index][key] = copy.deepcopy(old_row[key])
+
+    # A valid Pan ID already present in the incoming row is also Pan-owned and
+    # may be continued (for example, a previously materialized branch copy).
+    for index in new_body:
+        row = rows[index]
+        if not isinstance(row, dict) or index in assigned:
+            continue
+        incoming_id = row.get("messageId")
+        if (is_pan_message_id(incoming_id) and new_id_counts[incoming_id] == 1
+                and incoming_id not in used_ids):
+            assigned[index] = incoming_id
+            used_ids.add(incoming_id)
+
+    for index in new_body:
+        row = rows[index]
+        if not isinstance(row, dict):
+            continue
+        if index not in assigned:
+            _remember_steer_client_identity(row)
+            message_id = _new_pan_message_id()
+            while message_id in used_ids:
+                message_id = _new_pan_message_id()
+            assigned[index] = message_id
+            used_ids.add(message_id)
+        row["messageId"] = assigned[index]
+    return _retain_history_terminals(rows, previous)
+
+
+def _retain_history_terminals(rows: list[dict], previous: list[dict]) -> list[dict]:
+    """Retain Pan facts at the existing explicit reimport boundary only.
+
+    Missing terminal metadata in old/native history is valid. Never synthesize
+    events or retarget an anchor when its body no longer exists. A missing
+    anchor leaves a standalone event before the next surviving original row.
+    """
+    known = [row for row in previous if isinstance(row, dict)
+             and row.get("kind") == "terminal" and isinstance(row.get("terminal"), dict)
+             and isinstance(row.get("messageId"), str) and row.get("messageId")
+             and row.get("messageId") == row["terminal"].get("eventId")
+             and row["terminal"].get("status") in {"done", "error"}]
+    if not known:
+        return rows
+    ids = {row["messageId"] for row in known}
+    result = [row for row in rows if not isinstance(row, dict) or row.get("messageId") not in ids]
+    # Reverse insertion keeps adjacent standalone events in original order.
+    for event in reversed(known):
+        anchor = event["terminal"].get("anchorMessageId")
+        at = next((i + 1 for i, row in enumerate(result)
+                   if isinstance(row, dict) and anchor and row.get("messageId") == anchor), None)
+        if at is None:
+            old_at = previous.index(event)
+            following = {row.get("messageId") for row in previous[old_at + 1:]
+                         if isinstance(row, dict) and row.get("messageId")}
+            at = next((i for i, row in enumerate(result)
+                       if isinstance(row, dict) and row.get("messageId") in following), len(result))
+        result.insert(at, copy.deepcopy(event))
+    return result
+
+
 def append_history(s: "Session", message: dict) -> None:
     """Append one history row and advance the summary projection.
 
+    新追加的非空 user/assistant/tool/thinking 内容块在此分配 Pan messageId；
+    error/system 与 system_prompt 不分配。steer:<caller> 仅保留为 clientMessageId 别名。
     新追加的条目在此处打本地 ISO-8601 ts（setdefault：已有 ts 的行不被改写）。
     打点刻意放在追加边界而不是落盘边界：整体替换 / 导入 / branch 复制进来的
     provider 行（它们没有真实时间，只有 role/content）不带 ts，前端对缺失 ts
@@ -471,11 +821,43 @@ def append_history(s: "Session", message: dict) -> None:
     with s._summary_lock:
         ensure_summary_projection(s)
         if isinstance(message, dict):
+            if (_is_searchable_history_body(message)
+                    and not is_pan_message_id(message.get("messageId"))):
+                _remember_steer_client_identity(message)
+                message["messageId"] = _new_pan_message_id()
             message.setdefault("ts", datetime.now().isoformat())
         s.history.append(message)
         s.history_revision = max(0, int(getattr(s, "history_revision", 0) or 0)) + 1
         _apply_summary_message(s.summary_projection, message)
         s._summary_history_index = len(s.history)
+
+
+def history_tail_snapshot(s: "Session") -> dict | None:
+    """Return a deep copy of the current last history row, or None.
+
+    Used by the session error sample log: the snapshot must be taken at error
+    detection so a later concurrent append (report, steer, native user) can
+    never replace the message that actually preceded the error.  It never
+    filters by role — tool/thinking rows are valid preceding messages.
+    """
+    with s._summary_lock:
+        rows = getattr(s, "history", None)
+        if not isinstance(rows, list) or not rows:
+            return None
+        row = rows[-1]
+        if not isinstance(row, dict):
+            return None
+        return {
+            "role": row.get("role"),
+            "source": row.get("source"),
+            "messageId": row.get("messageId"),
+            "ts": row.get("ts"),
+            "content": copy.deepcopy(row.get("content")),
+            "historyIndex": len(rows) - 1,
+            "historyEpoch": getattr(s, "history_epoch", None),
+            "historyRevision": getattr(s, "history_revision", 0),
+            "raw": copy.deepcopy(row),
+        }
 
 
 def replace_history(s: "Session", history: list[dict]) -> None:
@@ -662,7 +1044,12 @@ def _summary_projection_from_jsonl(
     # read is not an empty history and must never be persisted as a complete
     # zero projection.
     with open(path, "rb") as handle:
-        for raw_line in handle:
+        for line_number, raw_line in enumerate(handle):
+            # A repair can parse hundreds of thousands of Python objects.
+            # Offloading alone does not guarantee loop fairness: release the
+            # GIL between bounded batches, including malformed/blank rows.
+            if line_number and line_number % 128 == 0:
+                time.sleep(0)
             line = raw_line.strip()
             if not line:
                 continue
@@ -750,23 +1137,54 @@ def _history_page_from_jsonl(
     known_total: int | None = None,
 ) -> tuple[list[dict], int]:
     """Read one bounded history page without materializing the full JSONL."""
-    # The common cold-list path asks for the last page (before=0).  A complete
-    # durable summary projection gives us the exact row count, so use that to
-    # avoid parsing every historical JSON object just to count it.  Reading
-    # bytes and counting line separators is implemented in C; only the bounded
-    # tail is decoded and parsed in Python.  If the projection and file disagree
-    # (for example, a writer appended JSONL before committing metadata), or the
-    # file has a crash tail, fall through to the compatibility scan below.
-    if before <= 0 and _is_nonnegative_int(known_total):
+    # A complete projection supplies the row count for both tail and older
+    # pages. Count separators across the file (C-level byte work), but retain
+    # and JSON-decode only the requested absolute window. Validating the final
+    # newline/count preserves the compatibility fallback for stale metadata
+    # and crash tails; this does not publish or hydrate full Session history.
+    if _is_nonnegative_int(known_total):
+        end = known_total if before <= 0 else min(before, known_total)
+        start = max(0, end - limit)
+        page_chunks: list[bytes] = []
+        newline_count = 0
+        tail_chunks: deque[tuple[bytes, int]] = deque()
+        tail_newlines = 0
+        last_byte = b""
         try:
-            raw = path.read_bytes()
+            with path.open("rb") as handle:
+                while chunk := handle.read(1024 * 1024):
+                    previous_count = newline_count
+                    chunk_newlines = chunk.count(b"\n")
+                    newline_count += chunk_newlines
+                    tail_chunks.append((chunk, chunk_newlines))
+                    tail_newlines += chunk_newlines
+                    while len(tail_chunks) > 1 and tail_newlines - tail_chunks[0][1] >= 2:
+                        _, removed = tail_chunks.popleft()
+                        tail_newlines -= removed
+                    last_byte = chunk[-1:]
+                    if newline_count < start or previous_count >= end:
+                        continue
+                    begin_at = 0
+                    if previous_count < start:
+                        for _ in range(start - previous_count):
+                            begin_at = chunk.find(b"\n", begin_at) + 1
+                    end_at = len(chunk)
+                    if newline_count >= end:
+                        end_at = 0
+                        for _ in range(end - previous_count):
+                            end_at = chunk.find(b"\n", end_at) + 1
+                    page_chunks.append(chunk[begin_at:end_at])
         except OSError:
             return [], 0
-        if raw.endswith(b"\n") and raw.count(b"\n") == known_total:
-            lines = raw.rsplit(b"\n", min(limit, known_total) + 1)
-            tail = lines[-(min(limit, known_total) + 1):-1]
+        if last_byte == b"\n" and newline_count == known_total:
+            lines = b"".join(page_chunks).split(b"\n")[:-1]
+            # Older windows must also reject a malformed complete final line,
+            # even if an outdated projection accidentally counts that line.
+            if end < known_total:
+                tail = b"".join(chunk for chunk, _ in tail_chunks)
+                lines.append(tail.rsplit(b"\n", 2)[-2])
             parsed: list[dict] = []
-            for line in tail:
+            for line in lines:
                 try:
                     value = json.loads(line.decode("utf-8"))
                 except (json.JSONDecodeError, UnicodeDecodeError):
@@ -775,7 +1193,8 @@ def _history_page_from_jsonl(
                     break
                 parsed.append(value)
             else:
-                return parsed, known_total
+                if len(parsed) == end - start + int(end < known_total):
+                    return parsed[:end - start], known_total
 
     page: deque[dict] = deque(maxlen=limit)
     total = 0
@@ -818,20 +1237,22 @@ def _history_file_signature(path: Path) -> tuple[int, int, int, int, int] | None
 
 
 def history_page(session_id: str, *, before: int = 0,
-                 limit: int = 50) -> dict | None:
+                 limit: int = 50, search_jump: bool = False) -> dict | None:
     """Return a bounded history page while keeping cold Sessions shallow.
 
     A fully hydrated Session is served from its in-memory history so unsaved
     worker appends remain visible.  A shallow/cold Session reads only the
     requested tail window from the companion JSONL and never replaces the
-    cached shallow object with the complete history. Repeated tail requests
+    cached shallow object with the complete history. Search jumps may request
+    up to 1000 rows per page; ordinary callers retain the 200-row cap. Repeated tail requests
     reuse one bounded page while the file signature is unchanged; appends and
     replacements invalidate it. This is the read/page boundary for
     Manage/session-history callers; explicit ``get()`` remains the compatibility
     full-history API.
     """
     try:
-        bounded_limit = max(1, min(int(limit), HISTORY_PAGE_MAX))
+        page_max = HISTORY_SEARCH_JUMP_PAGE_MAX if search_jump else HISTORY_PAGE_MAX
+        bounded_limit = max(1, min(int(limit), page_max))
     except (TypeError, ValueError):
         bounded_limit = 50
     try:
@@ -958,6 +1379,15 @@ def _strip_delivery_marks(history: list[dict]) -> list[dict]:
 _PAN_ACCESS_KEYS = ("restrict_to_managed", "can_claim_unmanaged", "auto_claim_created")
 _PROMPT_UNSET = object()  # distinguish an omitted original from explicit None/""
 
+# Legal values for Session.unread_recording_override (persisted per-Session
+# unread-recording state; see packages/core/unread_policy.py for the single
+# predicate). "record" forces this Session to record done unread regardless of
+# the global scope set; the global Notification apply clears it.
+UNREAD_RECORDING_OVERRIDE_VALUES = ("record",)
+# Distinguishes an omitted unread-state parameter from an explicit None
+# (None clears the override).
+_UNREAD_OVERRIDE_UNSET = object()
+
 # Queue receipts written by the previous queue implementation are retained as
 # compatibility metadata.  They are not a second queue: ``queue_pending`` is
 # still the only durable delivery queue.  Keeping the receipt ledger here lets
@@ -967,6 +1397,13 @@ _PROMPT_UNSET = object()  # distinguish an omitted original from explicit None/"
 
 @dataclass(init=False)
 class Session:
+    def __setattr__(self, name, value):
+        if name == "workdir":
+            with reference_transaction([value]):
+                object.__setattr__(self, name, value)
+        else:
+            object.__setattr__(self, name, value)
+
     id: str
     name: str
     adapter: str = "cbc"   # CLI adapter name, default "cbc"
@@ -978,6 +1415,9 @@ class Session:
     session_template: str | None = None  # session_template name this session was configured with (None = built-in default)
     original_prompt: str | None = None  # stable instructions, never a generated handoff
     handoff_prompt: str | None = None  # only the latest handoff brief
+    # Existing-target handoffs update metadata without changing CLI instructions.
+    frozen_system_prompt: dict | None = None
+    handoff_receipt: dict | None = None
     game_id: str | None = None        # RuleWhisper game identifier for MCP tool calls
     raw_usage: dict | None = None
     total_usage: dict | None = None
@@ -996,6 +1436,17 @@ class Session:
     # lifecycle transition.  This is deliberately separate from the live
     # worker status, which is derived from the in-memory Worker runtime.
     last_legal_worker_state: str | None = None
+    # Independent execution safety ledger; missing legacy data is unverified,
+    # never evidence of an unfinished run. Explicit run tokens start the policy.
+    legal_offline: bool = True
+    offline_migration_uncertainty: str | None = None
+    offline_owner: dict | None = None
+    offline_run: dict | None = None
+    illegal_batches: dict = field(default_factory=dict)
+    legality_schema_version: int = 2
+    operation_revision: int = 0
+    execution_operations: dict = field(default_factory=dict)
+    owner_retirements: dict = field(default_factory=dict)
     created_at: str = ""
     updated_at: str = ""
     order: int | None = None  # 用户自定义展示顺序（None = 未排序，按 created_at 排在末尾）
@@ -1004,6 +1455,11 @@ class Session:
     managed_by: str | None = None  # session id of the session managing this one
     readonly_session: bool = False  # manager blocks operations sent to this session
     queue_pending: list = field(default_factory=list)  # persisted message queue (for report consumption)
+    # Pause durable agent completion/error/zombie reports while allowing other
+    # queue sources to keep their normal delivery order.
+    queue_paused: bool = False
+    agent_reports_paused: bool = False
+    queue_item_locks_version: int = 1
     # Expiring browser edit leases keep a queued item at the same durable
     # position while preventing the Worker from handing it to the provider.
     queue_edit_locks: dict[str, dict] = field(default_factory=dict)
@@ -1018,6 +1474,23 @@ class Session:
     queue_idempotency_index: dict = field(default_factory=dict)
     queue_revision: int = 0
     task_seq: int = 0  # 已分配的任务序号计数（send_task 入队时自增；持久化在 session 上，跨 worker respawn 保持单调递增）
+    # 未读 done 游标模型：unread_done_generation 是每个真实 done 终态 +1 的
+    # 单调累计（唯一终态入口 worker._persist_terminal_state 在既有去重之后
+    # 累加）；unread_done_read_generation 是已读游标——ack 只推进到调用方已
+    # 观察的 generation，重复/重试/延迟的同一游标幂等，且永远不清新 generation。
+    # unread_done_count = generation - read，只是物化显示值（徽标/筛选）。
+    # error/cancelled/zombie 与子 report 批次不计；旧 JSON 缺字段按 0 载入，
+    # 仅带 count 的旧数据把它折算为未读 generation（见 __init__ 收敛），
+    # 绝不从 history/terminal_results 回溯补计。
+    unread_done_count: int = 0
+    unread_done_generation: int = 0
+    unread_done_read_generation: int = 0
+    # Per-Session unread-recording override ("record" = this Session records
+    # done unread regardless of the global scope set). The global
+    # Notification apply (save or Reapply settings) clears every override and
+    # re-aligns to the persisted scope set; None means "follow the global
+    # policy". Old JSON without the field loads as None.
+    unread_recording_override: str | None = None
     # The latest formal assign task selected for this Session.  This is a
     # routing context for subsequent agent_send messages, not a second queue
     # or an idempotency registry.  It is persisted so a Worker respawn cannot
@@ -1028,6 +1501,13 @@ class Session:
     # safely retransmit the same clientMessageId without starting the task twice.
     accepted_input_ids: list[str] = field(default_factory=list)
     report_subscriptions: set[str] = field(default_factory=set)  # managed sessions whose completion reports this session subscribes to
+    # Bounded receipts for explicit browser-requested task reports delivered to
+    # this (manager) Session.  Keyed by the deterministic manual-report key so a
+    # retry after an unconfirmed response can never double-deliver, even once
+    # the original queue item has been consumed and left queue_pending.
+    manual_report_receipts: dict = field(default_factory=dict)
+    qq_report_targets: set[str] = field(default_factory=set)  # Independent bot/contact completion recipients
+    qq_report_outbox: dict = field(default_factory=dict)  # One persisted send attempt per terminal/recipient
     qq_subscriptions: set[str] = field(default_factory=set)  # QQ conversations this session subscribes to ("user:<qq>"/"group:<group_id>")
     wechat_subscriptions: set[str] = field(default_factory=set)  # 微信会话（WeChat conversations）this session subscribes to ("user:<wxid>")
     notification_settings: dict = field(default_factory=dict)  # Pan completion notifications
@@ -1066,6 +1546,15 @@ class Session:
                  result_cursor: int = 0,
                  terminal_results: list[dict] | None = None,
                  last_legal_worker_state: str | None = None,
+                 legal_offline: bool = True,
+                 offline_migration_uncertainty: str | None = None,
+                 offline_owner: dict | None = None,
+                 offline_run: dict | None = None,
+                 illegal_batches: dict | None = None,
+                 legality_schema_version: int = 1,
+                 operation_revision: int = 0,
+                 execution_operations: dict | None = None,
+                 owner_retirements: dict | None = None,
                  created_at: str = "",
                  updated_at: str = "",
                  order: int | None = None,
@@ -1080,15 +1569,25 @@ class Session:
                  queue_idempotency_index: dict | None = None,
                  queue_revision: int = 0,
                  task_seq: int = 0,
+                 unread_done_count: int = 0,
+                 unread_done_generation: int = 0,
+                 unread_done_read_generation: int = 0,
+                 unread_recording_override: str | None = None,
                  active_task_id: str | None = None,
                  accepted_input_ids: list[str] | None = None,
+                 manual_report_receipts: dict | None = None,
                  summary_projection: dict | None = None,
                  report_subscriptions=None,
-                 qq_subscriptions=None,
+                 qq_subscriptions=None, qq_report_targets=None, qq_report_outbox=None,
                  wechat_subscriptions=None, notification_settings=None, *,
                  queue_edit_locks: dict[str, dict] | None = None,
+                 queue_paused: bool = False,
+                 agent_reports_paused: bool = False,
+                 queue_item_locks_version: int = 1,
                  original_prompt: str | None | object = _PROMPT_UNSET,
-                 handoff_prompt: str | None = None):
+                 handoff_prompt: str | None = None,
+                 frozen_system_prompt: dict | None = None,
+                 handoff_receipt: dict | None = None):
         """Manual init so legacy top-level capability kwargs still construct.
 
         ``pan_access`` is the single source of truth for the three capability
@@ -1116,6 +1615,8 @@ class Session:
         # Explicit canonical values (including None/"") beat the legacy alias.
         self.original_prompt = system_prompt if original_prompt is _PROMPT_UNSET else original_prompt
         self.handoff_prompt = handoff_prompt
+        self.frozen_system_prompt = frozen_system_prompt
+        self.handoff_receipt = handoff_receipt
         self.game_id = game_id
         self.raw_usage = raw_usage
         self.total_usage = total_usage
@@ -1148,6 +1649,30 @@ class Session:
             last_legal_worker_state if isinstance(last_legal_worker_state, str)
             else None
         )
+        self.offline_migration_uncertainty = offline_migration_uncertainty
+        self.legal_offline = legal_offline if type(legal_offline) is bool else True
+        self.offline_owner = copy.deepcopy(offline_owner) if isinstance(offline_owner, dict) else None
+        self.offline_run = copy.deepcopy(offline_run) if isinstance(offline_run, dict) else None
+        self.illegal_batches = copy.deepcopy(illegal_batches) if isinstance(illegal_batches, dict) else {}
+        self.legality_schema_version = legality_schema_version
+        self.operation_revision = operation_revision
+        self.execution_operations = copy.deepcopy(execution_operations or {})
+        self.owner_retirements = copy.deepcopy(owner_retirements or {})
+        # False without a durable execution identity is legacy/unverified data,
+        # not permission to invent an Illegal event or change consumability.
+        if not self.execution_operations and (not self.offline_run or not isinstance(self.offline_run.get("id"), str)
+                or not self.offline_run.get("id")
+                or not isinstance(self.offline_run.get("token"), str)
+                or not self.offline_run.get("token")
+                or type(self.offline_run.get("generation")) is not int
+                or self.offline_run["generation"] < 0):
+            if offline_run is not None or legal_offline is not True:
+                self.offline_migration_uncertainty = (self.offline_migration_uncertainty
+                    or "invalid-or-missing-execution-identity")
+            self.legal_offline = True
+            self.offline_run = None
+        from .legal_offline import migrate
+        migrate(self)
         self.created_at = created_at
         self.updated_at = updated_at
         try:
@@ -1161,6 +1686,9 @@ class Session:
         self.managed_by = managed_by
         self.readonly_session = bool(readonly_session)
         self.queue_pending = queue_pending if queue_pending is not None else []
+        self.queue_paused = bool(queue_paused)
+        self.agent_reports_paused = bool(agent_reports_paused)
+        self.queue_item_locks_version = 1
         self.queue_edit_locks = {
             key: copy.deepcopy(value)
             for key, value in (queue_edit_locks or {}).items()
@@ -1190,14 +1718,83 @@ class Session:
             self.queue_revision = int(queue_revision or 0)
         except (TypeError, ValueError):
             self.queue_revision = 0
+        if queue_item_locks_version != 1 and self.agent_reports_paused:
+            # Previous Pause reports stored only a Session flag. Upgrade its
+            # pending reports once, so later manual unlocks survive restarts.
+            migrated = False
+            for item in self.queue_pending:
+                if not isinstance(item, dict):
+                    continue
+                item_type = item.get("type")
+                source = item.get("source")
+                report = (
+                    item_type in {"report", "zombie"} and source in {None, "report"}
+                ) or (
+                    item_type is None and source == "report" and "result" in item
+                )
+                if (report and item.get("deliveryState", "queued") == "queued"
+                        and not item.get("queueLockAutoReport")):
+                    item["queueLockAutoReport"] = True
+                    migrated = True
+            if migrated:
+                self.queue_revision += 1
+        from .queue_locks import migrate as migrate_lock
+        for row in [*self.queue_pending, *self.queue_delivery_ledger.values()]:
+            if isinstance(row, dict):
+                migrate_lock(row)
         self.task_seq = task_seq
+        # 未读 done 游标收敛：count 只是 generation - read 的物化显示值。
+        # 旧 JSON（本功能前一版只落盘 count，或更早完全缺字段）把 count 折算为
+        # 未读 generation 补足，再夹紧 read <= generation，避免损坏值把游标
+        # 关系弄反；此后 count 不参与任何 ack 边界判断。
+        try:
+            unread_generation = max(0, int(unread_done_generation or 0))
+        except (TypeError, ValueError):
+            unread_generation = 0
+        try:
+            unread_read_generation = max(0, int(unread_done_read_generation or 0))
+        except (TypeError, ValueError):
+            unread_read_generation = 0
+        try:
+            unread_count = max(0, int(unread_done_count or 0))
+        except (TypeError, ValueError):
+            unread_count = 0
+        unread_generation = max(unread_generation, unread_count + unread_read_generation)
+        unread_read_generation = min(unread_read_generation, unread_generation)
+        self.unread_done_generation = unread_generation
+        self.unread_done_read_generation = unread_read_generation
+        self.unread_done_count = unread_generation - unread_read_generation
+        # Unknown override values (future enums, corrupted JSON) degrade to
+        # "follow the global policy" instead of failing the whole load.
+        self.unread_recording_override = (
+            unread_recording_override
+            if unread_recording_override in UNREAD_RECORDING_OVERRIDE_VALUES
+            else None
+        )
         self.active_task_id = active_task_id
         raw_accepted_ids = accepted_input_ids if accepted_input_ids is not None else []
         self.accepted_input_ids = list(dict.fromkeys(
             item for item in raw_accepted_ids
             if isinstance(item, str) and item
         ))[-ACCEPTED_INPUT_ID_MAX:]
+        self.manual_report_receipts = {
+            key: dict(value)
+            for key, value in (manual_report_receipts or {}).items()
+            if isinstance(key, str) and key and isinstance(value, dict)
+        }
+        # Keep only the newest receipts: insertion order is the delivery order.
+        if len(self.manual_report_receipts) > MANUAL_REPORT_RECEIPT_MAX:
+            for stale_key in list(self.manual_report_receipts)[:-MANUAL_REPORT_RECEIPT_MAX]:
+                self.manual_report_receipts.pop(stale_key, None)
         self._summary_lock = threading.RLock()
+        # Async usage writers hold this through their ordered durable ticket.
+        # Provider I/O works on a detached snapshot outside the gate.
+        self._usage_commit_lock = asyncio.Lock()
+        # Bumped whenever a whole-Session usage rewrite lands. The enrichment
+        # records the value it saw before its provider lookup; if it changed,
+        # the lookup ran against a usage base that no longer exists and the
+        # provider must be re-read before anything is accumulated.
+        self._usage_revision = 0
         # worker.py validates/rebuilds the persisted map once, then marks this
         # private flag.  Treat even version-1 data as not yet reconciled with
         # queue_pending/ledger: a crash can commit those fields separately.
@@ -1222,6 +1819,16 @@ class Session:
         self._history_loaded = True
         self._summary_worker_state = None
         self.report_subscriptions = report_subscriptions if report_subscriptions is not None else set()
+        self.qq_report_targets = {
+            key for key in qq_report_targets if isinstance(key, str)
+        } if isinstance(qq_report_targets, (set, list, tuple)) else set()
+        self.qq_report_outbox = {
+            key: copy.deepcopy(value)
+            for key, value in qq_report_outbox.items()
+            if (isinstance(key, str) and isinstance(value, dict)
+                and isinstance(value.get("target"), str)
+                and isinstance(value.get("text"), str))
+        } if isinstance(qq_report_outbox, dict) else {}
         self.qq_subscriptions = qq_subscriptions if qq_subscriptions is not None else set()
         self.wechat_subscriptions = (
             wechat_subscriptions if wechat_subscriptions is not None else set()
@@ -1234,8 +1841,11 @@ class Session:
         """Effective worker prompt; a compatibility view, never an inheritance source.
 
         Keep stored text verbatim. Empty/whitespace-only briefs add no wrapper;
-        sessions without a brief retain their original prompt exactly.
+        sessions without a brief retain their original prompt exactly. Existing
+        targets use their durable frozen value even after original/brief changes.
         """
+        if self.frozen_system_prompt is not None:
+            return self.frozen_system_prompt["value"]
         brief = self.handoff_prompt
         original = self.original_prompt
         if not brief or not brief.strip():
@@ -1258,6 +1868,7 @@ class Session:
         """
         self.original_prompt = value
         self.handoff_prompt = None
+        self.frozen_system_prompt = None
 
     # ── pan_access convenience accessors (capability flags) ──
 
@@ -1335,6 +1946,11 @@ class Session:
         Old top-level capability fields are migrated into nested pan_access
         (and the old keys removed) so pre-refactor JSON keeps loading.
         """
+        has_obsolete_legality_fields = "recovery_requested" in data or "recoveryRequested" in data
+        data.pop("recovery_requested", None)
+        data.pop("recoveryRequested", None)
+        if "legal_offline" not in data and not data.get("offline_migration_uncertainty"):
+            data["offline_migration_uncertainty"] = "legacy-missing-legality"
         _canonicalize_summary_projection_data(data)
         # Accept the API spelling as a defensive compatibility bridge for
         # hand-authored/older metadata, while the canonical session JSON keeps
@@ -1358,6 +1974,7 @@ class Session:
                 if alias in data:
                     data["queue_idempotency_index"] = data.pop(alias)
                     break
+        data.setdefault("queue_item_locks_version", 0)
         ac = data.pop("adapter_config", {}) or {}
         for old_key, new_key in [
             ("cbc_session_id", "cli_session_id"),
@@ -1375,7 +1992,9 @@ class Session:
                 pa[key] = data.pop(key)
         data["pan_access"] = pa
         data["adapter_config"] = ac
-        return cls(**data)
+        instance = cls(**data)
+        instance._obsolete_legality_fields_pending = has_obsolete_legality_fields
+        return instance
 
     def to_dict(self) -> dict:
         return {
@@ -1391,6 +2010,8 @@ class Session:
             "system_prompt": self.system_prompt,
             "original_prompt": self.original_prompt,
             "handoff_prompt": self.handoff_prompt,
+            "frozen_system_prompt": self.frozen_system_prompt,
+            "handoff_receipt": self.handoff_receipt,
             "game_id": self.game_id,
             "raw_usage": self.raw_usage,
             "total_usage": self.total_usage,
@@ -1403,6 +2024,15 @@ class Session:
             "result_cursor": self.result_cursor,
             "terminal_results": self.terminal_results,
             "last_legal_worker_state": self.last_legal_worker_state,
+            "legal_offline": self.legal_offline,
+            "offline_migration_uncertainty": self.offline_migration_uncertainty,
+            "offline_owner": self.offline_owner,
+            "offline_run": self.offline_run,
+            "illegal_batches": self.illegal_batches,
+            "legality_schema_version": self.legality_schema_version,
+            "operation_revision": self.operation_revision,
+            "execution_operations": self.execution_operations,
+            "owner_retirements": self.owner_retirements,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "order": self.order,
@@ -1411,15 +2041,25 @@ class Session:
             "managed_by": self.managed_by,
             "readonly_session": self.readonly_session,
             "queue_pending": self.queue_pending,
+            "queue_paused": self.queue_paused,
+            "agent_reports_paused": self.agent_reports_paused,
+            "queue_item_locks_version": self.queue_item_locks_version,
             "queue_edit_locks": self.queue_edit_locks,
             "queue_delivery_ledger": self.queue_delivery_ledger,
             "queue_idempotency_index": self.queue_idempotency_index,
             "queue_revision": self.queue_revision,
             "task_seq": self.task_seq,
+            "unread_done_count": self.unread_done_count,
+            "unread_done_generation": self.unread_done_generation,
+            "unread_done_read_generation": self.unread_done_read_generation,
+            "unread_recording_override": self.unread_recording_override,
             "active_task_id": self.active_task_id,
             "accepted_input_ids": self.accepted_input_ids,
+            "manual_report_receipts": self.manual_report_receipts,
             "summary_projection": dict(self.summary_projection),
             "report_subscriptions": sorted(self.report_subscriptions),
+            "qq_report_targets": sorted(self.qq_report_targets),
+            "qq_report_outbox": self.qq_report_outbox,
             "qq_subscriptions": sorted(self.qq_subscriptions),
             "wechat_subscriptions": sorted(self.wechat_subscriptions),
             "notification_settings": normalize_notification_settings(self.notification_settings),
@@ -1562,13 +2202,19 @@ def _summary_metadata_signature(s: Session) -> str:
         "adapter_config": s.adapter_config,
         "session_template": s.session_template,
         "workdir": s.workdir,
-        "last_legal_worker_state": s.last_legal_worker_state,
+        "legal_offline": s.legal_offline,
+        "operation_revision": s.operation_revision,
+        "offline_owner": s.offline_owner,
+        "offline_run": s.offline_run,
         "total_usage": s.total_usage,
         "order": s.order,
         "workspace_ids": list(s.workspace_ids),
         "managed": list(s.managed),
         "managed_by": s.managed_by,
         "readonly_session": s.readonly_session,
+        "unread_done_generation": int(s.unread_done_generation or 0),
+        "unread_done_read_generation": int(s.unread_done_read_generation or 0),
+        "unread_recording_override": s.unread_recording_override,
     }
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
 
@@ -1721,16 +2367,36 @@ def _hydrate_cached_session(session_id: str, cached: Session) -> Session | None:
     path = _path(session_id)
     if not path.exists():
         return None
-    try:
-        loaded = _from_data_with_history(
-            session_id, json.loads(path.read_text(encoding="utf-8")),
-        )
-    except (json.JSONDecodeError, OSError):
-        return None
-    cached.__dict__.update(loaded.__dict__)
-    cached._history_loaded = True
+    with cached._summary_lock:
+        try:
+            loaded = _from_data_with_history(
+                session_id, json.loads(path.read_text(encoding="utf-8")),
+            )
+        except (json.JSONDecodeError, OSError):
+            return None
+        # Retain the synchronization object shared with append and ID repair.
+        loaded._summary_lock = cached._summary_lock
+        # Hydration loads history, while cached accounting may have newer
+        # pending jobs or a commit in flight. Keep its usage gate, revision and
+        # provider state together; replacing the gate would admit two writers.
+        for key in ("_usage_commit_lock", "_usage_revision", "raw_usage",
+                    "total_usage", "usage_enrichment_pending", "adapter_config",
+                    "model"):
+            setattr(loaded, key, getattr(cached, key))
+        cached.__dict__.update(loaded.__dict__)
+        cached._history_loaded = True
     _cache[session_id] = cached
     return cached
+
+
+def get_cached(session_id: str) -> Session | None:
+    """Return the current in-memory object without disk I/O or hydration.
+
+    A miss is not proof of absence. Like any lookup, the returned object can
+    race with deletion; durable callers must check existence in their write
+    gate. This lookup does not wait behind unrelated offloaded store reads.
+    """
+    return _cache.get(session_id)
 
 
 def get(session_id: str, *, load_history: bool = True) -> Session | None:
@@ -1880,7 +2546,30 @@ def _run_persistence_ticket(state: _SessionSaveState, ticket: int,
             state.cancel_before_begin(ticket)
 
 
-def _save_body(s: Session, force_full: bool = False):
+def _replace_session_metadata(source: Path, target: Path) -> None:
+    """Keep the same ordered atomic write across brief Windows reader locks."""
+    for attempt in range(6):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError as exc:
+            if (os.name != "nt" or getattr(exc, "winerror", None) not in {5, 32, 33}
+                    or attempt == 5):
+                raise
+            # Readers (including shallow API reads) can deny delete-sharing.
+            # Retry only this prepared replace, never the provider input or
+            # terminal admission. Persistent errors still reach rollback.
+            time.sleep(.01 * (attempt + 1))
+
+
+@reference_commit
+def _save_body(s: Session, force_full: bool = False, *,
+               unread_done_read_generation: int | None = None,
+               unread_done_generation: int | None = None,
+               unread_recording_override: object = _UNREAD_OVERRIDE_UNSET,
+               adapter_config_override: dict | None = None,
+               adapter_config_publish_keys: frozenset[str] | None = None,
+               offline_override: dict | None = None):
     """Write one Session while its per-Session ticket is active.
 
     The history ``[start, end)`` cursor is deliberately kept from T-062.2:
@@ -1900,7 +2589,39 @@ def _save_body(s: Session, force_full: bool = False):
     # before the write, then never advance past that end.
     _ensure_summary_metadata(s)
     s.updated_at = datetime.now().isoformat()  # API reads the live object
-    meta_sig = _meta_signature(s)
+    metadata = s
+    if (unread_done_read_generation is not None
+            or unread_done_generation is not None
+            or unread_recording_override is not _UNREAD_OVERRIDE_UNSET
+            or adapter_config_override is not None
+            or offline_override is not None):
+        # Stage unread-policy state in the metadata projection, not the shared
+        # Session.  Readers and unrelated writes cannot observe or persist a
+        # cursor/override that has not committed successfully.
+        metadata = copy.copy(s)
+        if offline_override is not None:
+            for key, value in offline_override.items():
+                setattr(metadata, key, value)
+        if adapter_config_override is not None:
+            metadata.adapter_config = copy.deepcopy(adapter_config_override)
+        generation = max(0, int(s.unread_done_generation or 0))
+        read_generation = max(0, int(s.unread_done_read_generation or 0))
+        if unread_done_generation is not None:
+            generation = max(0, int(unread_done_generation))
+        if unread_done_read_generation is not None:
+            read_generation = max(
+                read_generation,
+                min(unread_done_read_generation, generation),
+            )
+        read_generation = min(read_generation, generation)
+        metadata.unread_done_generation = generation
+        metadata.unread_done_read_generation = read_generation
+        metadata.unread_done_count = generation - read_generation
+        if unread_recording_override is not _UNREAD_OVERRIDE_UNSET:
+            metadata.unread_recording_override = unread_recording_override
+        metadata.summary_projection = dict(s.summary_projection)
+        _ensure_summary_metadata(metadata)
+    meta_sig = _meta_signature(metadata)
     start = getattr(s, "_hist_persisted", 0)
     if not isinstance(start, int) or start < 0:
         start = 0
@@ -1923,7 +2644,7 @@ def _save_body(s: Session, force_full: bool = False):
     # 写临时文件 + os.replace 原子替换：主文件写一半崩溃也不会损坏
     # （history 真源在 jsonl，主文件只是元数据镜像 + 存在标记）。
     if force_full or meta_sig != getattr(s, "_last_meta_sig", None):
-        d = s.to_dict()
+        d = metadata.to_dict()
         d.pop("system_prompt")  # derived API/export alias is not durable state
         d["history"] = (
             getattr(s, "_history_tail", [])
@@ -1934,8 +2655,37 @@ def _save_body(s: Session, force_full: bool = False):
         tmp_path.write_text(
             json.dumps(d, ensure_ascii=False, indent=2),
             encoding="utf-8")
-        os.replace(tmp_path, main_path)
+        _replace_session_metadata(tmp_path, main_path)
         s._last_meta_sig = meta_sig
+    if metadata is not s:
+        # Publish before retiring the ticket so a subsequent writer cannot
+        # overwrite the just-committed cursor with its previous value.
+        if offline_override is not None:
+            from .legal_offline import restore as publish_offline
+            publish_offline(s, offline_override)
+        if (unread_done_read_generation is not None or unread_done_generation is not None
+                or unread_recording_override is not _UNREAD_OVERRIDE_UNSET):
+            s.unread_done_generation = metadata.unread_done_generation
+            s.unread_done_read_generation = metadata.unread_done_read_generation
+            s.unread_done_count = metadata.unread_done_count
+        if adapter_config_override is not None:
+            if adapter_config_publish_keys is None:
+                s.adapter_config = metadata.adapter_config
+            else:
+                # Worker native cursors may advance while the file write is
+                # blocked. Publish only the settings changed by this request.
+                published = dict(s.adapter_config)
+                for key in adapter_config_publish_keys:
+                    if key in metadata.adapter_config:
+                        published[key] = metadata.adapter_config[key]
+                    else:
+                        published.pop(key, None)
+                s.adapter_config = published
+        if unread_recording_override is not _UNREAD_OVERRIDE_UNSET:
+            s.unread_recording_override = metadata.unread_recording_override
+        # Reconcile with the live projection instead of replacing it: history
+        # may have advanced while the metadata filesystem write was in flight.
+        _ensure_summary_metadata(s)
     _cache[s.id] = s
 
 
@@ -1991,32 +2741,192 @@ def delete_history_item_at(s: Session, index: int) -> str | None:
     return "message_not_found"
 
 
-async def save_async(s: Session):
+async def await_persistence(future):
+    """Finish a durable operation before propagating even repeated cancellation."""
+    try:
+        return await asyncio.shield(future)
+    except asyncio.CancelledError:
+        while not future.done():
+            try:
+                await asyncio.shield(future)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if not future.cancelled():
+            future.exception()  # consume a failure before propagating cancellation
+        raise
+
+
+class DurableOutcome:
+    """Verifiable result of one durable write attempt.
+
+    ``await_persistence`` deliberately hides the underlying failure: when the
+    caller is cancelled while the writer fails, it consumes the real exception
+    and re-raises ``CancelledError``.  A caller therefore cannot treat
+    ``CancelledError`` as evidence that the bytes landed -- "the writer
+    retired" is not "the write succeeded".
+
+    This result is only ever set from an *observable* outcome:
+
+    * ``succeeded`` -- the writer future completed without raising, i.e. the
+      filesystem operation returned normally.
+    * ``error`` -- the writer future completed with this exception.
+    * ``cancelled`` -- the future itself was cancelled and
+      never ran to a result.
+
+    ``succeeded`` is the only value that may be treated as committed.
+    """
+
+    __slots__ = ("succeeded", "error", "cancelled")
+
+    def __init__(self):
+        self.succeeded = False
+        self.cancelled = False
+        self.error: BaseException | None = None
+
+
+async def _persist_async_outcome(
+    session_id: str, operation: Callable[[], object],
+    outcome: DurableOutcome | None = None,
+) -> DurableOutcome:
+    """Run one ordered durable operation and report its verifiable outcome.
+
+    Mirrors :func:`_persist_async` -- same ticket, same shielded writer, same
+    "cancellation waits for the writer to retire" contract -- but observes the
+    writer future *before* ``await_persistence`` erases its exception, so the
+    caller learns whether the write actually succeeded.
+
+    Pass ``outcome`` to observe a caller-owned object; the same instance is
+    filled in place, which is what lets a caller that was cancelled still read
+    the writer's verdict after the cancellation propagated.
+    """
+    if outcome is None:
+        outcome = DurableOutcome()
+
+    state, ticket, enqueued_at = _reserve_save_ticket(session_id)
+    try:
+        context = contextvars.copy_context()
+        result = state.submit_async(
+            ticket, lambda: context.run(
+                _run_persistence_ticket, state, ticket, enqueued_at, operation,
+            ),
+        )
+    except BaseException:
+        state.cancel_before_begin(ticket)
+        raise
+    inner = asyncio.wrap_future(result)
+
+    cancelled = False
+    while not inner.done():
+        try:
+            await asyncio.shield(inner)
+        except asyncio.CancelledError:
+            cancelled = True
+        except BaseException:
+            break
+    if inner.cancelled():
+        outcome.cancelled = True
+    else:
+        outcome.error = inner.exception()
+        outcome.succeeded = outcome.error is None
+    if cancelled or outcome.cancelled:
+        raise asyncio.CancelledError()
+    if outcome.error is not None:
+        raise outcome.error
+    return outcome
+
+
+async def save_async(s: Session, *, force_full: bool = False, outcome: DurableOutcome | None = None):
     """Async save for high-frequency worker calls, ordered per Session.
 
     The executor task is shielded so cancelling the caller cannot abandon a
     ticket in the per-Session queue or leave a filesystem writer holding the
     state.  The caller still receives ``CancelledError`` after that durable
     operation has retired.
+    An optional outcome exposes the actual ticket verdict even when caller
+    cancellation propagates after the writer retires.
     """
-    state, ticket, enqueued_at = _reserve_save_ticket(s.id)
+    if outcome is not None:
+        return await _persist_async_outcome(s.id, lambda: _save_body(s, force_full=force_full), outcome)
+    return await _persist_async(s.id, lambda: _save_body(s, force_full=force_full))
+
+
+async def commit_adapter_config_async(s: Session, adapter_config: dict,
+                                      *, previous_config: dict | None = None,
+                                      outcome: DurableOutcome | None = None):
+    """Publish plugin/connection settings only after their atomic file commit.
+
+    The shared Session stays on its old config while this ticket waits or
+    writes. Other readers and writers cannot see an uncommitted selection.
+    """
+    staged = copy.deepcopy(adapter_config)
+    previous = previous_config if previous_config is not None else s.adapter_config
+    changed = frozenset(key for key in previous.keys() | staged.keys()
+                        if (key not in previous or key not in staged or previous[key] != staged[key]))
+    def commit():
+        merged = dict(s.adapter_config)
+        for key in changed:
+            if key in staged:
+                merged[key] = staged[key]
+            else:
+                merged.pop(key, None)
+        return _save_body(s, adapter_config_override=merged, adapter_config_publish_keys=changed)
+    return await _persist_async_outcome(s.id, commit, outcome)
+
+
+async def ack_unread_done_async(s: Session, read_generation: int):
+    """Commit a read cursor before exposing it; caller holds unread_done_lock."""
+    def commit():
+        # The offloaded lookup may finish just before a concurrent delete.
+        # Recheck inside the ordered write gate to avoid resurrecting its files.
+        if not _path(s.id).is_file():
+            raise FileNotFoundError(f"Session {s.id} no longer exists")
+        return _save_body(s, unread_done_read_generation=read_generation)
+
+    return await _persist_async(s.id, commit)
+
+
+async def commit_unread_state_async(
+    s: Session,
+    *,
+    read_generation: int | None = None,
+    done_generation: int | None = None,
+    unread_recording_override: object = _UNREAD_OVERRIDE_UNSET,
+):
+    """Commit unread-policy state (cursors and/or the recording override).
+
+    Caller holds unread_done_lock, so this cannot interleave with a terminal
+    generation commit. The staged metadata (including the override) is
+    published only after the atomic write succeeds; a failure returns through
+    the ordered ticket and publishes nothing.
+    """
+    def commit():
+        if not _path(s.id).is_file():
+            raise FileNotFoundError(f"Session {s.id} no longer exists")
+        return _save_body(
+            s,
+            unread_done_read_generation=read_generation,
+            unread_done_generation=done_generation,
+            unread_recording_override=unread_recording_override,
+        )
+
+    return await _persist_async(s.id, commit)
+
+
+async def _persist_async(session_id: str, operation):
+    state, ticket, enqueued_at = _reserve_save_ticket(session_id)
     try:
-        save_task = asyncio.create_task(asyncio.to_thread(
-            _save_sync_reserved, s, False, state, ticket, enqueued_at,
-        ))
+        context = contextvars.copy_context()
+        result = state.submit_async(
+            ticket, lambda: context.run(
+                _run_persistence_ticket, state, ticket, enqueued_at, operation,
+            ),
+        )
     except BaseException:
         state.cancel_before_begin(ticket)
         raise
-    try:
-        return await asyncio.shield(save_task)
-    except asyncio.CancelledError:
-        try:
-            await asyncio.shield(save_task)
-        except BaseException:
-            # Preserve the caller's cancellation while the worker thread has
-            # nevertheless completed its release path and recorded failure.
-            pass
-        raise
+    return await await_persistence(asyncio.wrap_future(result))
 
 
 # ── cold-start summary repair ──
@@ -2287,12 +3197,21 @@ def delete(session_id: str):
     state, ticket, enqueued_at = _reserve_save_ticket(session_id)
 
     def remove_files():
-        path = _path(session_id)
-        if path.exists():
-            path.unlink()
-        hist_path = _history_path(session_id)
-        if hist_path.exists():
-            hist_path.unlink()
+        _remove_session_pin_locked(session_id)
+        # Composer drafts and message bookmarks live in sidecar files. Imported
+        # here (not at module scope) because both modules read SESSION_DIR from
+        # this module, and deleting a Session must not leave a draft or a
+        # bookmark that outlives it.
+        from packages.core import session_drafts
+        from packages.core import session_bookmarks
+        with session_drafts.session_deletion(session_id), \
+                session_bookmarks.session_deletion(session_id):
+            path = _path(session_id)
+            if path.exists():
+                path.unlink()
+            hist_path = _history_path(session_id)
+            if hist_path.exists():
+                hist_path.unlink()
         _cache.pop(session_id, None)
         _newline_terminated_jsonl.discard(str(hist_path))  # 文件已删，缓存作废
 
@@ -2339,7 +3258,7 @@ def effective_workspace_ids(session_or_id: "Session | str") -> list[str]:
     Broken/cyclic chains fail closed to ungrouped. Only a true root's persisted
     value is authoritative; old child workspace_ids are deliberately ignored.
     """
-    current = get(session_or_id) if isinstance(session_or_id, str) else session_or_id
+    current = get(session_or_id, load_history=False) if isinstance(session_or_id, str) else session_or_id
     seen: set[str] = set()
     while current is not None:
         if current.id in seen:
@@ -2347,7 +3266,9 @@ def effective_workspace_ids(session_or_id: "Session | str") -> list[str]:
         seen.add(current.id)
         if not current.managed_by:
             return list(current.workspace_ids[:1])
-        parent = get(current.managed_by)
+        # Membership needs only metadata. A cold summary request must not
+        # hydrate a manager's potentially long JSONL history for every child.
+        parent = get(current.managed_by, load_history=False)
         if parent is None:
             return []
         current = parent
@@ -2362,7 +3283,7 @@ def claim(manager_id: str, session_id: str) -> str | None:
 
     Claim 建立 managed 关系时默认自动 report_subscribe：manager.report_subscriptions
     自动加入 session_id，使该 manager 收到目标 session 的完成报告（done/error）。
-    仅当确实新增了 managed 条目或首次订阅时才 save(manager)（set.add 幂等）。
+    关系两端按序持久化；若写入失败，会回滚内存状态并尽力持久化回滚，返回错误。
 
     Refuses (returns an error string) if the target session is already managed
     by a different existing session. A dangling manager reference is treated
@@ -2400,70 +3321,368 @@ def claim(manager_id: str, session_id: str) -> str | None:
     if target.managed_by and target.managed_by != manager_id \
             and get(target.managed_by) is not None:
         return f"Session {session_id} is managed by {target.managed_by}, not {manager_id}"
-    changed = False
-    if session_id not in manager.managed:
-        manager.managed.append(session_id)
-        changed = True
-    if session_id not in manager.report_subscriptions:
-        manager.report_subscriptions.add(session_id)
-        changed = True
-    if changed:
-        save(manager)
-    if target.managed_by != manager_id or target.workspace_ids:
-        target.managed_by = manager_id
-        # A child never persists a competing/stale membership value.
-        target.workspace_ids = []
-        save(target)
+    old_managed = list(manager.managed)
+    old_subscriptions = set(manager.report_subscriptions)
+    old_managed_by = target.managed_by
+    old_workspace_ids = list(target.workspace_ids)
+    changed_manager = False
+    changed_target = False
+    try:
+        if session_id not in manager.managed:
+            manager.managed.append(session_id)
+            changed_manager = True
+        if session_id not in manager.report_subscriptions:
+            manager.report_subscriptions.add(session_id)
+            changed_manager = True
+        if target.managed_by != manager_id or target.workspace_ids:
+            target.managed_by = manager_id
+            # A child never persists a competing/stale membership value.
+            target.workspace_ids = []
+            changed_target = True
+        # Persist target first so a failure cannot leave a durable manager
+        # backlink to a target whose managed_by was never written.
+        if changed_target:
+            save(target)
+        if changed_manager:
+            save(manager)
+    except Exception as exc:
+        # Restore both cached objects and best-effort persist the rollback. If
+        # storage itself remains unavailable, return an error rather than
+        # reporting a successful claim with a one-sided relationship.
+        manager.managed = old_managed
+        manager.report_subscriptions = old_subscriptions
+        target.managed_by = old_managed_by
+        target.workspace_ids = old_workspace_ids
+        rollback_errors = []
+        for changed, session in ((changed_target, target), (changed_manager, manager)):
+            if changed:
+                try:
+                    save(session)
+                except Exception as rollback_exc:
+                    rollback_errors.append(str(rollback_exc))
+        detail = f"Failed to persist managed relationship: {exc}"
+        if rollback_errors:
+            detail += f"; rollback persistence failed: {'; '.join(rollback_errors)}"
+        return detail
     return None
 
 
 @_store_serialized
 def release(session_id: str) -> str | None:
-    """Remove the managed relationship pointing at session_id.
+    """Remove a Session and its relationship references before storage deletion.
 
-    Called when a session is deleted: the managing session's `managed` list is
-    cleaned up so it doesn't reference a deleted session (立项 #3), and every
-    other session's `report_subscriptions` is purged of session_id so no
-    session keeps subscribing to a deleted session's completion reports
-    (B1 残留清理).
+    Direct children are promoted to roots when this Session has no manager.
+    Otherwise they are reparented to its manager, including when that manager
+    is itself a root. Descendants below those direct children retain their
+    existing parent links and therefore keep inheriting the same root
+    Workspace.
+
+    Relationship metadata is validated before mutation. A broken, dangling,
+    one-sided, duplicated, or cyclic managed graph refuses release so callers
+    cannot delete a Session while leaving children pointing at a missing
+    manager. Writes are ordered child-first and rolled back in memory and on
+    disk as far as storage allows if any save fails.
+
+    Report subscriptions to the deleted Session are removed globally. When
+    children are reparented, their old manager's per-child subscription
+    setting is copied to the new manager; subscriptions for other children
+    already managed by the new manager are left untouched.
 
     Returns None on success, or an error message string.
     """
-    # 订阅残留清理：任何其它 session 的 report_subscriptions 不得引用被删 id。
-    # 同时解除被删 session 作为 manager 时留下的子 session 关系，避免
-    # children 被永久锁在一个不存在的 manager 上。
+    try:
+        all_sessions = list_all(load_history=False)
+        by_id = {s.id: s for s in all_sessions}
+        owners: dict[str, list[str]] = {}
+        for manager in all_sessions:
+            if not isinstance(manager.managed, list):
+                continue
+            for child_id in manager.managed:
+                if isinstance(child_id, str):
+                    owners.setdefault(child_id, []).append(manager.id)
+
+        target = by_id.get(session_id)
+        if target is None:
+            dangling = [
+                s.id for s in all_sessions
+                if s.managed_by == session_id
+                or session_id in s.managed
+                or session_id in s.report_subscriptions
+            ]
+            if dangling:
+                return (f"Cannot release missing Session {session_id}: "
+                        f"relationship references remain on {', '.join(dangling)}")
+            return None
+
+        def validate_direct_links(manager: Session) -> str | None:
+            if not isinstance(manager.managed, list):
+                return f"Session {manager.id} has invalid managed links"
+            if any(not isinstance(child_id, str) or not child_id
+                   for child_id in manager.managed):
+                return f"Session {manager.id} has invalid managed child id"
+            if len(manager.managed) != len(set(manager.managed)):
+                return f"Session {manager.id} has duplicate managed child links"
+            if manager.id in manager.managed:
+                return f"Session {manager.id} manages itself"
+            expected = set(manager.managed)
+            actual = {s.id for s in all_sessions if s.managed_by == manager.id}
+            if expected != actual:
+                return (f"Session {manager.id} managed links do not match child "
+                        "managed_by backlinks")
+            for child_id in manager.managed:
+                child = by_id.get(child_id)
+                if child is None:
+                    return f"Session {manager.id} references missing child {child_id}"
+                if child.managed_by != manager.id:
+                    return (f"Session {manager.id} child {child_id} has a "
+                            "different managed_by backlink")
+                child_owners = owners.get(child_id, [])
+                if child_owners != [manager.id]:
+                    return f"Session {child_id} has inconsistent manager backlinks"
+            return None
+
+        # Validate the target's full managed subtree, catching cycles and
+        # malformed links before deriving or applying any Workspace changes.
+        active: set[str] = set()
+        visited: set[str] = set()
+
+        def validate_subtree(manager: Session) -> str | None:
+            if manager.id in active:
+                return f"Managed cycle detected at Session {manager.id}"
+            if manager.id in visited:
+                return f"Managed graph has a shared child at Session {manager.id}"
+            link_error = validate_direct_links(manager)
+            if link_error:
+                return link_error
+            parent_id = manager.managed_by
+            parent_owners = owners.get(manager.id, [])
+            if parent_id:
+                parent = by_id.get(parent_id)
+                if parent is None:
+                    return (f"Session {manager.id} has missing manager "
+                            f"{parent_id}")
+                if parent_owners != [parent_id] or parent.managed.count(manager.id) != 1:
+                    return f"Session {manager.id} has inconsistent manager backlinks"
+            elif parent_owners:
+                return f"Root Session {manager.id} is listed by a manager"
+            active.add(manager.id)
+            visited.add(manager.id)
+            for child_id in manager.managed:
+                child_error = validate_subtree(by_id[child_id])
+                if child_error:
+                    return child_error
+            active.remove(manager.id)
+            return None
+
+        # Validate the full child subtree. Ancestors are walked separately so
+        # cycles above the target cannot be hidden by a valid child subtree.
+        graph_error = validate_subtree(target)
+        if graph_error:
+            return f"Cannot release Session {session_id}: {graph_error}"
+
+        ancestor_seen = {session_id}
+        current = target
+        while current.managed_by:
+            manager_id = current.managed_by
+            manager = by_id.get(manager_id)
+            if manager is None:
+                return (f"Cannot release Session {session_id}: missing manager "
+                        f"{manager_id}")
+            if manager_id in ancestor_seen:
+                return (f"Cannot release Session {session_id}: managed cycle "
+                        f"detected at {manager_id}")
+            # The manager itself is about to be edited when it is the direct
+            # parent. Validate all of its direct edges before replacing A.
+            link_error = validate_direct_links(manager)
+            if link_error:
+                return f"Cannot release Session {session_id}: {link_error}"
+            if manager.managed.count(current.id) != 1:
+                return (f"Cannot release Session {session_id}: manager "
+                        f"{manager_id} does not contain exactly one backlink")
+            if owners.get(current.id, []) != [manager_id]:
+                return (f"Cannot release Session {session_id}: inconsistent "
+                        f"manager backlinks for {current.id}")
+            ancestor_seen.add(manager_id)
+            current = manager
+
+        parent = by_id.get(target.managed_by) if target.managed_by else None
+        direct_children = [by_id[child_id] for child_id in target.managed]
+        child_ids = [child.id for child in direct_children]
+        old_target_subscriptions = set(target.report_subscriptions)
+
+        # Capture only relationship fields touched by release. The target is
+        # included because its old manager/list/subscription state is cleared
+        # before the caller removes its files.
+        originals: dict[str, dict] = {}
+        desired: dict[str, dict] = {}
+
+        def ensure_change(session: Session) -> dict:
+            if session.id not in originals:
+                originals[session.id] = {
+                    "managed": list(session.managed),
+                    "managed_by": session.managed_by,
+                    "workspace_ids": list(session.workspace_ids),
+                    "report_subscriptions": set(session.report_subscriptions),
+                }
+                desired[session.id] = {
+                    "managed": list(session.managed),
+                    "managed_by": session.managed_by,
+                    "workspace_ids": list(session.workspace_ids),
+                    "report_subscriptions": set(session.report_subscriptions),
+                }
+            return desired[session.id]
+
+        # Remove subscriptions to the deleted Session from every surviving
+        # record, regardless of who originally created that subscription.
+        for session in all_sessions:
+            if session.id == session_id:
+                continue
+            if session_id in session.report_subscriptions:
+                ensure_change(session)["report_subscriptions"].discard(session_id)
+
+        if parent is not None:
+            parent_state = ensure_change(parent)
+            replaced_managed: list[str] = []
+            for child_id in parent_state["managed"]:
+                if child_id == session_id:
+                    replaced_managed.extend(child_ids)
+                else:
+                    replaced_managed.append(child_id)
+            parent_state["managed"] = replaced_managed
+            parent_subscriptions = parent_state["report_subscriptions"]
+            for child_id in child_ids:
+                if child_id in old_target_subscriptions:
+                    parent_subscriptions.add(child_id)
+                else:
+                    parent_subscriptions.discard(child_id)
+
+        root_workspace_ids = (
+            effective_workspace_ids(target)[:1] if parent is None else []
+        )
+        for child in direct_children:
+            child_state = ensure_change(child)
+            child_state["managed_by"] = parent.id if parent is not None else None
+            # Managed children inherit from the new parent. Only a child
+            # promoted from a root manager receives the old effective value.
+            child_state["workspace_ids"] = [] if parent is not None else list(root_workspace_ids)
+
+        target_state = ensure_change(target)
+        target_state["managed"] = []
+        target_state["managed_by"] = None
+        target_state["report_subscriptions"] = set()
+
+        # Persist new children before the manager backlink, unrelated
+        # subscription cleanup next, and the record being deleted last.
+        save_order: list[str] = []
+
+        def queue_save(session: Session) -> None:
+            if session.id in desired and session.id not in save_order:
+                save_order.append(session.id)
+
+        for child in direct_children:
+            queue_save(child)
+        if parent is not None:
+            queue_save(parent)
+        for session in all_sessions:
+            if session.id != session_id:
+                queue_save(session)
+        queue_save(target)
+
+        # Include no-op parent/child objects only when an actual field changed.
+        changed = {
+            sid for sid, state in desired.items()
+            if state != originals[sid]
+        }
+        save_order = [sid for sid in save_order if sid in changed]
+        attempted: list[str] = []
+
+        def assign_state(sid: str, state: dict) -> None:
+            session = by_id[sid]
+            session.managed = list(state["managed"])
+            session.managed_by = state["managed_by"]
+            session.workspace_ids = list(state["workspace_ids"])
+            session.report_subscriptions = set(state["report_subscriptions"])
+
+        try:
+            for sid, state in desired.items():
+                assign_state(sid, state)
+            for sid in save_order:
+                attempted.append(sid)
+                save(by_id[sid])
+        except Exception as exc:
+            for sid, state in originals.items():
+                assign_state(sid, state)
+            rollback_errors = []
+            for sid in reversed(attempted):
+                try:
+                    save(by_id[sid])
+                except Exception as rollback_exc:
+                    rollback_errors.append(f"{sid}: {rollback_exc}")
+            detail = f"Failed to persist Session release: {exc}"
+            if rollback_errors:
+                detail += "; rollback persistence failed: " + "; ".join(rollback_errors)
+            return f"Cannot release Session {session_id}: {detail}"
+    except Exception as exc:
+        return f"Cannot release Session {session_id}: {type(exc).__name__}: {exc}"
+    return None
+
+
+@_store_serialized
+def delete_with_release(session_id: str) -> str | None:
+    """Release managed relationships and delete one Session as one operation.
+
+    The relationship changes are rolled back if the Session file removal
+    fails. This is the deletion entry point for server APIs; direct ``delete``
+    remains available for store maintenance that already owns relationship
+    handling.
+    """
     all_sessions = list_all(load_history=False)
-    detached_memberships = {
-        s.id: effective_workspace_ids(s)
-        for s in all_sessions if s.managed_by == session_id
+    originals = {
+        session.id: {
+            "managed": list(session.managed),
+            "managed_by": session.managed_by,
+            "workspace_ids": list(session.workspace_ids),
+            "report_subscriptions": set(session.report_subscriptions),
+        }
+        for session in all_sessions
     }
-    for s in all_sessions:
-        if s.id == session_id:
-            continue
-        if session_id in s.report_subscriptions:
-            s.report_subscriptions.discard(session_id)
-            save(s)
-        if s.managed_by == session_id:
-            s.managed_by = None
-            s.workspace_ids = detached_memberships.get(s.id, [])
-            save(s)
-    target = get(session_id)
-    if target is None:
-        return None  # nothing else to clean up
-    # The object is about to be deleted, but clear these in-memory too so the
-    # relationship is fully detached for callers holding the old object.
-    target.managed.clear()
-    target.report_subscriptions.clear()
-    manager_id = target.managed_by
-    if not manager_id:
-        save(target)
-        return None
-    manager = get(manager_id)
-    if manager is not None and session_id in manager.managed:
-        manager.managed.remove(session_id)
-        save(manager)
-    target.managed_by = None
-    save(target)
+    target = next((session for session in all_sessions if session.id == session_id), None)
+
+    release_error = release(session_id)
+    if release_error:
+        return release_error
+    try:
+        delete(session_id)
+    except Exception as exc:
+        rollback_errors = []
+        changed: list[Session] = []
+        for session in all_sessions:
+            old = originals[session.id]
+            current = {
+                "managed": list(session.managed),
+                "managed_by": session.managed_by,
+                "workspace_ids": list(session.workspace_ids),
+                "report_subscriptions": set(session.report_subscriptions),
+            }
+            if current != old or session.id == session_id:
+                session.managed = list(old["managed"])
+                session.managed_by = old["managed_by"]
+                session.workspace_ids = list(old["workspace_ids"])
+                session.report_subscriptions = set(old["report_subscriptions"])
+                changed.append(session)
+        if target is not None:
+            # delete() may have removed metadata before a later filesystem
+            # operation failed. Reinsert the old object so save can restore it.
+            _cache[session_id] = target
+        for session in reversed(changed):
+            try:
+                save(session)
+            except Exception as rollback_exc:
+                rollback_errors.append(f"{session.id}: {rollback_exc}")
+        detail = f"Failed to delete Session {session_id}: {exc}"
+        if rollback_errors:
+            detail += "; relationship rollback persistence failed: " + "; ".join(rollback_errors)
+        return detail
     return None
 
 
@@ -2512,17 +3731,194 @@ def unclaim(manager_id: str, session_id: str) -> str | None:
     return None
 
 
+def _handoff_existing(a, target_session_id, handoff_prompt, *, copy_settings,
+                      override_original_prompt, original_prompt, adapter, model, permission_mode):
+    """Preflight first, then one store-locked commit; never write to a CLI here.
+
+    HTTP callers also hold both queue locks. The normal queue consumer alone
+    owns reservation/delivery, including uncertain-outcome recovery.
+    """
+    from . import worker
+
+    if not isinstance(target_session_id, str) or not target_session_id:
+        return "target_session_id must be a nonempty existing Session ID (B)"
+    b = get(target_session_id)
+    if b is None:
+        return f"Target Session {target_session_id} not found; existing mode never creates B"
+    if a.id == b.id:
+        return "Source A and target B must be different Sessions"
+    if not isinstance(handoff_prompt, str) or not handoff_prompt.strip():
+        return "handoff_prompt must be a nonempty ordinary input for target B"
+    if copy_settings not in (None, False) or type(copy_settings) not in (bool, type(None)):
+        return "Existing target preserves B settings: omit copy_settings or pass false; true is unsupported. Use explicit model/permission_mode overrides"
+    if adapter is not None:
+        return "Existing target preserves B adapter and CLI context; adapter override is unsupported"
+    if type(override_original_prompt) is not bool or (override_original_prompt and not isinstance(original_prompt, str)):
+        return "override_original_prompt must be boolean; true requires original_prompt string (empty clears metadata only)"
+    intent = dict(targetSessionId=b.id, brief=handoff_prompt.strip(),
+                  overrideOriginalPrompt=override_original_prompt,
+                  originalPrompt=original_prompt if override_original_prompt else None,
+                  model=model, permissionMode=permission_mode)
+    if a.handoff_receipt is not None:
+        if a.handoff_receipt.get("intent") == intent:
+            return a, b  # Query the original receipt; never enqueue again.
+        return "Source A already handed off; inspect its handoff_receipt, do not resend an unknown result"
+    if a.readonly_session or b.readonly_session:
+        return "Readonly source/target cannot hand off"
+    # As in create mode, A may call handoff from its own running turn. Neither
+    # its runtime, final report, queued inputs nor Pause/Illegal state is reset.
+    # The terminal path reads the committed manager graph and reports to B.
+    if model is not None or permission_mode is not None:
+        if worker.find_alive_worker_by_session(b.id) is not None or worker._native_handoff_blocked(b):
+            return "Explicit target settings require B without a live/native Worker; handoff never restarts it"
+        from .adapters.validation import resolve_adapter, validate_model, validate_permission_mode
+        try:
+            target_adapter = resolve_adapter(b.adapter)
+            if model is not None:
+                validate_model(target_adapter, model)
+            if permission_mode is not None:
+                validate_permission_mode(target_adapter, permission_mode)
+        except (ValueError, TypeError) as exc:
+            return str(exc)
+
+    all_sessions = list_all(load_history=False)
+    by_id = {s.id: s for s in all_sessions}
+    # Validate complete affected trees and ancestors before touching backlinks.
+    affected = set()
+    for root in (a, b):
+        current = root
+        seen = set()
+        while current.managed_by:
+            if current.id in seen or current.managed_by not in by_id:
+                return "Managed cycle or missing manager; repair graph before handoff"
+            seen.add(current.id)
+            current = by_id[current.managed_by]
+        todo = [current]
+        seen = set()
+        while todo:
+            current = todo.pop()
+            if current.id in seen:
+                return "Managed cycle/shared child; handoff rejected"
+            seen.add(current.id)
+            affected.add(current.id)
+            if len(current.managed) != len(set(current.managed)):
+                return "Duplicate managed backlinks; handoff rejected"
+            owners = [s.id for s in all_sessions if current.id in s.managed]
+            if owners != ([current.managed_by] if current.managed_by else []):
+                return "Inconsistent manager backlinks; handoff rejected"
+            for child_id in current.managed:
+                child = by_id.get(child_id)
+                if child is None or child.managed_by != current.id:
+                    return "Missing/inconsistent managed child; handoff rejected"
+                todo.append(child)
+    def ancestors(s):
+        result = set()
+        while s.managed_by:
+            result.add(s.managed_by)
+            s = by_id[s.managed_by]
+        return result
+    if a.id in ancestors(b) or b.id in ancestors(a):
+        return "Source/target ancestor or parent-child handoff is unsupported; detach explicitly first"
+    if a.managed_by != b.managed_by:
+        return "Source and existing target have different managers; handoff cannot silently reparent B"
+    if effective_workspace_ids(a) != effective_workspace_ids(b) or len(effective_workspace_ids(a)) > 1:
+        return "Source/target Workspace inheritance differs; align roots explicitly before handoff"
+    for s in all_sessions:
+        if s.id not in (a.id, b.id) and (
+                s.qq_subscriptions & a.qq_subscriptions or s.wechat_subscriptions & a.wechat_subscriptions):
+            return "QQ/WeChat binding conflict with another Session; no binding is stolen"
+
+    fields = ("name", "managed", "managed_by", "workspace_ids", "report_subscriptions",
+              "qq_subscriptions", "wechat_subscriptions", "original_prompt", "handoff_prompt",
+              "frozen_system_prompt", "handoff_receipt", "model", "permission_mode",
+              "queue_pending", "queue_delivery_ledger", "queue_idempotency_index", "queue_revision",
+              "task_seq", "illegal_batches", "accepted_input_ids")
+    before = {s.id: {f: copy.deepcopy(getattr(s, f)) for f in fields} for s in all_sessions}
+    index_flags = {key: getattr(b, key, _PROMPT_UNSET) for key in
+                   ("_idempotency_index_present", "_idempotency_index_built")}
+    attempted = []
+    try:
+        # Freeze BEFORE metadata changes. None/empty/whitespace are preserved.
+        b.frozen_system_prompt = {"value": b.system_prompt}
+        b.original_prompt = original_prompt if override_original_prompt else a.original_prompt
+        b.handoff_prompt = handoff_prompt.strip()
+        if model is not None:
+            b.model = model
+        if permission_mode is not None:
+            b.permission_mode = permission_mode
+        b.managed = list(dict.fromkeys([*b.managed, *a.managed, a.id]))
+        b.report_subscriptions = (b.report_subscriptions | a.report_subscriptions | {a.id}) - {b.id}
+        b.qq_subscriptions |= a.qq_subscriptions
+        b.wechat_subscriptions |= a.wechat_subscriptions
+        for child_id in a.managed:
+            by_id[child_id].managed_by = b.id
+            by_id[child_id].workspace_ids = []
+        if a.managed_by:
+            parent = by_id[a.managed_by]
+            parent.managed = list(dict.fromkeys(b.id if sid == a.id else sid for sid in parent.managed))
+        for s in all_sessions:
+            if s.id not in (a.id, b.id) and a.id in s.report_subscriptions:
+                s.report_subscriptions.discard(a.id)
+                s.report_subscriptions.add(b.id)
+        a.managed = []
+        a.managed_by = b.id
+        a.workspace_ids = []
+        a.report_subscriptions = set()
+        a.qq_subscriptions = set()
+        a.wechat_subscriptions = set()
+        a.name = _available_name(f"(archive) {a.name}", exclude_ids={a.id})
+        item_id = f"q_{uuid.uuid4().hex}"
+        item = {"id": item_id, "type": "task", "text": handoff_prompt.strip(),
+                "source": "agent", "sourceSessionId": a.id,
+                "kind": "task", "queueItemId": item_id, "seq": b.task_seq + 1,
+                "revision": 1, "deliveryState": "queued", "dispatchState": "queued",
+                "taskId": b.active_task_id, "taskIdSource": "active", "createdAt": time.time(),
+                "clientMessageId": f"handoff:{a.id}:{b.id}"}
+        worker._stage_new_queue_item(b, item)  # Includes Illegal lock + original receipt/index.
+        b.task_seq += 1
+        a.handoff_receipt = {"intent": intent, "targetSessionId": b.id, "queueItemId": item_id}
+        for s in all_sessions:
+            if any(getattr(s, f) != before[s.id][f] for f in fields):
+                attempted.append(s.id)
+                save(s)
+    except Exception as exc:
+        for sid, values in before.items():
+            for f, value in values.items():
+                setattr(by_id[sid], f, value)
+        for key, value in index_flags.items():
+            if value is _PROMPT_UNSET:
+                b.__dict__.pop(key, None)
+            else:
+                setattr(b, key, value)
+        failures = []
+        for sid in reversed(attempted):
+            try:
+                save(by_id[sid])
+            except Exception as rollback_exc:
+                failures.append(f"{sid}: {rollback_exc}")
+        return f"Handoff persistence failed: {exc}; rollback failures: {failures}"
+    return a, b
+
+
 @_store_serialized
 def handoff_session(
     session_id: str,
     handoff_prompt: str,
     *,
-    copy_settings: bool = True,
+    copy_settings: bool | None = None,
+    override_original_prompt: bool = False,
+    original_prompt: str | None = None,
     adapter: str | None = None,
     model: str | None = None,
     permission_mode: str | None = None,
+    target_session_id: str | None = None,
 ) -> tuple[Session, Session] | str:
-    """替身交接（session_handoff v1）：创建孪生 session B 接替 session A。
+    """替身交接：省略 target_session_id 新建 B；指定则接替至已有 B。
+
+    已有 B 不调用新建合成器：冻结有效 system_prompt，覆盖 original 元数据，
+    简报持久入普通队列，返回 A.handoff_receipt 原消息 ID；设置默认保留 B。
+    copy_settings=true / adapter 覆写在已有模式拒绝。关系合并与回滚见
+    _handoff_existing；以下旧行为说明仅适用于新建模式。
 
     用途：精简上下文（B 全新会话，不继承 A 的 history / cli_session_id），或
     切换 adapter（普通 session 不能中途切 adapter）。
@@ -2537,7 +3933,8 @@ def handoff_session(
        adapter_config、model、permission_mode、session_template、pan_access、
        mcp_servers 等，**明确不含 system_prompt**；cli_session_id 清空——B 是
        全新会话）；false 时 B 用默认设置（此时调用方应显式传 adapter）。
-    4. **B.original_prompt = A.original_prompt，B.handoff_prompt = 本次简报**。
+    4. **B.original_prompt 默认继承 A.original_prompt；仅 override_original_prompt=true
+       时使用 original_prompt（空字符串清空），独立于 copy_settings。B.handoff_prompt = 本次简报**。
        B.system_prompt 仅计算本次简报 + original_prompt，不继承旧简报。
     5. **重命名**：A → `(archive) <原名>`，B → `<原名>`。
     6. **解除 A 的原关系网**：A.managed / report_subscriptions / qq_subscriptions
@@ -2548,8 +3945,23 @@ def handoff_session(
     a = get(session_id)
     if a is None:
         return f"Session {session_id} not found"
-    if not handoff_prompt or not handoff_prompt.strip():
+    if target_session_id is not None:
+        return _handoff_existing(
+            a, target_session_id, handoff_prompt, copy_settings=copy_settings,
+            override_original_prompt=override_original_prompt, original_prompt=original_prompt,
+            adapter=adapter, model=model, permission_mode=permission_mode)
+    if a.handoff_receipt is not None:
+        return "Source already handed off to existing B; inspect handoff_receipt, do not fall back to creating a new Session"
+    if copy_settings is None:
+        copy_settings = True
+    if not isinstance(handoff_prompt, str) or not handoff_prompt.strip():
         return "handoff_prompt is required — session A 的 agent 必须编写交接简报"
+
+    if type(override_original_prompt) is not bool:
+        return "override_original_prompt must be a boolean"
+    if override_original_prompt and not isinstance(original_prompt, str):
+        return "original_prompt must be a string when override_original_prompt is true"
+    selected_original_prompt = original_prompt if override_original_prompt else a.original_prompt
 
     orig_name = a.name
 
@@ -2560,6 +3972,7 @@ def handoff_session(
         new_permission_mode = permission_mode or a.permission_mode
         new_adapter_config = copy.deepcopy(a.adapter_config)
         new_adapter_config.pop("cli_session_id", None)  # B 是全新会话，不继承 A 的 CLI 上下文
+        new_adapter_config.pop("_steer_requests", None)  # Receipts belong only to the original Session/run.
         new_pan_access = copy.deepcopy(dict(a.pan_access))
         new_character_id = a.character_id
         new_template = a.session_template
@@ -2588,7 +4001,7 @@ def handoff_session(
             adapter_config=new_adapter_config,
             character_id=new_character_id,
             session_template=new_template,
-            original_prompt=a.original_prompt,
+            original_prompt=selected_original_prompt,
             handoff_prompt=handoff_prompt.strip(),
             game_id=new_game_id,
             notification_settings=new_notification_settings,
@@ -2661,11 +4074,21 @@ _all_loaded: bool = False
 
 
 @_store_serialized
-def list_all(*, load_history: bool = True) -> list[Session]:
+def list_all(*, load_history: bool = True, limit: int | None = None) -> list[Session]:
     global _all_loaded
+    if limit is not None and (type(limit) is not int or limit < 1):
+        raise ValueError('Session candidate limit must be a positive integer')
+    if limit is not None and len(_cache) > limit:
+        raise ValueError('Session query candidate limit exceeded')
     if not _all_loaded:
         if SESSION_DIR.exists():
-            for f in sorted(SESSION_DIR.iterdir()):
+            paths = []
+            for path in SESSION_DIR.iterdir():
+                if path.suffix == '.json':
+                    paths.append(path)
+                    if limit is not None and len(paths) > limit:
+                        raise ValueError('Session query candidate limit exceeded')
+            for f in sorted(paths):
                 if f.suffix == ".json":
                     try:
                         data = json.loads(f.read_text(encoding="utf-8"))
@@ -2682,6 +4105,8 @@ def list_all(*, load_history: bool = True) -> list[Session]:
                     except (json.JSONDecodeError, OSError):
                         pass
         _all_loaded = True
+    if limit is not None and len(_cache) > limit:
+        raise ValueError('Session query candidate limit exceeded')
     if load_history:
         # A previous summary=1 request may have populated shallow cache entries.
         # Hydrate those entries only when a caller explicitly asks for full
@@ -2733,6 +4158,164 @@ def apply_order(ordered_ids: list[str]) -> str | None:
             s.order = i
             save(s)
     return None
+
+
+def _pin_state_path() -> Path:
+    """Pin metadata lives beside, but separately from, Session order fields."""
+    return SESSION_DIR.parent / "session-pins.json"
+
+
+def _read_pin_state_locked() -> tuple[Path, int, tuple[str, ...]]:
+    global _PIN_STATE_CACHE, _PIN_STATE_CACHE_STAMP
+    path = _pin_state_path()
+    try:
+        stat = path.stat()
+        stamp = (stat.st_mtime_ns, stat.st_size, stat.st_ino)
+    except FileNotFoundError:
+        stamp = None
+    if (_PIN_STATE_CACHE is not None and _PIN_STATE_CACHE[0] == path
+            and _PIN_STATE_CACHE_STAMP == stamp):
+        return _PIN_STATE_CACHE
+    if stamp is None:
+        state = (path, 0, ())
+    else:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict) or raw.get("version") != 1:
+            raise ValueError("Invalid Session pin metadata")
+        revision = raw.get("revision")
+        session_ids = raw.get("sessionIds")
+        if (isinstance(revision, bool) or not isinstance(revision, int)
+                or revision < 0 or not isinstance(session_ids, list)
+                or not all(isinstance(item, str) and item for item in session_ids)
+                or len(set(session_ids)) != len(session_ids)):
+            raise ValueError("Invalid Session pin metadata")
+        state = (path, revision, tuple(session_ids))
+    _PIN_STATE_CACHE = state
+    _PIN_STATE_CACHE_STAMP = stamp
+    return state
+
+
+def _write_pin_state_locked(path: Path, revision: int, session_ids: list[str]) -> None:
+    global _PIN_STATE_CACHE, _PIN_STATE_CACHE_STAMP
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.tmp")
+    payload = {
+        "version": 1,
+        "revision": revision,
+        "sessionIds": session_ids,
+    }
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+    _PIN_STATE_CACHE = (path, revision, tuple(session_ids))
+    # Recheck the file on the next read. An external Pan process may replace
+    # it after this write; a path-only cache would never observe that change.
+    _PIN_STATE_CACHE_STAMP = None
+
+
+def session_pin_state() -> dict:
+    """Return a detached authoritative pin ordering snapshot."""
+    with _PIN_LOCK:
+        _, revision, session_ids = _read_pin_state_locked()
+        return {"pinRevision": revision, "sessionIds": list(session_ids)}
+
+
+def session_pin_order(session_id: str) -> int | None:
+    """Return this Session's rank in the shared pinned order, if pinned."""
+    with _PIN_LOCK:
+        _, _, session_ids = _read_pin_state_locked()
+        try:
+            return session_ids.index(session_id)
+        except ValueError:
+            return None
+
+
+def session_pin_projection(session_id: str) -> dict:
+    """Return the list-safe pin fields for one Session."""
+    with _PIN_LOCK:
+        _, revision, session_ids = _read_pin_state_locked()
+        try:
+            order = session_ids.index(session_id)
+        except ValueError:
+            order = None
+        return {
+            "pinned": order is not None,
+            "pinOrder": order,
+            "pinRevision": revision,
+        }
+
+
+@_store_serialized
+def set_session_pinned(session_id: str, pinned: bool) -> tuple[dict | None, str | None]:
+    """Pin/unpin one existing Session without touching Session.order."""
+    if session_id not in _cache and get(session_id) is None:
+        return None, "Session not found"
+    with _PIN_LOCK:
+        path, revision, current = _read_pin_state_locked()
+        ordered = list(current)
+        present = session_id in ordered
+        if pinned and not present:
+            ordered.append(session_id)
+        elif not pinned and present:
+            ordered.remove(session_id)
+        if ordered != list(current):
+            _write_pin_state_locked(path, revision + 1, ordered)
+            revision += 1
+        return {"pinRevision": revision, "sessionIds": ordered}, None
+
+
+@_store_serialized
+def reorder_pinned_sessions(
+    session_ids: list[str], expected_revision: int,
+) -> tuple[dict | None, str | None, str | None]:
+    """Reorder selected pinned IDs while leaving every unlisted slot intact.
+
+    The caller supplies the visible pinned members of one current UI group.
+    Replacing only those IDs' existing slots means filtered, collapsed, and
+    other-group pins retain both their slots and their mutual relative order.
+    """
+    with _PIN_LOCK:
+        path, revision, current = _read_pin_state_locked()
+        if expected_revision != revision:
+            return None, "pin_state_conflict", "Pinned Session state changed; refresh and retry"
+        if len(set(session_ids)) != len(session_ids):
+            return None, "duplicate_session_ids", "sessionIds contains duplicates"
+        all_ids = {session.id for session in list_all(load_history=False)}
+        unknown = [sid for sid in session_ids if sid not in all_ids]
+        if unknown:
+            return None, "session_not_found", f"Unknown Session id(s): {', '.join(unknown)}"
+        unpinned = [sid for sid in session_ids if sid not in current]
+        if unpinned:
+            return None, "session_not_pinned", "Every sessionId must currently be pinned"
+        requested = set(session_ids)
+        positions = [index for index, sid in enumerate(current) if sid in requested]
+        if len(positions) != len(session_ids):
+            return None, "session_not_pinned", "Every sessionId must currently be pinned"
+        ordered = list(current)
+        for index, sid in zip(positions, session_ids):
+            ordered[index] = sid
+        if ordered != list(current):
+            _write_pin_state_locked(path, revision + 1, ordered)
+            revision += 1
+        return {"pinRevision": revision, "sessionIds": ordered}, None, None
+
+
+def _remove_session_pin_locked(session_id: str) -> None:
+    """Drop a deleted Session from pin metadata while delete owns the store lock."""
+    with _PIN_LOCK:
+        path, revision, current = _read_pin_state_locked()
+        if session_id not in current:
+            return
+        try:
+            _write_pin_state_locked(
+                path, revision + 1, [sid for sid in current if sid != session_id],
+            )
+        except (OSError, ValueError):
+            # Session deletion must not strand the Session cache/files if a
+            # secondary metadata write fails; list projections ignore orphan IDs.
+            pass
 
 
 # ── migration helpers ──
@@ -2791,6 +4374,160 @@ def accumulate_raw_usage(existing: dict | None, entries: list[dict]) -> dict:
                 "rawUsage": ru,
             }
     return result
+
+
+def normalize_native_usage_entries(adapter: str, entries: list[dict]) -> list[dict]:
+    """Use the same ledger fields as live enrichment, keeping native cursors separate.
+
+    Codex storage returns absolute input/output counters; its adapter emits
+    prompt/completion deltas. Mixing those aliases in one per-model ledger
+    makes totals choose one alias and omit the other. Other providers already
+    return their enrichment field names.
+    """
+    if adapter != "codex":
+        return entries
+    mapping = {
+        "input_tokens": "prompt_tokens", "output_tokens": "completion_tokens",
+        "reasoning_output_tokens": "reasoning_tokens",
+        "cached_input_tokens": "cache_read_tokens",
+        "cache_write_input_tokens": "cache_write_tokens",
+    }
+    normalized = copy.deepcopy(entries)
+    for entry in normalized:
+        raw = entry.get("rawUsage") or {}
+        for native, ledger in mapping.items():
+            if native in raw:
+                raw[ledger] = raw.pop(native)
+    return normalized
+
+
+def replace_usage_totals(
+    s: Session, raw_usage: dict | None, *, native_entries: list[dict],
+) -> None:
+    """Replace usage and dedup position from the SAME native read.
+
+    Async writers hold usage_commit_lock through read, publish and persistence.
+    Native absolute counters and timestamps cannot be reconstructed from the
+    normalized per-model totals (Codex import and enrichment even use different
+    field names). Never infer a timestamp or cache counter from token totals.
+    """
+    s.raw_usage = raw_usage
+    s.total_usage = compute_total_usage(raw_usage)
+    s.adapter_config.update(native_usage_cursor_config(s.adapter, native_entries))
+    s._usage_revision = usage_revision(s) + 1
+
+
+def native_usage_cursor_config(adapter: str, native_entries: list[dict]) -> dict:
+    """Dedup position for precisely this native read, including new imports/forks."""
+    if adapter in {"codex", "opencode"}:
+        fields = (
+            ("input_tokens", "output_tokens", "reasoning_output_tokens",
+             "cached_input_tokens", "cache_write_input_tokens", "total_tokens")
+            if adapter == "codex" else
+            ("prompt_tokens", "completion_tokens", "reasoning_tokens",
+             "cache_read_tokens", "cache_write_tokens", "cost")
+        )
+        native = (native_entries[0].get("rawUsage") or {}) if native_entries else {}
+        return {adapter + "_prev_usage": {
+            key: native.get(key, 0) for key in fields
+        }}
+    elif adapter == "kimi":
+        from .adapters.kimi.adapter import _iso_to_ms
+        timestamps = [_iso_to_ms(entry.get("timestamp", ""))
+                      for entry in native_entries]
+        return {"kimi_last_usage_ts": max(
+            (ts for ts in timestamps if ts is not None), default=0)}
+    return {}
+
+
+class NativeReimportConflict(ValueError):
+    """The identity baseline changed before the reimport ticket could run."""
+
+
+async def replace_usage_totals_async(
+    s: Session, raw_usage: dict | None, *, native_entries: list[dict],
+    force_full: bool = False,
+    history: list[dict] | None = None,
+    expected_history_revision: int | None = None,
+    clear_last_result: bool = False,
+    validate_reimport: Callable[[bool], None] | None = None,
+) -> DurableOutcome:
+    """Caller holds usage_commit_lock; retire replacement and rollback together."""
+    def commit() -> None:
+        # Reimport must publish/save/rollback history in the same ticket as
+        # usage. A queued writer may start after a Worker appended new rows.
+        if (history is not None and expected_history_revision is not None and
+                s.history_revision != expected_history_revision):
+            raise NativeReimportConflict("Session history changed during native reimport; existing history retained")
+        history_before = {}
+        disk_before = {}
+        if history is not None:
+            for key in ("history", "history_epoch", "history_revision", "last_result",
+                        "summary_projection", "_history_loaded", "_summary_projection_complete",
+                        "_summary_history_index", "_hist_persisted", "_last_meta_sig", "updated_at"):
+                if hasattr(s, key):
+                    history_before[key] = getattr(s, key)
+            for path in (_path(s.id), _history_path(s.id)):
+                disk_before[path] = path.read_bytes() if path.exists() else None
+        raw_before, total_before = s.raw_usage, s.total_usage
+        cursor_key = {"codex": "codex_prev_usage", "opencode": "opencode_prev_usage",
+                      "kimi": "kimi_last_usage_ts"}.get(s.adapter)
+        missing = object()
+        cursor_before = copy.deepcopy(s.adapter_config.get(cursor_key, missing)) if (
+            cursor_key in s.adapter_config) else missing
+        try:
+            if validate_reimport is not None:
+                validate_reimport(False)
+            if history is not None:
+                replace_history(s, history)
+                if clear_last_result:
+                    s.last_result = None
+            replace_usage_totals(s, raw_usage, native_entries=native_entries)
+            _save_body(s, force_full=force_full)
+            if validate_reimport is not None:
+                validate_reimport(True)
+        except BaseException:
+            for key, value in history_before.items():
+                setattr(s, key, value)
+            s.raw_usage, s.total_usage = raw_before, total_before
+            if cursor_key:
+                if cursor_before is missing:
+                    s.adapter_config.pop(cursor_key, None)
+                else:
+                    s.adapter_config[cursor_key] = cursor_before
+            # Invalidate any detached lookup even when the replacement failed.
+            s._usage_revision = usage_revision(s) + 1
+            # _save_body writes JSONL before the metadata file. Restore both
+            # even if failure happened after one or both replacements landed.
+            for path, value in disk_before.items():
+                if value is None:
+                    path.unlink(missing_ok=True)
+                elif not path.exists() or path.read_bytes() != value:
+                    rollback = path.with_suffix(path.suffix + ".rollback")
+                    rollback.write_bytes(value)
+                    os.replace(rollback, path)
+            raise
+    def locked_commit():
+        if history is None:
+            return commit()
+        with s._summary_lock:
+            return commit()
+    return await _persist_async_outcome(s.id, locked_commit)
+
+
+def usage_revision(s: Session) -> int:
+    """Revision of whole-session usage replacement, checked after provider I/O."""
+    return int(getattr(s, "_usage_revision", 0) or 0)
+
+
+def usage_commit_lock(s: Session) -> asyncio.Lock:
+    """Event-loop gate for reimport and enrichment publish/save/rollback.
+
+    Provider enrichment runs on a detached snapshot outside this gate. No
+    threading lock is held across an await or acquired by executor writers.
+    """
+    return s._usage_commit_lock
+
 
 
 def compute_total_usage(raw_usage: dict | None) -> dict | None:

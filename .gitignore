@@ -9,6 +9,8 @@ __pycache__/
 
 # Node (if any)
 node_modules/
+# pnpm 重装前的依赖快照（含完整 node_modules 副本，勿入库）
+/packages/web/node_modules.backup-*/
 
 # React 前端构建产物
 packages/web/dist/
@@ -92,3 +94,58 @@ auth_token*
 !/assets/3.png
 !/assets/4.png
 !/assets/5.png
+
+# E2E disposable runtime state (evidence JSON/PNG under audit/e2e-runtime and
+# evidence/cbc-strict are kept; the per-run server session data is not).
+audit/e2e-runtime/sessions/
+audit/e2e-runtime/data/
+audit/e2e-runtime/session-workdir/
+audit/e2e-runtime/workdirs/
+audit/e2e-runtime/attachments/
+evidence/cbc-strict/runtime/
+packages/web/test-results/
+
+# Local workflow documents are maintained outside Git on main
+/.workflow/
+
+# T-QUEUE-SEND-LATENCY-20261014: keep reports, exclude owned runtime stores.
+/evidence/frozen-baseline-1db8d9bd/
+/evidence/queue-latency-baseline-1db8d9bd.zip
+/evidence/queue-latency-probe-*/
+/evidence/queue-control-latency-*/
+/evidence/mcp-send-latency-*/
+# Preserve raw failing JUnit locally; commit byte-exact gzip artifacts.
+/evidence/queue-send-latency-red.xml
+/evidence/mcp-send-latency-red.xml
+/evidence/queue-latency-prewrite-rejection-red.xml
+/.artifacts/handoff-existing/
+/evidence/queue-latency-ma-runtime-red.xml
+
+# practical 分支：evidence 采集产物一律不入库（gitignore 不影响已追踪文件，
+# 历史上已入库的 evidence 仍保留在版本库中）。含崩溃现场、会话历史等大体量数据。
+/evidence/
+
+# Isolated plugin-platform validation dependencies and mutable runtime data.
+/.validation/
+/evidence/diagnostics/
+/audit/plugin-platform-20261018/tmp-*/
+/audit/plugin-platform-20261018/pytest-cache/
+/audit/plugin-platform-20261018/venv/
+/audit/plugin-platform-20261018/pip-cache/
+/audit/plugin-platform-20261018/pnpm-store/
+/audit/plugin-platform-20261018/pnpm-home/
+/audit/plugin-platform-20261018/corepack/
+/audit/plugin-platform-20261018/*/private/
+/audit/plugin-platform-20261018/browser/vite-cache/
+/audit/plugin-platform-20261018/browser/tmp/
+/audit/plugin-platform-20261018/live-qq-*/sessions/
+/audit/plugin-platform-20261018/live-qq-*/characters/
+/audit/cc-switch-bridge-20261018/vite-cache/
+/audit/cc-switch-bridge-20261018/tmp/
+/audit/cc-switch-bridge-20261018/*/private/
+/audit/cc-switch-panel-direct-20261018/vite-cache/
+/audit/cc-switch-panel-direct-20261018/tmp/
+/audit/cc-switch-panel-cache-20261019/vite-cache/
+/audit/cc-switch-panel-cache-20261019/tmp/
+/audit/cc-switch-non-manual-gate-20261025/vite-cache/
+/audit/cc-switch-non-manual-gate-20261025/tmp/

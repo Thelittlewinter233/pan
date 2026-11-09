@@ -6,6 +6,7 @@ import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { Sidebar } from './Sidebar';
 import { useSessionStore } from '@/stores/sessionStore';
 import { useUIStore } from '@/stores/uiStore';
+import { DEFAULT_SETTINGS, useAppSettingsStore } from '@/stores/appSettingsStore';
 import { useEditorStore } from '@/stores/editorStore';
 
 function RouteProbe() {
@@ -24,9 +25,11 @@ describe('Sidebar Session search controls', () => {
     vi.useFakeTimers();
     localStorage.clear();
     useSessionStore.setState({ sessions: [], currentSessionId: null, multiSelectMode: false });
+    useAppSettingsStore.setState({ ...DEFAULT_SETTINGS, loaded: true });
     useUIStore.setState({
       sidebarCollapsed: false,
       searchQuery: '',
+      workspaceSearchQuery: '',
       specialFilters: new Set(),
       groupBy: 'none',
       sortBy: 'recent',
@@ -42,6 +45,19 @@ describe('Sidebar Session search controls', () => {
     );
   }
 
+  it('typing and clearing Session search leaves the workspace query untouched', () => {
+    useUIStore.setState({ workspaceSearchQuery: 'Alpha WS' });
+    renderSidebar();
+    fireEvent.change(screen.getByRole('textbox', { name: 'Search sessions' }), {
+      target: { value: 'worker-one' },
+    });
+    expect(useUIStore.getState().searchQuery).toBe('worker-one');
+    expect(useUIStore.getState().workspaceSearchQuery).toBe('Alpha WS');
+    fireEvent.click(screen.getByRole('button', { name: 'Clear session search' }));
+    expect(useUIStore.getState().searchQuery).toBe('');
+    expect(useUIStore.getState().workspaceSearchQuery).toBe('Alpha WS');
+  });
+
   it('shows an accessible clear button only when the query is non-empty', () => {
     renderSidebar();
     expect(screen.queryByRole('button', { name: 'Clear session search' })).toBeNull();
@@ -52,7 +68,34 @@ describe('Sidebar Session search controls', () => {
     expect(screen.getByRole('button', { name: 'Clear session search' })).toBeTruthy();
   });
 
-  it('renders the CWD root as a collapsible section labelled CWD', () => {
+  it('hides Group by by default while keeping Manager collapse and the toggle cycle usable', () => {
+    useSessionStore.setState({
+      sessions: [
+        { id: 'manager', name: 'Manager', alwaysThinkingEnabled: false, effort: '', history: [] },
+        { id: 'child', name: 'Child', managedBy: 'manager', alwaysThinkingEnabled: false, effort: '', history: [] },
+      ],
+    });
+    useUIStore.setState({ groupBy: 'workdir', collapsedGroups: new Set() });
+    renderSidebar();
+
+    expect(screen.queryByTitle(/Group by/)).toBeNull();
+    const collapseButton = screen.getByTitle('Collapse all groups');
+    fireEvent.click(collapseButton);
+    expect(useUIStore.getState().collapsedGroups.size).toBeGreaterThan(0);
+
+    act(() => useAppSettingsStore.getState().setShowGroupBy(true));
+    const groupButton = screen.getByTitle('Group by none (click to cycle)');
+    fireEvent.click(groupButton);
+    expect(useUIStore.getState().groupBy).toBe('none');
+
+    act(() => useAppSettingsStore.getState().setShowGroupBy(false));
+    expect(screen.queryByTitle(/Group by/)).toBeNull();
+    expect(useUIStore.getState().groupBy).toBe('manager');
+    expect(localStorage.getItem('pan:groupBy')).toBe('manager');
+  });
+
+  it('renders the CWD root as a collapsible section labelled CWD', async () => {
+    vi.useRealTimers();
     useEditorStore.setState({
       sessionId: 's1',
       workdir: 'D:\\project',
@@ -70,7 +113,9 @@ describe('Sidebar Session search controls', () => {
       </MemoryRouter>,
     );
 
-    expect(screen.getByText('CWD')).toBeTruthy();
+    // Finish React.lazy's actual module work before querying its rendered root.
+    await act(async () => { await vi.dynamicImportSettled(); });
+    expect(await screen.findByText('CWD')).toBeTruthy();
     expect(screen.getByText('D:/project')).toBeTruthy();
     const cwdHeader = screen.getByTestId('editor-root-header');
     expect(cwdHeader.querySelector('svg.lucide-chevron-down')).not.toBeNull();
@@ -79,14 +124,25 @@ describe('Sidebar Session search controls', () => {
     expect(cwdHeader.querySelector('svg.lucide-chevron-right')).not.toBeNull();
   });
 
-  it('opens the special filters menu to the right of its trigger', () => {
+  it('opens the special filters menu constrained to the viewport', () => {
     renderSidebar();
 
     fireEvent.click(screen.getByTitle('Special filters'));
 
+    // Viewport-constrained placement (fixed + measured trigger): the panel
+    // stays inside the window instead of relying on the old absolute left-0
+    // anchoring, which could overflow narrow screens.
     const menu = screen.getByRole('menu');
-    expect(menu.className).toContain('left-0');
-    expect(menu.className).not.toContain('right-0');
+    expect(menu.className).toContain('fixed');
+    const style = menu.getAttribute('style') ?? '';
+    const left = Number(/left:\s*([\d.]+)px/.exec(style)?.[1]);
+    const top = Number(/top:\s*([\d.]+)px/.exec(style)?.[1]);
+    const maxHeight = Number(/max-height:\s*([\d.]+)px/.exec(style)?.[1]);
+    expect(left).toBeGreaterThanOrEqual(0);
+    expect(left + 256).toBeLessThanOrEqual(window.innerWidth);
+    expect(top).toBeGreaterThan(0);
+    expect(maxHeight).toBeGreaterThan(0);
+    expect(maxHeight).toBeLessThanOrEqual(window.innerHeight);
   });
 
   it('clears the query and restores the unfiltered state', () => {
@@ -178,7 +234,8 @@ describe('Sidebar Session search controls', () => {
     expect(actions?.className).toContain('flex-wrap');
     expect(screen.getByRole('button', { name: 'Delete selected sessions' }).title).toBe('Delete selected sessions');
     expect(screen.getByRole('button', { name: 'Cancel selection' }).title).toBe('Cancel selection');
-    expect(screen.getByRole('button', { name: 'Move selected sessions to workspace' }).textContent).toContain('Workspace');
+    fireEvent.click(screen.getByRole('button', { name: /Actions/ }));
+    expect(screen.getByRole('menuitem', { name: 'Workspace' }).textContent).toContain('Workspace');
   });
 
   it('keeps full action labels and explicit accessible names in the wide selection bar', () => {
@@ -189,7 +246,8 @@ describe('Sidebar Session search controls', () => {
     expect(document.querySelector('aside')?.style.width).toBe('min(480px, 100vw)');
     expect(screen.getByRole('button', { name: 'Delete selected sessions' }).textContent).toContain('Delete');
     expect(screen.getByRole('button', { name: 'Cancel selection' }).textContent).toContain('Cancel');
-    expect(screen.getByRole('button', { name: 'Move selected sessions to workspace' }).textContent).toContain('Workspace');
+    fireEvent.click(screen.getByRole('button', { name: /Actions/ }));
+    expect(screen.getByRole('menuitem', { name: 'Workspace' }).textContent).toContain('Workspace');
     expect(document.querySelector('.sidebar-selection-action-icon')).toBeTruthy();
   });
 
@@ -355,6 +413,176 @@ describe('Sidebar session navigation from Jobs', () => {
     const { container } = renderJobsSidebar();
 
     fireEvent.click(container.querySelector('[data-session-card-id="jobs-session"]')!);
+
+    expect(screen.getByText('Chat view')).toBeTruthy();
+    expect(useUIStore.getState().mobileSidebarOpen).toBe(false);
+    vi.unstubAllGlobals();
+  });
+});
+
+// A real card activation must always land on the Chat view — from Jobs,
+// Terminal, plugin panels or Manage — including a re-click of the already
+// selected Session. Only the card body navigates: quick actions, the
+// multi-select checkbox and background store selections must not.
+// (The /editor sidebar intentionally shows the directory browser instead of
+// the Session list, so no card surface exists there to click.)
+describe('Sidebar session card activation returns to Chat from any non-chat route', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    useSessionStore.setState({
+      sessions: [
+        { id: 'nav-a', name: 'Nav A', alwaysThinkingEnabled: false, effort: '', history: [] },
+        { id: 'nav-b', name: 'Nav B', alwaysThinkingEnabled: false, effort: '', history: [] },
+      ],
+      currentSessionId: null,
+      multiSelectMode: false,
+      selectedIds: new Set(),
+    });
+    useUIStore.setState({
+      sidebarCollapsed: false,
+      mobileSidebarOpen: false,
+      searchQuery: '',
+      specialFilters: new Set(),
+      groupBy: 'none',
+      sortBy: 'recent',
+      dragEnabled: false,
+    });
+  });
+
+  function renderAt(initial: string) {
+    return render(
+      <MemoryRouter initialEntries={[initial]}>
+        <Sidebar />
+        <Routes>
+          <Route path="/" element={<div>Chat view</div>} />
+          <Route path="/editor" element={<div>Editor view</div>} />
+          <Route path="/jobs" element={<div>Jobs view</div>} />
+          <Route path="/terminals" element={<div>Terminal view</div>} />
+          <Route path="/plugins/:pluginId/:panelId" element={<div>Plugin panel view</div>} />
+          <Route path="/manage/:sessionId" element={<div>Manage view</div>} />
+        </Routes>
+        <RouteProbe />
+      </MemoryRouter>,
+    );
+  }
+
+  function clickCard(container: HTMLElement, id: string) {
+    fireEvent.click(container.querySelector(`[data-session-card-id="${id}"]`)!);
+  }
+
+  it('opens the clicked session in Chat from the Terminal route', () => {
+    const { container } = renderAt('/terminals');
+    expect(screen.getByText('Terminal view')).toBeTruthy();
+
+    clickCard(container, 'nav-a');
+
+    expect(screen.getByText('Chat view')).toBeTruthy();
+    expect(screen.getByTestId('route-probe').textContent).toContain('/: nav-a');
+  });
+
+  it('opens the clicked session in Chat from a plugin panel route', () => {
+    const { container } = renderAt('/plugins/demo/account-switcher');
+    expect(screen.getByText('Plugin panel view')).toBeTruthy();
+
+    clickCard(container, 'nav-b');
+
+    expect(screen.getByText('Chat view')).toBeTruthy();
+    expect(screen.getByTestId('route-probe').textContent).toContain('/: nav-b');
+  });
+
+  it('opens the clicked session in Chat from the Manage route', () => {
+    const { container } = renderAt('/manage/nav-a');
+    expect(screen.getByText('Manage view')).toBeTruthy();
+
+    clickCard(container, 'nav-b');
+
+    expect(screen.getByText('Chat view')).toBeTruthy();
+    expect(screen.getByTestId('route-probe').textContent).toContain('/: nav-b');
+  });
+
+  it('returns to Chat when re-clicking the already selected session from the Terminal route', () => {
+    useSessionStore.setState({ currentSessionId: 'nav-a' });
+    const { container } = renderAt('/terminals');
+    expect(screen.getByText('Terminal view')).toBeTruthy();
+
+    clickCard(container, 'nav-a');
+
+    expect(screen.getByText('Chat view')).toBeTruthy();
+    expect(screen.getByTestId('route-probe').textContent).toContain('/: nav-a');
+  });
+
+  it('returns to Chat again after navigating away and re-clicking the same session', () => {
+    const { container } = renderAt('/jobs');
+
+    clickCard(container, 'nav-a');
+    expect(screen.getByText('Chat view')).toBeTruthy();
+
+    // Route away via the Sidebar's own Jobs entry, then click the same
+    // (still selected) card again: it must come back to Chat.
+    fireEvent.click(screen.getByRole('link', { name: 'Jobs' }));
+    expect(screen.getByText('Jobs view')).toBeTruthy();
+
+    clickCard(container, 'nav-a');
+    expect(screen.getByText('Chat view')).toBeTruthy();
+    expect(screen.getByTestId('route-probe').textContent).toContain('/: nav-a');
+  });
+
+  it('stays on the chat route without stacking navigation when a card is clicked there', () => {
+    const { container } = renderAt('/');
+
+    clickCard(container, 'nav-a');
+
+    expect(screen.getByText('Chat view')).toBeTruthy();
+    expect(screen.getByTestId('route-probe').textContent).toContain('/: nav-a');
+  });
+
+  it('does not navigate when a card quick action is used from the Terminal route', () => {
+    const { container } = renderAt('/terminals');
+
+    fireEvent.click(container.querySelector('[data-session-card-id="nav-a"] [data-quick-action="pin"]')!);
+
+    expect(screen.getByText('Terminal view')).toBeTruthy();
+    expect(useSessionStore.getState().currentSessionId).toBeNull();
+  });
+
+  it('does not navigate when the multi-select checkbox is clicked from the Terminal route', () => {
+    useSessionStore.setState({ multiSelectMode: true });
+    const { container } = renderAt('/terminals');
+
+    fireEvent.click(container.querySelector('[data-session-card-id="nav-a"] [data-testid="select-checkbox-zone"]')!);
+
+    expect(screen.getByText('Terminal view')).toBeTruthy();
+    expect(useSessionStore.getState().selectedIds.has('nav-a')).toBe(true);
+    expect(useSessionStore.getState().currentSessionId).toBeNull();
+  });
+
+  it('does not navigate when the store selects a session in the background', () => {
+    renderAt('/terminals');
+
+    act(() => {
+      void useSessionStore.getState().selectSession('nav-a');
+    });
+
+    expect(screen.getByText('Terminal view')).toBeTruthy();
+    expect(screen.getByTestId('route-probe').textContent).toContain('/terminals: nav-a');
+    expect(useSessionStore.getState().currentSessionId).toBe('nav-a');
+  });
+
+  it('closes an open mobile Sidebar after navigating from the Terminal route to Chat', () => {
+    vi.stubGlobal('matchMedia', vi.fn(() => ({
+      matches: true,
+      media: '(max-width: 767px)',
+      onchange: null,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(() => false),
+    })));
+    useUIStore.setState({ mobileSidebarOpen: true });
+    const { container } = renderAt('/terminals');
+
+    clickCard(container, 'nav-b');
 
     expect(screen.getByText('Chat view')).toBeTruthy();
     expect(useUIStore.getState().mobileSidebarOpen).toBe(false);

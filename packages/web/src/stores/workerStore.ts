@@ -1,8 +1,10 @@
+import { isLocalSessionIdentity } from './sessionCreation';
 import { create } from 'zustand';
-import type { WorkerInfo, SettingsBody, ApiGenericResponse } from '@/types';
+import type { WorkerInfo, SettingsBody, ApiGenericResponse, DelayedRestartState } from '@/types';
 import {
   killSessionWorker,
   restartOrStartWorker,
+  requestDelayedRestart,
   interruptSessionWorker,
   steerSessionWorker,
   takeoverSessionWorker,
@@ -30,7 +32,26 @@ function findWorker(
   return null;
 }
 
+function sameRuntimeWorker(previous: WorkerInfo | undefined, workerId: string | null,
+  generation?: number): boolean {
+  return previous?.id === workerId && (generation === undefined
+    || previous?.generation === undefined || previous.generation === generation);
+}
+
+function canClearKilledRuntime(previousId: string | null | undefined, previousGeneration: number | null | undefined,
+  currentId: string | null | undefined, currentGeneration: number | null | undefined): boolean {
+  if (!currentId) return true;
+  // An active entry with an unknown generation cannot be proven to be the
+  // killed runtime, even when its worker id has not changed.
+  return currentId === previousId && typeof previousGeneration === 'number'
+    && typeof currentGeneration === 'number' && currentGeneration === previousGeneration;
+}
+
 interface WorkerStore {
+  delayedRestarts: Record<string, DelayedRestartState>;
+  applyDelayedRestart: (intent: DelayedRestartState) => void;
+  delayedRestart: (sessionId: string) => Promise<DelayedRestartState | null>;
+  refreshDelayedRestart: (sessionId: string) => Promise<void>;
   workers: Record<string, WorkerInfo>;
   currentWorkerId: string | null;
   refreshSeq: number;
@@ -77,6 +98,24 @@ interface WorkerStore {
 let workerTouchSeq = 0;
 
 export const useWorkerStore = create<WorkerStore>((set, get) => ({
+  delayedRestarts: {},
+  applyDelayedRestart: (intent) => {
+    const previous = get().delayedRestarts[intent.sessionId];
+    if (previous && previous.revision >= intent.revision) return;
+    set((s) => ({ delayedRestarts: { ...s.delayedRestarts, [intent.sessionId]: intent } }));
+  },
+  delayedRestart: async (sessionId) => {
+    const epoch = get().runtimeEpoch;
+    const intent = await requestDelayedRestart(sessionId);
+    if (get().runtimeEpoch === epoch && intent) get().applyDelayedRestart(intent);
+    return intent;
+  },
+  refreshDelayedRestart: async (sessionId) => {
+    if (isLocalSessionIdentity(sessionId)) return;
+    const epoch = get().runtimeEpoch;
+    const intent = await requestDelayedRestart(sessionId, 'GET');
+    if (get().runtimeEpoch === epoch && intent) get().applyDelayedRestart(intent);
+  },
   workers: {},
   currentWorkerId: null,
   currentWorker: null,
@@ -101,7 +140,22 @@ export const useWorkerStore = create<WorkerStore>((set, get) => ({
   },
 
   killCurrent: async (sessionId) => {
+    const { id: previousId, generation: previousGeneration } = get().workers[sessionId] ?? {};
+    const epoch = get().runtimeEpoch;
+    const previousSession = useSessionStore.getState().sessions.find((s) => s.id === sessionId);
+    const previousSessionId = previousSession?.workerId;
+    const previousSessionGeneration = previousSession?.workerGeneration;
     await killSessionWorker(sessionId);
+    const current = get().workers[sessionId];
+    const currentSession = useSessionStore.getState().sessions.find((s) => s.id === sessionId);
+    if (get().runtimeEpoch !== epoch
+      || !canClearKilledRuntime(previousId, previousGeneration, current?.id, current?.generation)
+      || !canClearKilledRuntime(previousSessionId, previousSessionGeneration,
+        currentSession?.workerId, currentSession?.workerGeneration)) return;
+    useSessionStore.getState().updateSession(sessionId, {
+      workerId: null,
+      workerStatus: null,
+    });
     set((s) => {
       const workers = { ...s.workers };
       delete workers[sessionId];
@@ -157,23 +211,25 @@ export const useWorkerStore = create<WorkerStore>((set, get) => ({
       previous.generation !== undefined &&
       generation < previous.generation
     ) return;
-    if (terminal && previous?.id && workerId && previous.id !== workerId) return;
+    const newerGeneration = generation !== undefined && previous?.generation !== undefined
+      && generation > previous.generation;
+    if (terminal && previous?.id && workerId && previous.id !== workerId && !newerGeneration) return;
     const now: WorkerInfo = {
       id: workerId || '',
       sessionId,
       status: (status as WorkerInfo['status']) || 'offline',
-      ...(generation !== undefined ? { generation } : previous?.generation !== undefined ? { generation: previous.generation } : {}),
+      ...(generation !== undefined ? { generation } : previous?.id === workerId && previous?.generation !== undefined ? { generation: previous.generation } : {}),
       ...(status === 'idle' || status === null || status === undefined
         ? {}
-        : previous?.nativeStatus
+        : sameRuntimeWorker(previous, workerId, generation) && previous?.nativeStatus
           ? { nativeStatus: previous.nativeStatus }
           : {}),
       ...(status === 'idle' || status === null || status === undefined
         ? {}
-        : previous?.nativeUsage
+        : sameRuntimeWorker(previous, workerId, generation) && previous?.nativeUsage
           ? { nativeUsage: previous.nativeUsage }
           : {}),
-      ...(status !== null && status !== undefined && previous?.id === workerId && previous?.nativeRateLimits
+      ...(status !== null && status !== undefined && sameRuntimeWorker(previous, workerId, generation) && previous?.nativeRateLimits
         ? { nativeRateLimits: previous.nativeRateLimits }
         : {}),
     };
@@ -203,6 +259,7 @@ export const useWorkerStore = create<WorkerStore>((set, get) => ({
     set((s) => {
       const previous = s.workers[sessionId];
       if (!previous && !workerId) return s;
+      if (previous && workerId && previous.id !== workerId) return s;
       const worker: WorkerInfo = previous
         ? { ...previous, nativeStatus }
         : {
@@ -229,6 +286,7 @@ export const useWorkerStore = create<WorkerStore>((set, get) => ({
     set((s) => {
       const previous = s.workers[sessionId];
       if (!previous && !workerId) return s;
+      if (previous && workerId && previous.id !== workerId) return s;
       const worker: WorkerInfo = previous
         ? { ...previous, nativeUsage }
         : {
@@ -255,6 +313,7 @@ export const useWorkerStore = create<WorkerStore>((set, get) => ({
     set((s) => {
       const previous = s.workers[sessionId];
       if (!previous && !workerId) return s;
+      if (previous && workerId && previous.id !== workerId) return s;
       const worker: WorkerInfo = previous
         ? { ...previous, nativeRateLimits }
         : {
@@ -291,10 +350,15 @@ export const useWorkerStore = create<WorkerStore>((set, get) => ({
   refresh: async () => {
     const refreshSeq = get().refreshSeq + 1;
     const touchedAtStart = { ...get().workerTouchedSeq };
+    // A Pan restart while this request is in flight invalidates the response:
+    // the previous process's worker list must not resurrect stale workers
+    // after the client accepted the new server epoch.
+    const epochAtStart = get().runtimeEpoch;
     set({ refreshSeq });
     try {
       const workers = await listWorkers();
       if (get().refreshSeq !== refreshSeq) return;
+      if (epochAtStart !== null && get().runtimeEpoch !== epochAtStart) return;
       const map: Record<string, WorkerInfo> = {};
       for (const w of workers) {
         const previous = useWorkerStore.getState().workers[w.sessionId];
@@ -304,13 +368,13 @@ export const useWorkerStore = create<WorkerStore>((set, get) => ({
           sessionId: w.sessionId,
           status,
           ...(w.generation !== undefined ? { generation: w.generation } : {}),
-          ...(status !== 'idle' && previous?.nativeStatus
+          ...(status !== 'idle' && sameRuntimeWorker(previous, w.workerId, w.generation) && previous?.nativeStatus
             ? { nativeStatus: previous.nativeStatus }
             : {}),
-          ...(status !== 'idle' && previous?.nativeUsage
+          ...(status !== 'idle' && sameRuntimeWorker(previous, w.workerId, w.generation) && previous?.nativeUsage
             ? { nativeUsage: previous.nativeUsage }
             : {}),
-          ...(previous?.id === w.workerId && previous?.nativeRateLimits
+          ...(sameRuntimeWorker(previous, w.workerId, w.generation) && previous?.nativeRateLimits
             ? { nativeRateLimits: previous.nativeRateLimits }
             : {}),
         };
@@ -346,6 +410,7 @@ export const useWorkerStore = create<WorkerStore>((set, get) => ({
       ? state
       : {
           runtimeEpoch: epoch,
+          delayedRestarts: {},
           workers: {},
           currentWorkerId: null,
           currentWorker: null,

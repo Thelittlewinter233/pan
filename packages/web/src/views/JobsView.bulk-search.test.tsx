@@ -3,29 +3,41 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import JobsView from './JobsView';
+import { useJobStore } from '@/stores/jobStore';
 import type { Job, JobKind } from '@/types/jobs';
 
 const api = vi.hoisted(() => ({
+  updateActionJob: vi.fn(),
+  fetchActionRegistry: vi.fn(), fetchCompleteJobTemplates: vi.fn(),
   fetchJobs: vi.fn(),
   fetchJob: vi.fn(),
   fetchJobKinds: vi.fn(),
   fetchJobRuns: vi.fn(),
   fetchCompletedJobRetentionSettings: vi.fn(),
   updateCompletedJobRetentionSettings: vi.fn(),
+  pinJob: vi.fn(),
   patchJob: vi.fn(),
   deleteJob: vi.fn(),
+  cancelJob: vi.fn(),
 }));
 const wsHandlers = vi.hoisted(() => new Map<string, (event: unknown) => void>());
 
 vi.mock('@/services/api', () => ({
+  fetchLegacyJob: async () => ({ jobId: 'legacy' }),
+  retryLegacyJob: vi.fn(),
+  updateActionJob: api.updateActionJob,
+  fetchActionRegistry: api.fetchActionRegistry,
+  fetchCompleteJobTemplates: api.fetchCompleteJobTemplates,
   fetchJobs: api.fetchJobs,
   fetchJob: api.fetchJob,
   fetchJobKinds: api.fetchJobKinds,
   fetchJobRuns: api.fetchJobRuns,
   fetchCompletedJobRetentionSettings: api.fetchCompletedJobRetentionSettings,
   updateCompletedJobRetentionSettings: api.updateCompletedJobRetentionSettings,
+  pinJob: api.pinJob,
   patchJob: api.patchJob,
   deleteJob: api.deleteJob,
+  cancelJob: api.cancelJob,
   createJob: vi.fn(),
   runJobNow: vi.fn(),
 }));
@@ -80,11 +92,13 @@ const scheduledJob = (overrides: Partial<Job> = {}): Job =>
   });
 
 function renderView() {
-  return render(
+  const view = render(
     <MemoryRouter>
       <JobsView />
     </MemoryRouter>,
   );
+  fireEvent.click(screen.getByRole('button', { name: 'Legacy Jobs / 旧 Job' }));
+  return view;
 }
 
 function enterSelectionMode() {
@@ -142,8 +156,55 @@ function retentionResponse(
 }
 
 describe('JobsView search, status filters, and bulk actions', () => {
+  it('keeps legacy records and their projections out of the new Job tab', async () => {
+    const old = job({ name: 'Old process', kind: 'background-process', status: 'failed' });
+    const fresh = scheduledJob({ jobId: 'job_new', name: 'New Action Job', unified: {
+      action: { api: 'action_reference', actionId: 'a', arguments: {} },
+      config: { name: 'New Action Job', actionId: 'a', arguments: {}, schedule: [], enabled: true },
+    } });
+    const projection = { ...old, jobId: 'job_projection', name: 'Compatibility only', unified: {
+      ...fresh.unified!, compatibility: { legacyKind: 'background-process', migration: 'projection-only' as const },
+    } };
+    api.fetchJobs.mockResolvedValue([old, projection, fresh]);
+    api.fetchJob.mockResolvedValue(projection);
+    renderView();
+    expect(await screen.findByText('Old process')).toBeTruthy();
+    expect(screen.getByText('Compatibility only')).toBeTruthy();
+    expect(screen.queryByText('New Action Job')).toBeNull();
+    fireEvent.click(screen.getByText('Compatibility only'));
+    expect(await screen.findByLabelText('Legacy execution details')).toBeTruthy();
+    expect(screen.queryByText('Unified execution')).toBeNull();
+    expect(screen.queryByText('Action reference')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /^Close$/ }));
+    fireEvent.change(screen.getByRole('searchbox'), { target: { value: 'Compatibility' } });
+    fireEvent.click(screen.getByRole('button', { name: /^Unified Jobs$/ }));
+    expect(await screen.findByText('New Action Job')).toBeTruthy();
+    expect(screen.queryByText('Old process')).toBeNull();
+    expect(screen.queryByText('Compatibility only')).toBeNull();
+    expect((screen.getByRole('searchbox') as HTMLInputElement).value).toBe('');
+    fireEvent.click(screen.getByRole('button', { name: 'Legacy Jobs / 旧 Job' }));
+    expect((screen.getByRole('searchbox') as HTMLInputElement).value).toBe('Compatibility');
+  });
+  it('keeps the opened config revision when WS replaces a dirty unified Job', async () => {
+    const initial = scheduledJob({ name: 'Unified revision draft', enabled: true, configRevision: 7,
+      unified: { action: { api: 'action_reference', actionId: 'a', arguments: {} }, config: {
+        name: 'Unified revision draft', actionId: 'a', arguments: {}, schedule: [], trigger: { kind: 'immediate' }, enabled: true } } });
+    api.fetchJobs.mockResolvedValue([initial]); api.updateActionJob.mockResolvedValue(initial);
+    renderView();
+    fireEvent.click(screen.getByRole('button', { name: /^Unified Jobs$/ }));
+    fireEvent.click(await screen.findByText('Unified revision draft'));
+    fireEvent.click(await screen.findByRole('button', { name: /^Edit$/ }));
+    fireEvent.change(await screen.findByLabelText('Name'), { target: { value: 'Kept user draft' } });
+    act(() => useJobStore.getState().upsertJob({ ...initial, configRevision: 8 }));
+    fireEvent.click(screen.getByRole('button', { name: 'Save unified Job' }));
+    await waitFor(() => expect(api.updateActionJob).toHaveBeenCalled());
+    expect(api.updateActionJob.mock.calls[0]?.[2]).toBe(7);
+    expect(api.updateActionJob.mock.calls[0]?.[1].name).toBe('Kept user draft');
+  });
   beforeEach(() => {
     vi.resetAllMocks();
+    api.fetchActionRegistry.mockResolvedValue({ actions: [] });
+    api.fetchCompleteJobTemplates.mockResolvedValue([]);
     wsHandlers.clear();
     api.fetchJobs.mockResolvedValue([]);
     api.fetchJob.mockResolvedValue(undefined);
@@ -162,6 +223,64 @@ describe('JobsView search, status filters, and bulk actions', () => {
   afterEach(() => {
     cleanup();
     wsHandlers.clear();
+    // The job list now lives in the shared store; isolate it per test.
+    useJobStore.setState({
+      jobs: [], loaded: false, loading: false, error: null, pinMetadataUnavailable: false,
+    });
+  });
+
+  it('keeps a pin through lifecycle events and restores ordinary ordering after unpin', async () => {
+    const pinned = job({ jobId: 'pinned', name: 'Pinned reminder', status: 'completed', pinned: true });
+    api.fetchJobs.mockResolvedValue([pinned, job({ jobId: 'running', name: 'Running process', status: 'running' })]);
+    api.pinJob.mockResolvedValue({ ...pinned, pinned: false });
+    const { container } = renderView();
+    await screen.findByText('Pinned reminder');
+    const names = () => Array.from(container.querySelectorAll('div[title]')).map((el) => el.getAttribute('title')).filter((v) => v === 'Pinned reminder' || v === 'Running process');
+    expect(names()).toEqual(['Pinned reminder', 'Running process']);
+    const { pinned: ignored, ...eventJob } = pinned;
+    expect(ignored).toBe(true);
+    act(() => useJobStore.getState().upsertJob({ ...eventJob, updatedAt: 99 }));
+    expect(screen.getByLabelText('Pinned')).toBeTruthy();
+    expect(names()).toEqual(['Pinned reminder', 'Running process']);
+    fireEvent.click(screen.getAllByRole('button', { name: 'Job actions' })[0]!);
+    fireEvent.click(screen.getByRole('menuitem', { name: /^Unpin$/ }));
+    await waitFor(() => expect(screen.queryByLabelText('Pinned')).toBeNull());
+    expect(api.pinJob).toHaveBeenCalledWith('pinned', false);
+    expect(names()).toEqual(['Running process', 'Pinned reminder']);
+  });
+
+  it('shows unavailable pin metadata, disables pin, and leaves ordinary filters usable', async () => {
+    api.fetchJobs.mockResolvedValue([job({ pinned: null, pinMetadataStatus: 'unavailable' })]);
+    renderView();
+    await screen.findByText('Reminder');
+    expect(screen.getByRole('status').textContent).toContain('Pin states are unknown');
+    fireEvent.click(screen.getByRole('button', { name: 'Job actions' }));
+    const pin = screen.getByRole('menuitem', { name: 'Pin unavailable' });
+    expect((pin as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(pin);
+    expect(api.pinJob).not.toHaveBeenCalled();
+    expect(screen.getByRole('menuitem', { name: 'Delete' })).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Job actions' }));
+    fireEvent.change(screen.getByRole('searchbox', { name: 'Search jobs' }), { target: { value: 'Reminder' } });
+    expect(screen.getByTitle('Reminder')).toBeTruthy();
+  });
+
+  it('shows metadata failure for an empty list via the list envelope', async () => {
+    api.fetchJobs.mockImplementation(async (onStatus) => { onStatus('unavailable'); return []; });
+    renderView();
+    await waitFor(() => expect(screen.getByRole('status').textContent).toContain('Pin states are unknown'));
+  });
+
+  it('clears a cached pin when an update explicitly reports unknown metadata', async () => {
+    const pinned = job({ pinned: true, pinMetadataStatus: 'available' });
+    api.fetchJobs.mockResolvedValue([pinned, job({ jobId: 'cached', name: 'Cached pin', pinned: true })]);
+    renderView();
+    await screen.findByText('Cached pin');
+    expect(screen.getAllByLabelText('Pinned')).toHaveLength(2);
+    await screen.findAllByLabelText('Pinned');
+    act(() => useJobStore.getState().upsertJob({ ...pinned, pinned: null, pinMetadataStatus: 'unavailable' }));
+    expect(screen.queryByLabelText('Pinned')).toBeNull();
+    expect(screen.getByRole('status').textContent).toContain('Pin states are unknown');
   });
 
   it('matches Completed and Timeout only to their persisted API statuses', async () => {
@@ -425,7 +544,7 @@ describe('JobsView search, status filters, and bulk actions', () => {
       'true',
     );
     expect(screen.getByRole('textbox', { name: 'Name' })).toBeTruthy();
-    expect(screen.getByRole('button', { name: 'Create job' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Save unified Job' })).toBeTruthy();
   });
 
   it('selects and deselects visible results without opening a detail drawer; row menus stay isolated', async () => {
@@ -550,8 +669,8 @@ describe('JobsView search, status filters, and bulk actions', () => {
     selectAllVisible();
     fireEvent.click(screen.getByRole('button', { name: 'Delete selected (3)' }));
 
-    await waitFor(() => expect(wsHandlers.has('job.deleted')).toBe(true));
-    act(() => wsHandlers.get('job.deleted')?.({ jobId: 'delete-ws' }));
+    // A deletion elsewhere arrives through the shared store (global WS wiring).
+    act(() => useJobStore.getState().removeJob('delete-ws'));
     const dialog = await screen.findByRole('dialog', { name: 'Delete selected jobs' });
     expect(dialog.textContent).toContain('Delete 2 selected jobs?');
 
@@ -596,4 +715,68 @@ describe('JobsView search, status filters, and bulk actions', () => {
     });
     expect(screen.getByText('Lifecycle B')).toBeTruthy();
   });
+});
+
+
+describe('Job cancellation and ordering', () => {
+  beforeEach(() => { vi.resetAllMocks(); localStorage.clear(); useJobStore.setState({ jobs: [], loading: false, error: null }); api.fetchJobKinds.mockResolvedValue([]); api.fetchJobs.mockResolvedValue([]); api.fetchJobRuns.mockResolvedValue([]); });
+  afterEach(cleanup);
+  it('retains a failed cancellation and prevents duplicate requests', async () => {
+    api.fetchJobs.mockResolvedValue([job({ status: 'running', label: 'Build validation' })]);
+    let reject!: (error: Error) => void;
+    api.cancelJob.mockImplementation(() => new Promise((_, r) => { reject = r; }));
+    renderView();
+    const button = await screen.findByRole('button', { name: 'Cancel job' });
+    fireEvent.click(button); fireEvent.click(button);
+    expect(api.cancelJob).toHaveBeenCalledTimes(1);
+    expect(screen.getAllByRole('button', { name: 'Cancelling…' }).every(e => (e as HTMLButtonElement).disabled)).toBe(true);
+    await act(async () => reject(new Error('Cancellation refused')));
+    expect((await screen.findAllByRole('button', { name: 'Cancel job' })).length).toBeGreaterThan(0);
+    expect(screen.getAllByText('Reminder').length).toBeGreaterThan(0);
+    expect(api.deleteJob).not.toHaveBeenCalled();
+  });
+  it('sorts equal timestamps by ID and persists direction while live updates reorder', async () => {
+    api.fetchJobs.mockResolvedValue([job({ jobId: 'b', name: 'Second', updatedAt: 2 }), job({ jobId: 'a', name: 'First', updatedAt: 2 })]);
+    renderView(); await screen.findByText('First');
+    fireEvent.change(screen.getByLabelText('Sort jobs'), { target: { value: 'updated' } });
+    expect(screen.getAllByText(/First|Second/).map(e => e.textContent)).toEqual(['First', 'Second']);
+    act(() => useJobStore.getState().upsertJob(job({ jobId: 'b', name: 'Second', updatedAt: 3 })));
+    expect(screen.getAllByText(/First|Second/).map(e => e.textContent)).toEqual(['Second', 'First']);
+    fireEvent.click(screen.getByRole('button', { name: 'Descending' }));
+    expect(JSON.parse(localStorage.getItem('pan:jobsSort')!).direction).toBe('asc');
+  });
+});
+
+
+it('sorts created time and actual kind safely with missing legacy times last', async () => {
+  localStorage.clear();
+  api.fetchJobKinds.mockResolvedValue([]);
+  api.fetchJobs.mockResolvedValue([
+    job({ jobId: 'b', name: 'Beta', kind: 'session-message', createdAt: '2026-01-02T00:00:00Z' }),
+    job({ jobId: 'a', name: 'Alpha', kind: 'background-process', createdAt: 1 }),
+    job({ jobId: 'c', name: 'Legacy', createdAt: 'invalid' }),
+  ]);
+  renderView(); await screen.findByText('Alpha');
+  const names = () => screen.getAllByText(/^(Alpha|Beta|Legacy)$/).map(e => e.textContent);
+  fireEvent.change(screen.getByLabelText('Sort jobs'), { target: { value: 'created' } });
+  expect(names()).toEqual(['Beta', 'Alpha', 'Legacy']);
+  fireEvent.click(screen.getByRole('button', { name: 'Descending' }));
+  expect(names()).toEqual(['Alpha', 'Beta', 'Legacy']);
+  fireEvent.change(screen.getByLabelText('Sort jobs'), { target: { value: 'kind' } });
+  expect(names()).toEqual(['Alpha', 'Beta', 'Legacy']);
+  cleanup();
+});
+
+
+it('keeps accepted asynchronous cancellation disabled until the live terminal event', async () => {
+  localStorage.clear();
+  const running = job({ jobId: 'async-cancel', status: 'running' });
+  api.fetchJobs.mockResolvedValue([running]); api.fetchJobKinds.mockResolvedValue([]);
+  api.cancelJob.mockResolvedValue(undefined); api.fetchJob.mockResolvedValue(running);
+  renderView(); fireEvent.click(await screen.findByRole('button', { name: 'Cancel job' }));
+  await waitFor(() => expect(api.fetchJob).toHaveBeenCalledWith('async-cancel'));
+  expect((screen.getByRole('button', { name: 'Cancelling…' }) as HTMLButtonElement).disabled).toBe(true);
+  act(() => useJobStore.getState().upsertJob({ ...running, status: 'cancelled', updatedAt: 2 }));
+  await waitFor(() => expect(screen.queryByRole('button', { name: 'Cancelling…' })).toBeNull());
+  cleanup();
 });

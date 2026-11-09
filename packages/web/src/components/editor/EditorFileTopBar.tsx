@@ -1,16 +1,19 @@
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Check, Copy, Download, MessageSquare, Save as SaveIcon } from 'lucide-react';
+import { Check, Copy, Download, ExternalLink, FolderOpen, MessageSquare, Save as SaveIcon } from 'lucide-react';
 import { useMediaQuery } from '@/hooks/useMediaQuery';
 import { useCurrentSession } from '@/stores/sessionStore';
 import { useEditorStore } from '@/stores/editorStore';
+import { useCapability, usePlatformStore } from '@/stores/platformStore';
 import { useUIStore } from '@/stores/uiStore';
 import { copyText } from '@/utils/clipboard';
+import { openFileExternally, revealFileExternally } from '@/services/api';
 
 interface EditorFileTopBarProps {
   /** Session-relative path used by backend operations and attachment queue. */
   operationPath: string;
   imagePreview?: boolean;
+  previewFailed?: boolean;
   imageDisplayName?: string;
   imageDownloadHref?: string;
 }
@@ -65,9 +68,23 @@ export function getDisplayPath(workdir: string | null | undefined, operationPath
   return `${normalizedWorkdir}${separator}${normalizedPath}`;
 }
 
+function revealUnavailableReason(platform: string | null): string {
+  switch (platform) {
+    case 'windows':
+      return '当前环境没有可用的资源管理器';
+    case 'darwin':
+      return '当前环境没有可用的 Finder';
+    case 'linux':
+      return '当前环境没有可用的桌面文件管理器';
+    default:
+      return '当前平台不支持在系统资源管理器中定位';
+  }
+}
+
 export function EditorFileTopBar({
   operationPath,
   imagePreview = false,
+  previewFailed = false,
   imageDisplayName,
   imageDownloadHref,
 }: EditorFileTopBarProps) {
@@ -76,10 +93,14 @@ export function EditorFileTopBar({
   const downloadFile = useEditorStore((s) => s.downloadFile);
   const requestSave = useEditorStore((s) => s.requestSave);
   const isDirty = useEditorStore((s) => s.dirty.has(operationPath));
+  const platform = usePlatformStore((s) => s.platform);
+  const revealAvailable = useCapability('fileManager.reveal');
   const requestChatAttachment = useUIStore((s) => s.requestChatAttachment);
   const showToast = useUIStore((s) => s.showToast);
   const navigate = useNavigate();
   const [copied, setCopied] = useState(false);
+  const [openingExternal, setOpeningExternal] = useState(false);
+  const [revealingExternal, setRevealingExternal] = useState(false);
   const resetCopiedRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const displayPath = imageDisplayName || getDisplayPath(currentSession?.workdir, operationPath);
   const copyKey = `${currentSession?.id ?? ''}\u0000${currentSession?.workdir ?? ''}\u0000${operationPath}`;
@@ -157,6 +178,63 @@ export function EditorFileTopBar({
     link.remove();
   };
 
+  // Attachment previews use a virtual tab key ("attachment:<session>:<id>")
+  // with no server filesystem path, so neither OS action can run. Dirty
+  // buffers do have a path: these actions intentionally use the on-disk file
+  // and never flush the buffer.
+  const hasRealPath = Boolean(operationPath) && !operationPath.startsWith('attachment:');
+  const externalActionDisabledReason = !currentSession?.id
+    ? '当前没有可用的 session'
+    : !hasRealPath
+      ? '该文件没有可用的本地路径'
+      : null;
+  // The reveal action additionally needs a runtime desktop file manager. A
+  // failed/absent capability probe stays available (Windows baseline) and the
+  // server's 501 is surfaced as a toast.
+  const revealDisabledReason =
+    externalActionDisabledReason ??
+    (revealAvailable
+      ? null
+      : `无法在系统资源管理器中定位：${revealUnavailableReason(platform)}`);
+  // OS actions always hand the on-disk file to the platform. Unsaved edits are
+  // never written implicitly; say so instead of hiding the action.
+  const externalOpenTitle = isDirty
+    ? '用系统默认方式打开磁盘上的版本（未保存的修改不会写入）'
+    : '用系统默认方式打开';
+
+  const handleOpenExternal = async () => {
+    const sessionId = currentSession?.id;
+    if (!sessionId || externalActionDisabledReason) return;
+    setOpeningExternal(true);
+    try {
+      await openFileExternally(sessionId, operationPath);
+      if (isDirty) showToast('已打开磁盘上的版本，未保存的修改未写入');
+    } catch (error) {
+      showToast(
+        `打开失败：${error instanceof Error ? error.message : '未知错误'}`,
+        'error',
+      );
+    } finally {
+      setOpeningExternal(false);
+    }
+  };
+
+  const handleRevealExternal = async () => {
+    const sessionId = currentSession?.id;
+    if (!sessionId || revealDisabledReason) return;
+    setRevealingExternal(true);
+    try {
+      await revealFileExternally(sessionId, operationPath);
+    } catch (error) {
+      showToast(
+        `定位失败：${error instanceof Error ? error.message : '未知错误'}`,
+        'error',
+      );
+    } finally {
+      setRevealingExternal(false);
+    }
+  };
+
   return (
     <div
       data-testid="editor-file-topbar"
@@ -172,7 +250,7 @@ export function EditorFileTopBar({
         type="button"
         aria-label="保存文件"
         title={isDirty ? '保存文件' : '文件没有未保存修改'}
-        disabled={!isDirty}
+        disabled={!isDirty || previewFailed}
         onClick={() => requestSave(operationPath)}
         className="flex h-7 shrink-0 items-center gap-1 rounded px-1.5 text-text-tertiary hover:bg-bg-tertiary hover:text-text-primary disabled:cursor-not-allowed disabled:opacity-40"
       >
@@ -188,7 +266,27 @@ export function EditorFileTopBar({
       >
         {copied ? <Check size={14} /> : <Copy size={14} />}
       </button>
-      {(isMobile || imagePreview) && (
+      <button
+        type="button"
+        aria-label="用系统默认方式打开"
+        title={externalActionDisabledReason ?? externalOpenTitle}
+        disabled={Boolean(externalActionDisabledReason) || openingExternal}
+        onClick={() => void handleOpenExternal()}
+        className="flex h-7 w-7 shrink-0 items-center justify-center rounded text-text-tertiary hover:bg-bg-tertiary hover:text-text-primary disabled:cursor-not-allowed disabled:opacity-40"
+      >
+        <ExternalLink size={14} />
+      </button>
+      <button
+        type="button"
+        aria-label="在系统资源管理器中定位"
+        title={revealDisabledReason ?? '在系统资源管理器中定位'}
+        disabled={Boolean(revealDisabledReason) || revealingExternal}
+        onClick={() => void handleRevealExternal()}
+        className="flex h-7 w-7 shrink-0 items-center justify-center rounded text-text-tertiary hover:bg-bg-tertiary hover:text-text-primary disabled:cursor-not-allowed disabled:opacity-40"
+      >
+        <FolderOpen size={14} />
+      </button>
+      {(isMobile || imagePreview || previewFailed) && (
         <>
           <button
             type="button"

@@ -1,13 +1,20 @@
 // @vitest-environment jsdom
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { createRef } from 'react';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { render, act, fireEvent, cleanup, screen } from '@testing-library/react';
-import { ChatMessages, SCROLL_BOTTOM_THRESHOLD } from './ChatMessages';
+import { ChatMessages, SCROLL_BOTTOM_THRESHOLD, type ChatMessagesHandle } from './ChatMessages';
 import { formatMessageTs, groupMessages, getItemRole } from './MessageBubble';
 import { useSessionStore } from '@/stores/sessionStore';
 import { DEFAULT_SETTINGS, useAppSettingsStore } from '@/stores/appSettingsStore';
 import type { Message } from '@/types';
+import { markDurableRow } from '@/stores/messageOrdering';
+import { useGlobalShortcuts } from '@/shortcuts/useGlobalShortcuts';
+import {
+  hasChatScrollToBottomHandler,
+  requestChatScrollToBottom,
+} from '@/shortcuts/chatScrollBridge';
 
 // ── Mock @tanstack/react-virtual ──
 // The real virtualizer needs real layout / ResizeObserver, which jsdom does not
@@ -23,16 +30,24 @@ const m = vi.hoisted(() => {
       getItemKey?: (index: number) => string | number;
       estimateSize?: (index: number) => number;
     } | null;
+    nestedOptions: {
+      count?: number;
+      getItemKey?: (index: number) => string | number;
+      estimateSize?: (index: number) => number;
+      gap?: number;
+    } | null;
     /** Simulated measured row heights, in item order. */
     sizes: number[];
     /** Every scrollToIndex the component asked the virtualizer for. */
     scrollToIndexCalls: Array<{ index: number; align?: string }>;
     dynamicMeasurements: boolean;
     measuredByKey: Map<string, number>;
+    rerender?: () => void;
   } = {
     totalSize: 0,
     virtualItems: [],
     options: null,
+    nestedOptions: null,
     sizes: [],
     scrollToIndexCalls: [],
     dynamicMeasurements: false,
@@ -43,7 +58,7 @@ const m = vi.hoisted(() => {
       element.querySelector('button[aria-expanded]') ? 48 : 80;
   const measureMountedRows = (options = state.options) => {
     if (!options?.getItemKey) return;
-    for (const element of document.querySelectorAll<HTMLElement>('[data-index]')) {
+    for (const element of document.querySelectorAll<HTMLElement>('[data-scroll-anchor-key][data-index]')) {
       state.measuredByKey.set(String(options.getItemKey(Number(element.dataset.index))), rowHeight(element));
     }
   };
@@ -77,13 +92,28 @@ vi.mock('@tanstack/react-virtual', async () => {
     count?: number;
     getItemKey?: (index: number) => string | number;
     estimateSize?: (index: number) => number;
+    gap?: number;
+    overscan?: number;
+    getScrollElement?: () => HTMLElement | null;
   }) => {
     const [, rerender] = useReducer((value: number) => value + 1, 0);
-    m.state.options = options;
+    const isNested = options.gap === 8;
+    if (isNested) m.state.nestedOptions = options;
+    else {
+      m.state.options = options;
+      m.state.rerender = rerender;
+    }
     return {
-      getTotalSize: () => m.getTotalSize(),
-      getVirtualItems: () =>
-        m.state.virtualItems.map((item) => ({
+      getTotalSize: () => isNested
+        ? (options.count ?? 0) * (options.estimateSize?.(0) ?? 48) + Math.max(0, (options.count ?? 0) - 1) * 8
+        : m.getTotalSize(),
+      getVirtualItems: () => (isNested
+        ? Array.from({ length: options.count ?? 0 }, (_, index) => ({
+          index,
+          start: index * ((options.estimateSize?.(index) ?? 48) + 8),
+          size: options.estimateSize?.(index) ?? 48,
+        }))
+        : m.state.virtualItems).map((item) => ({
           ...item,
           key: options.getItemKey?.(item.index) ?? item.index,
         })),
@@ -213,6 +243,8 @@ beforeEach(() => {
   m.setTotalSize(0);
   m.setVirtualItems([]);
   m.state.options = null;
+  m.state.nestedOptions = null;
+  m.state.rerender = undefined;
   m.state.dynamicMeasurements = false;
   m.state.measuredByKey.clear();
   useSessionStore.setState({
@@ -231,6 +263,29 @@ afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
   cleanup();
+});
+
+it('keeps an explicit navigation jump when cold-row measurement changes total size without a wheel gesture', () => {
+  vi.useFakeTimers();
+  const messages = msgs(20, 'navigation-cold');
+  useSessionStore.setState({ currentSessionId: 'navigation-cold', currentMessages: messages });
+  m.setTotalSize(2000);
+  m.setVirtualItems(messages.map((_, index) => ({ index, start: index * 100, size: 100 })));
+  const ref = createRef<ChatMessagesHandle>();
+  const view = render(<ChatMessages ref={ref} />);
+  act(() => { vi.advanceTimersByTime(10); });
+  const scroller = view.container.querySelector<HTMLElement>('.overflow-auto')!;
+  act(() => {
+    expect(ref.current!.scrollToMessage(messages[4]!)).toBe(true);
+    // The mock virtualizer records scrollToIndex without performing layout.
+    // Supply its navigation offset; no wheel input accompanies a rail click.
+    scroller.scrollTop = 400;
+    programmaticScroll(scroller);
+  });
+  m.setTotalSize(3500);
+  view.rerender(<ChatMessages ref={ref} />);
+  act(() => { vi.advanceTimersByTime(10); });
+  expect(scroller.scrollTop).toBe(400);
 });
 
 it('groups only adjacent thinking blocks and keeps semantic boundaries', () => {
@@ -252,6 +307,52 @@ it('groups only adjacent thinking blocks and keeps semantic boundaries', () => {
     'thinking', 'assistant', 'thinking', 'tool', 'thinking', 'user',
   ]);
   expect(grouped[0]).toMatchObject({ type: 'thinking_group', items: messages.slice(0, 2) });
+});
+
+it('keeps a search-selected QQ body row visible and block-highlighted until the target clears', () => {
+  const hiddenQqMessage: Message = {
+    role: 'user',
+    content: '@@@@by qq: needle from QQ history',
+    messageId: 'qq-message-1',
+  };
+  const visibleMessage: Message = { role: 'assistant', content: 'other row', messageId: 'assistant-1' };
+  useAppSettingsStore.setState({ showQQ: false });
+  useSessionStore.setState({ currentSessionId: 's1', currentMessages: [hiddenQqMessage, visibleMessage] });
+  m.setVirtualItems([{ index: 0, start: 0, size: 100 }]);
+
+  const view = render(<ChatMessages searchTargetMessageId="qq-message-1" />);
+  expect(view.container.querySelector('[data-search-target="true"]')?.textContent)
+    .toContain('needle from QQ history');
+
+  view.rerender(<ChatMessages searchTargetMessageId={null} />);
+  expect(view.container.textContent).not.toContain('needle from QQ history');
+  expect(view.container.querySelector('.chat-message-search-target')).toBeNull();
+});
+
+it('scopes a global search highlight to its target Session', () => {
+  const target: Message = { role: 'assistant', content: 'needle target', messageId: 'same-id' };
+  useAppSettingsStore.setState({ showQQ: true });
+  useSessionStore.setState({ currentSessionId: 's1', currentMessages: [target] });
+  m.setVirtualItems([{ index: 0, start: 0, size: 100 }]);
+
+  const view = render(
+    <ChatMessages searchTarget={{ sessionId: 's2', messageId: 'same-id' }} />,
+  );
+  expect(view.container.querySelector('[data-search-target="true"]')).toBeNull();
+
+  view.rerender(<ChatMessages searchTarget={{ sessionId: 's1', messageId: 'same-id' }} />);
+  expect(view.container.querySelector('[data-search-target="true"]')?.textContent).toContain('needle target');
+});
+
+it('removes the navigation flash immediately when search unmounts', () => {
+  const target: Message = { role: 'assistant', content: 'needle target', messageId: 'target' };
+  useSessionStore.setState({ currentSessionId: 's1', currentMessages: [target] });
+  m.setVirtualItems([{ index: 0, start: 0, size: 100 }]);
+  const handle = createRef<ChatMessagesHandle>();
+  const view = render(<ChatMessages ref={handle} searchTarget={{ sessionId: 's1', messageId: 'target', query: 'needle' }} />);
+  act(() => { expect(handle.current?.scrollToMessage(target, 0)).toBe(true); });
+  view.rerender(<ChatMessages ref={handle} searchTarget={null} />);
+  expect(view.container.querySelector('.chat-message-search-target, .chat-message-jump-highlight')).toBeNull();
 });
 
 it('merges each adjacent tool/thinking run only when the preference is enabled', () => {
@@ -523,7 +624,7 @@ describe('worker report message treatment', () => {
 
     expect(container.querySelectorAll('.worker-report-label')).toHaveLength(1);
     expect(container.querySelector('.message-row-worker-report')?.textContent).toContain('finished');
-    expect(container.querySelector('.message-row-worker-report')?.textContent).toContain('Worker report');
+    expect(container.querySelector('.message-row-worker-report')?.textContent).toContain('TA report');
   });
 });
 
@@ -571,7 +672,7 @@ describe('view mode layering', () => {
       const row = container.querySelector('.message-row-worker-report');
       expect(row).not.toBeNull();
       expect(row?.classList.contains('message-row-assistant')).toBe(true);
-      expect(row?.textContent).toContain('Worker report');
+      expect(row?.textContent).toContain('TA report');
 
       cleanup();
     }
@@ -676,6 +777,33 @@ describe('ChatMessages scroll positioning', () => {
     expect(scrollEl.scrollTop).toBe(2600);
   });
 
+  it('stops following the bottom after a history-result jump', () => {
+    const initial = msgs(5).map((message, index) => ({ ...message, messageId: `history-${index}` }));
+    useSessionStore.setState({ currentSessionId: 's1', currentMessages: initial });
+    m.setTotalSize(2000);
+    const ref = createRef<ChatMessagesHandle>();
+    const { container } = render(<ChatMessages ref={ref} />);
+    const scrollEl = container.querySelector('.overflow-auto') as HTMLElement;
+    expect(scrollEl.scrollTop).toBe(2000);
+
+    act(() => {
+      expect(ref.current?.scrollToMessage(initial[0]!, 0)).toBe(true);
+      // Model the programmatic scroll produced by the real virtualizer when it
+      // brings an older search result into view.
+      scrollEl.scrollTop = 0;
+      fireEvent.scroll(scrollEl);
+    });
+
+    m.setTotalSize(2400);
+    act(() => {
+      useSessionStore.setState({
+        currentMessages: [...initial, { role: 'assistant', content: 'later history row', messageId: 'history-5' }],
+      });
+    });
+
+    expect(scrollEl.scrollTop).toBe(0);
+  });
+
   it('keeps following through measurement scrolls, stream growth, final, result, and DONE', () => {
     const initial = msgs(4);
     useSessionStore.setState({ currentSessionId: 's1', currentMessages: initial });
@@ -722,6 +850,61 @@ describe('ChatMessages scroll positioning', () => {
       { role: 'assistant', content: 'final answer refreshed', messageId: 'canonical-1' },
       { role: 'system', content: '[DONE] Task completed', nativeItemId: 'done-1' },
     ]);
+  });
+
+  it('does not restore a stale reading anchor after streaming suppresses the wheel scroll event', () => {
+    vi.useFakeTimers();
+    const restoreGeometry = installRowGeometry();
+    try {
+      const messages = msgs(22).map((message, index) => ({ ...message, messageId: `stable-${index}` }));
+      useSessionStore.setState({ currentSessionId: 'stream-anchor-expiry', currentMessages: messages.slice(0, 20) });
+      m.setTotalSize(2000);
+      m.setVirtualItems(rowWindow([9, 10, 11, 12, 13, 14]));
+      const { container } = render(<ChatMessages />);
+      const scrollEl = container.querySelector('.overflow-auto') as HTMLElement;
+      act(() => { vi.advanceTimersByTime(100); });
+      userScroll(scrollEl, 1000);
+      act(() => { vi.advanceTimersByTime(100); });
+      fireEvent.wheel(scrollEl, { deltaY: -300 });
+      // A queued layout scroll at the old position precedes actual wheel
+      // movement. It must not recreate the anchor the gesture just discarded.
+      fireEvent.scroll(scrollEl);
+      // A streaming render lands between wheel input and its scroll event.
+      m.setTotalSize(2100);
+      act(() => { useSessionStore.setState({ currentMessages: messages.slice(0, 21) }); });
+      scrollEl.scrollTop = 700;
+      fireEvent.scroll(scrollEl);
+      fireEvent(scrollEl, new Event('scrollend'));
+      act(() => { vi.advanceTimersByTime(350); });
+      // Once the input quiet period ends, another delta must not revive the
+      // anchor from before the gesture and pull the reader down by 300px.
+      m.setTotalSize(2200);
+      act(() => { useSessionStore.setState({ currentMessages: messages }); });
+      act(() => { vi.advanceTimersByTime(50); });
+      expect(scrollEl.scrollTop).toBe(700);
+    } finally {
+      restoreGeometry();
+    }
+  });
+
+  it('keeps upward intent when a layout scroll arrives before the wheel movement', () => {
+    vi.useFakeTimers();
+    useSessionStore.setState({ currentSessionId: 's1', currentMessages: msgs(4) });
+    m.setTotalSize(2000);
+    const { container } = render(<ChatMessages />);
+    const scrollEl = container.querySelector('.overflow-auto') as HTMLElement;
+    fireEvent.wheel(scrollEl, { deltaY: -700 });
+    // A queued browser anchoring correction reaches the old bottom before
+    // the upward wheel's actual scroll. It must not re-enable tail follow.
+    scrollEl.scrollTop = 2020;
+    fireEvent.scroll(scrollEl);
+    act(() => useSessionStore.setState({ currentMessages: [...msgs(4)] }));
+    scrollEl.scrollTop = 1300;
+    fireEvent.scroll(scrollEl);
+    act(() => vi.advanceTimersByTime(1000));
+    m.setTotalSize(2400);
+    act(() => useSessionStore.setState({ currentMessages: [...msgs(4)] }));
+    expect(scrollEl.scrollTop).toBe(1300);
   });
 
   it.each(['wheel', 'touchstart'] as const)(
@@ -804,6 +987,25 @@ describe('ChatMessages scroll positioning', () => {
     });
 
     expect(scrollEl.scrollTop).toBe(2400);
+  });
+
+  it.each([[995, 600], [500, 2400]])('handles native scrollbar press at x=%i without treating body clicks as scrolling', (clientX, expectedTop) => {
+    useSessionStore.setState({ currentSessionId: 'scrollbar-input', currentMessages: msgs(4) });
+    m.setTotalSize(2000);
+    const { container } = render(<ChatMessages />);
+    const scrollEl = container.querySelector('.overflow-auto') as HTMLElement;
+    Object.defineProperties(scrollEl, {
+      offsetWidth: { configurable: true, value: 1000 },
+      clientWidth: { configurable: true, value: 983 },
+      clientLeft: { configurable: true, value: 0 },
+    });
+    vi.spyOn(scrollEl, 'getBoundingClientRect').mockReturnValue({ left: 0, right: 1000, top: 0, bottom: 400, width: 1000, height: 400, x: 0, y: 0, toJSON: () => ({}) });
+    fireEvent.mouseDown(scrollEl, { button: 0, clientX });
+    scrollEl.scrollTop = 600;
+    fireEvent.scroll(scrollEl);
+    m.setTotalSize(2400);
+    act(() => { useSessionStore.setState({ currentMessages: [...msgs(4), { role: 'assistant', content: 'tail update' }] }); });
+    expect(scrollEl.scrollTop).toBe(expectedTop);
   });
 
   it('lets a pressed mouse pointer drag opt out of follow mode', () => {
@@ -1167,6 +1369,97 @@ describe('ChatMessages scroll positioning', () => {
     expect(loadOlderMessages).toHaveBeenCalledOnce();
   });
 
+  it('loads from an upward wheel at the top without needing another scroll event', () => {
+    vi.useFakeTimers();
+    const loadOlderMessages = vi.fn(async () => {});
+    useSessionStore.setState({ currentSessionId: 'wheel-at-top', currentMessages: msgs(4),
+      hasMoreMessages: true, historyLoading: false, loadOlderMessages });
+    m.setTotalSize(2000);
+    const { container } = render(<ChatMessages />);
+    const scrollEl = container.querySelector('.overflow-auto') as HTMLElement;
+    scrollEl.scrollTop = 0;
+    for (let index = 0; index < 20; index += 1) fireEvent.wheel(scrollEl, { deltaY: -700 });
+    act(() => vi.advanceTimersByTime(150));
+    expect(loadOlderMessages).toHaveBeenCalledOnce();
+    act(() => vi.advanceTimersByTime(1000));
+    expect(loadOlderMessages).toHaveBeenCalledOnce();
+  });
+
+  it.each([[false, -700], [true, -700], [false, 700], [true, 700]] as const)(
+    'serializes pending input with cached=%s and direction=%s', async (cached, deltaY) => {
+    vi.useFakeTimers();
+    const originalPrefetchCheck = useSessionStore.getState().hasPrefetchedOlderMessages;
+    try {
+      let release!: () => void;
+      const loadOlderMessages = vi.fn(() => {
+        useSessionStore.setState({ historyLoading: true });
+        return new Promise<void>(resolve => { release = () => {
+          useSessionStore.setState({ historyLoading: false,
+            currentMessages: [...msgs(2, 'older'), ...useSessionStore.getState().currentMessages] }); resolve();
+        }; });
+      });
+      useSessionStore.setState({ currentSessionId: 'pending-wheel', currentMessages: msgs(4),
+        hasMoreMessages: true, historyLoading: false, loadOlderMessages,
+        hasPrefetchedOlderMessages: () => cached });
+      m.setTotalSize(2000);
+      const { container } = render(<ChatMessages />);
+      const scrollEl = container.querySelector('.overflow-auto') as HTMLElement;
+      userScroll(scrollEl, 0);
+      act(() => vi.advanceTimersByTime(150));
+      expect(loadOlderMessages).toHaveBeenCalledOnce();
+      fireEvent.wheel(scrollEl, { deltaY });
+      act(() => vi.advanceTimersByTime(50));
+      expect(loadOlderMessages).toHaveBeenCalledOnce();
+      await act(async () => { release(); await Promise.resolve(); });
+      act(() => vi.advanceTimersByTime(150));
+      expect(loadOlderMessages).toHaveBeenCalledTimes(deltaY < 0 ? 2 : 1);
+    } finally {
+      useSessionStore.setState({ hasPrefetchedOlderMessages: originalPrefetchCheck });
+    }
+  });
+
+  it('does not postpone an upward request indefinitely across streaming renders', () => {
+    vi.useFakeTimers();
+    // Unlike the default zero-delay rAF shim, browser frames can still be
+    // settling when the next stream row arrives and renews layout suppression.
+    vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) =>
+      window.setTimeout(() => cb(Date.now()), 16));
+    vi.stubGlobal('cancelAnimationFrame', (id: number) => window.clearTimeout(id));
+    const loadOlderMessages = vi.fn(async () => {});
+    useSessionStore.setState({ currentSessionId: 'streaming-top', currentMessages: msgs(4),
+      hasMoreMessages: true, historyLoading: false, loadOlderMessages });
+    m.setTotalSize(2000);
+    const { container } = render(<ChatMessages />);
+    const scrollEl = container.querySelector('.overflow-auto') as HTMLElement;
+    scrollEl.scrollTop = 0;
+    fireEvent.wheel(scrollEl, { deltaY: -700 });
+    for (let index = 0; index < 5; index += 1) {
+      act(() => vi.advanceTimersByTime(30));
+      act(() => useSessionStore.setState({ currentMessages: msgs(5 + index) }));
+    }
+    expect(loadOlderMessages).toHaveBeenCalledOnce();
+  });
+
+  it('releases an obsolete page request after reselecting the same Session', async () => {
+    vi.useFakeTimers();
+    let release!: () => void;
+    const loadOlderMessages = vi.fn(() => new Promise<void>(resolve => { release = resolve; }));
+    useSessionStore.setState({ currentSessionId: 'reselected-page', currentMessages: msgs(4),
+      hasMoreMessages: true, historyLoading: false, loadOlderMessages,
+      _selectionSeq: { 'reselected-page': 1 } });
+    m.setTotalSize(2000);
+    const { container } = render(<ChatMessages />);
+    const scrollEl = container.querySelector('.overflow-auto') as HTMLElement;
+    userScroll(scrollEl, 0);
+    act(() => vi.advanceTimersByTime(150));
+    expect(loadOlderMessages).toHaveBeenCalledOnce();
+    act(() => useSessionStore.setState({ _selectionSeq: { 'reselected-page': 2 } }));
+    await act(async () => { release(); await Promise.resolve(); });
+    fireEvent.wheel(scrollEl, { deltaY: -700 });
+    act(() => vi.advanceTimersByTime(150));
+    expect(loadOlderMessages).toHaveBeenCalledTimes(2);
+  });
+
   it('lets a new upward gesture cancel the prior page anchor and load another page', async () => {
     vi.useFakeTimers();
     let page = 0;
@@ -1328,9 +1621,10 @@ describe('ChatMessages scroll positioning', () => {
     }
   });
 
-  it('re-resolves a grouped pagination anchor when prepended history changes the group key', async () => {
+  it.each([false, true])('re-resolves a grouped pagination anchor when prepended history changes the group key (cached=%s)', async (cached) => {
     vi.useFakeTimers();
     const restoreGeometry = installToolGroupRowGeometry();
+    const originalPrefetchCheck = useSessionStore.getState().hasPrefetchedOlderMessages;
     try {
       useAppSettingsStore.setState({ mergeConsecutiveNonBodyBlocks: false });
       const initial: Message[] = [
@@ -1358,6 +1652,7 @@ describe('ChatMessages scroll positioning', () => {
         hasMoreMessages: true,
         historyLoading: false,
         loadOlderMessages,
+        hasPrefetchedOlderMessages: () => cached,
       });
       m.setTotalSize(700);
       m.setVirtualItems(rowWindow([0, 1, 2, 3]));
@@ -1376,7 +1671,7 @@ describe('ChatMessages scroll positioning', () => {
       const beforeOffset = beforeRow.getBoundingClientRect().top - scrollEl.getBoundingClientRect().top;
 
       await act(async () => {
-        vi.advanceTimersByTime(180);
+        vi.advanceTimersByTime(cached ? 40 : 180);
         await Promise.resolve();
       });
 
@@ -1388,6 +1683,7 @@ describe('ChatMessages scroll positioning', () => {
       expect(afterRow.getBoundingClientRect().top - scrollEl.getBoundingClientRect().top).toBe(beforeOffset);
       expect(scrollEl.scrollTop).toBe(200);
     } finally {
+      useSessionStore.setState({ hasPrefetchedOlderMessages: originalPrefetchCheck });
       restoreGeometry();
     }
   });
@@ -2340,6 +2636,79 @@ describe('non-body disclosure and virtual measurements across a session switch',
   });
 });
 
+describe('non-body child virtualization and top-level group counts', () => {
+  it('counts exposed groups at the top level and virtualizes merged child runs inside the outer row', () => {
+    const messages: Message[] = [
+      { role: 'tool', content: 'Bash({})', blockId: 'count-tool-1' },
+      { role: 'tool', content: 'Read({})', blockId: 'count-tool-2' },
+      { role: 'thinking', content: 'plan one', blockId: 'count-thinking-1' },
+      { role: 'thinking', content: 'plan two', blockId: 'count-thinking-2' },
+      { role: 'user', content: 'body message', blockId: 'count-user' },
+      { role: 'assistant', content: 'body reply', blockId: 'count-assistant' },
+    ];
+    useSessionStore.setState({ currentSessionId: 'display-group-counts', currentMessages: messages });
+    m.setTotalSize(400);
+    m.setVirtualItems(rowWindow([0, 1, 2, 3]));
+    const { container } = render(<ChatMessages />);
+
+    // With merge disabled, Tool and Thinking stay direct top-level groups.
+    // Each existing body row also stays one direct display item.
+    expect(m.state.options?.count).toBe(4);
+    expect(m.state.nestedOptions).toBeNull();
+    expect(container.querySelectorAll('.tool-group, .thinking')).toHaveLength(2);
+
+    act(() => useAppSettingsStore.setState({ mergeConsecutiveNonBodyBlocks: true }));
+    expect(m.state.options?.count).toBe(3); // one non-body row plus two body rows
+    expect(container.querySelectorAll('.non-body-group')).toHaveLength(1);
+    expect(container.querySelectorAll('.tool-group, .thinking')).toHaveLength(0);
+
+    fireEvent.click(screen.getByRole('button', { name: /4 non-body blocks/ }));
+    expect(m.state.nestedOptions?.count).toBe(2);
+    expect(container.querySelector('[data-testid="non-body-group-window"]')?.getAttribute('data-group-count'))
+      .toBe('2');
+    expect(container.querySelectorAll('[data-child-group]')).toHaveLength(2);
+  });
+
+  it('remeasures the parent row when the nested disclosure opens and closes', () => {
+    mockClientHeight = 100;
+    m.state.dynamicMeasurements = true;
+    useAppSettingsStore.setState({ mergeConsecutiveNonBodyBlocks: true });
+    const messages: Message[] = Array.from({ length: 24 }, (_, index) => ({
+      role: index % 2 === 0 ? 'thinking' : 'tool',
+      content: `child ${index}`,
+      blockId: `measure-child-${index}`,
+    }));
+    useSessionStore.setState({ currentSessionId: 'nested-parent-measure', currentMessages: messages });
+    m.setVirtualItems([{ index: 0, start: 0, size: 48 }]);
+    const { container } = render(<ChatMessages />);
+    const scrollElement = container.querySelector('.overflow-auto') as HTMLElement;
+    const parentKey = String(m.state.options?.getItemKey?.(0));
+
+    act(() => {
+      m.measureMountedRows();
+      m.state.rerender?.();
+    });
+    expect(m.state.measuredByKey.get(parentKey)).toBe(48);
+    expect(Math.max(0, scrollElement.scrollHeight - scrollElement.clientHeight)).toBe(0);
+
+    fireEvent.click(screen.getByRole('button', { name: /24 non-body blocks/ }));
+    act(() => {
+      m.measureMountedRows();
+      m.state.rerender?.();
+    });
+    expect(m.state.measuredByKey.get(parentKey)).toBe(320);
+    expect(scrollElement.scrollHeight - scrollElement.clientHeight).toBe(220);
+
+    fireEvent.click(screen.getByRole('button', { name: /24 non-body blocks/ }));
+    act(() => {
+      m.measureMountedRows();
+      m.state.rerender?.();
+    });
+    expect(m.state.measuredByKey.get(parentKey)).toBe(48);
+    expect(Math.max(0, scrollElement.scrollHeight - scrollElement.clientHeight)).toBe(0);
+  });
+});
+
 // ── Snapshot write retry ──
 // A snapshot write can find no anchor row on screen (a long jump lands before
 // React has rendered the new window). Skipping the write that way would lose the
@@ -2393,5 +2762,140 @@ describe('scroll snapshot write retry', () => {
       restoreGeometry();
       vi.useRealTimers();
     }
+  });
+});
+
+
+describe('canonical viewport range for folded groups', () => {
+  it('uses durable folded-group endpoints and rejects another Session identity', () => {
+    const restore = installRowGeometry();
+    try {
+      const messages: Message[] = Array.from({ length: 100 }, (_, i) => ({ role: 'thinking', content: `thought ${i}`, messageId: `fold-epoch-${1000 + i}` }));
+      messages.forEach((message, i) => markDurableRow(message, 1000 + i));
+      useSessionStore.setState({ currentSessionId: 'fold', currentMessages: messages,
+        sessionTranscripts: { fold: { window: { rows: new Map(messages.map((message, i) => [1000 + i, message])), start: 1000, end: 1100, total: 1100, epoch: 'fold-epoch', revision: 1 }, runtime: [], anchorOffset: 1100, serverEpoch: null } } });
+      m.setTotalSize(100); m.setVirtualItems(rowWindow([0]));
+      const ref = createRef<ChatMessagesHandle>();
+      const { container } = render(<ChatMessages ref={ref} />);
+      const scroller = container.querySelector('.overflow-auto') as HTMLElement;
+      scroller.scrollTop = 0;
+      expect(ref.current?.getViewportHistoryRange?.()).toEqual({ start: 1000, end: 1099 });
+      expect(container.querySelector('[aria-expanded="true"]')).toBeNull();
+      // Simulate a store switch before React commits the new DOM.
+      useSessionStore.setState({ currentSessionId: 'other' });
+      expect(ref.current?.getViewportHistoryRange?.()).toBeNull();
+    } finally { restore(); }
+  });
+});
+
+// Mounts the single global dispatcher next to the real chat list, so these
+// cases exercise the same keydown path the app shell installs (no ad hoc
+// listener and no second scrolling algorithm).
+function ShortcutHarness() {
+  useGlobalShortcuts(() => {});
+  return null;
+}
+
+describe('chat scroll-to-bottom shortcut', () => {
+  it('reuses the button recovery for the mounted Session and resumes follow-bottom', () => {
+    useSessionStore.setState({
+      currentSessionId: 's1',
+      sessions: [{ id: 's1', name: 's1' }] as never,
+      currentMessages: msgs(4),
+    });
+    m.setTotalSize(2000);
+    const { container } = render(<><ShortcutHarness /><ChatMessages /></>);
+    const scrollEl = container.querySelector('.overflow-auto') as HTMLElement;
+    expect(scrollEl.scrollTop).toBe(2000);
+
+    userScroll(scrollEl, 700);
+    expect(container.querySelector('[title="Scroll to bottom"]')).not.toBeNull();
+    expect(hasChatScrollToBottomHandler('s1')).toBe(true);
+
+    expect(fireEvent.keyDown(document, { key: 'End', code: 'End', ctrlKey: true })).toBe(false);
+    expect(scrollEl.scrollTop).toBe(2000);
+    expect(container.querySelector('[title="Scroll to bottom"]')).toBeNull();
+
+    // The explicit recovery re-arms follow mode: a streamed tail and the
+    // virtualizer's taller measurement both land at the real end.
+    m.setTotalSize(2400);
+    act(() => {
+      useSessionStore.setState({ currentMessages: [...msgs(4), ...msgs(1, 'new')] });
+    });
+    expect(scrollEl.scrollTop).toBe(2400);
+  });
+
+  it('does not touch the container when the list is already at the bottom', () => {
+    useSessionStore.setState({
+      currentSessionId: 's1',
+      sessions: [{ id: 's1', name: 's1' }] as never,
+      currentMessages: msgs(4),
+    });
+    m.setTotalSize(2000);
+    const { container } = render(<><ShortcutHarness /><ChatMessages /></>);
+    const scrollEl = container.querySelector('.overflow-auto') as HTMLElement;
+
+    // 2000px of content in a 400px viewport: 1600 is the true bottom.
+    userScroll(scrollEl, 1600);
+    expect(container.querySelector('[title="Scroll to bottom"]')).toBeNull();
+
+    // scrollToBottom() would write 2000 here, so an unchanged 1600 proves the
+    // already-at-bottom branch made no correction.
+    expect(fireEvent.keyDown(document, { key: 'End', code: 'End', ctrlKey: true })).toBe(false);
+    expect(scrollEl.scrollTop).toBe(1600);
+  });
+
+  it('refuses a previous Session and unregisters when the list unmounts', () => {
+    useSessionStore.setState({
+      currentSessionId: 's1',
+      sessions: [{ id: 's1', name: 's1' }, { id: 's2', name: 's2' }] as never,
+      currentMessages: msgs(4),
+    });
+    m.setTotalSize(2000);
+    const view = render(<><ShortcutHarness /><ChatMessages /></>);
+    const scrollEl = view.container.querySelector('.overflow-auto') as HTMLElement;
+    userScroll(scrollEl, 600);
+    expect(hasChatScrollToBottomHandler('s1')).toBe(true);
+
+    // The same container now renders Session B. A request that still names A
+    // must neither reach B's list nor leave the list where A left it.
+    m.setTotalSize(900);
+    act(() => {
+      useSessionStore.setState({ currentSessionId: 's2', currentMessages: msgs(3, 'b') });
+    });
+    userScroll(scrollEl, 100);
+    const before = scrollEl.scrollTop;
+    expect(hasChatScrollToBottomHandler('s1')).toBe(false);
+    expect(requestChatScrollToBottom('s1')).toBe(false);
+    expect(scrollEl.scrollTop).toBe(before);
+    expect(hasChatScrollToBottomHandler('s2')).toBe(true);
+
+    view.unmount();
+    expect(hasChatScrollToBottomHandler('s2')).toBe(false);
+  });
+
+  it('leaves the chord native for editable targets and for an empty chat', () => {
+    useSessionStore.setState({
+      currentSessionId: 's1',
+      sessions: [{ id: 's1', name: 's1' }] as never,
+      currentMessages: msgs(4),
+    });
+    m.setTotalSize(2000);
+    const { container } = render(<><ShortcutHarness /><ChatMessages /></>);
+    const scrollEl = container.querySelector('.overflow-auto') as HTMLElement;
+    userScroll(scrollEl, 700);
+
+    const textarea = document.createElement('textarea');
+    document.body.append(textarea);
+    expect(fireEvent.keyDown(textarea, { key: 'End', code: 'End', ctrlKey: true })).toBe(true);
+    expect(scrollEl.scrollTop).toBe(700);
+    textarea.remove();
+
+    // An empty chat renders no list: nothing registers, so the key stays free.
+    cleanup();
+    useSessionStore.setState({ currentSessionId: 'empty', currentMessages: [] });
+    render(<><ShortcutHarness /><ChatMessages /></>);
+    expect(hasChatScrollToBottomHandler('empty')).toBe(false);
+    expect(fireEvent.keyDown(document, { key: 'End', code: 'End', ctrlKey: true })).toBe(true);
   });
 });

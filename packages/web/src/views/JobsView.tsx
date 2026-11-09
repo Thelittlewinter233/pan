@@ -1,3 +1,4 @@
+import { useAutomationAuth } from '@/stores/automationStore';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
@@ -5,12 +6,17 @@ import {
   ListChecks,
   MoreHorizontal,
   Pause,
+  Pin,
+  PinOff,
   Play,
   Plus,
   Settings2,
   Trash2,
 } from 'lucide-react';
 import { NewJobForm } from '@/components/jobs/NewJobForm';
+import { UnifiedJobForm } from '@/components/jobs/UnifiedJobForm';
+import { JobTemplateEditor } from '@/components/jobs/JobTemplateEditor';
+import { JobUserAuthorization } from '@/components/automation/JobUserAuthorization';
 import { JobDetailDrawer } from '@/components/jobs/JobDetailDrawer';
 import { JobRetentionSettings } from '@/components/jobs/JobRetentionSettings';
 import { entryToSpec } from '@/components/jobs/ScheduleListEditor';
@@ -18,17 +24,23 @@ import { Button } from '@/components/ui/Button';
 import { Modal } from '@/components/ui/Modal';
 import { useUIStore } from '@/stores/uiStore';
 import { useSessionStore } from '@/stores/sessionStore';
+import { useJobStore } from '@/stores/jobStore';
 import { wsClient } from '@/services/ws';
 import { scheduleEntries } from '@/types/jobs';
 import {
-  createJob,
+  cancelJob,
   deleteJob as deleteJobApi,
   fetchJob,
   fetchJobKinds,
   fetchJobRuns,
-  fetchJobs,
   patchJob,
+  pinJob,
   runJobNow,
+  createActionJob,
+  createJob,
+  updateActionJob,
+  fetchActionRegistry,
+  mutateActionJob,
 } from '@/services/api';
 import type {
   Job,
@@ -39,8 +51,18 @@ import type {
   JobRunRecord,
   JobStatus,
 } from '@/types/jobs';
+import type { Action } from '@/types/actions';
 
-type Tab = 'list' | 'create' | 'settings';
+function canCancelJob(job: Job): boolean {
+  return (isUnifiedJob(job) || job.kind !== 'scheduled-task') && ['pending', 'scheduled', 'starting', 'running', 'restarting'].includes(job.status);
+}
+function isUnifiedJob(job: Job): boolean { return Boolean(job.unified && !job.unified.compatibility); }
+function timestampMs(value: unknown): number | null {
+  const result = typeof value === 'number' ? value * 1000 : typeof value === 'string' && value.trim() ? Date.parse(value) : NaN;
+  return Number.isFinite(result) ? result : null;
+}
+
+type Tab = 'list' | 'legacy' | 'create' | 'settings';
 
 type StatusFilter =
   'all' | 'active' | 'scheduled' | 'completed' | 'failed' | 'timed_out' | 'undeliverable';
@@ -77,6 +99,12 @@ function statusColor(status: string): string {
     case 'starting':
       return 'border-accent/50 bg-accent/10 text-accent';
     case 'scheduled':
+    case 'restarting':
+    case 'cleaning':
+    case 'cleanup_pending':
+    case 'deleting':
+    case 'unknown':
+    case 'uncertain':
       return 'border-warning/50 bg-warning/10 text-warning';
     case 'completed':
       return 'border-success/50 bg-success/10 text-success';
@@ -98,6 +126,10 @@ function sourceSummary(job: Job): string {
 function targetSummary(job: Job): string {
   if (job.action?.api === 'resume_legal_running') {
     return 'dynamic: legal running Sessions without a live Worker';
+  }
+  if (job.action?.api === 'send_qq') {
+    const { targetType, targetId, botUin } = job.action.args;
+    return `QQ ${targetType} ${targetId} · ${botUin ? `bot ${botUin}` : 'default bot'}`;
   }
   return job.target.sessionId ?? 'no target';
 }
@@ -129,7 +161,8 @@ function lastResultSummary(job: Job): string {
   }
   if (job.lastError) return `last error: ${job.lastError}`;
   if (job.lastStatus) return `last ${job.lastStatus}`;
-  return `runs ${job.runCount}`;
+  return isUnifiedJob(job) ? `runs ${job.runCount ?? 0}`
+    : job.kind === 'background-process' ? `legacy ${job.status}` : `deliveries ${job.runCount ?? 0}`;
 }
 
 /** 活跃优先排序档位：running → starting → scheduled → pending → completed → failed → timed_out → cancelled。 */
@@ -138,6 +171,10 @@ function activeRank(status: JobStatus): number {
     case 'running':
       return 0;
     case 'starting':
+    case 'cleaning':
+    case 'cleanup_pending':
+    case 'deleting':
+    case 'restarting':
       return 1;
     case 'scheduled':
       return 2;
@@ -157,12 +194,12 @@ function activeRank(status: JobStatus): number {
 }
 
 function updatedAtMs(job: Job): number {
-  const v = job.updatedAt;
-  return typeof v === 'number' ? v * 1000 : Date.parse(v) || 0;
+  return timestampMs(job.updatedAt) ?? 0;
 }
 
-/** 活跃优先；同组内按 updatedAt 倒序（新在前）。 */
-function compareJobs(a: Job, b: Job): number {
+/** 置顶优先；每组保留活跃优先和 updatedAt 倒序（新在前）。 */
+function compareJobs(a: Job, b: Job, usePins = true): number {
+  if (usePins && !!a.pinned !== !!b.pinned) return a.pinned ? -1 : 1;
   const ra = activeRank(a.status);
   const rb = activeRank(b.status);
   if (ra !== rb) return ra - rb;
@@ -208,8 +245,12 @@ function JobRow({
   menuOpen,
   onToggleMenu,
   onRunNow,
+  pinUnavailable,
+  onTogglePinned,
   onTogglePaused,
   onDelete,
+  onCancel,
+  cancelling,
   selectionMode,
   selected,
   selectionDisabled,
@@ -221,8 +262,12 @@ function JobRow({
   menuOpen: boolean;
   onToggleMenu: () => void;
   onRunNow: () => void;
+  pinUnavailable: boolean;
+  onTogglePinned: () => void;
   onTogglePaused: () => void;
   onDelete: () => void;
+  onCancel: () => void;
+  cancelling: boolean;
   selectionMode: boolean;
   selected: boolean;
   selectionDisabled: boolean;
@@ -233,7 +278,9 @@ function JobRow({
   const isScheduledTask = job.kind === 'scheduled-task';
   const hasTarget = !!job.target.sessionId;
   const canRunNow = job.action?.api === 'shell'
+    || Boolean(isUnifiedJob(job) && job.enabled)
     || job.action?.api === 'resume_legal_running'
+    || job.action?.api === 'send_qq'
     || hasTarget;
   return (
     <div
@@ -257,17 +304,12 @@ function JobRow({
             />
           </label>
         )}
-        <span
-          className={`shrink-0 rounded border px-1.5 py-px text-[10px] font-medium ${statusColor(job.status)}`}
-        >
-          {job.status}
-        </span>
-        <span className="shrink-0 rounded border border-border-default bg-bg-tertiary px-1.5 py-px text-[10px] text-text-secondary">
-          {kindLabel}
-        </span>
         <div className="min-w-0 flex-1 truncate text-sm text-text-primary" title={job.name}>
           {job.name}
         </div>
+        {job.label && <span title={job.label} className="min-w-0 max-w-[28%] truncate rounded border border-accent/50 bg-accent/10 px-1.5 py-px text-[11px] font-medium text-accent">{job.label}</span>}
+        {canCancelJob(job) && <button type="button" disabled={cancelling || selectionDisabled} onClick={(e) => { e.stopPropagation(); onCancel(); }} className="shrink-0 rounded border border-warning/50 px-1.5 py-1 text-[11px] text-warning disabled:opacity-50">{cancelling ? 'Cancelling…' : 'Cancel job'}</button>}
+        {!pinUnavailable && job.pinned && <span title="Pinned" aria-label="Pinned" className="shrink-0 text-accent"><Pin size={14} /></span>}
         {job.paused && (
           <span className="shrink-0 rounded border border-warning/50 bg-warning/10 px-1 py-px text-[10px] text-warning">
             Paused
@@ -302,6 +344,12 @@ function JobRow({
                 role="menu"
                 className="absolute right-0 top-full mt-1 z-30 w-40 rounded border border-border-default bg-bg-tertiary py-1 shadow-xl"
               >
+                <button role="menuitem" type="button" disabled={pinUnavailable}
+                  className={`${menuItemClass} disabled:cursor-not-allowed disabled:opacity-50`}
+                  onClick={(e) => { e.stopPropagation(); onToggleMenu(); onTogglePinned(); }}>
+                  {job.pinned ? <PinOff size={13} /> : <Pin size={13} />}
+                  {pinUnavailable ? 'Pin unavailable' : job.pinned ? 'Unpin' : 'Pin'}
+                </button>
                 {isScheduledTask && (
                   <button
                     role="menuitem"
@@ -355,6 +403,15 @@ function JobRow({
       </div>
 
       <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px] text-text-tertiary">
+        <span
+          className={`shrink-0 rounded border px-1.5 py-px text-[10px] font-medium ${statusColor(job.status)}`}
+        >
+          {job.status}
+        </span>
+        <span className="shrink-0 rounded border border-border-default bg-bg-tertiary px-1.5 py-px text-[10px] text-text-secondary">
+          {kindLabel}
+        </span>
+
         <span>
           {sourceSummary(job)} → {targetSummary(job)}
         </span>
@@ -393,19 +450,61 @@ function JobRow({
  * 契约；WS 订阅 5 类 job 事件驱动列表与 toast。客户端做排序与筛选。
  */
 export default function JobsView() {
+  const authorizationToken = useAutomationAuth((state) => state.token || state.authenticated);
   const navigate = useNavigate();
   const showToast = useUIStore((s) => s.showToast);
+  const toastRef = useRef(showToast); toastRef.current = showToast;
   const sessions = useSessionStore((s) => s.sessions);
   const loadSessions = useSessionStore((s) => s.loadSessions);
 
+  const [sort, setSort] = useState(() => {
+    try { const value = JSON.parse(localStorage.getItem('pan:jobsSort') || 'null');
+      if (['active', 'updated', 'created', 'kind'].includes(value?.key) && ['asc', 'desc'].includes(value?.direction)) return value as { key: string; direction: string };
+    } catch { /* storage unavailable */ }
+    return { key: 'active', direction: 'desc' };
+  });
+  useEffect(() => { try { localStorage.setItem('pan:jobsSort', JSON.stringify(sort)); } catch { /* storage unavailable */ } }, [sort]);
+  const cancelRequests = useRef(new Set<string>());
+  const [cancellingIds, setCancellingIds] = useState<Set<string>>(new Set());
   const [tab, setTab] = useState<Tab>('list');
-  const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
-  const [kindFilter, setKindFilter] = useState<'all' | JobKind>('all');
-  const [searchQuery, setSearchQuery] = useState('');
-  const [jobs, setJobs] = useState<Job[]>([]);
+  const [legacyCreateOpen, setLegacyCreateOpen] = useState(false);
+  const dirtyEditor = useRef(false);
+  const editorDirtyChange = useCallback((dirty: boolean) => { dirtyEditor.current = dirty; }, []);
+  const requestTab = (next: Tab) => {
+    if (dirtyEditor.current && !window.confirm('Discard unsaved Job configuration?')) return;
+    dirtyEditor.current = false; setTab(next);
+  };
+  const [laneFilters, setLaneFilters] = useState<Record<'list' | 'legacy', {
+    status: StatusFilter; kind: 'all' | JobKind; query: string;
+  }>>({ list: { status: 'all', kind: 'all', query: '' }, legacy: { status: 'all', kind: 'all', query: '' } });
+  const lane = tab === 'legacy' ? 'legacy' : 'list';
+  const { status: statusFilter, kind: kindFilter, query: searchQuery } = laneFilters[lane];
+  const setStatusFilter = (status: StatusFilter) => setLaneFilters((previous) => ({ ...previous, [lane]: { ...previous[lane], status } }));
+  const setKindFilter = (kind: 'all' | JobKind) => setLaneFilters((previous) => ({ ...previous, [lane]: { ...previous[lane], kind } }));
+  const setSearchQuery = (query: string) => setLaneFilters((previous) => ({ ...previous, [lane]: { ...previous[lane], query } }));
+  // The unified job store owns the list (shared with the nav running badge);
+  // this page only owns view state on top of it.
+  const allJobs = useJobStore((s) => s.jobs);
+  // /api/jobs is a mixed read facade. Compatibility projections never confer
+  // Action execution ownership on a legacy record.
+  const jobs = useMemo(() => allJobs.filter((job) =>
+    tab === 'legacy' ? !isUnifiedJob(job) : isUnifiedJob(job)), [allJobs, tab]);
+  const loading = useJobStore((s) => s.loading);
+  const error = useJobStore((s) => s.error);
+  const pinMetadataUnavailable = useJobStore((s) => s.pinMetadataUnavailable);
+  const loadJobs = useJobStore((s) => s.loadJobs);
+  const upsertJob = useJobStore((s) => s.upsertJob);
+  const removeJob = useJobStore((s) => s.removeJob);
+  useEffect(() => {
+    let changed = false;
+    for (const id of cancelRequests.current) {
+      const current = allJobs.find((job) => job.jobId === id);
+      if (!current || !canCancelJob(current)) { cancelRequests.current.delete(id); changed = true; }
+    }
+    if (changed) setCancellingIds(new Set(cancelRequests.current));
+  }, [allJobs]);
   const [kindMetas, setKindMetas] = useState<JobKindMeta[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [actions, setActions] = useState<Action[]>([]);
   const [submitting, setSubmitting] = useState(false);
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedJobIds, setSelectedJobIds] = useState<Set<string>>(() => new Set());
@@ -423,34 +522,18 @@ export default function JobsView() {
   const [newTargetId, setNewTargetId] = useState('');
   const [deleteJobId, setDeleteJobId] = useState<string | null>(null);
   const [editJobId, setEditJobId] = useState<string | null>(null);
+  const [editSnapshot, setEditSnapshot] = useState<Job | null>(null);
 
   const [runs, setRuns] = useState<JobRunRecord[]>([]);
   const [runsLoading, setRunsLoading] = useState(false);
   const [runsLimit, setRunsLimit] = useState(RUNS_PAGE);
 
-  const upsert = useCallback((job: Job) => {
-    setJobs((prev) =>
-      prev.some((j) => j.jobId === job.jobId)
-        ? prev.map((j) => (j.jobId === job.jobId ? job : j))
-        : [...prev, job],
-    );
-  }, []);
-
-  const loadJobs = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      setJobs(await fetchJobs());
-    } catch (e) {
-      setError(errMsg(e));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
+  // Fresh authoritative list whenever the page is entered. The store is also
+  // hydrated globally on socket open, so this is a refresh — not the only load
+  // — and it keeps working when the socket never connected.
   useEffect(() => {
     void loadJobs();
-  }, [loadJobs]);
+  }, [loadJobs, authorizationToken]);
 
   useEffect(() => {
     void fetchJobKinds()
@@ -459,43 +542,20 @@ export default function JobsView() {
   }, []);
 
   useEffect(() => {
+    if (tab !== 'create' && editJobId === null) return;
+    let active = true;
+    void fetchActionRegistry().then((registry) => { if (active) setActions(registry.actions || []); })
+      .catch((e: unknown) => { if (active) toastRef.current(errMsg(e), 'error'); });
+    return () => { active = false; };
+  }, [tab, editJobId, authorizationToken]);
+
+  useEffect(() => {
     void loadSessions();
   }, [loadSessions]);
 
-  // WS：job.created/updated/deleted 驱动列表；fired/partial_failed 弹 toast。
+  // WS：job.created/updated/deleted 由 useWebSocket 统一写入 jobStore（导航徽标
+  // 共用同一份列表）；本页只保留 fired/partial_failed 的 toast 通知。
   useEffect(() => {
-    const offCreated = wsClient.on('job.created', (ev) => {
-      const job = (ev as unknown as { job?: Job }).job;
-      if (job) upsert(job);
-    });
-    const offUpdated = wsClient.on('job.updated', (ev) => {
-      const job = (ev as unknown as { job?: Job }).job;
-      if (job) upsert(job);
-    });
-    const offDeleted = wsClient.on('job.deleted', (ev) => {
-      const jobId = (ev as unknown as { jobId?: string }).jobId;
-      if (!jobId) return;
-      if (bulkActiveIdsRef.current.has(jobId)) bulkDeletedIdsRef.current.add(jobId);
-      setJobs((prev) => prev.filter((j) => j.jobId !== jobId));
-      setSelectedJobId((cur) => (cur === jobId ? null : cur));
-      setSelectedJobIds((prev) => {
-        if (!prev.has(jobId)) return prev;
-        const next = new Set(prev);
-        next.delete(jobId);
-        return next;
-      });
-      setBatchDeleteIds((prev) => {
-        if (!prev) return null;
-        const remaining = prev.filter((id) => id !== jobId);
-        return remaining.length > 0 ? remaining : null;
-      });
-      setBulkFeedback((prev) => {
-        if (!prev?.failed[jobId]) return prev;
-        const failed = { ...prev.failed };
-        delete failed[jobId];
-        return { ...prev, failed };
-      });
-    });
     const offFired = wsClient.on('scheduler.task.fired', (ev) => {
       const e = ev as unknown as {
         task?: { name?: string };
@@ -514,13 +574,44 @@ export default function JobsView() {
       );
     });
     return () => {
-      offCreated();
-      offUpdated();
-      offDeleted();
       offFired();
       offPartial();
     };
-  }, [showToast, upsert]);
+  }, [showToast]);
+
+  // Deletions now arrive through the shared store (global WS wiring, this
+  // page's own delete, or another client). Reconcile page-local selection
+  // state against the list so a removed job cannot leave a stale selection,
+  // bulk id or feedback entry behind.
+  const knownJobIdsRef = useRef<Set<string> | null>(null);
+  useEffect(() => {
+    const previous = knownJobIdsRef.current;
+    const current = new Set(allJobs.map((job) => job.jobId));
+    knownJobIdsRef.current = current;
+    if (!previous) return;
+    for (const jobId of previous) {
+      if (current.has(jobId)) continue;
+      if (bulkActiveIdsRef.current.has(jobId)) bulkDeletedIdsRef.current.add(jobId);
+      setSelectedJobId((cur) => (cur === jobId ? null : cur));
+      setSelectedJobIds((prev) => {
+        if (!prev.has(jobId)) return prev;
+        const next = new Set(prev);
+        next.delete(jobId);
+        return next;
+      });
+      setBatchDeleteIds((prev) => {
+        if (!prev) return null;
+        const remaining = prev.filter((id) => id !== jobId);
+        return remaining.length > 0 ? remaining : null;
+      });
+      setBulkFeedback((prev) => {
+        if (!prev?.failed[jobId]) return prev;
+        const failed = { ...prev.failed };
+        delete failed[jobId];
+        return { ...prev, failed };
+      });
+    }
+  }, [allJobs]);
 
   // 详情 runs：随选中 job / limit 拉取。
   useEffect(() => {
@@ -557,6 +648,8 @@ export default function JobsView() {
     [kindMetas],
   );
 
+  const pinUnavailable = pinMetadataUnavailable || jobs.some((job) => job.pinMetadataStatus === 'unavailable');
+
   const visibleJobs = useMemo(() => {
     const query = searchQuery.trim().toLowerCase();
     return jobs
@@ -575,8 +668,16 @@ export default function JobsView() {
             .toLowerCase()
             .includes(query),
       )
-      .sort(compareJobs);
-  }, [jobs, statusFilter, kindFilter, searchQuery]);
+      .sort((a, b) => {
+        if (sort.key === 'active') return compareJobs(a, b, !pinUnavailable) || a.jobId.localeCompare(b.jobId);
+        if (!pinUnavailable && !!a.pinned !== !!b.pinned) return a.pinned ? -1 : 1;
+        const av = sort.key === 'kind' ? a.kind || null : timestampMs(sort.key === 'created' ? a.createdAt : a.updatedAt);
+        const bv = sort.key === 'kind' ? b.kind || null : timestampMs(sort.key === 'created' ? b.createdAt : b.updatedAt);
+        if (av === null || bv === null) return av === bv ? a.jobId.localeCompare(b.jobId) : av === null ? 1 : -1;
+        const result = typeof av === 'string' && typeof bv === 'string' ? av.localeCompare(bv) : Number(av) - Number(bv);
+        return result * (sort.direction === 'asc' ? 1 : -1) || a.jobId.localeCompare(b.jobId);
+      });
+  }, [jobs, statusFilter, kindFilter, searchQuery, pinUnavailable, sort]);
 
   const visibleJobIds = useMemo(() => visibleJobs.map((job) => job.jobId), [visibleJobs]);
   const selectedVisibleJobs = useMemo(
@@ -610,7 +711,9 @@ export default function JobsView() {
   const selectedJob = jobs.find((j) => j.jobId === selectedJobId) ?? null;
   const changeTargetJob = jobs.find((j) => j.jobId === changeTargetJobId) ?? null;
   const deleteJob = jobs.find((j) => j.jobId === deleteJobId) ?? null;
-  const editJob = jobs.find((j) => j.jobId === editJobId) ?? null;
+  // An open draft and its CAS revision are one snapshot. A WS refresh may update
+  // the list, but cannot promote the revision attached to unsaved input.
+  const editJob = editSnapshot?.jobId === editJobId ? editSnapshot : null;
   // 抽屉 z-50 会盖住 z-40 的居中 Modal → 有对话框时隐藏抽屉。
   const dialogOpen =
     changeTargetJobId !== null ||
@@ -674,7 +777,9 @@ export default function JobsView() {
         succeeded += alreadyPaused.length;
         const toPause = candidates.filter((job) => !job.paused);
         const results = await Promise.allSettled(
-          toPause.map((job) => patchJob(job.jobId, { paused: true })),
+          toPause.map((job) => isUnifiedJob(job) && job.unified && job.configRevision != null
+            ? updateActionJob(job.jobId, { ...job.unified.config, enabled: false }, job.configRevision)
+            : patchJob(job.jobId, { paused: true })),
         );
         results.forEach((result, index) => {
           const job = toPause[index];
@@ -682,13 +787,13 @@ export default function JobsView() {
           if (result.status === 'fulfilled') {
             succeeded += 1;
             succeededIds.add(job.jobId);
-            upsert(result.value);
+            upsertJob(result.value);
           } else if (!bulkDeletedIdsRef.current.has(job.jobId)) {
             failed[job.jobId] = { name: job.name, error: errMsg(result.reason) };
           }
         });
       } else {
-        const results = await Promise.allSettled(candidates.map((job) => deleteJobApi(job.jobId)));
+        const results = await Promise.allSettled(candidates.map((job) => isUnifiedJob(job) ? mutateActionJob(job, 'delete') : deleteJobApi(job.jobId)));
         results.forEach((result, index) => {
           const job = candidates[index];
           if (!job) return;
@@ -700,7 +805,7 @@ export default function JobsView() {
           }
         });
         if (succeededIds.size > 0) {
-          setJobs((prev) => prev.filter((job) => !succeededIds.has(job.jobId)));
+          succeededIds.forEach((id) => removeJob(id));
           setSelectedJobId((current) => (current && succeededIds.has(current) ? null : current));
         }
       }
@@ -728,33 +833,41 @@ export default function JobsView() {
       setSelectedJobId(jobId);
       setRunsLimit(RUNS_PAGE);
       try {
-        upsert(await fetchJob(jobId));
+        upsertJob(await fetchJob(jobId));
       } catch {
         // keep the list copy if the detail fetch fails
       }
     },
-    [upsert],
+    [upsertJob],
   );
 
-  const handleCreate = async (input: JobCreateInput) => {
+  const handleUnifiedCreate = async (config: import('@/types/jobs').UnifiedJobConfig) => {
+    setSubmitting(true);
+    try {
+      const job = await createActionJob(config);
+      upsertJob(job);
+      dirtyEditor.current = false;
+      setTab('list');
+      showToast(`Created unified Job "${job.name}"`);
+    } catch (e) { showToast(errMsg(e), 'error'); throw e; }
+    finally { setSubmitting(false); }
+  };
+
+  const handleLegacyCreate = async (input: JobCreateInput) => {
     setSubmitting(true);
     try {
       const job = await createJob(input);
-      upsert(job);
-      setTab('list');
-      showToast(`Created job "${job.name}"`);
-    } catch (e) {
-      showToast(errMsg(e), 'error');
-    } finally {
-      setSubmitting(false);
-    }
+      upsertJob(job); setLegacyCreateOpen(false); setTab('legacy');
+      showToast(`Created legacy Job "${job.name}"`);
+    } catch (e) { showToast(errMsg(e), 'error'); }
+    finally { setSubmitting(false); }
   };
 
   const handleUpdate = async (jobId: string, patch: JobPatchInput) => {
     setSubmitting(true);
     try {
       const job = await patchJob(jobId, patch);
-      upsert(job);
+      upsertJob(job);
       setEditJobId(null);
       showToast(`Saved job "${job.name}"`);
     } catch (e) {
@@ -764,13 +877,41 @@ export default function JobsView() {
     }
   };
 
+  const handleUnifiedUpdate = async (job: Job, config: import('@/types/jobs').UnifiedJobConfig) => {
+    setSubmitting(true);
+    try {
+      if (job.configRevision == null) throw new Error('Configuration revision missing; reload before saving');
+      const revision = job.configRevision;
+      const updated = await updateActionJob(job.jobId, config, revision);
+      upsertJob(updated); dirtyEditor.current = false; setEditJobId(null); showToast(`Saved unified Job "${updated.name}"`);
+    } catch (e) { showToast(errMsg(e), 'error'); throw e; }
+    finally { setSubmitting(false); }
+  };
+
   const handleRunNow = async (job: Job) => {
     if (bulkActionRef.current) return;
     try {
-      upsert(await runJobNow(job.jobId));
+      if (isUnifiedJob(job)) { await mutateActionJob(job, 'run-now'); upsertJob(await fetchJob(job.jobId)); }
+      else upsertJob(await runJobNow(job.jobId));
       showToast(`Ran job "${job.name}"`);
     } catch (e) {
       showToast(errMsg(e), 'error');
+    }
+  };
+
+  const handleAttemptRecovery = async (job: Job, operation: 'retry' | 'confirm-recovery') => {
+    if (!window.confirm('Confirm another Attempt of the same Run? Reconcile all possible prior effects first. Unknown process identity remains blocked.')) return;
+    try { await mutateActionJob(job, operation); upsertJob(await fetchJob(job.jobId)); }
+    catch (e) { showToast(errMsg(e), 'error'); }
+  };
+
+  const handleTogglePinned = async (job: Job) => {
+    if (bulkActionRef.current || pinUnavailable) return;
+    try {
+      upsertJob(await pinJob(job.jobId, !job.pinned));
+    } catch (e) {
+      showToast(`${errMsg(e)}. Refresh to read the current pin state.`, 'error');
+      void loadJobs();
     }
   };
 
@@ -778,7 +919,12 @@ export default function JobsView() {
     if (bulkActionRef.current) return;
     const next = !job.paused;
     try {
-      upsert(await patchJob(job.jobId, { paused: next }));
+      if (isUnifiedJob(job)) {
+        if (job.configRevision == null || !job.unified) throw new Error('Reload configuration revision before confirming');
+        upsertJob(await updateActionJob(job.jobId, { ...job.unified.config, enabled: !job.enabled }, job.configRevision));
+        return;
+      }
+      upsertJob(await patchJob(job.jobId, { paused: next }));
       showToast(next ? `Paused job "${job.name}"` : `Resumed job "${job.name}"`);
     } catch (e) {
       showToast(errMsg(e), 'error');
@@ -794,7 +940,10 @@ export default function JobsView() {
       return spec;
     });
     try {
-      upsert(await patchJob(job.jobId, { schedule: specs }));
+      if (job.unified && !job.unified.compatibility) {
+        if (job.configRevision == null) throw new Error('Reload configuration revision before confirming');
+        upsertJob(await updateActionJob(job.jobId, { ...job.unified.config, schedule: specs }, job.configRevision));
+      } else upsertJob(await patchJob(job.jobId, { schedule: specs }));
     } catch (e) {
       showToast(errMsg(e), 'error');
     }
@@ -813,7 +962,7 @@ export default function JobsView() {
       const job = await patchJob(changeTargetJob.jobId, {
         target: { sessionId: newTargetId.trim() || null },
       });
-      upsert(job);
+      upsertJob(job);
       setChangeTargetJobId(null);
       showToast(
         hadBacklog
@@ -825,16 +974,36 @@ export default function JobsView() {
     }
   };
 
+  const handleCancel = async (job: Job) => {
+    if (!canCancelJob(job) || cancelRequests.current.has(job.jobId)) return;
+    cancelRequests.current.add(job.jobId);
+    setCancellingIds(new Set(cancelRequests.current));
+    let accepted = false;
+    try {
+      if (isUnifiedJob(job)) await mutateActionJob(job, 'cancel');
+      else await cancelJob(job.jobId);
+      accepted = true;
+      showToast('Cancellation requested');
+      try { upsertJob(await fetchJob(job.jobId)); }
+      catch { showToast('Cancellation accepted; current status unavailable. Refresh to confirm.', 'warning'); }
+    } catch (e) { showToast(errMsg(e), 'error'); }
+    finally { if (!accepted) { cancelRequests.current.delete(job.jobId); setCancellingIds(new Set(cancelRequests.current)); } }
+  };
+
   const handleDelete = async () => {
     if (!deleteJob || bulkActionRef.current) return;
     try {
-      await deleteJobApi(deleteJob.jobId);
-      setJobs((prev) => prev.filter((j) => j.jobId !== deleteJob.jobId));
+      if (isUnifiedJob(deleteJob)) await mutateActionJob(deleteJob, 'delete');
+      else await deleteJobApi(deleteJob.jobId);
+      removeJob(deleteJob.jobId);
       if (selectedJobId === deleteJob.jobId) setSelectedJobId(null);
       setDeleteJobId(null);
       showToast(`Deleted job "${deleteJob.name}"`);
     } catch (e) {
       showToast(errMsg(e), 'error');
+      // Production DELETE may durably enter cleanup_pending before refusing.
+      // Reload its facts without retrying the destructive operation.
+      try { upsertJob(await fetchJob(deleteJob.jobId)); } catch { /* retain current record */ }
     }
   };
 
@@ -861,7 +1030,7 @@ export default function JobsView() {
           aria-pressed={tab === 'list'}
           disabled={bulkAction !== null}
           onClick={() => {
-            setTab('list');
+            requestTab('list');
             setSelectionMode(false);
             clearSelectionForViewChange();
           }}
@@ -872,14 +1041,19 @@ export default function JobsView() {
           }`}
         >
           <ListChecks size={12} />
-          Jobs
+          Unified Jobs
+        </button>
+        <button type="button" aria-pressed={tab === 'legacy'} disabled={bulkAction !== null}
+          onClick={() => { requestTab('legacy'); setSelectionMode(false); clearSelectionForViewChange(); setSelectedJobId(null); }}
+          className={`rounded border px-2.5 py-1 text-xs ${tab === 'legacy' ? 'border-accent/50 text-accent' : 'border-border-default text-text-secondary'}`}>
+          Legacy Jobs / 旧 Job
         </button>
         <button
           type="button"
           aria-pressed={tab === 'create'}
           disabled={bulkAction !== null}
           onClick={() => {
-            setTab('create');
+            requestTab('create');
             setSelectionMode(false);
             clearSelectionForViewChange();
           }}
@@ -897,7 +1071,7 @@ export default function JobsView() {
           aria-pressed={tab === 'settings'}
           disabled={bulkAction !== null}
           onClick={() => {
-            setTab('settings');
+            requestTab('settings');
             setSelectionMode(false);
             clearSelectionForViewChange();
           }}
@@ -912,7 +1086,15 @@ export default function JobsView() {
         </button>
       </div>
 
-      {tab === 'list' ? (
+      {(tab === 'list' || tab === 'legacy') && <p className="shrink-0 px-4 py-2 text-xs text-text-secondary" role="note">
+        {tab === 'legacy'
+          ? '旧 Job · background_jobs registry / legacy scheduler · 旧 runner 与原始 Job 状态。与新 Job 可共用存储目录；不迁移、不自动转换。删除走原安全取消/清理路径；退出未确认时保留 cleanup_pending，须显式再次核对。'
+          : '统一新 Job · Action-reference registry records / Action runtime · Run / Attempt 状态。存储目录可与旧 Job 共用；此处仅展示新执行语义。'}
+      </p>}
+      {tab === 'legacy' && <div className="shrink-0 px-4 pb-2">
+        <Button size="sm" onClick={() => setLegacyCreateOpen(true)} disabled={bulkAction !== null}>New legacy Job</Button>
+      </div>}
+      {tab === 'list' || tab === 'legacy' ? (
         <div className="flex min-h-0 flex-1 flex-col">
           {/* Keep filters, search, selection actions, and counts visible while rows scroll. */}
           <div className="shrink-0 border-b border-border-muted bg-bg-primary">
@@ -939,6 +1121,12 @@ export default function JobsView() {
                 ))}
               </div>
 
+              {pinUnavailable && (
+                <div role="status" className="rounded border border-warning/50 px-3 py-2 text-xs text-warning">
+                  Pin metadata unavailable. Pin states are unknown and pin actions are disabled.
+                  Jobs remain usable; restore the metadata and refresh to read the current pin states.
+                </div>
+              )}
               <div className="grid min-w-0 grid-cols-1 gap-2 sm:grid-cols-[minmax(0,0.8fr)_minmax(0,1.2fr)]">
                 <label className="flex min-w-0 items-center gap-2">
                   <span className="shrink-0 text-[11px] text-text-tertiary">Kind</span>
@@ -986,6 +1174,13 @@ export default function JobsView() {
                 </label>
               </div>
 
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                <label>Sort by <select aria-label="Sort jobs" value={sort.key} disabled={bulkAction !== null} onChange={(e) => setSort({ ...sort, key: e.target.value })} className="rounded border border-border-default bg-bg-tertiary p-1.5">
+                  <option value="active">Active first</option><option value="updated">Updated time</option><option value="created">Created time</option><option value="kind">Kind</option>
+                </select></label>
+                <button type="button" disabled={sort.key === 'active' || bulkAction !== null} onClick={() => setSort({ ...sort, direction: sort.direction === 'asc' ? 'desc' : 'asc' })} className="rounded border border-border-default px-2 py-1.5 disabled:opacity-50">{sort.direction === 'asc' ? 'Ascending' : 'Descending'}</button>
+                <span className="text-[11px] text-text-tertiary">Pinned jobs first</span>
+              </div>
               <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-text-tertiary">
                 <span aria-live="polite">
                   {visibleJobs.length} of {jobs.length} jobs
@@ -1129,7 +1324,11 @@ export default function JobsView() {
                       menuOpen={menuJobId === job.jobId}
                       onToggleMenu={() => setMenuJobId(menuJobId === job.jobId ? null : job.jobId)}
                       onRunNow={() => void handleRunNow(job)}
+                      pinUnavailable={pinUnavailable}
+                      onTogglePinned={() => void handleTogglePinned(job)}
                       onTogglePaused={() => void handleTogglePaused(job)}
+                      onCancel={() => void handleCancel(job)}
+                      cancelling={cancellingIds.has(job.jobId)}
                       onDelete={() => setDeleteJobId(job.jobId)}
                       selectionMode={selectionMode}
                       selected={selectedJobIds.has(job.jobId)}
@@ -1149,11 +1348,8 @@ export default function JobsView() {
       ) : tab === 'create' ? (
         <div className="min-h-0 flex-1 overflow-y-auto">
           <div className="mx-auto w-full max-w-2xl p-4">
-            <NewJobForm
-              kindMetas={kindMetas}
-              submitting={submitting}
-              onCreate={handleCreate}
-            />
+            <JobUserAuthorization />
+            <JobTemplateEditor actions={actions} submitting={submitting} onCreate={handleUnifiedCreate} onInstantiated={(job) => { dirtyEditor.current = false; upsertJob(job); setTab('list'); }} onDirtyChange={editorDirtyChange} />
           </div>
         </div>
       ) : (
@@ -1174,10 +1370,14 @@ export default function JobsView() {
           onClose={() => setSelectedJobId(null)}
           onRunNow={() => void handleRunNow(selectedJob)}
           onTogglePaused={() => void handleTogglePaused(selectedJob)}
+          onCancel={() => void handleCancel(selectedJob)}
+          cancelling={cancellingIds.has(selectedJob.jobId)}
           onDelete={() => setDeleteJobId(selectedJob.jobId)}
           onChangeTarget={() => openChangeTarget(selectedJob)}
-          onEdit={() => setEditJobId(selectedJob.jobId)}
+          onEdit={() => { setEditSnapshot(structuredClone(selectedJob)); setEditJobId(selectedJob.jobId); }}
           onToggleEntryEnabled={(entryId) => void handleToggleEntry(selectedJob, entryId)}
+          onRetry={isUnifiedJob(selectedJob) ? () => void handleAttemptRecovery(selectedJob, 'retry') : undefined}
+          onConfirmRecovery={isUnifiedJob(selectedJob) ? () => void handleAttemptRecovery(selectedJob, 'confirm-recovery') : undefined}
         />
       )}
 
@@ -1214,6 +1414,11 @@ export default function JobsView() {
             </Button>
           </div>
         </div>
+      </Modal>
+
+      <Modal open={legacyCreateOpen} onClose={() => { if (!submitting) setLegacyCreateOpen(false); }} title="New legacy Job" size="lg">
+        <p className="mb-3 text-xs text-text-secondary">创建旧 registry 记录，使用旧 runner / scheduler；不会转换为新 Action Job。</p>
+        {legacyCreateOpen && <NewJobForm kindMetas={kindMetas} submitting={submitting} onCreate={(input) => void handleLegacyCreate(input)} />}
       </Modal>
 
       {/* Delete confirmation dialog */}
@@ -1280,20 +1485,27 @@ export default function JobsView() {
       {/* Edit job dialog */}
       <Modal
         open={editJobId !== null}
-        onClose={() => setEditJobId(null)}
+        onClose={() => { if (!dirtyEditor.current || window.confirm('Discard unsaved Job configuration?')) { dirtyEditor.current = false; setEditJobId(null); } }}
         title="Edit job"
         size="lg"
       >
-        {editJob && (
-          <NewJobForm
-            key={editJob.jobId}
-            mode="edit"
-            initialJob={editJob}
-            kindMetas={kindMetas}
-            submitting={submitting}
-            onSave={(patch) => void handleUpdate(editJob.jobId, patch)}
-          />
-        )}
+        {editJob && isUnifiedJob(editJob) && <JobUserAuthorization />}
+        {editJob && (editJob.unified && !editJob.unified.compatibility ? <UnifiedJobForm
+          key={editJob.jobId}
+          initial={editJob.unified.config}
+          actions={actions}
+          expectedRevision={editJob.configRevision}
+          onDirtyChange={editorDirtyChange}
+          submitting={submitting}
+          onSubmit={(config) => handleUnifiedUpdate(editJob, config)}
+        /> : <NewJobForm
+          key={editJob.jobId}
+          mode="edit"
+          initialJob={editJob}
+          kindMetas={kindMetas}
+          submitting={submitting}
+          onSave={(patch) => void handleUpdate(editJob.jobId, patch)}
+        />)}
       </Modal>
     </div>
   );

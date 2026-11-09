@@ -21,14 +21,94 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: "9.7.0"
+
+      - name: Build React for browser regressions
+        working-directory: packages/web
+        run: |
+          pnpm install --frozen-lockfile
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm build
+
+      - name: Install terminal emulator dependencies
+        run: npm ci --prefix packages/core/terminal/emulator_sidecar
+
+      - name: Install Codex native test dependency
+        shell: pwsh
+        run: |
+          npm install --global --prefix "$env:RUNNER_TEMP/pan-codex" --no-audit --no-fund @openai/codex@0.162.1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "$env:RUNNER_TEMP/pan-codex" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r minimal-requirements.txt
           pip install -r packages/qq/requirements.txt
-          pip install pytest-timeout
+          pip install pytest-timeout playwright==1.63.0
+
+      - name: Install browser regression dependency
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/pan-playwright
+        run: python -m playwright install --only-shell chromium
 
       - name: Run tests
         env:
-          PYTHONPATH: ${{ github.workspace }}
-        run: python -m pytest tests/ packages/qq -q
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/pan-playwright
+        run: python scripts/run_tests_isolated.py -- python -m pytest tests/ packages/qq -q -ra --junitxml=pytest-results.xml
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-results-${{ matrix.python-version }}
+          path: pytest-results.xml
+          if-no-files-found: warn
+
+  posix-fast:
+    # Cross-platform Phase A fast layer (docs/plans&overviews/CROSS_PLATFORM_PLAN_20261025.md):
+    # import the real server, collect, and run the platform unit subset on real
+    # macOS/Linux. The Windows job above stays the fidelity/full-suite gate.
+    name: posix-fast (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r minimal-requirements.txt
+          pip install pytest-timeout
+
+      - name: Import server on POSIX
+        run: python -c "import packages.web.server"
+
+      - name: Collect platform subset
+        run: >
+          python -m pytest --collect-only -q
+          tests/test_platform_layer.py
+          tests/test_platform_api.py
+          tests/test_platform_import_chain.py
+          tests/test_portability_paths.py
+
+      - name: Run platform subset
+        run: >
+          python -m pytest -q
+          tests/test_platform_layer.py
+          tests/test_platform_api.py
+          tests/test_platform_import_chain.py
+          tests/test_portability_paths.py

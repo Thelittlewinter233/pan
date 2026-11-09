@@ -11,8 +11,13 @@ import {
   ListChecks,
   Info,
   Trash2,
+  Eye,
+  Circle,
+  CheckCheck,
 } from 'lucide-react';
 import type { Session } from '@/types';
+import { ReimportError, sessionUnreadAction } from '@/services/api';
+import { useReimportConfirmationStore } from '@/stores/reimportConfirmationStore';
 
 interface SessionMenuProps {
   session: Session;
@@ -24,11 +29,12 @@ interface SessionMenuProps {
   onPostbox?: (id: string) => void;
   /** Open the session details modal for this session. */
   onDetails?: (id: string) => void;
+  onHandoff?: (id: string) => void;
   onRename?: (id: string) => void;
   onDelete?: (id: string) => void;
 }
 
-export function SessionMenu({ session, position, onClose, onManage, onPostbox, onDetails, onRename, onDelete }: SessionMenuProps) {
+export function SessionMenu({ session, position, onClose, onManage, onPostbox, onDetails, onRename, onHandoff, onDelete }: SessionMenuProps) {
   const menuRef = useRef<HTMLDivElement>(null);
   // 挂载前先用点击锚点，量取菜单尺寸后按视口空间翻转/收敛到最终落点。
   const [placement, setPlacement] = useState<{ x: number; y: number }>(() => position);
@@ -98,7 +104,12 @@ export function SessionMenu({ session, position, onClose, onManage, onPostbox, o
       await reimport(session.id, activeWorkspaceId);
       showToast('Session reimported');
     } catch (e) {
-      showToast(e instanceof Error ? e.message : 'Reimport failed', 'error');
+      if (e instanceof ReimportError && e.conflict) {
+        useReimportConfirmationStore.getState().open({ sessionId: session.id,
+          sessionName: session.name || session.id, workspaceId: activeWorkspaceId, conflict: e.conflict });
+      } else {
+        showToast(e instanceof Error ? e.message : 'Reimport failed', 'error');
+      }
     }
   };
 
@@ -141,6 +152,55 @@ export function SessionMenu({ session, position, onClose, onManage, onPostbox, o
     onDetails?.(session.id);
   };
 
+  // Dynamic unread action, driven by the backend policy projection:
+  // excluded → Enable unread tracking; recording + count 0 → Mark as unread;
+  // recording + count > 0 → Clear unread. The request carries the state the
+  // caller saw; a stale expectation fails with state_changed and we re-read.
+  const unreadTracking = session.unreadTracking !== false;
+  const unreadCount = Number.isFinite(session.unreadDoneCount)
+    ? Math.max(0, Math.floor(session.unreadDoneCount ?? 0))
+    : 0;
+  const unreadAction = !unreadTracking
+    ? { key: 'enable-tracking' as const, label: 'Enable unread tracking', Icon: Eye }
+    : unreadCount > 0
+      ? { key: 'clear-unread' as const, label: 'Clear unread', Icon: CheckCheck }
+      : { key: 'mark-unread' as const, label: 'Mark as unread', Icon: Circle };
+  const UnreadActionIcon = unreadAction.Icon;
+
+  const handleUnreadAction = async () => {
+    onClose();
+    try {
+      if (unreadAction.key === 'enable-tracking') {
+        await sessionUnreadAction(session.id, unreadAction.key, { expectedExcluded: true });
+      } else {
+        await sessionUnreadAction(session.id, unreadAction.key, {
+          expectedGeneration: session.unreadDoneGeneration ?? 0,
+        });
+      }
+      try {
+        await useSessionStore.getState().loadSessions({ throwOnError: true });
+      } catch {
+        showToast('Saved, but the Session list could not refresh', 'error');
+      }
+      showToast(
+        unreadAction.key === 'enable-tracking'
+          ? 'Unread tracking enabled'
+          : unreadAction.key === 'mark-unread'
+            ? 'Marked as unread'
+            : 'Unread cleared',
+      );
+    } catch (e) {
+      // A stale expectation means another client changed this Session while
+      // the menu was open; re-read the authoritative state instead of guessing.
+      try {
+        await useSessionStore.getState().loadSessions({ throwOnError: true });
+      } catch {
+        // The toast below still reports the real failure.
+      }
+      showToast(e instanceof Error ? e.message : 'Unread action failed', 'error');
+    }
+  };
+
   // 通过 portal 挂到 <body>：Sidebar 的移动端容器带 transform（translateX），
   // 会成为 `position: fixed` 后代的包含块（与 Modal.tsx 相同的原因）。固定定位
   // 的坐标来自 getBoundingClientRect()（视口坐标），保证菜单相对视口落位准确。
@@ -157,6 +217,10 @@ export function SessionMenu({ session, position, onClose, onManage, onPostbox, o
         <Pencil size={12} className="text-text-tertiary shrink-0" />
         Rename
       </button>
+      {onHandoff && <button
+        onClick={() => { onClose(); onHandoff(session.id); }}
+        className="w-full text-left px-3 py-1.5 text-xs text-text-primary hover:bg-accent/20 flex items-center gap-2"
+      ><GitBranch size={12} />Session Handoff</button>}
       {session.cliSessionId && (
         <>
           <button
@@ -195,6 +259,14 @@ export function SessionMenu({ session, position, onClose, onManage, onPostbox, o
       >
         <Info size={12} className="text-text-tertiary shrink-0" />
         Details
+      </button>
+      <button
+        onClick={() => { void handleUnreadAction(); }}
+        data-testid="session-unread-action"
+        className="w-full text-left px-3 py-1.5 text-xs text-text-primary hover:bg-accent/20 transition-colors flex items-center gap-2"
+      >
+        <UnreadActionIcon size={12} className="text-text-tertiary shrink-0" />
+        {unreadAction.label}
       </button>
       <button
         onClick={handleMultiSelect}

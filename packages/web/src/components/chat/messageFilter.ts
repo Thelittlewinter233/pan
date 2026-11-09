@@ -1,5 +1,6 @@
 import type { Message } from '@/types';
 import type { AppSettings } from '@/stores/appSettingsStore';
+import type { CanonicalRow } from '@/stores/messageOrdering';
 
 /** Meta-agent orchestration messages (`worker_send` auto-prepends this marker). */
 export const META_AGENT_PREFIX = '////by agent';
@@ -7,6 +8,15 @@ export const META_AGENT_PREFIX = '////by agent';
 export const TASK_AGENT_PREFIX = '@@@@by agent';
 /** QQ-injected messages (inbox reminders / subscription pushes). */
 export const QQ_PREFIX = '@@@@by qq';
+
+/** Current production header and the historical System header. Match a whole
+ * marker after leading whitespace, never a mention or a longer word. */
+const SYSTEM_HEADER = /^\/\/\/\/by (?:pan system|system)(?=\s|:|$)/;
+
+function hasSystemHeader(message: Message): boolean {
+  return (message.role === 'user' || message.role === 'assistant' || message.role === 'system')
+    && SYSTEM_HEADER.test(message.content.trimStart());
+}
 
 export type MessageVisibilitySettings = Pick<
   AppSettings,
@@ -25,21 +35,67 @@ export function filterVisibleMessages(
   const { showMetaAgent, showTaskAgent, showQQ } = settings;
   return messages.filter((m) => {
     const content = m.content.trimStart();
-    if (!showMetaAgent && content.startsWith(META_AGENT_PREFIX)) return false;
-    if (!showTaskAgent && content.startsWith(TASK_AGENT_PREFIX)) return false;
+    if (!showMetaAgent && m.source !== 'report' && content.startsWith(META_AGENT_PREFIX)) return false;
+    if (!showTaskAgent && (m.source === 'report' || content.startsWith(TASK_AGENT_PREFIX))) return false;
     if (!showQQ && content.startsWith(QQ_PREFIX)) return false;
     return true;
   });
 }
 
 
-export type QuickJumpKind = 'user' | 'worker';
+/**
+ * Navigation marker kinds (the rail consumption contract).
+ *
+ * - `user`     — user-role rows without structured agent provenance
+ *   (browser sends, automation fills, prompt injection, QQ, user-typed
+ *   markers).
+ * - `worker`   — TA report (`@@@@by agent`); existing value kept verbatim.
+ * - `system`   — current `////by pan system` or legacy `////by system`
+ *   header on a user/assistant/system body row, independent of provenance.
+ * - `maAssign` — MA assign: formal dispatch — `role: "user"`,
+ *   `source: "agent"`, no inherited task id and no `////by agent` prefix
+ *   (mirrors the `ma-assign` label tag).
+ * - `maMsg`    — MA msg: every other agent-sourced row — the `////by agent`
+ *   identity prefix that `agent_send` / `agent_send_force` prepend, or an
+ *   inherited-task-id follow-up (`taskIdSource: "active"`).
+ *
+ * MA classification is structured: `source: "agent"` is required for both MA
+ * kinds; a body that merely starts with `////by agent` never classifies.
+ */
+export type QuickJumpKind = 'user' | 'worker' | 'system' | 'maAssign' | 'maMsg';
+
+/**
+ * Rail marker kinds.  `bookmark` is not a provenance kind: it marks a
+ * bookmarked body block that carries no quick-jump kind of its own (a plain
+ * assistant text block, or any user/assistant row whose kind is `null`).
+ * A bookmarked row that already has a quick-jump kind keeps that kind and is
+ * decorated instead — the rail never shows a second tag for one block.
+ */
+export type NavigationKind = QuickJumpKind | 'bookmark';
+
+/** Roles the backend accepts as bookmark targets (user text + assistant text). */
+function isBookmarkableRole(message: Message): boolean {
+  return message.role === 'user' || message.role === 'assistant';
+}
+
+/**
+ * The rail kind for one row: its quick-jump kind when it has one, otherwise
+ * `bookmark` when the row is bookmarked bookmarkable content, otherwise null.
+ * The `bookmarked` flag is the server projection (history/navigation rows)
+ * or a client overlay applied by the rail before classification.
+ */
+export function getNavigationKind(message: Message): NavigationKind | null {
+  const quick = getQuickJumpKind(message);
+  if (quick) return quick;
+  if (message.bookmarked && isBookmarkableRole(message)) return 'bookmark';
+  return null;
+}
 
 export interface QuickJumpMessage {
   message: Message;
   /** Index in the filtered message list used by ChatMessages. */
   index: number;
-  kind: QuickJumpKind;
+  kind: NavigationKind;
   preview: string;
 }
 
@@ -47,26 +103,113 @@ export interface QuickJumpMessage {
  * stable while older pages are prepended to the chat window. */
 export interface QuickJumpIndexItem {
   fromEnd: number;
-  kind: QuickJumpKind;
+  kind: NavigationKind;
   preview: string;
+  /** True when this row is bookmarked; drives the marker decoration. */
+  bookmarked?: boolean;
 }
 
-/** Return the marker category used by the quick-location rail, if any. */
+/**
+ * Return the marker category used by the quick-location rail, if any.
+ *
+ * MA classification basis — structured agent provenance only.  A body that
+ * merely starts with `////by agent` is never enough: a user-typed or
+ * source-less row with that literal text stays `user` (the existing
+ * `filterVisibleMessages` prefix rule is kept for visibility toggles and is
+ * deliberately not reused here).
+ * - `@@@@by agent` → `worker` (TA report, the old judgment; checked first and
+ *   role-independent because some adapters serialize reports as user rows).
+ * - System header on a body row → `system`, before any role/source split.
+ *   Leading whitespace is ignored; current and legacy headers are accepted.
+ * - `role: "user"` + `source: "agent"` → inside the confirmed provenance,
+ *   the send/follow-up split: the `////by agent` identity prefix of
+ *   `agent_send` / `agent_send_force`, or an inherited
+ *   `taskIdSource: "active"` follow-up, yields `maMsg`; otherwise
+ *   `maAssign`.  The prefix only splits an already-confirmed source — it
+ *   never proves the source itself.  Invariant: `maAssign` ⇔
+ *   `getMessageSourceTag(...)` is `'ma-assign'`.
+ * - any other `user` row → `user` (browser sends, scheduler/background jobs,
+ *   prompt injection, QQ, user-typed markers); non-user rows without the
+ *   report prefix → `null`.
+ *
+ * Indistinguishable boundary (documented on purpose): an env-less
+ * `agent_send` / `agent_send_force` without the identity prefix and without
+ * an inherited active task id carries exactly the same durable fields as an
+ * assign and classifies as `maAssign`; only the prefix and the inherited id
+ * separate send/force from assign.  History persisted before the structured
+ * source fields existed carries no provenance and stays `user` / `null` —
+ * the current managed relation is never used to guess an old origin.
+ */
 export function getQuickJumpKind(message: Message): QuickJumpKind | null {
   const content = message.content.trimStart();
   // A task-agent report wins over the role because reports can be serialized
   // as user messages by some adapters.
-  if (content.startsWith(TASK_AGENT_PREFIX)) return 'worker';
-  if (message.role === 'user') return 'user';
+  if (message.source === 'report' || content.startsWith(TASK_AGENT_PREFIX)) return 'worker';
+  if (hasSystemHeader(message)) return 'system';
+  if (message.role !== 'user') return null;
+  if (message.source === 'agent') {
+    // Within confirmed agent provenance, the send/follow-up markers split
+    // messages from assigns; the prefix never proves the source itself.
+    return content.startsWith(META_AGENT_PREFIX) || message.taskIdSource === 'active'
+      ? 'maMsg'
+      : 'maAssign';
+  }
+  return 'user';
+}
+
+/** Durable source tag rendered next to a message body. */
+export type MessageSourceTag = 'ta-report' | 'system' | 'ma-assign';
+
+/**
+ * Classify the source tag for a message body, or null when it carries none.
+ * The navigation kinds mirror this determination, so the body pill and the
+ * rail tooltip can never disagree: `ma-assign` ⇔ kind `maAssign`,
+ * `ta-report` ⇔ kind `worker`, `system` ⇔ kind `system`.
+ *
+ * - `ta-report` — the task-agent completion report marker (`@@@@by agent`).
+ *   Kept exactly as before: prefix-based and role-independent because some
+ *   adapters serialize reports as user rows.
+ * - `system` — current/legacy System header on a body row; checked after
+ *   TA report and before MA assign, including histories without source fields.
+ * - `ma-assign` — a formal dispatch into this Session: `role: "user"`,
+ *   structured `source: "agent"` (编排注入), no inherited task id
+ *   (`taskIdSource: "active"`, backend `_is_formal_task_item`) and no
+ *   `////by agent` identity prefix (that prefix marks `agent_send` /
+ *   `agent_send_force` messages instead).
+ *
+ * Browser messages (`user`), scheduler/background jobs (`automation`),
+ * prompt injection (`system_prompt`) and report/notice rows (`report`) can
+ * never carry the MA assign tag; literal `////by agent` text is never treated as an
+ * assign.  History persisted before the structured fields existed stays
+ * without an MA label on purpose: the current managed relation is never used to guess
+ * an old origin.
+ */
+export function getMessageSourceTag(message: Message): MessageSourceTag | null {
+  const content = message.content.trimStart();
+  if (message.source === 'report' || content.startsWith(TASK_AGENT_PREFIX)) return 'ta-report';
+  if (hasSystemHeader(message)) return 'system';
+  if (
+    message.role === 'user'
+    && message.source === 'agent'
+    && message.taskIdSource !== 'active'
+    && !content.startsWith(META_AGENT_PREFIX)
+  ) {
+    return 'ma-assign';
+  }
   return null;
 }
 
 /** Remove transport/source headers before showing a compact hover preview. */
 export function getQuickJumpPreview(content: string, maxLength = 120): string {
   const trimmed = content.trimStart();
-  const withoutHeader = trimmed.replace(
-    /^(?:@@@@by agent|\/\/\/\/by agent|@@@@by qq)\s*:\s*[^\r\n]*(?:\r?\n|$)/,
-    '',
+  // System headers carry no sender metadata. Preserve inline text after an
+  // optional colon as well as the body after the production newline header.
+  const withoutHeader = (SYSTEM_HEADER.test(trimmed)
+    ? trimmed.replace(SYSTEM_HEADER, '').replace(/^[^\S\r\n]*:/, '')
+    : trimmed.replace(
+        /^(?:@@@@by agent|\/\/\/\/by agent|@@@@by qq)\s*:\s*[^\r\n]*(?:\r?\n|$)/,
+        '',
+      )
   ).trimStart();
   const normalized = withoutHeader.replace(/\s+/g, ' ').trim();
   if (normalized.length <= maxLength) return normalized;
@@ -83,26 +226,68 @@ export function getQuickJumpIndexItems(
 ): QuickJumpIndexItem[] {
   return messages.flatMap((message, index) => {
     if (filterVisibleMessages([message], settings).length === 0) return [];
-    const kind = getQuickJumpKind(message);
+    const kind = getNavigationKind(message);
     return kind
       ? [{
           fromEnd: total - 1 - (start + index),
           kind,
           preview: getQuickJumpPreview(message.content),
+          ...(message.bookmarked ? { bookmarked: true } : {}),
         }]
       : [];
   });
 }
 
-/** Build the visible user/worker targets shown by the navigation rail. */
+/**
+ * Build compact navigation targets from canonical rows that already know their
+ * own absolute history offset.
+ *
+ * The rendered transcript interleaves canonical history rows with local
+ * display markers (`[DONE] Task completed`) and runtime rows, so an array
+ * position is not a canonical offset: counting positions instead of reading
+ * offsets shifted every `fromEnd` behind a terminal bar and made the rail jump
+ * to a neighbouring message.
+ *
+ * The caller supplies only rows whose offset `markDurableRow` proved, so a
+ * terminal status bar is excluded for lack of a canonical offset — not by
+ * matching its text. Real TA reports, System notices and any body that merely
+ * contains "task completed" keep their marker-based classification and stay
+ * navigable. The visible filter is still applied per row, so the
+ * showMetaAgent/showTaskAgent/showQQ toggles behave exactly as before.
+ */
+export function getQuickJumpIndexItemsByOffset(
+  rows: readonly CanonicalRow[],
+  total: number,
+  settings: MessageVisibilitySettings,
+): QuickJumpIndexItem[] {
+  return rows.flatMap(({ offset, message }) => {
+    if (filterVisibleMessages([message], settings).length === 0) return [];
+    const kind = getNavigationKind(message);
+    return kind
+      ? [{
+          fromEnd: total - 1 - offset,
+          kind,
+          preview: getQuickJumpPreview(message.content),
+          ...(message.bookmarked ? { bookmarked: true } : {}),
+        }]
+      : [];
+  });
+}
+
+/** Build the visible navigation targets shown by the navigation rail. */
 export function getQuickJumpMessages(
   messages: Message[],
   settings: MessageVisibilitySettings,
 ): QuickJumpMessage[] {
   return filterVisibleMessages(messages, settings).flatMap((message, index) => {
-    const kind = getQuickJumpKind(message);
+    const kind = getNavigationKind(message);
     return kind
-      ? [{ message, index, kind, preview: getQuickJumpPreview(message.content) }]
+      ? [{
+          message,
+          index,
+          kind,
+          preview: getQuickJumpPreview(message.content),
+        }]
       : [];
   });
 }

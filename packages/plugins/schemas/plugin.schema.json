@@ -1,0 +1,153 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Pan plugin v1",
+  "type": "object",
+  "required": ["protocol", "id", "source"],
+  "properties": {
+    "protocol": {"const": "pan-plugin/v1"},
+    "id": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{0,47}$"},
+    "display_name": {"type": "string"},
+    "version": {"type": "string", "minLength": 1},
+    "aliases": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "source": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": {"enum": ["mcp", "pan_api", "panel"]},
+        "server_ref": {"type": "string", "minLength": 1},
+        "capabilities_file": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {"if": {"properties": {"kind": {"const": "mcp"}}}, "then": {"required": ["server_ref"]}},
+        {"if": {"properties": {"kind": {"const": "pan_api"}}}, "then": {"required": ["capabilities_file"]}},
+        {"if": {"properties": {"kind": {"const": "panel"}}},
+         "then": {"not": {"anyOf": [{"required": ["server_ref"]}, {"required": ["capabilities_file"]}]}}}
+      ]
+    },
+    "exposure": {
+      "type": "object",
+      "properties": {
+        "supported_modes": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["standalone", "pan_native", "gateway"]}},
+        "default_mode": {"enum": ["standalone", "pan_native", "gateway"]}
+      },
+      "additionalProperties": false
+    },
+    "events": {
+      "type": "object",
+      "required": [
+        "provider",
+        "definitions",
+        "subscriptions"
+      ],
+      "properties": {
+        "provider": {
+          "type": "object",
+          "required": [
+            "transport",
+            "command_ref"
+          ],
+          "properties": {
+            "transport": {
+              "const": "stdio_jsonrpc"
+            },
+            "command_ref": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": false
+        },
+        "definitions": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+            "type": "object",
+            "required": [
+              "type",
+              "schema",
+              "schemaVersion",
+              "description"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "minLength": 3,
+                "maxLength": 128
+              },
+              "schema": {
+                "type": "object"
+              },
+              "schemaVersion": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "description": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 2000
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "subscriptions": {
+          "type": "array",
+          "maxItems": 128,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 128
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "message_source": {
+      "type": "object",
+      "properties": {
+        "auto_report_default": {"type": "boolean"},
+        "legacy_sources": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
+      },
+      "additionalProperties": false
+    },
+    "tool_exports": {"type": "object", "additionalProperties": {"type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"}},
+    "data": {"type": "object", "properties": {"version": {"type": "integer", "minimum": 1}}, "required": ["version"], "additionalProperties": false},
+    "agent_capabilities": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 3}},
+    "panels": {"type": "array", "items": {
+      "type": "object", "required": ["id", "title", "renderer"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{0,47}$"},
+        "title": {"type": "string", "minLength": 1, "maxLength": 80},
+        "renderer": {"enum": ["account-switcher/v1", "web-app/v1"]},
+        "actions": {"type": "object", "minProperties": 1, "additionalProperties": {
+          "type": "object", "required": ["capability", "effect"],
+          "properties": {"capability": {"type": "string"}, "effect": {"enum": ["read", "write_external"]}},
+          "additionalProperties": false
+        }},
+        "entry": {"type": "string", "minLength": 1, "maxLength": 512},
+        "build": {
+          "type": "object",
+          "required": ["command", "output"],
+          "properties": {
+            "command": {"type": "array", "minItems": 1, "maxItems": 32,
+                        "items": {"type": "string", "minLength": 1, "maxLength": 4096}},
+            "cwd": {"type": "string", "minLength": 1, "maxLength": 512},
+            "output": {"type": "string", "minLength": 1, "maxLength": 512},
+            "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 3600}
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {"if": {"properties": {"renderer": {"const": "account-switcher/v1"}}, "required": ["renderer"]},
+         "then": {"required": ["actions"], "not": {"anyOf": [{"required": ["entry"]}, {"required": ["build"]}]}}},
+        {"if": {"properties": {"renderer": {"const": "web-app/v1"}}, "required": ["renderer"]},
+         "then": {"required": ["entry", "build"]}}
+      ]
+    }}
+  },
+  "additionalProperties": false
+}

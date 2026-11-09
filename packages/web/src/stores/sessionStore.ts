@@ -1,3 +1,8 @@
+import {
+  beginSessionCreation, isLocalSessionIdentity, isSessionCreating, settleSessionCreation,
+  markSessionRemovedDuringCreation, wasSessionRemovedDuringCreation,
+} from './sessionCreation';
+import { takeHistoryPrefetch, peekHistoryPrefetch, type HistoryPrefetchContext } from '@/services/historyPagePrefetch';
 import { create } from 'zustand';
 import type {
   Session,
@@ -7,12 +12,13 @@ import type {
   SettingsBody,
   RewindScope,
   StreamEvent,
+  TerminalIdentity,
 } from '@/types';
 import {
   fetchSessions,
   fetchSessionHistory,
-  deleteSessionHistoryMessage,
   rewindSessionHistory,
+  deleteSessionHistoryMessage,
   createSession,
   deleteSession,
   batchDeleteSessions,
@@ -20,8 +26,14 @@ import {
   branchSession,
   reimportSession,
   setSessionWorkspaces,
+  setSessionPinned as setSessionPinnedApi,
+  ackSessionUnreadDone as ackSessionUnreadApi,
+  reorderPinnedSessions as reorderPinnedSessionsApi,
+  reportTaskManually as reportTaskManuallyApi,
+  ApiRequestError,
+  ManualReportRejectedError,
 } from '@/services/api';
-import { isMockMode } from '@/demo/mockBackend';
+import { applyMockPinnedOrder, isMockMode } from '@/demo/mockBackend';
 import { useUIStore } from '@/stores/uiStore';
 import { getCreationWorkspaceIds } from '@/utils/creationWorkspace';
 import { ALL_WORKSPACES, UNGROUPED_WORKSPACES } from '@/utils/sessionFilters';
@@ -96,6 +108,13 @@ interface SessionStore {
   currentMessages: Message[];
   hasMoreMessages: boolean;
   historyLoading: boolean;
+  /**
+   * Explicit browser-requested task reports, keyed `${sessionId}:${messageId}`.
+   * Kept in the store (not component state) so a virtualized row remount never
+   * loses or restarts an in-flight report, and a second click on the same
+   * block is a no-op instead of a duplicate delivery.
+   */
+  manualTaskReports: Record<string, ManualTaskReportEntry>;
   /** 首次进入 session 时拉取 fresh history 的进行中标志。summary=1 快照不带
    *  每条 history，selectSession 后 currentMessages 短暂为空——此时应显示转圈
    *  loading，而非「无消息」空态。与 historyLoading（loadOlderMessages 用）
@@ -117,6 +136,8 @@ interface SessionStore {
   // so it only skips reverting workerStatus/workerId for sessions that WS
   // events actually freshened *while its own HTTP request was in flight*.
   _sessionWsTouchedSeq: Record<string, number>;
+  /** Latest locally applied shared pin snapshot; protects in-flight list reads. */
+  _pinStateTouchedSeq: number;
   _historyRefreshSeq: Record<string, number>;
   _historyPageSeq: Record<string, number>;
   /** Monotonic per-session selection request sequence; protects A→B→A. */
@@ -141,14 +162,38 @@ interface SessionStore {
   historyWindowStarts: Record<string, number>;
 
   // Actions
-  loadSessions: () => Promise<void>;
-  selectSession: (id: string) => Promise<void>;
+  loadSessions: (options?: { throwOnError?: boolean }) => Promise<void>;
+  selectSession: (id: string, signal?: AbortSignal) => Promise<void>;
+  /** 推进某 Session 的未读 done 已读游标（服务端落盘）。
+   *  observedGeneration 为调用方实际看到的 done generation（唯一 ack 边界：
+   *  后端按 max(read, observed) 单调推进，重复/延迟/重试游标幂等，永不清除
+   *  其后的新 generation）；缺省取当前显示的 generation。
+   *  “选择即读”“选中会话新 done 自动已读”和徽标双击共用此入口。 */
+  ackSessionUnread: (id: string, observedGeneration?: number) => Promise<void>;
   refreshCurrentSessionHistory: () => Promise<void>;
-  loadOlderMessages: (limit?: number) => Promise<void>;
+  loadOlderMessages: (limit?: number, signal?: AbortSignal, searchJump?: boolean) => Promise<void>;
+  hasPrefetchedOlderMessages: () => boolean;
   /** Load pages until the stable fromEnd target is present in currentMessages. */
-  ensureMessageLoaded: (fromEnd: number, total: number) => Promise<Message | null>;
+  ensureMessageLoaded: (fromEnd: number, total: number, signal?: AbortSignal) => Promise<Message | null>;
+  /** Hide one visible history row via the backend sidecar (non-destructive). */
   deleteCurrentMessage: (message: Message) => Promise<void>;
   rewindCurrentMessage: (message: Message, scope: RewindScope) => Promise<void>;
+  /**
+   * Explicitly report one completed task to the Session's manager.
+   * `target` carries the identity captured when the button rendered (never
+   * re-read from live session state), so a late update or Session switch can
+   * never re-target the click at a different task.
+   */
+  reportTaskManually: (
+    sessionId: string,
+    target: {
+      taskId: string | null;
+      taskSeq: number | null;
+      messageId: string;
+      /** Durable terminal cursor; binds a plain run whose terminal has no taskSeq. */
+      resultCursor?: number;
+    },
+  ) => Promise<void>;
   /** Apply a session.rewind.progress WS event to the matching in-flight job. */
   applyRewindProgress: (event: StreamEvent) => void;
   /** Close the progress popup but KEEP the job running (not a cancel). */
@@ -171,11 +216,18 @@ interface SessionStore {
     adapter?: string,
     sessionTemplate?: string,
     settings?: {
+      nativeControl?: boolean;
       model?: string;
       permissionMode?: string;
       alwaysThinkingEnabled?: boolean;
       effort?: string;
       outputMode?: string;
+      modelContextWindow?: number;
+      modelAutoCompactTokenLimit?: number;
+      systemPrompt?: string;
+      mcpServers?: string[];
+      pluginBindings?: import('@/types').PluginBinding[];
+      panAccess?: import('@/types').PanAccess;
       workspaceIds?: string[];
     },
   ) => Promise<void>;
@@ -184,15 +236,23 @@ interface SessionStore {
   batchRemoveSessions: () => Promise<void>;
   rename: (id: string, name: string) => Promise<void>;
   branch: (id: string, name: string) => Promise<void>;
-  reimport: (id: string, activeWorkspaceId?: string) => Promise<void>;
+  reimport: (id: string, activeWorkspaceId?: string, confirmationToken?: string) => Promise<void>;
   setInputDraft: (id: string, draft: string) => void;
   acceptServerEpoch: (epoch: string | null | undefined) => void;
   beginUnscopedReplay: (sessionIds: string[]) => void;
   addMessage: (msg: Message) => void;
+  /** Append a terminal marker to its owning Session transcript, once per identity. */
+  appendWorkerResultMarker: (
+    sessionId: string,
+    marker: Message,
+    meta: LiveStreamMeta,
+    coverage?: TerminalCoverage,
+    deferUntilCoverage?: boolean,
+  ) => boolean;
   appendMessages: (msgs: Message[]) => void;
   /** Append a user-side control/message to its target Session projection. */
   appendLocalMessage: (sessionId: string, msg: Message) => void;
-  getLiveStreamMessages: (sessionId: string) => Message[];
+  getLiveStreamMessages: (sessionId: string, meta?: LiveStreamMeta) => Message[];
   /** Read the current task watermark before building a stream projection. */
   canApplyLiveStream: (sessionId: string, meta: LiveStreamMeta) => boolean;
   applyLiveStream: (sessionId: string, messages: Message[], meta: LiveStreamMeta) => boolean;
@@ -202,6 +262,8 @@ interface SessionStore {
       status?: string;
       cancelled?: boolean;
       result?: string;
+      rawResult?: string;
+      historyTerminalId?: string;
       terminalCoverage?: TerminalCoverage;
       historyEpoch?: string;
       historyRevision?: number;
@@ -225,20 +287,24 @@ interface SessionStore {
   updateQueuedMessage: (sessionId: string, item: { id: string; text: string; parts?: Message['parts'] }) => void;
   removeQueuedMessage: (sessionId: string, queueItemId: string) => void;
   /** Append user messages after the server confirms local CLI hand-off. */
-  appendDeliveredMessages: (sessionId: string, msgs: Message[]) => void;
+  appendDeliveredMessages: (sessionId: string, msgs: Message[], meta?: LiveStreamMeta, summary?: Partial<Session>) => void;
   /** Apply settings locally first, then reconcile or roll back the exact mutation. */
   patchSessionSettings: (
     sessionId: string,
     patch: SessionSettingPatch,
     persist: (id: string, settings: SettingsBody) => Promise<Session | ApiGenericResponse>,
   ) => Promise<SessionSettingsMutationResult>;
+  applySessionSnapshots: (sessions: Session[]) => void;
   updateSession: (id: string, data: Partial<Session>, preserveOnSnapshot?: boolean) => void;
+  setSessionPinned: (id: string, pinned: boolean) => Promise<void>;
+  reorderPinned: (ids: string[]) => Promise<void>;
+  applyPinnedSnapshot: (snapshot: { pinRevision: number; sessionIds: string[] }) => boolean;
   /** 就地更新某 session 卡片：追加结果文本到 history + lastResult + historyTotal，
    *  不等 300ms 防抖全量兜底即可让「最后消息 summary」立即最新（镜像 vanilla
    *  `_applyWorkerUpdate` 的就地更新路径）。 */
   applyResultToSession: (
     id: string,
-    e: { status?: string; cancelled?: boolean; result?: string },
+    e: { status?: string; cancelled?: boolean; result?: string; rawResult?: string },
   ) => void;
   toggleMultiSelect: (id?: string) => void;
   toggleSelection: (id: string) => void;
@@ -254,6 +320,71 @@ let wsTouchSeq = 0;
 let localTouchSeq = 0;
 let settingsTouchSeq = 0;
 let localMessageSeq = 0;
+let pinMutationSeq = 0;
+/** 同一 Session 同时只允许一个未读 ack 在途：后续触发合并进 `unreadAckWanted`
+ *  并在在途请求完成后继续收敛，避免 WS 回放 / 选中路径叠加出 ack 风暴。 */
+const unreadAckInFlight = new Set<string>();
+/** 每个 Session 的已观察 done generation 清零意图（唯一 ack 边界）；随成功
+ *  发送逐个消费，重复/延迟游标由服务端 max(read, observed) 幂等吸收。 */
+const unreadAckWanted = new Map<string, number>();
+
+/** Coerce a wire unread-done count/generation into a safe non-negative int. */
+function normalizedUnreadCount(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? Math.max(0, Math.floor(value))
+    : 0;
+}
+
+/**
+ * Queue summary triple (queuePendingCount / queueAllLocked / queueRevision) is
+ * versioned by the durable queueRevision alone — it deliberately does NOT ride
+ * summaryRevision (queue mutations do not bump the projection revision), so a
+ * list snapshot fetched before a queue event must not overwrite the newer WS
+ * patch, and vice versa.  Equal revisions accept the incoming payload (same
+ * durable state); missing versions on either side fall back to incoming.
+ */
+function preserveNewerQueue(current: Session, incoming: Session): Session {
+  const currentRevision = current.queueRevision;
+  const incomingRevision = incoming.queueRevision;
+  if (typeof currentRevision !== 'number' || typeof incomingRevision !== 'number') {
+    return incoming;
+  }
+  if (currentRevision <= incomingRevision) return incoming;
+  return {
+    ...incoming,
+    queuePendingCount: current.queuePendingCount,
+    queueAllLocked: current.queueAllLocked,
+    queuePaused: current.queuePaused,
+    queueRevision: currentRevision,
+  };
+}
+
+/**
+ * The unread-done cursor pair (generation, read generation) is a logical
+ * clock: both components only grow. A snapshot or WS payload whose pair is
+ * older than the local pair (e.g. a list response fetched before an ack and
+ * replayed after it) must not roll the badge or the read cursor back. Equal
+ * pairs accept the incoming payload — the server stays authoritative for the
+ * materialized count in that case.
+ */
+function preserveNewerUnread(current: Session, incoming: Session): Session {
+  const currentGeneration = current.unreadDoneGeneration;
+  const incomingGeneration = incoming.unreadDoneGeneration;
+  if (typeof currentGeneration !== 'number' || typeof incomingGeneration !== 'number') {
+    return incoming;
+  }
+  const currentRead = normalizedUnreadCount(current.unreadDoneReadGeneration);
+  const incomingRead = normalizedUnreadCount(incoming.unreadDoneReadGeneration);
+  const currentIsNewer = currentGeneration > incomingGeneration
+    || (currentGeneration === incomingGeneration && currentRead > incomingRead);
+  if (!currentIsNewer) return incoming;
+  return {
+    ...incoming,
+    unreadDoneCount: current.unreadDoneCount,
+    unreadDoneGeneration: currentGeneration,
+    unreadDoneReadGeneration: currentRead,
+  };
+}
 
 // Local user rows are transient projection state, not a new persisted wire
 // field.  Keep the count at which a row was created outside Zustand so an
@@ -292,9 +423,21 @@ function messageShapeKey(message: Message): string {
   return `${message.role}\u0000${message.content}\u0000${JSON.stringify(message.parts ?? null)}`;
 }
 
+function clientMessageIdentityAliases(message: Message): string[] {
+  return [
+    ...(message.clientMessageId ? [`client:${message.clientMessageId}`] : []),
+    // Steer keeps this caller token on its optimistic row as messageId. The
+    // durable history row has a Pan messageId and carries the token here.
+    ...(message.messageId?.startsWith('steer:')
+      ? [`client:${message.messageId}`]
+      : []),
+  ];
+}
+
 function explicitMessageIdentity(message: Message): string[] {
   return [
     ...(message.messageId ? [`message:${message.messageId}`] : []),
+    ...clientMessageIdentityAliases(message),
     ...(message.blockId ? [`block:${message.blockId}`] : []),
     ...queueIds(message).map((id) => `queue:${canonicalQueueId(id)}`),
     ...deliveryKeys(message).map((key) => `delivery:${key}`),
@@ -367,10 +510,71 @@ export interface SessionSettingsMutationResult {
   stale: boolean;
 }
 
+/** Lifecycle of one explicit task report bound to a message block. */
+export interface ManualTaskReportEntry {
+  /** `sending` guards concurrent clicks; `uncertain` means the request outcome
+   *  is unknown (transport failure) — a retry relies on server idempotency. */
+  state: 'sending' | 'sent' | 'failed' | 'uncertain';
+  error?: string;
+  queueItemId?: string;
+  /** Task identity captured when the report was sent (audit / re-render proof). */
+  taskId?: string | null;
+  taskSeq?: number | null;
+}
+
+/**
+ * Store key for one report: the delivery unit is the task **run**, so the same
+ * run cannot start (or show) two parallel reports regardless of which block a
+ * caller points at.
+ */
+export function manualTaskReportKey(
+  sessionId: string,
+  target: { taskId: string | null; taskSeq: number | null; resultCursor?: number },
+): string {
+  // Mirrors the server's run-identity key (`manual:{session}:{taskId|-}:{taskSeq
+  // 或 rc:resultCursor}`): a plain run whose terminal has no taskSeq is keyed
+  // by its durable result cursor, so two cursor-only runs can never share one
+  // local entry.  Runs with a taskSeq keep the historical key shape.
+  const runKey = target.taskSeq
+    ?? (typeof target.resultCursor === 'number' ? `rc:${target.resultCursor}` : null);
+  return `${sessionId}:${target.taskId ?? '-'}:${runKey ?? '-'}`;
+}
+
+/** Mirror bound for the client's per-task terminal index (server summary bound). */
+const TERMINAL_IDENTITY_LIMIT = 16;
+
+/**
+ * Merge one terminal identity into the bounded per-task index (newest last).
+ * A terminal is identified by its stable terminalKey, else by its ordered
+ * cursor plus task identity, so a replayed event updates its own row instead of
+ * appending a duplicate.
+ */
+function mergeTerminalIdentity(
+  existing: TerminalIdentity[] | null | undefined,
+  incoming: TerminalIdentity,
+): TerminalIdentity[] {
+  const rows = [...(existing ?? [])];
+  const sameRow = (row: TerminalIdentity, other: TerminalIdentity): boolean => {
+    if (row.terminalKey && other.terminalKey) return row.terminalKey === other.terminalKey;
+    if (typeof row.resultCursor === 'number' && typeof other.resultCursor === 'number'
+        && row.resultCursor !== other.resultCursor) return false;
+    return (row.taskId ?? null) === (other.taskId ?? null)
+      && (row.taskSeq ?? null) === (other.taskSeq ?? null);
+  };
+  const index = rows.findIndex((row) => sameRow(row, incoming));
+  if (index >= 0) {
+    rows[index] = { ...rows[index], ...incoming };
+  } else {
+    rows.push(incoming);
+  }
+  return rows.slice(-TERMINAL_IDENTITY_LIMIT);
+}
+
 export interface LiveStreamBuffer {
   workerId?: string;
   generation?: number;
   taskSeq?: number;
+  executionSeq?: number;
   taskId?: string;
   replayed?: boolean;
   turnId?: string;
@@ -380,6 +584,8 @@ export interface LiveStreamBuffer {
   taskKey?: string;
   /** Absolute history boundary captured when this task entered running state. */
   historyStartOffset?: number;
+  /** Summary prefix observed at this execution's first stream frame. */
+  summaryBaseTotal?: number;
   revision: number;
   messages: Message[];
   /** Projection indexes let delta updates avoid scanning canonical history. */
@@ -391,6 +597,10 @@ export interface LiveStreamBuffer {
    * a stale index overwrite an unrelated message.
    */
   projectionRefs?: Record<string, Message>;
+  /** Background-only display cache, valid for one canonical window/runtime. */
+  projectionDisplay?: Message[];
+  projectionWindow?: LoadedWindow;
+  projectionRuntime?: Message[];
 }
 
 /**
@@ -409,15 +619,70 @@ export interface SessionTranscript {
   /** Absolute offset where the runtime region starts. */
   anchorOffset: number;
   serverEpoch: string | null;
+  /** Executions superseded without a result, awaiting newer canonical coverage. */
+  retiredRuns?: Array<{ taskKey: string; start: number; epoch: string | null; revision: number }>;
+  /** Completed task scopes awaiting their versioned canonical history page. */
+  completedRuns?: Array<{
+    taskKey: string;
+    start: number;
+    epoch: string;
+    revision: number;
+    precedingRevision?: number;
+    finalRow: Message;
+  }>;
 }
 
 // Stable keys for runtime rows so a re-delivered live buffer replaces its own
 // previous run instead of appending a second copy.
 const runtimeKeys = new WeakMap<Message, string>();
+const completedLiveRows = new WeakSet<Message>();
+export function markCompletedLiveRows(rows: Message[]): void {
+  rows.forEach(row => completedLiveRows.add(row));
+}
+
+/** Retire only provisional slots of an execution whose ownership has ended. */
+function retireLiveProjection(base: SessionTranscript, buffer: Pick<LiveStreamBuffer, 'taskKey'>): SessionTranscript {
+  if (!buffer.taskKey) return base;
+  const prefix = `slot:${buffer.taskKey}:`;
+  return { ...base, runtime: base.runtime.filter(row =>
+    !runtimeKeyOf(row)?.startsWith(prefix) || completedLiveRows.has(row)) };
+}
+
+function deferRetiredProjection(base: SessionTranscript, buffer: LiveStreamBuffer): SessionTranscript {
+  if (!buffer.messages.length || !buffer.taskKey) return base;
+  return { ...base, retiredRuns: [...(base.retiredRuns ?? []), {
+    taskKey: buffer.taskKey, start: buffer.historyStartOffset ?? base.anchorOffset,
+    epoch: base.window.epoch, revision: base.window.revision,
+  }] };
+}
+
+function convergeRetiredRuns(base: SessionTranscript): SessionTranscript {
+  if (!base.retiredRuns?.length) return base;
+  let next = base;
+  const pending = base.retiredRuns.filter(run => {
+    const window = base.window;
+    if (window.epoch !== run.epoch || window.revision <= run.revision
+        || window.start === null || window.start > run.start || window.total <= run.start) return true;
+    for (let offset = run.start; offset < window.total; offset += 1) {
+      if (!window.rows.has(offset)) return true;
+    }
+    // A newer execution proves the old one ended, but only this newer complete
+    // canonical region proves what survived. Keep confirmed complete items.
+    next = retireLiveProjection(next, { taskKey: run.taskKey });
+    return false;
+  });
+  return next === base ? base : { ...next, retiredRuns: pending };
+}
 /** Canonical end offset proven to precede a local worker.result marker. */
 const terminalMarkerCoverage = Symbol('terminalMarkerCoverage');
+/** Server history boundary retained until its page has been loaded locally. */
+const terminalMarkerBoundary = Symbol('terminalMarkerBoundary');
+/** Resync-only marker that must wait for its canonical boundary before display. */
+const terminalMarkerAwaitCoverage = Symbol('terminalMarkerAwaitCoverage');
 type TerminalMarkerMessage = Message & {
   [terminalMarkerCoverage]?: { epoch: string | null; end: number };
+  [terminalMarkerBoundary]?: { historyEpoch?: string; historyRevision?: number };
+  [terminalMarkerAwaitCoverage]?: boolean;
 };
 
 function bindRuntimeKey(message: Message, key: string): Message {
@@ -438,10 +703,19 @@ export interface TerminalCoverage {
 
 export interface LiveStreamMeta {
   serverEpoch?: string;
+  lastLegalWorkerState?: string | null;
+  legalOffline?: boolean;
+  illegalOffline?: boolean;
+  legalityDiagnostics?: Session["legalityDiagnostics"];
   workerId?: string;
   generation?: number;
   taskSeq?: number;
+  executionSeq?: number;
   taskId?: string;
+  /** Stable backend identity for one terminal event, including seq-less tasks. */
+  terminalKey?: string;
+  /** Monotonic per-Session terminal cursor used to reject delayed replays. */
+  resultCursor?: number;
   /** True only for the server's reconnect replay cache, not live traffic. */
   replayed?: boolean;
   turnId?: string;
@@ -452,13 +726,56 @@ export interface LiveStreamMeta {
 interface TerminalWatermark extends LiveStreamMeta {
   status: string;
   revision: number;
-  /** Task identity of the terminal event, for idempotent replays. */
-  taskKey?: string;
-  /** Result body recorded at terminal time (replay detection without a cursor). */
-  result?: string;
   /** Durable coverage boundary carried by `worker.result`. */
   historyEpoch?: string;
   historyRevision?: number;
+}
+
+function terminalMarkerEnd(
+  window: LoadedWindow,
+  marker: Message,
+): number | undefined {
+  const row = marker as TerminalMarkerMessage;
+  const known = row[terminalMarkerCoverage];
+  if (known?.epoch === window.epoch) return known.end;
+  const boundary = row[terminalMarkerBoundary];
+  if (!boundary?.historyEpoch || boundary.historyEpoch !== window.epoch
+      || typeof boundary.historyRevision !== 'number'
+      || !Number.isSafeInteger(boundary.historyRevision)
+      || window.revision < boundary.historyRevision) return undefined;
+
+  // In an unchanged history epoch, every append advances historyRevision once
+  // and increases total by one. Their difference therefore identifies the
+  // absolute end offset covered by this terminal result, even if its live rows
+  // have already converged into history or later tasks have appended rows.
+  const end = window.total - (window.revision - boundary.historyRevision);
+  if (!Number.isSafeInteger(end) || end < 0 || end > window.total) return undefined;
+  row[terminalMarkerCoverage] = { epoch: window.epoch, end };
+  return end;
+}
+
+export function workerResultMarkerId(
+  sessionId: string,
+  meta: {
+    terminalKey?: string;
+    resultCursor?: number;
+    taskSeq?: number;
+    executionSeq?: number;
+    taskId?: string | null;
+  },
+): string | undefined {
+  const identity = meta.terminalKey
+    ? `terminal:${meta.terminalKey}`
+    : meta.resultCursor !== undefined
+      ? `cursor:${meta.resultCursor}`
+      : meta.taskSeq !== undefined && meta.taskId
+        ? `seq:${meta.taskSeq}:task:${meta.taskId}`
+        : meta.taskSeq !== undefined
+          ? String(meta.taskSeq)
+          : meta.taskId
+            ? `task:${meta.taskId}`
+            : undefined;
+  return identity ? `worker.result:${sessionId}:${identity}` : undefined;
 }
 
 /**
@@ -485,6 +802,17 @@ function isOlderMeta(incoming: LiveStreamMeta, known: LiveStreamMeta): boolean {
   if (incoming.workerId && known.workerId && incoming.workerId !== known.workerId) {
     return incoming.generation === undefined || known.generation === undefined
       || incoming.generation <= known.generation;
+  }
+  if (incoming.executionSeq !== undefined && known.executionSeq !== undefined) {
+    if (incoming.executionSeq !== known.executionSeq) {
+      return incoming.executionSeq < known.executionSeq;
+    }
+  } else if (incoming.executionSeq !== undefined) {
+    // First post-upgrade execution can follow a persisted legacy terminal.
+    // The backend allocates this cursor only at a new queue execution boundary.
+    return false;
+  } else if (known.executionSeq !== undefined && sameWorkerGeneration(incoming, known)) {
+    return true;
   }
   if (incoming.taskSeq !== undefined && known.taskSeq !== undefined) {
     if (incoming.taskSeq < known.taskSeq) return true;
@@ -528,6 +856,20 @@ function isOlderMeta(incoming: LiveStreamMeta, known: LiveStreamMeta): boolean {
   return false;
 }
 
+function workerStatusMetadata(meta: LiveStreamMeta): Partial<Session> {
+  return {
+    ...(meta.legalityDiagnostics !== undefined ? { legalityDiagnostics: meta.legalityDiagnostics } : {}),
+    ...(meta.legalOffline !== undefined ? { legalOffline: meta.legalOffline } : {}),
+    ...(meta.illegalOffline !== undefined ? { illegalOffline: meta.illegalOffline } : {}),
+    ...(meta.generation !== undefined ? { workerGeneration: meta.generation } : {}),
+    ...(meta.taskSeq !== undefined ? { workerTaskSeq: meta.taskSeq } : {}),
+    ...(meta.executionSeq !== undefined ? { workerExecutionSeq: meta.executionSeq } : {}),
+    ...(meta.taskId !== undefined ? { workerTaskId: meta.taskId } : {}),
+    ...(meta.lastLegalWorkerState !== undefined
+      ? { lastLegalWorkerState: meta.lastLegalWorkerState } : {}),
+  };
+}
+
 function isBlockedByTerminal(
   incoming: LiveStreamMeta,
   terminal: TerminalWatermark | undefined,
@@ -535,6 +877,11 @@ function isBlockedByTerminal(
 ): boolean {
   if (!terminal) return false;
   if (isOlderMeta(incoming, terminal)) return true;
+  if (incoming.executionSeq !== undefined && terminal.executionSeq === undefined) return false;
+  if (incoming.executionSeq !== undefined && terminal.executionSeq !== undefined) {
+    return status !== 'idle' && sameWorkerGeneration(incoming, terminal)
+      && incoming.executionSeq <= terminal.executionSeq;
+  }
   if (status === 'idle' && sameWorkerGeneration(incoming, terminal)) return false;
   if (status === 'running'
       && sameWorkerGeneration(incoming, terminal)
@@ -597,22 +944,74 @@ function sameSessionSnapshot(previous: Session, next: Session, server: Session):
 const SUMMARY_PROJECTION_FIELDS = [
   'summaryRevision', 'lastUserPreview', 'lastAssistantPreview',
   'lastDisplayPreview', 'lastMessage', 'historyTotal', 'updatedAt',
-  'workerStatus', 'workerId', 'workerGeneration', 'workerTaskId', 'workerTaskSeq',
+  'historyEpoch', 'historyRevision',
+  'summaryHistoryRevision',
+  // Execution legality is a durable Session fact, independent of live Worker
+  // task cursors (a crash snapshot legitimately omits executionSeq).
+  'legalOffline', 'illegalOffline', 'legalityDiagnostics',
 ] as const;
 
+const SUMMARY_PREVIEW_FIELDS = [
+  'lastUserPreview', 'lastAssistantPreview', 'lastDisplayPreview', 'lastMessage',
+] as const;
+
+const WORKER_SNAPSHOT_FIELDS = ['workerId', 'workerStatus', 'workerGeneration',
+  'workerTaskId', 'workerTaskSeq', 'workerExecutionSeq', 'lastLegalWorkerState'] as const;
+
+/** Worker generation/task cursors are independent of history summaryRevision. */
+function preserveNewerWorker(current: Session, incoming: Session, terminal?: TerminalWatermark): Session {
+  const olderGeneration = typeof current.workerGeneration === 'number'
+    && typeof incoming.workerGeneration === 'number'
+    && incoming.workerGeneration < current.workerGeneration;
+  const cursorMeta = (session: Session): LiveStreamMeta => ({
+    workerId: session.workerId ?? undefined,
+    generation: session.workerGeneration ?? undefined,
+    taskSeq: session.workerTaskSeq ?? undefined,
+    executionSeq: session.workerExecutionSeq ?? undefined,
+  });
+  const olderTask = current.workerId === incoming.workerId
+    && current.workerGeneration === incoming.workerGeneration
+    && isOlderMeta(cursorMeta(incoming), cursorMeta(current));
+  const completedTask = incoming.workerStatus === 'running' && terminal
+    && sameWorkerGeneration(cursorMeta(incoming), terminal)
+    && isBlockedByTerminal(cursorMeta(incoming), terminal, 'running');
+  if (!olderGeneration && !olderTask && !completedTask) return incoming;
+  return { ...incoming, workerId: current.workerId, workerStatus: current.workerStatus,
+    workerGeneration: current.workerGeneration, workerTaskId: current.workerTaskId,
+    workerTaskSeq: current.workerTaskSeq, workerExecutionSeq: current.workerExecutionSeq, lastLegalWorkerState: current.lastLegalWorkerState };
+}
+
 /** A delayed HTTP/WS snapshot must not roll a newer summary projection back. */
-function preserveNewerSummary(current: Session, incoming: Session): Session {
+function preserveNewerSummary(current: Session, incoming: Session, terminal?: TerminalWatermark, summary: Partial<Session> = incoming): Session {
   const currentRevision = current.summaryRevision;
   const incomingRevision = incoming.summaryRevision;
+  const summaryProvided = typeof summary.summaryRevision === 'number';
+  const currentHistoryRevision = current.summaryHistoryRevision ?? current.historyRevision;
+  const unchangedHistory = typeof currentHistoryRevision === 'number'
+    && typeof summary.historyRevision === 'number'
+    && summary.historyRevision === currentHistoryRevision;
+  if (summaryProvided && typeof summary.historyRevision === 'number') {
+    incoming = { ...incoming, summaryHistoryRevision: summary.historyRevision };
+  }
+  // A delta changes the live preview without changing the durable revision.
+  // Re-reading that same immutable projection must not erase the live suffix.
+  // Unversioned local writes still advance the preview normally.
+  if (summaryProvided && typeof currentRevision === 'number'
+      && (currentRevision === incomingRevision || unchangedHistory)) {
+    incoming = { ...incoming };
+    for (const field of SUMMARY_PREVIEW_FIELDS) {
+      if (field in current) Object.assign(incoming, { [field]: current[field] });
+    }
+  }
   if (typeof currentRevision !== 'number'
       || currentRevision <= (typeof incomingRevision === 'number' ? incomingRevision : -1)) {
-    return incoming;
+    return preserveNewerWorker(current, preserveNewerQueue(current, preserveNewerUnread(current, incoming)), terminal);
   }
   const preserved = { ...incoming, summaryRevision: currentRevision };
   for (const field of SUMMARY_PROJECTION_FIELDS) {
     if (field in current) Object.assign(preserved, { [field]: current[field] });
   }
-  return preserved;
+  return preserveNewerWorker(current, preserveNewerQueue(current, preserveNewerUnread(current, preserved)), terminal);
 }
 
 // ── Transcript helpers ──────────────────────────────────────────────────────
@@ -627,7 +1026,10 @@ function ensureTranscript(
   session: Session,
 ): SessionTranscript {
   const existing = transcripts?.[session.id];
-  if (existing && !transcriptIsStale(existing, session)) return existing;
+  // A versioned window is replaced only by mergeWindowPage's authoritative
+  // epoch/revision comparison. Summary metadata does not carry replacement
+  // rows and must never re-tag the mirrored display as a new durable window.
+  if (existing && (existing.window.epoch || !transcriptIsStale(existing, session))) return existing;
   return {
     window: windowFromSession(session),
     runtime: [],
@@ -639,14 +1041,19 @@ function ensureTranscript(
 /**
  * A transcript is stale when the Session's canonical projection cannot be a
  * continuation of the window it was built from: the epoch changed, or the row
- * count shrank (history replaced rather than appended). Real flows only grow,
- * so this never fires in production; it is what keeps a transcript from
- * outliving the Session snapshot it was derived from.
+ * count shrank in an unversioned snapshot (legacy fixtures and compatibility).
+ * Versioned windows retain their offsets within an epoch; a delayed summary
+ * count is not a history replacement boundary.
  */
 function transcriptIsStale(transcript: SessionTranscript, session: Session): boolean {
   if (session.historyEpoch && transcript.window.epoch
       && session.historyEpoch !== transcript.window.epoch) return true;
-  if (typeof session.historyTotal === 'number'
+  // A summary can lag a history response while a background Worker finishes.
+  // Within a known epoch, a smaller summary count cannot invalidate durable
+  // offsets or promote the mirrored runtime rows into canonical history.
+  const sameKnownEpoch = Boolean(session.historyEpoch && transcript.window.epoch
+    && session.historyEpoch === transcript.window.epoch);
+  if (!sameKnownEpoch && typeof session.historyTotal === 'number'
       && session.historyTotal < transcript.window.total) return true;
   return false;
 }
@@ -811,6 +1218,95 @@ function coveredTerminalRunEnd(
   return end;
 }
 
+/** Only a complete, versioned task region may replace transient provider items.
+ * Missing native items are legitimate: Codex's final history need not retain
+ * every progress/thinking notification sent over the live stream.
+ */
+function convergeCompletedRuns(transcript: SessionTranscript): SessionTranscript {
+  if (!transcript.completedRuns?.length) return transcript;
+  const { window } = transcript;
+  const covered = new Set<string>();
+  const representedRows = new Set<Message>();
+  let loadedIdentities: Set<string> | undefined;
+  let recoveredAnchorOffset = transcript.anchorOffset;
+  const pending = transcript.completedRuns.filter((run) => {
+    if (run.epoch !== window.epoch || window.revision < run.revision) return true;
+    // Same append/revision invariant as terminalMarkerEnd. Later tasks must
+    // not expand the completed task's durable boundary.
+    const end = window.total - (window.revision - run.revision);
+    const precedingEnd = run.precedingRevision === undefined
+      ? run.start
+      : window.total - (window.revision - run.precedingRevision);
+    let start = Math.min(run.start, precedingEnd);
+    if (!Number.isSafeInteger(start) || start < 0
+        || !Number.isSafeInteger(end) || end <= start || end > window.total) return true;
+    const recoveringBoundary = window.start !== null && start < window.start;
+    if (recoveringBoundary) {
+      // Running can arrive before the first history/list response, recording
+      // an unknown boundary as zero. Do not demand every older history row:
+      // an explicit final-item identity at this versioned end, plus a loaded
+      // user boundary, proves a bounded canonical region for the sealed run.
+      // Without either proof retain the runtime (including paginated tails).
+      const last = window.rows.get(end - 1);
+      const finalIds = explicitIdentityOf(run.finalRow);
+      if (!last || last.role !== 'assistant' || !finalIds.length
+          || !explicitIdentityOf(last).some(id => finalIds.includes(id))) return true;
+      let boundary: number | undefined;
+      for (let offset = end - 2; offset >= window.start!; offset -= 1) {
+        const row = window.rows.get(offset);
+        if (!row) return true;
+        if (row.role === 'user') {
+          boundary = offset;
+          break;
+        }
+      }
+      if (boundary === undefined) return true;
+      start = boundary;
+    }
+    let hasFinal = false;
+    for (let offset = start; offset < end; offset += 1) {
+      const row = window.rows.get(offset);
+      if (!row) return true;
+      if (row.role === 'assistant' && runtimeRowCompatible(run.finalRow, row)) hasFinal = true;
+    }
+    if (!hasFinal) return true;
+    if (recoveringBoundary) {
+      recoveredAnchorOffset = Math.max(recoveredAnchorOffset, end);
+      loadedIdentities ??= new Set([...window.rows.values()].flatMap(row =>
+        explicitIdentityOf(row).map(id => `${row.role}\0${id}`)));
+      const prefix = `slot:${run.taskKey}:`;
+      let unrepresented = false;
+      for (const row of transcript.runtime) {
+        if (!runtimeKeyOf(row)?.startsWith(prefix)) continue;
+        const emptyThinking = row.role === 'thinking' && !row.content.trim()
+          && (!row.parts?.length || row.parts.every(part => part.type === 'text' && !part.text.trim()));
+        if (emptyThinking || explicitIdentityOf(row).some(id => loadedIdentities!.has(`${row.role}\0${id}`))) {
+          representedRows.add(row);
+        } else {
+          // A mid-turn user/Steer boundary cannot prove earlier nonempty
+          // runtime absent from this page. Keep it until older history loads.
+          unrepresented = true;
+        }
+      }
+      if (unrepresented) return true;
+    }
+    covered.add(`slot:${run.taskKey}:`);
+    return false;
+  });
+  if (covered.size === 0 && representedRows.size === 0) return transcript;
+  const prefixes = [...covered];
+  return {
+    ...transcript,
+    anchorOffset: recoveredAnchorOffset,
+    completedRuns: pending,
+    runtime: transcript.runtime.filter((row) => {
+      if (representedRows.has(row)) return false;
+      const key = runtimeKeyOf(row);
+      return key === null || !prefixes.some((prefix) => key.startsWith(prefix));
+    }),
+  };
+}
+
 function projectTranscript(
   transcript: SessionTranscript,
   liveBuffer?: LiveStreamBuffer,
@@ -868,14 +1364,65 @@ function projectTranscript(
     }
   }
   const display: Message[] = [];
-  for (const [offset, message] of ordered) {
-    if (offset < anchorOffset) display.push(message);
+  const terminalMarkersByEnd = new Map<number, Message[]>();
+  const anchoredTerminalMarkers = new Set<Message>();
+  const emittedTerminalMarkers = new Set<Message>();
+  const outsideLoadedMarkers = new Set<Message>();
+  for (const row of runtime) {
+    if (!isLocalMarker(row) || !row.nativeItemId?.startsWith('worker.result:')) continue;
+    const end = terminalMarkerEnd(window, row);
+    if (end === undefined) {
+      if ((row as TerminalMarkerMessage)[terminalMarkerAwaitCoverage]) {
+        outsideLoadedMarkers.add(row);
+      }
+      continue;
+    }
+    if (window.start !== null && end < window.start) {
+      // Its owning history rows are outside this loaded page. Keep the marker
+      // in the Session runtime, but do not display it at the unrelated tail.
+      outsideLoadedMarkers.add(row);
+      continue;
+    }
+    const represented = end === window.start || end === window.end
+      || window.rows.has(end) || window.rows.has(end - 1);
+    if (!represented) {
+      if ((row as TerminalMarkerMessage)[terminalMarkerAwaitCoverage]) {
+        outsideLoadedMarkers.add(row);
+      }
+      continue;
+    }
+    const markers = terminalMarkersByEnd.get(end) ?? [];
+    markers.push(row);
+    terminalMarkersByEnd.set(end, markers);
+    anchoredTerminalMarkers.add(row);
   }
+  const pushTerminalMarkersAt = (end: number): void => {
+    const markers = terminalMarkersByEnd.get(end);
+    if (!markers) return;
+    display.push(...markers);
+    markers.forEach((marker) => emittedTerminalMarkers.add(marker));
+    terminalMarkersByEnd.delete(end);
+  };
   const emitted = new Set<number>();
+  const pushCanonicalRow = (offset: number, message: Message): void => {
+    pushTerminalMarkersAt(offset);
+    display.push(message);
+    emitted.add(offset);
+    pushTerminalMarkersAt(offset + 1);
+  };
+  if (window.start !== null && window.start < anchorOffset) {
+    pushTerminalMarkersAt(window.start);
+  }
+  for (const [offset, message] of ordered) {
+    if (offset >= anchorOffset) break;
+    pushCanonicalRow(offset, message);
+  }
+  pushTerminalMarkersAt(anchorOffset);
   let next = anchorOffset;
   let aligned = true;
   for (let index = 0; index < runtime.length; index += 1) {
     const row = runtime[index]!;
+    if (anchoredTerminalMarkers.has(row) || outsideLoadedMarkers.has(row)) continue;
     // Result markers bound a single completed turn. Once its whole runtime
     // run is durable, show canonical order and keep the marker after that run.
     // This also advances the offset before the next turn, so identical text in
@@ -892,15 +1439,17 @@ function projectTranscript(
           const coveredEnd = coveredTerminalRunEnd(window, next, run);
           if (coveredEnd !== undefined) {
             for (let offset = next; offset < coveredEnd; offset += 1) {
-              display.push(window.rows.get(offset)!);
-              emitted.add(offset);
+              pushCanonicalRow(offset, window.rows.get(offset)!);
             }
             const marker = runtime[markerIndex]!;
-            (marker as TerminalMarkerMessage)[terminalMarkerCoverage] = {
-              epoch: window.epoch,
-              end: coveredEnd,
-            };
-            display.push(marker);
+            if (!anchoredTerminalMarkers.has(marker)) {
+              (marker as TerminalMarkerMessage)[terminalMarkerCoverage] = {
+                epoch: window.epoch,
+                end: coveredEnd,
+              };
+              display.push(marker);
+              emittedTerminalMarkers.add(marker);
+            }
             next = coveredEnd;
             index = markerIndex;
             continue;
@@ -931,13 +1480,12 @@ function projectTranscript(
         }
         if (fullyLoaded) {
           for (let offset = next; offset < coverage.end; offset += 1) {
-            display.push(window.rows.get(offset)!);
-            emitted.add(offset);
+            pushCanonicalRow(offset, window.rows.get(offset)!);
           }
           next = coverage.end;
         }
       }
-      display.push(row);
+      if (!emittedTerminalMarkers.has(row)) display.push(row);
       continue;
     }
     const canonicalOffset = explicitIdentityOf(row)
@@ -975,13 +1523,11 @@ function projectTranscript(
         }
         // A canonical row the client never streamed (agent/user/tool injection)
         // belongs before this runtime row.
-        display.push(durable);
-        emitted.add(next);
+        pushCanonicalRow(next, durable);
         next += 1;
       }
       if (matched >= 0) {
-        display.push(window.rows.get(matched)!);
-        emitted.add(matched);
+        pushCanonicalRow(matched, window.rows.get(matched)!);
         next = matched + 1;
         continue;
       }
@@ -990,9 +1536,43 @@ function projectTranscript(
     display.push(row);
   }
   for (const [offset, message] of ordered) {
-    if (offset >= anchorOffset && !emitted.has(offset)) display.push(message);
+    if (offset >= anchorOffset && !emitted.has(offset)) pushCanonicalRow(offset, message);
   }
-  return display;
+  if (window.end !== null) pushTerminalMarkersAt(window.end);
+  return anchorHistoryTerminals(display);
+}
+
+/** Fixed server anchors beat frame arrival order, including late old results.
+ * Missing/paged-out anchors keep an independent row at its canonical offset.
+ * Never infer an anchor from whichever message happens to be last. */
+export function anchorHistoryTerminals(rows: Message[]): Message[] {
+  const anchors = new Set(rows.filter(row => row.kind !== 'terminal').map(row => row.messageId));
+  const events = new Map<string, Message[]>();
+  const seen = new Set<string>();
+  const result: Message[] = [];
+  for (const row of rows) {
+    const terminal = row.terminal;
+    if (row.kind !== 'terminal' || !terminal) continue;
+    if (seen.has(terminal.eventId)) continue;
+    seen.add(terminal.eventId);
+    if (terminal.anchorMessageId && anchors.has(terminal.anchorMessageId)) {
+      const group = events.get(terminal.anchorMessageId) ?? [];
+      group.push(row);
+      events.set(terminal.anchorMessageId, group);
+    }
+  }
+  seen.clear();
+  for (const row of rows) {
+    if (row.kind === 'terminal' && row.terminal) {
+      if (seen.has(row.terminal.eventId)) continue;
+      seen.add(row.terminal.eventId);
+      if (row.terminal.anchorMessageId && anchors.has(row.terminal.anchorMessageId)) continue;
+    }
+    result.push(row);
+    if (row.messageId) result.push(...(events.get(row.messageId) ?? []).sort(
+      (a, b) => a.terminal!.order - b.terminal!.order));
+  }
+  return result;
 }
 
 function withTranscript(
@@ -1024,6 +1604,7 @@ function sessionOf(state: SessionStore, sessionId: string): Session | undefined 
 function explicitIdentityOf(message: Message): string[] {
   return [
     ...(message.messageId ? [`message:${message.messageId}`] : []),
+    ...clientMessageIdentityAliases(message),
     ...(message.blockId ? [`block:${message.blockId}`] : []),
     ...queueIds(message).map((id) => `queue:${canonicalQueueId(id)}`),
     ...deliveryKeys(message).map((key) => `delivery:${key}`),
@@ -1036,6 +1617,31 @@ interface LiveProjection {
   indexes: Record<string, number>;
   refs: Record<string, Message>;
   appended: number;
+}
+
+/**
+ * A persisted hand-off receipt can trail its first stream frames. Place only
+ * the input identified by that receipt ahead of the matching execution.
+ */
+function placeDeliveredInput(
+  rows: Message[], incoming: Message[], buffer: LiveStreamBuffer | undefined,
+  meta: LiveStreamMeta | undefined,
+): Message[] {
+  if (!buffer || meta?.executionSeq === undefined
+      || buffer.executionSeq !== meta.executionSeq
+      || !meta.workerId || buffer.workerId !== meta.workerId
+      || meta.generation === undefined || buffer.generation !== meta.generation) return rows;
+  const prefix = `slot:${buffer.taskKey}:`;
+  const first = rows.findIndex(row => runtimeKeyOf(row)?.startsWith(prefix));
+  if (first < 0) return rows;
+  const moving = new Set(rows.slice(first + 1).filter(row =>
+    row.role === 'user' && !isDurableRow(row)
+      && incoming.some(message => hasExplicitIdentityOverlap(row, message))));
+  if (moving.size === 0) return rows;
+  // Only a proven input for this execution crosses its live rows. Steer and
+  // unrelated queue arrivals retain their interleaving and canonical offsets.
+  return [...rows.slice(0, first), ...moving,
+    ...rows.slice(first).filter(row => !moving.has(row))];
 }
 
 /**
@@ -1197,9 +1803,10 @@ function projectLiveRows(
         const merged = {
           ...target,
           ...live,
-          ...(keepDurableBody ? { content: target.content } : {}),
+          ...(keepDurableBody ? { content: target.content, rawContent: target.rawContent } : {}),
         };
         inheritMessageIdentity(merged, target);
+        if (completedLiveRows.has(live) || completedLiveRows.has(target)) completedLiveRows.add(merged);
         if (durableOffset !== undefined) markDurableRow(merged, durableOffset);
         display[targetIndex] = merged;
       }
@@ -1212,6 +1819,7 @@ function projectLiveRows(
     }
     targetIndexes[slot] = targetIndex;
     targetRefs[slot] = display[targetIndex]!;
+    if (completedLiveRows.has(live)) completedLiveRows.add(display[targetIndex]!);
     for (const key of keys) {
       indexes[key] = targetIndex;
       refs[key] = display[targetIndex]!;
@@ -1277,11 +1885,12 @@ function applyHistoryPageToState(
   sessionId: string,
   page: HistoryPage,
   base?: SessionTranscript,
+  preparedMerge?: ReturnType<typeof mergeWindowPage>,
 ): Partial<SessionStore> {
   const session = sessionOf(s, sessionId);
   if (!session) return s;
   const transcript = base ?? ensureTranscript(s.sessionTranscripts, session);
-  const merged = mergeWindowPage(transcript.window, page);
+  const merged = preparedMerge ?? mergeWindowPage(transcript.window, page);
   if (!merged.accepted) {
     // A page that neither adds an offset nor advances the revision is not an
     // error — a focus refresh of an unchanged window is exactly this — but the
@@ -1298,7 +1907,7 @@ function applyHistoryPageToState(
   };
   if (merged.replacedEpoch) {
     // A new epoch invalidates every runtime row of the old identity scope.
-    next = { ...next, runtime: [], anchorOffset: merged.window.total };
+    next = { ...next, runtime: [], completedRuns: [], anchorOffset: merged.window.total };
   } else {
     // Track rendered rows that neither carry a canonical offset nor belong to
     // the runtime region, so a rebuild cannot drop them. The leading run that
@@ -1338,6 +1947,7 @@ function applyHistoryPageToState(
   // the window we already have must not reconstruct the display: rows that
   // exist only in the rendered projection (an optimistic user row, an
   // agent-injected message) would be dropped by a rebuild.
+  next = convergeRetiredRuns(convergeCompletedRuns(next));
   const projected = projectTranscript(next, s.liveStreamBuffers[sessionId]);
   // Keep the previous array reference when the projection is unchanged: callers
   // (and the agent-injection retry) compare array identity to decide whether a
@@ -1357,7 +1967,7 @@ function applyHistoryPageToState(
   const projectedTotal = Math.max(
     merged.window.total,
     session.historyTotal ?? 0,
-    canonicalDisplay.length,
+    typeof session.summaryRevision === 'number' ? 0 : canonicalDisplay.length,
   );
   return {
     sessions: s.sessions.map((candidate) => candidate.id === sessionId
@@ -1369,7 +1979,8 @@ function applyHistoryPageToState(
           historyTruncated: (merged.window.start ?? 0) > 0,
           historyEpoch: merged.window.epoch ?? candidate.historyEpoch,
           historyRevision: merged.window.revision,
-          ...(lastCanonicalRow
+          summaryHistoryRevision: candidate.summaryHistoryRevision ?? candidate.historyRevision,
+          ...(lastCanonicalRow && typeof candidate.lastDisplayPreview !== 'string'
             ? { lastMessage: String(lastCanonicalRow.content).slice(0, 200) }
             : {}),
         }
@@ -1402,6 +2013,32 @@ function durableRowsOf(state: SessionStore, sessionId: string): Message[] {
   return (session?.history ?? []).filter((row) => !isLocalMarker(row));
 }
 
+/**
+ * The canonical row stored at an absolute history offset, or null when that
+ * offset cannot be attributed to a durable row.
+ *
+ * Only a window that already exists is an authority here: its rows were tagged
+ * by `markDurableRow` from a history page response or from the transcript's own
+ * seeding, so the offset it hands back is attributable. A missing offset returns
+ * null so the caller pages or reports the target as unlocatable, never guesses.
+ *
+ * With no transcript there is deliberately no answer. `Session.history` mirrors
+ * the rendered transcript and can still contain runtime, live and optimistic
+ * rows; neither dropping local markers nor handing that array to
+ * `windowFromSession` (which derives offsets from array positions) proves a
+ * canonical origin, and seeding here would also tag runtime objects as durable.
+ * A Session with no transcript is not yet navigable by canonical offset. The
+ * ordinary path is unaffected: `selectSession` and `ensureTranscript` install a
+ * transcript before navigation can run.
+ */
+function canonicalRowAtOffset(
+  state: SessionStore,
+  sessionId: string,
+  offset: number,
+): Message | null {
+  return state.sessionTranscripts[sessionId]?.window.rows.get(offset) ?? null;
+}
+
 /** Append rows that are not already represented, keeping the tail deduped. */
 function appendCanonicalRows(history: Message[], rows: Message[]): Message[] {
   if (rows.length === 0) return history;
@@ -1423,6 +2060,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
   sessions: [],
   activeRewinds: [],
   rewindTarget: null,
+  manualTaskReports: {},
   sessionsLoading: false,
   currentSessionId: null,
   currentMessages: [],
@@ -1437,6 +2075,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
   rendering: false,
   _loadSeq: 0,
   _sessionWsTouchedSeq: {},
+  _pinStateTouchedSeq: 0,
   _historyRefreshSeq: {},
   _historyPageSeq: {},
   _selectionSeq: {},
@@ -1453,16 +2092,22 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
   unscopedReplayPending: {},
   historyWindowStarts: {},
 
-  loadSessions: async () => {
+  loadSessions: async (options) => {
     // Reserve this refresh's sequence + snapshot the per-session WS touch
     // counters so a stale in-flight response can neither overwrite a newer
     // refresh nor revert sessions that were locally freshened while THIS
     // request was in flight.
     const loadSeq = get()._loadSeq + 1;
     const touchedAtStart = get()._sessionWsTouchedSeq;
+    const workersAtStart = new Map(get().sessions.map(session => [session.id, session]));
     const localTouchedAtStart = get()._sessionLocalTouchedSeq ?? {};
     const settingsTouchedAtStart = get()._sessionSettingsTouchedSeq ?? {};
+    const pinTouchedAtStart = get()._pinStateTouchedSeq ?? 0;
     const eventPatchesAtStart = get()._sessionEventPatches ?? {};
+    // Snapshot the accepted server epoch: a Pan restart while this request is
+    // in flight must not let the previous process's response (captured
+    // mid-shutdown) revert Sessions after the client accepted the new epoch.
+    const epochAtStart = get().serverEpoch;
     set({ _loadSeq: loadSeq, sessionsLoading: true });
     try {
       // summary=1: lean list (no per-session history download). Card preview
@@ -1470,6 +2115,10 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       // session's messages are loaded by selectSession via fetchSessionHistory.
       const sessions = await fetchSessions(true);
       if (get()._loadSeq !== loadSeq) return; // superseded by a newer refresh
+      // A response served by the pre-restart process must not overwrite
+      // post-restart state, even when no newer request superseded its seq
+      // (the epoch change is the later authority boundary here).
+      if (epochAtStart !== null && get().serverEpoch !== epochAtStart) return;
       const { currentSessionId } = get();
 
       set((s) => {
@@ -1493,9 +2142,10 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
         //    carrying it must not regress a status WS events already settled.
         // Anything else means the snapshot is authoritative for this session —
         // including the settled status of a completion event we never received.
+        const currentById = new Map(s.sessions.map((session) => [session.id, session]));
         const merged = sessions.map((sess) => {
           const sid = sess.id;
-          const cur = s.sessions.find((x) => x.id === sid);
+          const cur = currentById.get(sid);
           if (!cur) return sess;
           const touchedBefore = Object.prototype.hasOwnProperty.call(
             touchedAtStart,
@@ -1503,14 +2153,22 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
           );
           const touchedDuringFetch =
             (s._sessionWsTouchedSeq[sid] ?? 0) > (touchedAtStart[sid] ?? 0);
+          const workerChangedDuringFetch = touchedDuringFetch && WORKER_SNAPSHOT_FIELDS.some(field =>
+            cur[field] !== workersAtStart.get(sid)?.[field]);
           const locallyTouchedDuringFetch =
             (s._sessionLocalTouchedSeq?.[sid] ?? 0) > (localTouchedAtStart[sid] ?? 0);
           const settingsTouchedDuringFetch =
             (s._sessionSettingsTouchedSeq?.[sid] ?? 0) > (settingsTouchedAtStart[sid] ?? 0);
+          const pinStateTouchedDuringFetch =
+            (s._pinStateTouchedSeq ?? 0) > pinTouchedAtStart;
           const snapshotIsTransientDone = sess.workerStatus === 'done';
-          const preserveLocalWorker =
-            touchedDuringFetch ||
-            (touchedBefore && (cur.workerStatus === null || snapshotIsTransientDone));
+          const newerGeneration = typeof sess.workerGeneration === 'number'
+            && typeof cur.workerGeneration === 'number'
+            && sess.workerGeneration > cur.workerGeneration;
+          const preserveLocalWorker = !newerGeneration && (
+            workerChangedDuringFetch ||
+            (touchedBefore && (cur.workerStatus === null || snapshotIsTransientDone))
+          );
           let next = sess;
           // summary=1 intentionally omits history.  Do not let that empty
           // projection erase a loaded/local history that is needed when the
@@ -1519,22 +2177,19 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
           // canonical history and reconciles this projection by identity.
           const summaryHasHistory = Array.isArray(sess.history)
             && sess.history.length > 0;
-          const hasLocalUserProjection = Boolean(
-            cur && (cur.history || []).some(isLocallyOwnedUserMessage),
-          );
           if (cur && !summaryHasHistory && (cur.history || []).length > 0) {
             next = {
               ...next,
               history: cur.history,
               historyTruncated: cur.historyTruncated,
+              historyStart: cur.historyStart,
+              historyEpoch: cur.historyEpoch,
+              historyRevision: cur.historyRevision,
               historyTotal: Math.max(
                 sess.historyTotal ?? 0,
                 cur.historyTotal ?? 0,
                 cur.history.length,
               ),
-              ...(hasLocalUserProjection && cur.lastMessage
-                ? { lastMessage: cur.lastMessage }
-                : {}),
             };
           }
           // The selected chat is rendered from `currentMessages` plus its
@@ -1588,17 +2243,24 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
               // it is the destroy/crash transition, not a missing value.
               workerStatus: cur.workerStatus,
               workerId: cur.workerId,
+              lastLegalWorkerState: cur.lastLegalWorkerState,
+              workerGeneration: cur.workerGeneration,
+              workerTaskId: cur.workerTaskId,
+              workerTaskSeq: cur.workerTaskSeq,
+              workerExecutionSeq: cur.workerExecutionSeq,
             };
           }
-          // summary=1 omits workerId (server.py `_session_summary`) — carry the
-          // last-known value forward so the toolbar / worker actions keep
+          // Legacy summaries can omit workerId. Carry the last-known value
+          // forward only when the identity is absent so the toolbar / worker actions keep
           // resolving the worker after a plain list refresh. Only when the
           // server still reports a live worker (workerStatus present): once the
           // worker is killed/crashed the summary flips workerStatus to null,
           // and a dead workerId must not keep the action buttons alive.
           const carryWorkerId = preserveLocalWorker
             ? cur.workerId
-            : (cur.workerId && sess.workerStatus ? cur.workerId : sess.workerId);
+            : ('workerId' in sess
+              ? sess.workerId
+              : (cur.workerId && sess.workerStatus ? cur.workerId : undefined));
           // summary=1 omits the per-session settings — keep the current
           // session's known values (loaded on demand via the settings popover)
           // across refreshes so the pills / effort select don't flip to
@@ -1635,7 +2297,29 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
           // that this response cannot visibly roll back the newer payload.
           const eventPatch = s._sessionEventPatches?.[sid] ?? eventPatchesAtStart[sid];
           if (eventPatch && Object.keys(eventPatch).length > 0) {
-            next = { ...next, ...eventPatch };
+            // Pre-request worker patches have already reached local state.
+            // They must not overrule the later HTTP runtime truth. Other
+            // fields retain the existing one-shot event protection.
+            const applicablePatch = { ...eventPatch };
+            if (!workerChangedDuringFetch) {
+              for (const field of WORKER_SNAPSHOT_FIELDS) delete applicablePatch[field];
+            }
+            next = { ...next, ...applicablePatch };
+          }
+          if (pinStateTouchedDuringFetch) {
+            next = {
+              ...next,
+              pinned: cur.pinned,
+              pinOrder: cur.pinOrder,
+              pinRevision: cur.pinRevision,
+            };
+          } else if ((cur.pinRevision ?? -1) > (next.pinRevision ?? -1)) {
+            next = {
+              ...next,
+              pinned: cur.pinned,
+              pinOrder: cur.pinOrder,
+              pinRevision: cur.pinRevision,
+            };
           }
           const mutation = s.sessionSettingMutations?.[sid];
           if (settingsTouchedDuringFetch || mutation?.pending) {
@@ -1648,12 +2332,23 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
               next = mergeSessionSettingPatch(next, mutation?.authoritative);
             }
           }
-          next = preserveNewerSummary(cur, next);
+          // Compare intact server projections. Local history preservation and
+          // cached event patches must not splice an old preview/revision into
+          // a newer HTTP response before the monotonicity check.
+          if (typeof sess.summaryRevision === 'number') {
+            for (const field of SUMMARY_PROJECTION_FIELDS) {
+              // These cursors describe the loaded window (or the client's
+              // separate summary cursor), not fields owned by this merge.
+              if (field === 'historyEpoch' || field === 'historyRevision' || field === 'summaryHistoryRevision') continue;
+              if (field in sess) Object.assign(next, { [field]: sess[field] });
+            }
+          }
+          next = preserveNewerSummary(cur, next, s.terminalWatermarks[sid], sess);
           return sameSessionSnapshot(cur, next, sess) ? cur : next;
         });
         const consumedEventIds = new Set(sessions.map((sess) => sess.id));
         return {
-          sessions: merged,
+          sessions: [...merged, ...s.sessions.filter(session => isSessionCreating(session.id))],
           _sessionEventPatches: Object.fromEntries(
             Object.entries(s._sessionEventPatches ?? {}).filter(([sid]) => !consumedEventIds.has(sid)),
           ),
@@ -1687,8 +2382,9 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
           initialLoading: false,
         });
       }
-    } catch {
+    } catch (error) {
       console.warn('[sessionStore] loadSessions failed');
+      if (options?.throwOnError) throw error;
     } finally {
       // 只有最新的刷新请求拥有 sessionsLoading 标志：被更新请求取代的旧响应
       // 在 finally 里不能清掉新请求的转圈状态（否则刷新瞬间 sidebar 闪烁）。
@@ -1696,12 +2392,16 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
     }
   },
 
-  selectSession: async (id: string) => {
+  selectSession: async (id: string, signal?: AbortSignal) => {
     // Drafts are persisted by InputRow's onChange → setInputDraft; nothing to
     // save here. (Previously read a non-existent `#chatInput` DOM node.)
 
     const session = get().sessions.find((s) => s.id === id);
     if (!session) return;
+    if (isLocalSessionIdentity(id)) {
+      set({ currentSessionId: id, currentMessages: [], initialLoading: false });
+      return;
+    }
 
     const loaded = (session.history || []).length;
     const needsOlder = !!session.historyTruncated;
@@ -1740,19 +2440,31 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       };
     });
 
+    // 选择即读：选中即推进该 Session 的未读 done 已读游标（乐观清零 +
+    // ack 落盘）。selectSession 是 currentSessionId 的唯一写入入口，因此
+    // 卡片点击与命令面板 / 历史搜索 / 导入等既有导航选择全部走同一条路径；
+    // ack 边界用已观察的 generation，而不是可重复减的计数。
+    const unreadAtSelection = normalizedUnreadCount(session.unreadDoneCount);
+    const unreadGenerationAtSelection = normalizedUnreadCount(session.unreadDoneGeneration);
+    if (unreadAtSelection > 0 && unreadGenerationAtSelection > 0) {
+      void get().ackSessionUnread(id, unreadGenerationAtSelection);
+    }
+
     // 进入 session 后立即拉服务端最新历史替换快照。React 的快照只靠防抖
     // loadSessions 刷新，可能滞后或（在 _loadSeq 超驰/事件丢失时）过期——
     // 事件刷新快照可能先于 history 持久化，不能覆盖正在流式显示的回复。
     try {
-      const data: ApiSessionHistoryResponse = await fetchSessionHistory(
-        id,
-        0,
-        historyPageSize(),
-      );
+      const data: ApiSessionHistoryResponse = signal
+        ? await fetchSessionHistory(id, 0, historyPageSize(), signal)
+        : await fetchSessionHistory(id, 0, historyPageSize());
       if (
+        signal?.aborted ||
         get().currentSessionId !== id ||
         get()._selectionSeq[id] !== selectionSeq
       ) {
+        if (signal?.aborted && get().currentSessionId === id && get()._selectionSeq[id] === selectionSeq) {
+          set({ initialLoading: false });
+        }
         // 用户已切走，丢弃过期结果。若当前已无选中 session（如该 session 在
         // 请求期间被删除），不会有后续 selectSession 重置 initialLoading——
         // 这里兜底清掉，避免 chat 面板一直停在转圈。
@@ -1761,6 +2473,12 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       }
       get().applyHistoryPage(id, data as HistoryPage);
     } catch {
+      if (signal?.aborted) {
+        if (get().currentSessionId === id && get()._selectionSeq[id] === selectionSeq) {
+          set({ initialLoading: false });
+        }
+        return;
+      }
       // 网络失败：保留快照（上方已 set），不阻塞切换。同样清掉
       // initialLoading——否则「空快照 + 拉取失败」会让 chat 面板一直转圈。
       if (
@@ -1775,7 +2493,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
 
   refreshCurrentSessionHistory: async () => {
     const sid = get().currentSessionId;
-    if (!sid) return;
+    if (!sid || isLocalSessionIdentity(sid)) return;
     const requestSeq = (get()._historyRefreshSeq[sid] ?? 0) + 1;
     set((s) => ({
       _historyRefreshSeq: { ...s._historyRefreshSeq, [sid]: requestSeq },
@@ -1797,13 +2515,18 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
     }
   },
 
-  ensureMessageLoaded: async (fromEnd: number, total: number) => {
+  ensureMessageLoaded: async (fromEnd: number, total: number, signal?: AbortSignal) => {
     const absoluteIndex = total - 1 - fromEnd;
     if (absoluteIndex < 0) return null;
+    const sessionId = get().currentSessionId;
+    if (!sessionId) return null;
+    const selectionSeq = get()._selectionSeq[sessionId];
+    const selectionIsCurrent = (state: SessionStore) =>
+      state.currentSessionId === sessionId && state._selectionSeq[sessionId] === selectionSeq;
     let previousEnd = Number.POSITIVE_INFINITY;
     for (let attempt = 0; attempt < 400; attempt += 1) {
       const state = get();
-      if (!state.currentSessionId) return null;
+      if (signal?.aborted || !selectionIsCurrent(state)) return null;
       if (state.historyLoadEnd <= absoluteIndex || !state.hasMoreMessages) break;
       if (state.historyLoading) {
         await new Promise((resolve) => setTimeout(resolve, 25));
@@ -1815,17 +2538,28 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       // span in one bounded request instead of replaying 50-message pages;
       // normal scroll pagination keeps its 50-message default below.
       const needed = state.historyLoadEnd - absoluteIndex;
-      await state.loadOlderMessages(Math.min(Math.max(needed, 50), 1000));
+      const pageSize = Math.min(Math.max(needed, 50), 1000);
+      await state.loadOlderMessages(pageSize, signal, true);
     }
     const state = get();
-    if (!state.currentSessionId || state.historyLoadEnd > absoluteIndex) return null;
-    const localIndex = absoluteIndex - state.historyLoadEnd;
-    return state.currentMessages[localIndex] ?? null;
+    if (signal?.aborted || !selectionIsCurrent(state) || state.historyLoadEnd > absoluteIndex) return null;
+    // `absoluteIndex` is a canonical history offset, so it must be resolved in
+    // canonical index space. `currentMessages` interleaves local markers
+    // (`[DONE] Task completed`) and runtime rows, so its positions drift from
+    // canonical offsets by one per preceding non-canonical row — indexing it
+    // directly returned the neighbouring row and sent quick-jump to the wrong
+    // message. Resolve the durable row that owns this offset instead; an offset
+    // the window cannot prove stays null so the caller reports it as
+    // unlocatable rather than landing on a guessed neighbour.
+    return canonicalRowAtOffset(state, sessionId, absoluteIndex);
   },
 
-  loadOlderMessages: async (limit?: number) => {
+  hasPrefetchedOlderMessages: () => peekHistoryPrefetch(getHistoryPrefetchContext(), get().historyLoadEnd),
+
+  loadOlderMessages: async (limit?: number, signal?: AbortSignal, searchJump = false) => {
     const { currentSessionId, historyLoading, historyLoadEnd } = get();
     if (
+      signal?.aborted ||
       historyLoading ||
       historyLoadEnd <= 0 ||
       !currentSessionId
@@ -1838,12 +2572,13 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
     set((s) => ({ _historyPageSeq: { ...s._historyPageSeq, [sid]: pageSeq } }));
 
     try {
-      const data: ApiSessionHistoryResponse = await fetchSessionHistory(
-        sid,
-        historyLoadEnd,
-        limit ?? historyPageSize(),
-      );
-      if (get().currentSessionId !== sid || get()._historyPageSeq[sid] !== pageSeq) {
+      const context = getHistoryPrefetchContext();
+      const cached = !searchJump && (limit ?? historyPageSize()) === context?.limit
+        ? takeHistoryPrefetch(context, historyLoadEnd) : null;
+      const data: ApiSessionHistoryResponse = cached ?? (signal
+        ? await fetchSessionHistory(sid, historyLoadEnd, limit ?? historyPageSize(), signal, searchJump)
+        : await fetchSessionHistory(sid, historyLoadEnd, limit ?? historyPageSize(), undefined, searchJump));
+      if (signal?.aborted || get().currentSessionId !== sid || get()._historyPageSeq[sid] !== pageSeq) {
         if (get().currentSessionId === sid) set({ historyLoading: false });
         return;
       }
@@ -1953,6 +2688,63 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
           : item
       )),
     }));
+  },
+
+  reportTaskManually: async (sessionId, target) => {
+    const key = manualTaskReportKey(sessionId, target);
+    // One in-flight report per (task, block): a second click (or a remount
+    // racing the first request) must never start a parallel delivery.
+    if (get().manualTaskReports[key]?.state === 'sending') return;
+    if (get().manualTaskReports[key]?.state === 'sent') return;
+    set((s) => ({
+      manualTaskReports: {
+        ...s.manualTaskReports,
+        [key]: { state: 'sending', taskId: target.taskId, taskSeq: target.taskSeq },
+      },
+    }));
+    const fail = (state: 'failed' | 'uncertain', message: string) => {
+      set((s) => ({
+        manualTaskReports: {
+          ...s.manualTaskReports,
+          [key]: { state, error: message, taskId: target.taskId, taskSeq: target.taskSeq },
+        },
+      }));
+      useUIStore.getState().showToast(message, state === 'failed' ? 'error' : 'warning');
+    };
+    try {
+      const data = await reportTaskManuallyApi(
+        sessionId, target.taskId, target.taskSeq, target.messageId, target.resultCursor);
+      set((s) => ({
+        manualTaskReports: {
+          ...s.manualTaskReports,
+          [key]: {
+            state: 'sent',
+            queueItemId: data.queueItemId,
+            taskId: target.taskId,
+            taskSeq: target.taskSeq,
+          },
+        },
+      }));
+      useUIStore.getState().showToast(
+        data.alreadyReported ? '该任务已向 manager 汇报过' : '已向 manager 汇报该任务',
+        'info',
+      );
+    } catch (error) {
+      if (error instanceof ManualReportRejectedError) {
+        // Definite server-side rejection: nothing was delivered, so a retry
+        // is a fresh attempt (the button re-arms).
+        fail('failed', error.message);
+        return;
+      }
+      if (error instanceof ApiRequestError) {
+        fail('uncertain', `汇报结果不确定（${error.message}），请重试确认`);
+        return;
+      }
+      fail('uncertain',
+        error instanceof Error && error.message
+          ? `汇报结果不确定（${error.message}），请重试确认`
+          : '汇报结果不确定，请重试确认');
+    }
   },
 
   applyRewindProgress: (event: StreamEvent) => {
@@ -2080,7 +2872,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
     const activeWorkspaceId = useUIStore.getState().activeWorkspaceId;
     const initialWorkspaceIds = settings?.workspaceIds ?? [];
     const placeholder: Session = {
-      id: `__pending_${name}`,
+      id: beginSessionCreation(name),
       name: '...',
       adapter: adapter || 'cbc',
       model: settings?.model ?? null,
@@ -2097,6 +2889,8 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       // 不会被下方 set 自动重置，若不在此清空，左侧卡片已切到新 session 但
       // 聊天区仍渲染旧 session 内容，需反复切换才刷新（bug 1）。
       currentMessages: [],
+      hasMoreMessages: false,
+      historyLoading: false,
       // 新 session 没有 history 需要拉取——清掉可能残留的 initialLoading，
       // 否则空历史的新会话会一直显示转圈而非空态。
       initialLoading: false,
@@ -2127,6 +2921,15 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
         const withoutPlaceholder = s.sessions.filter(
           (se) => se.id !== placeholder.id,
         );
+        // A delete after session.created but before this response wins.
+        if (wasSessionRemovedDuringCreation(session.id)) {
+          return {
+            sessions: withoutPlaceholder.filter(se => se.id !== session.id),
+            ...(s.currentSessionId === placeholder.id
+              ? { currentSessionId: null, currentMessages: [], initialLoading: false }
+              : {}),
+          };
+        }
         // Only append the real session if a concurrent reload didn't already
         // bring it in (avoids a duplicate row).
         const alreadyLoaded = withoutPlaceholder.some((se) => se.id === session.id);
@@ -2140,12 +2943,9 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
                 : se,
             )
           : [...withoutPlaceholder, session];
-        // A concurrent loadSessions() also resets currentSessionId to null
-        // when it can't find the client-only placeholder in the server list —
-        // treat that as "still the newly created session" so the selection
-        // lands on the real session.
+        // Only this selected creation owns the selection; null is user intent.
         const wasCurrent =
-          s.currentSessionId === placeholder.id || s.currentSessionId === null;
+          s.currentSessionId === placeholder.id;
         return {
           sessions,
           currentSessionId: wasCurrent ? session.id : s.currentSessionId,
@@ -2154,20 +2954,25 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
           // 仅当创建流程仍是当前选中时才覆盖——若用户中途切走，保持其当前
           // session 的消息不变，避免把别的 session 的消息区清空。
           currentMessages: wasCurrent ? session.history || [] : s.currentMessages,
-          initialLoading: false,
+          ...(wasCurrent ? { initialLoading: false } : {}),
         };
       });
     } catch (e) {
       set((s) => ({
         sessions: s.sessions.filter((se) => se.id !== placeholder.id),
-        initialLoading: false,
+        ...(s.currentSessionId === placeholder.id
+          ? { currentSessionId: null, currentMessages: [], initialLoading: false }
+          : {}),
       }));
       throw e;
+    } finally {
+      settleSessionCreation(placeholder.id);
     }
   },
 
   removeSession: async (id: string) => {
     if (id.startsWith('__pending_')) return;
+    markSessionRemovedDuringCreation(id);
     // Optimistic removal
     set((s) => ({
       sessions: s.sessions.filter((session) => session.id !== id),
@@ -2205,6 +3010,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
 
   removeSessions: async (ids: string[], cascadeIds: string[] = []) => {
     const selected = new Set(ids.filter((id) => !id.startsWith('__pending_')));
+    selected.forEach(markSessionRemovedDuringCreation);
     if (selected.size === 0) return;
     set((s) => ({
       sessions: s.sessions.filter((session) => !selected.has(session.id)),
@@ -2242,6 +3048,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
     const { selectedIds } = get();
     const ids = Array.from(selectedIds);
     if (ids.length === 0) return;
+    ids.forEach(markSessionRemovedDuringCreation);
 
     set((s) => ({
       sessions: s.sessions.filter(
@@ -2285,16 +3092,14 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
     await get().loadSessions();
   },
 
-  reimport: async (id: string, activeWorkspaceId = useUIStore.getState().activeWorkspaceId) => {
+  reimport: async (id: string, activeWorkspaceId = useUIStore.getState().activeWorkspaceId, confirmationToken) => {
     const session = get().sessions.find((s) => s.id === id);
     if (!session?.cliSessionId) return;
 
-    const reimportedSession = await reimportSession(
-      id,
-      session.adapter || 'cbc',
-      session.cliSessionId,
-      session.workdir,
-    );
+    const args = [id, session.adapter || 'cbc', session.cliSessionId, session.workdir] as const;
+    const reimportedSession = confirmationToken
+      ? await reimportSession(...args, confirmationToken)
+      : await reimportSession(...args);
     const concreteWorkspaceId = activeWorkspaceId
       && activeWorkspaceId !== ALL_WORKSPACES
       && activeWorkspaceId !== UNGROUPED_WORKSPACES
@@ -2493,6 +3298,87 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
     });
   },
 
+  appendWorkerResultMarker: (sessionId, marker, meta, coverage, deferUntilCoverage = false) => {
+    if (!sessionId || marker.role !== 'system') return false;
+    const touchSeq = (localTouchSeq += 1);
+    let appended = false;
+    set((s) => {
+      const session = sessionOf(s, sessionId);
+      const base = s.sessionTranscripts[sessionId]
+        ?? (session
+          ? ensureTranscript(s.sessionTranscripts, session)
+          : { window: createWindow(), runtime: [], anchorOffset: 0, serverEpoch: null });
+      const markerId = marker.nativeItemId;
+      const watermark = s.terminalWatermarks[sessionId];
+      if (watermark) {
+        const sameTerminal = Boolean(
+          (meta.terminalKey && watermark.terminalKey
+            && meta.terminalKey === watermark.terminalKey)
+          || (meta.resultCursor !== undefined && watermark.resultCursor !== undefined
+            && meta.resultCursor === watermark.resultCursor)
+          || (meta.taskSeq !== undefined && watermark.taskSeq !== undefined
+            && meta.taskSeq === watermark.taskSeq
+            && !(meta.taskId && watermark.taskId && meta.taskId !== watermark.taskId)),
+        );
+        const comparableCursor = meta.resultCursor !== undefined
+          && watermark.resultCursor !== undefined;
+        const sameCursorDistinctIdentity = meta.taskSeq !== undefined
+          && watermark.taskSeq !== undefined && meta.taskSeq === watermark.taskSeq
+          && Boolean((meta.terminalKey && watermark.terminalKey
+            && meta.terminalKey !== watermark.terminalKey)
+            || (meta.taskId && watermark.taskId && meta.taskId !== watermark.taskId));
+        if (!sameTerminal && comparableCursor && meta.resultCursor! < watermark.resultCursor!) {
+          return s;
+        }
+        if (!sameTerminal && !comparableCursor && isOlderMeta(meta, watermark)
+            && !sameCursorDistinctIdentity) return s;
+      }
+      if (markerId && (
+        base.runtime.some((row) => row.nativeItemId === markerId)
+        || (s.currentSessionId === sessionId
+          && s.currentMessages.some((row) => row.nativeItemId === markerId))
+      )) return s;
+
+      markLocalMarker(marker);
+      if (coverage?.historyEpoch && typeof coverage.historyRevision === 'number') {
+        (marker as TerminalMarkerMessage)[terminalMarkerBoundary] = {
+          historyEpoch: coverage.historyEpoch,
+          historyRevision: coverage.historyRevision,
+        };
+      }
+      if (deferUntilCoverage) {
+        (marker as TerminalMarkerMessage)[terminalMarkerAwaitCoverage] = true;
+      }
+      const row = bindRuntimeKey(
+        marker,
+        markerId ? `marker:${markerId}` : `marker:${touchSeq}`,
+      );
+      const transcript: SessionTranscript = {
+        ...base,
+        runtime: [...base.runtime, row],
+      };
+      appended = true;
+      const touched = {
+        _sessionLocalTouchedSeq: {
+          ...s._sessionLocalTouchedSeq,
+          [sessionId]: touchSeq,
+        },
+      };
+      if (s.currentSessionId !== sessionId) {
+        return { ...withTranscript(s, sessionId, transcript), ...touched };
+      }
+
+      const display = projectTranscript(transcript, s.liveStreamBuffers[sessionId]);
+      return {
+        currentMessages: display,
+        sessions: mirrorHistory(s.sessions, sessionId, display),
+        ...withTranscript(s, sessionId, transcript),
+        ...touched,
+      };
+    });
+    return appended;
+  },
+
   appendMessages: (msgs: Message[]) => {
     if (!msgs.length) return;
     const touchSeq = (localTouchSeq += 1);
@@ -2541,7 +3427,10 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
               nextHistory.length,
               historyTotal + (alreadyInHistory ? 0 : 1),
             ),
-            lastMessage: localMessage.content.slice(0, 200),
+            // Steer HTTP acknowledgement can arrive after its assistant WS
+            // summary. This local transcript echo owns no canonical preview.
+            lastMessage: typeof session.summaryRevision === 'number'
+              ? session.lastMessage : localMessage.content.slice(0, 200),
           }
         : session);
       const alreadyCurrent = s.currentMessages.some((candidate) =>
@@ -2569,12 +3458,17 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
     });
   },
 
-  getLiveStreamMessages: (sessionId) =>
-    (get().liveStreamBuffers[sessionId]?.messages || []).slice(),
+  getLiveStreamMessages: (sessionId, meta) => {
+    const buffer = get().liveStreamBuffers[sessionId];
+    // A missed result/running pair must not seed the new execution with the
+    // previous execution's cumulative items or transient native aliases.
+    if (!buffer || (meta && taskScopeKey(sessionId, meta, buffer) !== buffer.taskKey)) return [];
+    return buffer.messages.slice();
+  },
 
   canApplyLiveStream: (sessionId, meta) => {
     const state = get();
-    if (meta.replayed === true && meta.taskSeq === undefined && !meta.taskId
+    if (meta.replayed === true && meta.executionSeq === undefined && meta.taskSeq === undefined && !meta.taskId
         && (state.unscopedReplayPending[sessionId]
           || (state.unscopedReplayPending['*']
             && state.unscopedReplayPending[sessionId] !== false))) return false;
@@ -2588,7 +3482,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
     if (!messages.length) return false;
     let accepted = false;
     set((s) => {
-      if (meta.replayed === true && meta.taskSeq === undefined && !meta.taskId
+      if (meta.replayed === true && meta.executionSeq === undefined && meta.taskSeq === undefined && !meta.taskId
           && (s.unscopedReplayPending[sessionId]
             || (s.unscopedReplayPending['*']
               && s.unscopedReplayPending[sessionId] !== false))) return s;
@@ -2602,18 +3496,26 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       ) + 1;
       const taskKey = taskScopeKey(sessionId, meta, previous);
       const session = sessionOf(s, sessionId);
-      const base = session
+      let base = session
         ? ensureTranscript(s.sessionTranscripts, session)
         : { window: createWindow(), runtime: [], anchorOffset: 0, serverEpoch: null };
+      const replacing = previous && taskKey !== previous.taskKey;
+      if (replacing) {
+        base = deferRetiredProjection(base, previous);
+        if (previous.messages.length) queueMicrotask(() => { void get().recoverSessionHistory(sessionId); });
+      }
       const buffer: LiveStreamBuffer = {
         ...meta,
         taskKey,
-        historyStartOffset: previous?.historyStartOffset ?? base.anchorOffset,
+        historyStartOffset: replacing ? Math.max(base.window.total, base.anchorOffset)
+          : previous?.historyStartOffset ?? base.anchorOffset,
+        summaryBaseTotal: (!replacing ? previous?.summaryBaseTotal : undefined)
+          ?? Math.max(session?.historyTotal ?? 0, base.window.total, base.anchorOffset),
         revision,
         messages: messages.slice(),
       };
       accepted = true;
-      const replayPending = (meta.taskSeq !== undefined || Boolean(meta.taskId))
+      const replayPending = (meta.executionSeq !== undefined || meta.taskSeq !== undefined || Boolean(meta.taskId))
         && (s.unscopedReplayPending[sessionId]
           || s.unscopedReplayPending['*'])
         ? { ...s.unscopedReplayPending, [sessionId]: false }
@@ -2623,9 +3525,14 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       // moves rows appended during the turn (Steer/queue delivery) in front of
       // stream blocks that had already appeared. Use the target Session's
       // current projection, then retain that exact interleaving in runtime.
-      const targetDisplay = s.currentSessionId === sessionId
+      const selected = s.currentSessionId === sessionId;
+      const targetDisplay = replacing ? projectTranscript(base) : selected
         ? s.currentMessages
-        : projectTranscript(base, previous);
+        : previous?.projectionDisplay
+          && previous.projectionWindow === base.window
+          && previous.projectionRuntime === base.runtime
+          ? previous.projectionDisplay
+          : projectTranscript(base, previous);
       const projected = projectLiveRows(
         targetDisplay,
         previous,
@@ -2636,16 +3543,20 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       buffer.projectionIndexes = projected.indexes;
       buffer.projectionRefs = projected.refs;
       const runtime = projected.display.filter((row) => !isDurableRow(row));
+      if (!selected) {
+        buffer.projectionDisplay = projected.display;
+        buffer.projectionWindow = base.window;
+        buffer.projectionRuntime = runtime;
+      }
       const transcript: SessionTranscript = {
         ...base,
         runtime,
       };
-      if (s.currentSessionId === sessionId) {
+      if (selected) {
         return {
           liveStreamBuffers: { ...s.liveStreamBuffers, [sessionId]: buffer },
           unscopedReplayPending: replayPending,
           currentMessages: projected.display,
-          sessions: mirrorHistory(s.sessions, sessionId, projected.display),
           ...withTranscript(s, sessionId, transcript),
         };
       }
@@ -2665,7 +3576,8 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       const terminal = s.terminalWatermarks[sessionId];
       const previousBuffer = s.liveStreamBuffers[sessionId];
       const result = typeof event.result === 'string' ? event.result : '';
-      const hasResult = result.trim().length > 0;
+      const hasResult = result.trim().length > 0
+        && !(event.historyTerminalId && event.status === 'error');
       const status = event.status === 'error'
         ? 'error'
         : event.status === 'cancelled' || event.cancelled
@@ -2673,16 +3585,32 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
           : 'done';
       const incomingTaskKey = taskScopeKey(sessionId, meta, previousBuffer);
       if (terminal) {
-        // Every side effect of a terminal event is idempotent. A replay or a
-        // late event for the same task cursor must not add a second assistant
-        // row, clear a newer live buffer, or move the DONE anchor.
-        if (isOlderMeta(meta, terminal)) return s;
+        // Backend terminal identity is stronger than taskSeq: reports and
+        // compatibility tasks can have no taskSeq, and a cursor can be reused
+        // across distinct task identities. resultCursor also lets an older
+        // replay be rejected after a newer terminal has already been applied.
+        const sameTerminalKey = Boolean(meta.terminalKey && terminal.terminalKey
+          && meta.terminalKey === terminal.terminalKey);
+        if (sameTerminalKey) return s;
+        const hasComparableResultCursor = meta.resultCursor !== undefined
+          && terminal.resultCursor !== undefined;
+        if (hasComparableResultCursor && meta.resultCursor! <= terminal.resultCursor!) return s;
+
+        const distinctTaskIdentity = Boolean(
+          (meta.terminalKey && terminal.terminalKey
+            && meta.terminalKey !== terminal.terminalKey)
+          || (meta.resultCursor !== undefined && terminal.resultCursor !== undefined
+            && meta.resultCursor !== terminal.resultCursor)
+          || (meta.taskId && terminal.taskId && meta.taskId !== terminal.taskId),
+        );
         const sameCursor = terminal.taskSeq !== undefined && meta.taskSeq !== undefined
           && terminal.taskSeq === meta.taskSeq;
-        const noCursor = terminal.taskSeq === undefined && meta.taskSeq === undefined
-          && terminal.taskId === undefined && meta.taskId === undefined;
-        if (sameCursor || terminal.taskKey === incomingTaskKey) return s;
-        if (noCursor && terminal.result === result) return s;
+        const sameCursorWithDistinctIdentity = sameCursor && distinctTaskIdentity;
+        if (!hasComparableResultCursor && isOlderMeta(meta, terminal)
+            && !sameCursorWithDistinctIdentity) return s;
+        if (sameCursor && !distinctTaskIdentity) return s;
+        if (meta.taskId && terminal.taskId && meta.taskId === terminal.taskId
+            && !distinctTaskIdentity) return s;
       }
       if (previousBuffer && isOlderMeta(meta, previousBuffer)) return s;
       const coverage: TerminalCoverage = event.terminalCoverage ?? {
@@ -2699,6 +3627,12 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       const base = session
         ? ensureTranscript(s.sessionTranscripts, session)
         : { window: createWindow(), runtime: [], anchorOffset: 0, serverEpoch: null };
+      const markerId = workerResultMarkerId(sessionId, meta);
+      if (markerId && (
+        base.runtime.some((row) => row.nativeItemId === markerId)
+        || (s.currentSessionId === sessionId
+          && s.currentMessages.some((row) => row.nativeItemId === markerId))
+      )) return s;
       const liveMessages = previousBuffer?.messages ?? [];
       // The protocol-referenced final block is the last assistant block *of this
       // task's own live rows* — never "the last assistant anywhere".
@@ -2713,7 +3647,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       let appendedResult = false;
       if (hasResult) {
         finalized = liveMessages.map((message, index) => {
-          const next = index === finalSlot ? { ...message, content: result } : { ...message };
+          const next = index === finalSlot ? { ...message, content: result, ...(event.rawResult !== undefined || message.rawContent !== undefined ? { rawContent: event.rawResult ?? result } : {}) } : { ...message };
           inheritMessageIdentity(next, message);
           return next;
         });
@@ -2721,12 +3655,18 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
           const row: Message = {
             role: 'assistant',
             content: result,
+            ...(event.rawResult !== undefined ? { rawContent: event.rawResult } : {}),
             ...(meta.turnId ? { nativeItemId: `turn:${meta.turnId}` } : {}),
           };
           finalized = [...finalized, row];
           appendedResult = true;
         }
       }
+      // Codex plan/diff are live turn summaries and never durable history
+      // rows. Their own terminal is sufficient proof to retire them; waiting
+      // for complete older history can strand them behind the DONE marker.
+      // Keep every ordinary native item under the existing coverage rules.
+      finalized = finalized.filter(row => !row.nativeAggregate);
       const revision = Math.max(
         previousBuffer?.revision ?? 0,
         terminal?.revision ?? 0,
@@ -2820,10 +3760,32 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
           // previous version of a row (a superseded live buffer object), not an
           // untracked row that needs adopting.
           const key = runtimeKeyOf(row);
-          return key === null || !trackedKeys.has(key);
+          return key === null || (!trackedKeys.has(key) && !previousLiveKeys.has(key));
         });
         if (adopted.length > 0) {
           nextTranscript = { ...nextTranscript, runtime: [...adopted, ...nextTranscript.runtime] };
+        }
+      }
+      if (previousBuffer?.taskKey && hasResult && coverage.historyEpoch
+          && Number.isSafeInteger(coverage.historyRevision)
+          && previousBuffer.historyStartOffset !== undefined) {
+        const finalRow = finalized.findLast(row => row.role === 'assistant');
+        if (finalRow?.role === 'assistant') {
+          nextTranscript = {
+            ...nextTranscript,
+            completedRuns: [...(nextTranscript.completedRuns ?? []), {
+              taskKey: incomingTaskKey,
+              start: previousBuffer.historyStartOffset,
+              epoch: coverage.historyEpoch,
+              revision: coverage.historyRevision!,
+              ...(terminal?.historyEpoch === coverage.historyEpoch
+                && typeof terminal.historyRevision === 'number'
+                && terminal.historyRevision < coverage.historyRevision!
+                ? { precedingRevision: terminal.historyRevision } : {}),
+              finalRow,
+            }],
+          };
+          nextTranscript = convergeCompletedRuns(nextTranscript);
         }
       }
       const display = isCurrent && finalized.length > 0
@@ -2853,7 +3815,23 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
             result,
             timestamp: new Date().toISOString(),
             ...(meta.taskSeq !== undefined ? { taskSeq: meta.taskSeq } : {}),
+            ...(meta.taskId !== undefined ? { taskId: meta.taskId } : {}),
           },
+          // Mirror the durable terminal this event describes into the bounded
+          // per-task index, so a task that just completed gets its own explicit
+          // report action immediately instead of waiting for the next list read.
+          // The history boundary comes from the terminal coverage, which is the
+          // same epoch/revision the server validates the tail block against.
+          terminalResults: mergeTerminalIdentity(candidate.terminalResults, {
+            status,
+            ...(meta.taskId !== undefined ? { taskId: meta.taskId } : {}),
+            ...(meta.taskSeq !== undefined ? { taskSeq: meta.taskSeq } : {}),
+            ...(meta.terminalKey !== undefined ? { terminalKey: meta.terminalKey } : {}),
+            ...(meta.resultCursor !== undefined ? { resultCursor: meta.resultCursor } : {}),
+            ...(coverage.historyEpoch ? { historyEpoch: coverage.historyEpoch } : {}),
+            ...(typeof coverage.historyRevision === 'number'
+              ? { historyRevision: coverage.historyRevision } : {}),
+          }),
         };
       });
 
@@ -2864,6 +3842,13 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
         // durable history now covers this task, so converge the runtime rows
         // onto the canonical rows instead of trusting the stream's shape.
         queueMicrotask(() => {
+          // A resync snapshot can supply this durable tail in the same turn.
+          // Avoid another HTTP read once the versioned final row is present.
+          const window = get().sessionTranscripts[sessionId]?.window;
+          if (window && coverage.historyEpoch === window.epoch
+              && typeof coverage.historyRevision === 'number'
+              && window.revision >= coverage.historyRevision
+              && (window.total === 0 || window.rows.has(window.total - 1))) return;
           void get().recoverSessionHistory(sessionId);
         });
       }
@@ -2876,10 +3861,8 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
           ...s.terminalWatermarks,
           [sessionId]: {
             ...meta,
-            taskKey: incomingTaskKey,
             status,
             revision,
-            result,
             ...(coverage.historyEpoch ? { historyEpoch: coverage.historyEpoch } : {}),
             ...(typeof coverage.historyRevision === 'number'
               ? { historyRevision: coverage.historyRevision }
@@ -2909,14 +3892,18 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       const session = sessionOf(s, sessionId);
       if (!session) return s;
       const base = ensureTranscript(s.sessionTranscripts, session);
-      accepted = mergeWindowPage(base.window, page).accepted;
-      return applyHistoryPageToState(s, sessionId, page);
+      // Reuse this merge: copying and tagging a long loaded window twice
+      // contributes no additional authority check inside the same store set.
+      const merged = mergeWindowPage(base.window, page);
+      accepted = merged.accepted;
+      return applyHistoryPageToState(s, sessionId, page, base, merged);
     });
     return accepted;
   },
 
   /** Recover the canonical tail after a terminal event's coverage boundary. */
   recoverSessionHistory: async (sessionId) => {
+    if (isLocalSessionIdentity(sessionId)) return;
     const requestSeq = (get()._historyRefreshSeq[sessionId] ?? 0) + 1;
     set((s) => ({
       _historyRefreshSeq: { ...s._historyRefreshSeq, [sessionId]: requestSeq },
@@ -2953,10 +3940,15 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       // legacy/taskId-only path compatible by applying this guard only when a
       // taskSeq is present on either side.
       if (previous
-          && (meta.taskSeq !== undefined || previous.taskSeq !== undefined)
+          && (meta.executionSeq !== undefined || previous.executionSeq !== undefined
+            || meta.taskSeq !== undefined || previous.taskSeq !== undefined)
           && isOlderMeta(meta, previous)) return s;
-      if (previous && status === 'running' && meta.taskSeq !== undefined
-          && previous.taskSeq !== undefined && meta.taskSeq > previous.taskSeq) {
+      if (previous && status === 'running'
+          && ((meta.executionSeq !== undefined
+            && (!sameWorkerGeneration(meta, previous)
+              || previous.executionSeq === undefined || meta.executionSeq > previous.executionSeq))
+            || (meta.executionSeq === undefined && meta.taskSeq !== undefined
+              && previous.taskSeq !== undefined && meta.taskSeq > previous.taskSeq))) {
         // A new task on the same worker starts a fresh transient turn. Keep an
         // empty task-scoped watermark instead of deleting the buffer outright:
         // a late old delta must be rejected during the gap before the first
@@ -2970,6 +3962,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
           workerId: meta.workerId,
           generation: meta.generation,
           taskSeq: meta.taskSeq,
+          executionSeq: meta.executionSeq,
           taskId: meta.taskId,
           taskKey: taskScopeKey(sessionId, meta),
           historyStartOffset: captureHistoryBoundary(),
@@ -2977,10 +3970,18 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
           messages: [],
         };
         accepted = true;
+        const base = s.sessionTranscripts[sessionId];
+        const transcript = base ? deferRetiredProjection(base, previous) : undefined;
+        if (previous.messages.length) queueMicrotask(() => { void get().recoverSessionHistory(sessionId); });
         return {
           liveStreamBuffers: nextBuffers,
+          ...(transcript ? {
+            ...withTranscript(s, sessionId, transcript),
+            ...(s.currentSessionId === sessionId ? { currentMessages: projectTranscript(transcript) } : {}),
+          } : {}),
           sessions: s.sessions.map((session) => session.id === sessionId
-            ? { ...session, workerId: meta.workerId ?? session.workerId, workerStatus: status }
+            ? { ...session, workerId: meta.workerId ?? session.workerId, workerStatus: status,
+                ...workerStatusMetadata(meta) }
             : session),
           _sessionWsTouchedSeq: { ...s._sessionWsTouchedSeq, [sessionId]: (wsTouchSeq += 1) },
         };
@@ -2992,12 +3993,13 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
               ...session,
               workerId: terminal ? null : meta.workerId ?? session.workerId,
               workerStatus: status,
+              ...workerStatusMetadata(meta),
             }
           : session),
         _sessionWsTouchedSeq: { ...s._sessionWsTouchedSeq, [sessionId]: (wsTouchSeq += 1) },
       };
       if (!terminal && status === 'running' && !previous
-          && (meta.taskSeq !== undefined || Boolean(meta.taskId))) {
+          && (meta.executionSeq !== undefined || meta.taskSeq !== undefined || Boolean(meta.taskId))) {
         const nextBuffers = { ...s.liveStreamBuffers };
         nextBuffers[sessionId] = {
           ...meta,
@@ -3029,9 +4031,16 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
         ) + 1;
         const nextBuffers = { ...s.liveStreamBuffers };
         delete nextBuffers[sessionId];
+        const base = s.sessionTranscripts[sessionId];
+        const transcript = base && previous ? retireLiveProjection(base, previous) : base;
+        if (previous?.messages.length) queueMicrotask(() => { void get().recoverSessionHistory(sessionId); });
         return {
           ...next,
           liveStreamBuffers: nextBuffers,
+          ...(transcript && transcript !== base ? {
+            ...withTranscript(s, sessionId, transcript),
+            ...(s.currentSessionId === sessionId ? { currentMessages: projectTranscript(transcript) } : {}),
+          } : {}),
           terminalWatermarks: {
             ...s.terminalWatermarks,
             [sessionId]: { ...meta, status: status || 'terminal', revision },
@@ -3045,10 +4054,20 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
 
   clearLiveStream: (sessionId) => {
     set((s) => {
-      if (!s.liveStreamBuffers[sessionId]) return s;
+      const buffer = s.liveStreamBuffers[sessionId];
+      if (!buffer) return s;
       const liveStreamBuffers = { ...s.liveStreamBuffers };
       delete liveStreamBuffers[sessionId];
-      return { liveStreamBuffers };
+      // Lifecycle replacement ends this live projection even without a result.
+      // Preserve durable window rows and locally owned user/queue rows; only
+      // the interrupted buffer's task slots cease to be authoritative.
+      const base = s.sessionTranscripts[sessionId];
+      if (!base) return { liveStreamBuffers };
+      const transcript = retireLiveProjection(base, buffer);
+      if (buffer.messages.length) queueMicrotask(() => { void get().recoverSessionHistory(sessionId); });
+      return { liveStreamBuffers, ...withTranscript(s, sessionId, transcript),
+        ...(s.currentSessionId === sessionId ? { currentMessages: projectTranscript(transcript) } : {}),
+      };
     });
   },
 
@@ -3086,12 +4105,12 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
         ? {
             ...session,
             history: nextHistory,
-            historyTotal: Math.max(
+            historyTotal: typeof session.summaryRevision === 'number' ? session.historyTotal : Math.max(
               session.historyTotal ?? history.length,
               nextHistory.length,
               historyTotal + (historyHasItem ? 0 : 1),
             ),
-            lastMessage: item.text.slice(0, 200),
+            lastMessage: typeof session.summaryRevision === 'number' ? session.lastMessage : item.text.slice(0, 200),
           }
         : session);
       return {
@@ -3150,7 +4169,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       if (!changed) return s;
       return {
         sessions: s.sessions.map((session) => session.id === sessionId
-          ? { ...session, history, lastMessage: item.text.slice(0, 200) }
+          ? { ...session, history, lastMessage: typeof session.summaryRevision === 'number' ? session.lastMessage : item.text.slice(0, 200) }
           : session),
         ...(s.sessionTranscripts[sessionId] ? withTranscript(s, sessionId, {
           ...s.sessionTranscripts[sessionId]!,
@@ -3210,7 +4229,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
     });
   },
 
-  appendDeliveredMessages: (sessionId: string, msgs: Message[]) => {
+  appendDeliveredMessages: (sessionId: string, msgs: Message[], meta?: LiveStreamMeta, summary?: Partial<Session>) => {
     if (!msgs.length) return;
     const touchSeq = (localTouchSeq += 1);
     const localMessages = msgs.map((message) => ({
@@ -3299,7 +4318,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
         // made A→B→A erase an otherwise successful hand-off.
         nextHistory.push(...historyAppend);
         const last = localMessages[localMessages.length - 1];
-        return {
+        const next = preserveNewerSummary(session, {
           ...session,
           history: nextHistory,
           historyTotal: Math.max(
@@ -3307,7 +4326,24 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
             nextHistory.length,
           ),
           lastMessage: last?.content.slice(0, 200) ?? session.lastMessage,
-        };
+          ...(summary ?? {}),
+        }, s.terminalWatermarks[sessionId], summary ?? {});
+        const live = s.liveStreamBuffers[sessionId];
+        // write/drain can yield to stdout before the input receipt is sent.
+        // This exact execution's input prefix precedes its streamed response,
+        // even when the receipt advances the history/summary revisions later.
+        // A Steer/unrelated execution or a summary covering later history does
+        // not qualify. Keep the input's canonical cursor and lastUserPreview.
+        if (live && meta?.executionSeq !== undefined && live.executionSeq === meta.executionSeq
+            && meta.workerId && live.workerId === meta.workerId
+            && meta.generation !== undefined && live.generation === meta.generation
+            && (live.summaryBaseTotal ?? live.historyStartOffset) !== undefined && typeof summary?.historyTotal === 'number'
+            && summary.historyTotal <= (live.summaryBaseTotal ?? live.historyStartOffset)! + localMessages.length) {
+          const response = live.messages.findLast(row => row.role === 'assistant' && row.content);
+          if (response) return { ...next, lastMessage: response.content.slice(0, 200),
+            lastDisplayPreview: response.content.slice(0, 200), lastAssistantPreview: response.content.slice(0, 200) };
+        }
+        return next;
       });
 
       const deliveredRuntime = base.runtime.map(row => {
@@ -3326,6 +4362,11 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
             bindRuntimeKey(row, `delivered:${touchSeq}:${index}`),
           )
         : [];
+      const deliveryDisplay = [...selectedMessages, ...currentAppend];
+      const display = placeDeliveredInput(deliveryDisplay, localMessages,
+        s.liveStreamBuffers[sessionId], meta);
+      const runtime = placeDeliveredInput([...deliveredRuntime, ...runtimeRows], localMessages,
+        s.liveStreamBuffers[sessionId], meta);
       return {
         sessions,
         _pendingQueueIds: {
@@ -3342,10 +4383,10 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
           ...s._sessionLocalTouchedSeq,
           [sessionId]: touchSeq,
         },
-        ...(selected && (currentAppend.length || currentChanged)
-          ? { currentMessages: [...selectedMessages, ...currentAppend] }
+        ...(selected && (currentAppend.length || currentChanged || display !== deliveryDisplay)
+          ? { currentMessages: display }
           : {}),
-        ...withTranscript(s, sessionId, { ...base, runtime: [...deliveredRuntime, ...runtimeRows] }),
+        ...withTranscript(s, sessionId, { ...base, runtime }),
       };
     });
   },
@@ -3459,6 +4500,35 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
     }
   },
 
+  applySessionSnapshots: (snapshots) => {
+    const incomingById = new Map(snapshots.map(session => [session.id, session]));
+    set((s) => {
+      const touches = { ...s._sessionWsTouchedSeq };
+      let changed = false;
+      const sessions = s.sessions.map(current => {
+        const incoming = incomingById.get(current.id);
+        if (!incoming) return current;
+        const patch: Partial<Session> = { ...incoming };
+        // Summary snapshots never own the loaded history window.
+        delete patch.history;
+        delete patch.historyStart;
+        delete patch.historyTruncated;
+        delete patch.historyEpoch;
+        delete patch.historyRevision;
+        const next = preserveNewerSummary(current, mergeSessionSettingPatch(
+          { ...current, ...patch },
+          s.sessionSettingMutations[current.id]?.pending
+            ? s.sessionSettingMutations[current.id]?.patch : undefined,
+        ), s.terminalWatermarks[current.id], incoming);
+        if (sameSessionSnapshot(current, next, patch as Session)) return current;
+        changed = true;
+        touches[current.id] = (wsTouchSeq += 1);
+        return next;
+      });
+      return changed ? { sessions, _sessionWsTouchedSeq: touches } : s;
+    });
+  },
+
   updateSession: (id: string, data: Partial<Session>, preserveOnSnapshot = false) => {
     const touchSeq = (wsTouchSeq += 1);
     set((s) => ({
@@ -3472,6 +4542,8 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
                   ? s.sessionSettingMutations[id].patch
                   : undefined,
               ),
+              s.terminalWatermarks[id],
+              data,
             )
           : session,
       ),
@@ -3485,6 +4557,193 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
           }
         : {}),
     }));
+  },
+
+  applyPinnedSnapshot: (snapshot) => {
+    const currentRevision = get().sessions.reduce(
+      (revision, session) => Math.max(revision, session.pinRevision ?? 0),
+      0,
+    );
+    if (snapshot.pinRevision < currentRevision) return false;
+    const orderById = new Map(snapshot.sessionIds.map((id, index) => [id, index]));
+    set((state) => ({
+      sessions: state.sessions.map((session) => {
+        const pinOrder = orderById.get(session.id);
+        return {
+          ...session,
+          pinned: pinOrder !== undefined,
+          pinOrder: pinOrder ?? null,
+          pinRevision: snapshot.pinRevision,
+        };
+      }),
+      _pinStateTouchedSeq: (state._pinStateTouchedSeq ?? 0) + 1,
+    }));
+    return true;
+  },
+
+  ackSessionUnread: async (id, observedGeneration) => {
+    const session = get().sessions.find((item) => item.id === id);
+    if (!session) return;
+    const generation = normalizedUnreadCount(session.unreadDoneGeneration);
+    const readGeneration = normalizedUnreadCount(session.unreadDoneReadGeneration);
+    const displayCount = normalizedUnreadCount(session.unreadDoneCount);
+    const observed = observedGeneration === undefined
+      ? generation
+      : normalizedUnreadCount(observedGeneration);
+    // 没有 generation 游标（旧服务端/不完整载荷）或没有新的已观察代时不 ack：
+    // 绝不用裸计数清零充当竞态边界。
+    if (generation <= 0 || observed <= 0) return;
+    if (displayCount <= 0 || observed <= readGeneration) return;
+    if (isMockMode()) {
+      set((s) => ({
+        sessions: s.sessions.map((item) =>
+          item.id === id ? { ...item, unreadDoneCount: 0 } : item),
+      }));
+      return;
+    }
+    // 记录清零意图（在途期间的重复触发取最大 generation 合并，完成后继续收敛）。
+    unreadAckWanted.set(id, Math.max(unreadAckWanted.get(id) ?? 0, observed));
+    if (unreadAckInFlight.has(id)) return;
+    unreadAckInFlight.add(id);
+    try {
+      for (;;) {
+        const wanted = unreadAckWanted.get(id) ?? 0;
+        const current = get().sessions.find((item) => item.id === id);
+        const currentGeneration = normalizedUnreadCount(current?.unreadDoneGeneration);
+        const currentRead = normalizedUnreadCount(current?.unreadDoneReadGeneration);
+        // ack 边界 = min(意图, 当前显示 generation)：只推进调用方已观察的代，
+        // 在途期间新到的 generation 不会被旧意图超量吞掉。
+        const ackBoundary = Math.min(wanted, currentGeneration);
+        if (!current || ackBoundary <= 0) break;
+        if (ackBoundary <= currentRead) {
+          // 意图已无新代可清（例如其它路径已完成同一 ack）→ 清理后结束。
+          unreadAckWanted.delete(id);
+          break;
+        }
+        unreadAckWanted.delete(id);
+        // 乐观清零只改显示计数，不动游标：服务端真源与版本比较会把状态收敛
+        // 回来，不会把未确认的游标写进本地版本时钟。
+        set((s) => ({
+          sessions: s.sessions.map((item) =>
+            item.id === id ? { ...item, unreadDoneCount: 0 } : item),
+        }));
+        try {
+          const response = await ackSessionUnreadApi(id, ackBoundary);
+          const responseGeneration = normalizedUnreadCount(response.unreadDoneGeneration);
+          const responseRead = normalizedUnreadCount(response.unreadDoneReadGeneration);
+          const responseCount = normalizedUnreadCount(response.unreadDoneCount);
+          set((s) => ({
+            sessions: s.sessions.map((item) => {
+              if (item.id !== id) return item;
+              const storeGeneration = normalizedUnreadCount(item.unreadDoneGeneration);
+              const storeRead = normalizedUnreadCount(item.unreadDoneReadGeneration);
+              // 过期响应（期间已有更新的 WS 计数/游标）不得降级本地状态。
+              const responseIsNewer = responseGeneration > storeGeneration
+                || (responseGeneration === storeGeneration && responseRead >= storeRead);
+              if (!responseIsNewer) return item;
+              return {
+                ...item,
+                unreadDoneCount: responseCount,
+                unreadDoneGeneration: responseGeneration,
+                unreadDoneReadGeneration: responseRead,
+              };
+            }),
+          }));
+        } catch (error) {
+          // 失败：清掉本次意图（不按旧响应忙重试），以服务端为真源回源恢复；
+          // 后续是否重试由列表/WS 状态变化重新触发。
+          unreadAckWanted.delete(id);
+          console.warn('[sessionStore] ackSessionUnread failed', id, error);
+          try {
+            await get().loadSessions();
+          } catch {
+            // 列表也拉取失败时保留乐观清零；下一次列表/WS 快照会重新对齐。
+          }
+          break;
+        }
+        // 是否续作由“最新 wanted + 当前 store 游标”决定，而不是旧响应的
+        // count：ack 在途期间到达的更大 generation（其旧响应会被版本保护
+        // 跳过）必须在此继续收敛，否则意图滞留。
+        const nextWanted = unreadAckWanted.get(id) ?? 0;
+        const latest = get().sessions.find((item) => item.id === id);
+        const latestGeneration = normalizedUnreadCount(latest?.unreadDoneGeneration);
+        const latestRead = normalizedUnreadCount(latest?.unreadDoneReadGeneration);
+        if (Math.min(nextWanted, latestGeneration) <= latestRead) {
+          // 没有新的已观察代：清理滞留意图后结束。
+          if (nextWanted > 0) unreadAckWanted.delete(id);
+          break;
+        }
+      }
+    } finally {
+      unreadAckInFlight.delete(id);
+    }
+  },
+
+  setSessionPinned: async (id, pinned) => {
+    const mutationSeq = ++pinMutationSeq;
+    if (isMockMode()) {
+      const state = get();
+      const ordered = state.sessions
+        .filter((session) => session.pinned && session.id !== id)
+        .sort((a, b) => (a.pinOrder ?? Number.MAX_SAFE_INTEGER) - (b.pinOrder ?? Number.MAX_SAFE_INTEGER))
+        .map((session) => session.id);
+      if (pinned) ordered.push(id);
+      const pinRevision = Math.max(0, ...state.sessions.map((session) => session.pinRevision ?? 0)) + 1;
+      applyMockPinnedOrder(ordered, pinRevision);
+      state.applyPinnedSnapshot({ pinRevision, sessionIds: ordered });
+      return;
+    }
+    let response;
+    try {
+      response = await setSessionPinnedApi(id, pinned);
+    } catch (error) {
+      await get().loadSessions();
+      throw error;
+    }
+    if (mutationSeq !== pinMutationSeq) {
+      await get().loadSessions();
+      return;
+    }
+    if (!get().applyPinnedSnapshot(response)) {
+      await get().loadSessions();
+    }
+  },
+
+  reorderPinned: async (ids) => {
+    const mutationSeq = ++pinMutationSeq;
+    if (isMockMode()) {
+      const state = get();
+      const current = state.sessions
+        .filter((session) => session.pinned)
+        .sort((a, b) => (a.pinOrder ?? Number.MAX_SAFE_INTEGER) - (b.pinOrder ?? Number.MAX_SAFE_INTEGER))
+        .map((session) => session.id);
+      const requested = new Set(ids);
+      const slots = current.flatMap((id, index) => requested.has(id) ? [index] : []);
+      const ordered = current.slice();
+      slots.forEach((slot, index) => { ordered[slot] = ids[index]!; });
+      const pinRevision = Math.max(0, ...state.sessions.map((session) => session.pinRevision ?? 0)) + 1;
+      applyMockPinnedOrder(ordered, pinRevision);
+      state.applyPinnedSnapshot({ pinRevision, sessionIds: ordered });
+      return;
+    }
+    const pinRevision = get().sessions.reduce(
+      (revision, session) => Math.max(revision, session.pinRevision ?? 0),
+      0,
+    );
+    let response;
+    try {
+      response = await reorderPinnedSessionsApi(ids, pinRevision);
+    } catch (error) {
+      await get().loadSessions();
+      throw error;
+    }
+    if (mutationSeq !== pinMutationSeq) {
+      await get().loadSessions();
+      return;
+    }
+    if (!get().applyPinnedSnapshot(response)) {
+      await get().loadSessions();
+    }
   },
 
   applyResultToSession: (id, e) => {
@@ -3505,7 +4764,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
         if (typeof result === 'string' && result.trim()) {
           const last = history[history.length - 1];
           if (!(last && last.role === 'assistant' && last.content === result)) {
-            history.push({ role: 'assistant', content: result });
+            history.push({ role: 'assistant', content: result, ...(e.rawResult !== undefined ? { rawContent: e.rawResult } : {}) });
             historyTotal += 1;
           }
         }
@@ -3592,4 +4851,21 @@ export function useCurrentSession() {
 if (typeof window !== 'undefined'
     && new URLSearchParams(window.location.search).has('panE2E')) {
   (window as unknown as Record<string, unknown>).__panSessionStore = useSessionStore;
+}
+
+/** Exact authority boundary for disposable speculative history pages. */
+export function getHistoryPrefetchContext(): HistoryPrefetchContext | null {
+  const state = useSessionStore.getState();
+  const sid = state.currentSessionId;
+  if (!sid || !state.hasMoreMessages || state.historyLoadEnd <= 0) return null;
+  const session = state.sessions.find((item) => item.id === sid);
+  const window = state.sessionTranscripts[sid]?.window;
+  // A replacement may reset the revision counter. Do not reuse the old
+  // window's pages while a newer summary advertises a different epoch.
+  if (window?.epoch && session?.historyEpoch && window.epoch !== session.historyEpoch) return null;
+  const epoch = window?.epoch ?? session?.historyEpoch;
+  const revision = Math.max(window?.revision ?? 0, session?.historyRevision ?? 0);
+  if (typeof epoch !== 'string' || !epoch || !Number.isSafeInteger(revision) || revision < 0) return null;
+  return { sessionId: sid, selection: state._selectionSeq[sid] ?? 0, serverEpoch: state.serverEpoch,
+    historyEpoch: epoch, historyRevision: revision, limit: historyPageSize() };
 }

@@ -252,8 +252,14 @@ def test_queue_reservation_persists_frontend_message_identity(monkeypatch):
     monkeypatch.setattr(worker, "_process_alive", lambda _worker: True)
 
     async def scenario():
-        assert await worker._reserve_queue_unit(w, s, [task], task["text"]) is True
+        assert await worker._reserve_queue_unit(w, s, [task], task["text"]) is False
+        assert s.history == []
+        assert task["deliveryState"] == "writing"
+        assert s.queue_delivery_ledger[task["id"]]["deliveryState"] == "reserved"
+        assert await worker._commit_queue_handoff(w, s, [task]) is True
         assert s.history[0]["queueItemIds"] == [task["id"]]
+        assert len(s.history) == 1
+        assert s.queue_pending == []
 
     asyncio.run(scenario())
     _cleanup()
@@ -291,6 +297,8 @@ def test_report_and_qq_batch_is_contiguous_and_all_or_back(monkeypatch):
     assert all(value in batches[0] for value in ("r1", "r2", "hello"))
     assert s.queue_pending == [task]
     assert len(s.history) == 1
+    assert s.history[0]["role"] == "user"
+    assert _sess.is_pan_message_id(s.history[0]["messageId"])
     assert len(s.history[0]["delivered_keys"]) == 3
     assert s.history[0]["queueItemIds"] == [report1["id"], report2["id"], qq["id"]]
     _cleanup()
@@ -370,7 +378,7 @@ def test_inherited_task_id_is_not_terminal_idempotency_key(monkeypatch):
     s = _setup_session()
     w = _make_worker(s.id)
 
-    async def no_flush(_worker):
+    async def no_flush(_worker, **_kwargs):
         return None
 
     monkeypatch.setattr(worker, "_flush_history_now", no_flush)

@@ -5,6 +5,8 @@ import {
   decideStartupRecovery,
   fetchStartupRecovery,
 } from '@/services/api';
+import { useSessionStore } from '@/stores/sessionStore';
+import { useWorkerStore } from '@/stores/workerStore';
 import type {
   ApiStartupRecoveryChoice,
   ApiStartupRecoveryRecord,
@@ -22,19 +24,35 @@ const CHOICES: Array<{
   },
   {
     value: 'preserve-running',
-    title: 'Keep their legal state as running',
-    detail: 'Do not restart them and leave their persisted legal state unchanged.',
+    title: 'Keep Illegal / pending recovery',
+    detail: 'Do not restart them; retain Illegal status and its automatic locks.',
   },
   {
     value: 'sync-actual',
-    title: 'Update legal state to current Worker state',
-    detail: 'Do not restart them; Pan will read each current runtime state and persist it.',
+    title: 'Mark these Sessions as safely offline',
+    detail: 'Clear Illegal status and its automatic locks; preserve Manual locks. Do not send a recovery message.',
   },
 ];
 
 function makeTabId(): string {
   return globalThis.crypto?.randomUUID?.()
     ?? `tab-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
+/**
+ * Converge the Session list after a recovery decision completes.
+ *
+ * Legal-state writes (`sync-actual`, the durable preserve/restart outcomes)
+ * are deliberately silent on the WebSocket — the Session list learns about
+ * them exclusively through the HTTP snapshot. `restart` converges on its own
+ * through worker spawn/status events, but the other choices fire no event at
+ * all, so without this refresh the sidebar keeps the pre-decision snapshot
+ * and a Session whose legal state was just synchronized to the (idle) runtime
+ * keeps rendering the legal-running mismatch indicator indefinitely.
+ */
+export function convergeAfterStartupRecovery(): void {
+  void useSessionStore.getState().loadSessions();
+  void useWorkerStore.getState().refresh();
 }
 
 export function StartupRecoveryPrompt() {
@@ -44,6 +62,11 @@ export function StartupRecoveryPrompt() {
   const [selected, setSelected] = useState<ApiStartupRecoveryChoice | null>(null);
   const [busy, setBusy] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
+  // A decision can complete through this tab's submit, another tab, or the
+  // automatic startup preference. Converge exactly once per mount when the
+  // record is first observed as completed, so the sidebar cannot keep a stale
+  // legal-running red (or a stale running status) from before the decision.
+  const convergedRef = useRef(false);
 
   useEffect(() => {
     if (isMockMode()) return;
@@ -57,6 +80,10 @@ export function StartupRecoveryPrompt() {
         if (!active) return;
         setRecord(status);
         if (status.state === 'no_candidates' || status.state === 'completed') {
+          if (status.state === 'completed' && !convergedRef.current) {
+            convergedRef.current = true;
+            convergeAfterStartupRecovery();
+          }
           setClaimed(false);
           setLoadError(null);
           return;
@@ -74,6 +101,12 @@ export function StartupRecoveryPrompt() {
           error: claim.error ?? status.error,
           candidateSnapshot: claim.candidates ?? status.candidateSnapshot,
         }));
+        // The claim can observe another tab's (or the automatic preference's)
+        // completed decision; the convergence requirement is identical.
+        if (claim.state === 'completed' && !convergedRef.current) {
+          convergedRef.current = true;
+          convergeAfterStartupRecovery();
+        }
         if (claim.decision) setSelected(claim.decision);
         setLoadError(null);
       } catch (error) {
@@ -97,6 +130,10 @@ export function StartupRecoveryPrompt() {
     try {
       const next = await decideStartupRecovery(record.generation, tabId.current, selected);
       setRecord(next);
+      if (next.state === 'completed') {
+        if (!convergedRef.current) convergedRef.current = true;
+        convergeAfterStartupRecovery();
+      }
       if (next.state === 'failed') setLoadError(next.error || 'Startup recovery failed.');
     } catch (error) {
       setLoadError(error instanceof Error ? error.message : String(error));
@@ -151,7 +188,7 @@ export function StartupRecoveryPrompt() {
           Continue previous Sessions?
         </h2>
         <p className="mt-2 text-sm text-text-secondary">
-          Pan found {record.candidateSnapshot.length} Session(s) whose persisted legal state is running
+          Pan found {record.candidateSnapshot.length} Illegal Session(s) pending recovery
           and which currently have no live Worker.
         </p>
         <ul className="mt-3 max-h-32 space-y-1 overflow-y-auto rounded border border-border-muted bg-bg-primary px-3 py-2 text-xs text-text-secondary">
@@ -163,7 +200,9 @@ export function StartupRecoveryPrompt() {
         </ul>
         <fieldset className="mt-4 space-y-2">
           <legend className="sr-only">Choose startup recovery action</legend>
-          {CHOICES.map((choice, index) => {
+          {(lockedChoice === 'clear-illegal' ? [{ value: 'clear-illegal' as const,
+            title: 'Clear Illegal status for all Sessions and treat them as safely offline',
+            detail: 'Retry the saved startup policy. Release incident locks, preserve Manual locks, and retain live or unknown owner protections.' }] : CHOICES).map((choice, index) => {
             const disabledByRecordedChoice = Boolean(lockedChoice && lockedChoice !== choice.value);
             return (
               <label

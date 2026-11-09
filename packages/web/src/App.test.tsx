@@ -1,13 +1,19 @@
 // @vitest-environment jsdom
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { Layout } from './App';
 import { useSessionStore } from './stores/sessionStore';
 import { useUIStore } from './stores/uiStore';
 import { useWorkspaceStore } from './stores/workspaceStore';
+import { useDetailStore } from './stores/detailStore';
 
 vi.mock('./hooks/useWebSocket', () => ({ useWebSocket: vi.fn() }));
+
+// Load the real dependency graph during setup; UI assertions keep their budget.
+beforeAll(async () => {
+  await import('./components/detail/DetailPanel');
+});
 
 afterEach(() => {
   cleanup();
@@ -17,6 +23,7 @@ afterEach(() => {
 describe('responsive WorkspaceRail placement', () => {
   beforeEach(() => {
     localStorage.clear();
+    useDetailStore.getState().closeDetail();
     useSessionStore.setState({
       sessions: [
         { id: 'inside', name: 'Inside workspace', adapter: 'codex', workspaceIds: ['ws-alpha'], alwaysThinkingEnabled: false, effort: '', history: [] },
@@ -133,5 +140,49 @@ describe('responsive WorkspaceRail placement', () => {
     expect(desktopRail?.style.width).toBe('0px');
     fireEvent.click(desktopHandle);
     await waitFor(() => expect(desktopRail?.style.width).toBe('172px'));
+  });
+
+  it('keeps both floating and nav entries for collapsing and expanding the desktop Sidebar', async () => {
+    stubViewport(false);
+    renderLayout();
+
+    const collapse = await screen.findByTestId('sidebar-collapse-handle');
+    expect(collapse.getAttribute('aria-label')).toBe('收起侧边栏');
+    fireEvent.click(collapse);
+
+    expect(useUIStore.getState().sidebarCollapsed).toBe(true);
+    // Both the floating expand handle and the pre-existing nav entry exist.
+    const floatingExpand = screen.getByTestId('sidebar-collapse-handle');
+    expect(floatingExpand.getAttribute('aria-label')).toBe('展开侧边栏');
+    expect(screen.getByTitle('Expand sidebar')).toBeTruthy();
+    // The workspace handle survives the collapse and keeps its own action.
+    expect(screen.getByTestId('workspace-rail-handle')).toBeTruthy();
+
+    // Floating entry expands...
+    fireEvent.click(floatingExpand);
+    expect(useUIStore.getState().sidebarCollapsed).toBe(false);
+
+    // ...and the nav entry still works as the second entry.
+    fireEvent.click(screen.getByTestId('sidebar-collapse-handle'));
+    expect(useUIStore.getState().sidebarCollapsed).toBe(true);
+    fireEvent.click(screen.getByTitle('Expand sidebar'));
+    expect(useUIStore.getState().sidebarCollapsed).toBe(false);
+    expect(await screen.findByTestId('sidebar-collapse-handle')).toBeTruthy();
+  });
+
+  it('opens a deferred detail panel, closes it, and reopens with fresh content', async () => {
+    stubViewport(false);
+    renderLayout();
+    act(() => useDetailStore.getState().openDetail({ type: 'tool', content: 'first tool result' }));
+    await act(async () => {
+      // Await the real lazy pane and its Markdown dependencies before assertions.
+      await vi.dynamicImportSettled();
+    });
+    expect((await screen.findAllByText('first tool result')).length).toBeGreaterThan(0);
+    fireEvent.click(screen.getByTitle('Close detail panel'));
+    expect(screen.queryByText('first tool result')).toBeNull();
+    act(() => useDetailStore.getState().openDetail({ type: 'thinking', content: '**second thought**' }));
+    expect(await screen.findByText('second thought')).toBeTruthy();
+    expect(screen.queryByText('first tool result')).toBeNull();
   });
 });

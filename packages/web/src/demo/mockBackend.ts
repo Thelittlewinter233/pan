@@ -123,8 +123,57 @@ export const mockSessions: Session[] = loadSessions();
 // turning the demo into a second backend implementation.
 const mockQueues: Record<string, AgentQueueItem[]> = {};
 const mockQueueRevisions: Record<string, number> = {};
+const mockAgentReportsPaused: Record<string, boolean> = {};
 const mockQueueClientIds: Record<string, Map<string, string>> = {};
 let mockQueueSequence = 0;
+
+// Explicit task reports recorded by the mock, mirroring the server's
+// deterministic (session, task, message) idempotency so a browser retry can be
+// observed as exactly one delivery.
+const mockManualReports: Array<{
+  /** Server-identical deterministic report key. */
+  key: string;
+  sessionId: string;
+  taskId: string | null;
+  messageId: string;
+  at: number;
+}> = [];
+
+// Every manual-report attempt the mock handled, with its server-side outcome.
+// `delivered`/`replayed` prove what a lost response would have confirmed;
+// `rejected`/`dropped` are the failure simulations.  Exposed on window for
+// isolated browser tests (the mock short-circuits fetch in-page, so the
+// network layer cannot observe these requests).
+const mockManualReportAttempts: Array<{
+  sessionId: string;
+  taskId: string | null;
+  taskSeq: number | null;
+  resultCursor: number | null;
+  messageId: string;
+  outcome: 'delivered' | 'replayed' | 'rejected' | 'dropped' | 'dropped_after_delivery';
+}> = [];
+
+declare global {
+  interface Window {
+    /** Test hook for the mock manual-report route: 'reject' returns a definite
+     *  server failure, 'drop' fails the transport before recording anything
+     *  (unconfirmed outcome), 'lose_receipt' records the delivery and then
+     *  fails the transport (the already-sent-but-unconfirmed case). */
+    __panMockManualReport?: { mode?: 'reject' | 'drop' | 'lose_receipt' };
+    /** Test-observable log of manual-report attempts and deliveries. */
+    __panMockManualReportLog?: {
+      attempts: typeof mockManualReportAttempts;
+      deliveries: typeof mockManualReports;
+    };
+  }
+}
+
+if (typeof window !== 'undefined') {
+  window.__panMockManualReportLog = {
+    attempts: mockManualReportAttempts,
+    deliveries: mockManualReports,
+  };
+}
 
 function decodePathPart(value: string): string {
   try {
@@ -138,6 +187,19 @@ function queueForSession(sessionId: string): AgentQueueItem[] {
   return mockQueues[sessionId] ?? [];
 }
 
+function withMockQueueLock(
+  item: AgentQueueItem,
+  manual?: boolean,
+  automatic?: boolean,
+): AgentQueueItem {
+  const lockManual = manual ?? item.meta?.lockManual ?? false;
+  const lockAutoReport = automatic ?? item.meta?.lockAutoReport ?? false;
+  return {
+    ...item,
+    meta: { ...item.meta, lockManual, lockAutoReport, locked: lockManual || lockAutoReport },
+  };
+}
+
 function queueRevisionForSession(sessionId: string): number {
   return mockQueueRevisions[sessionId] ?? 0;
 }
@@ -148,17 +210,24 @@ function bumpQueueRevision(sessionId: string): number {
   return next;
 }
 
-function queueResponse(sessionId: string): { ok: true; items: AgentQueueItem[]; queueRevision: number } {
+function queueResponse(sessionId: string): {
+  ok: true;
+  items: AgentQueueItem[];
+  queueRevision: number;
+  agentReportsPaused: boolean;
+} {
   return {
     ok: true,
     items: queueForSession(sessionId).slice(),
     queueRevision: queueRevisionForSession(sessionId),
+    agentReportsPaused: mockAgentReportsPaused[sessionId] ?? false,
   };
 }
 
 function clearMockQueues(): void {
   for (const key of Object.keys(mockQueues)) delete mockQueues[key];
   for (const key of Object.keys(mockQueueRevisions)) delete mockQueueRevisions[key];
+  for (const key of Object.keys(mockAgentReportsPaused)) delete mockAgentReportsPaused[key];
   for (const key of Object.keys(mockQueueClientIds)) delete mockQueueClientIds[key];
   mockQueueSequence = 0;
 }
@@ -199,6 +268,17 @@ export function applyMockSessionUpdate(id: string, patch: Partial<Session>): voi
   }
 }
 
+export function applyMockPinnedOrder(sessionIds: string[], pinRevision: number): void {
+  const orderById = new Map(sessionIds.map((id, index) => [id, index]));
+  for (const session of mockSessions) {
+    const pinOrder = orderById.get(session.id);
+    session.pinned = pinOrder !== undefined;
+    session.pinOrder = pinOrder ?? null;
+    session.pinRevision = pinRevision;
+  }
+  persistSessions();
+}
+
 /** Reset the demo data to its seeded state (used by the DemoBadge reset). */
 export function resetMockData(): void {
   try {
@@ -207,6 +287,8 @@ export function resetMockData(): void {
     // no-op
   }
   clearMockQueues();
+  mockManualReports.length = 0;
+  mockManualReportAttempts.length = 0;
 }
 
 /**
@@ -303,7 +385,59 @@ const cliAdapters = ['cbc', 'kimi', 'opencode', 'codex'].map((name) => ({
 function handleMockRequest(method: string, path: string, body: unknown): unknown {
   // ── Sessions ──
   if (method === 'GET' && path === '/api/sessions') {
-    return { sessions: mockSessions.map(mockSessionView) };
+    // Mirror the real list read: the summary carries no history rows.  Clients
+    // load the transcript through the history endpoint, exactly like against a
+    // real backend.
+    return {
+      sessions: mockSessions.map((session) => ({
+        ...session,
+        // `undefined` disappears in the JSON response, mirroring the real list
+        // read where the summary carries no history rows.
+        history: undefined,
+      })),
+    };
+  }
+  if (method === 'POST' && path === '/api/sessions/pins/order') {
+    const values = body && typeof body === 'object' ? body as Record<string, unknown> : {};
+    const requested = Array.isArray(values.sessionIds)
+      ? values.sessionIds.filter((id): id is string => typeof id === 'string')
+      : [];
+    const current = mockSessions
+      .filter((session) => session.pinned)
+      .sort((a, b) => (a.pinOrder ?? Number.MAX_SAFE_INTEGER) - (b.pinOrder ?? Number.MAX_SAFE_INTEGER))
+      .map((session) => session.id);
+    if (requested.some((id) => !current.includes(id)) || new Set(requested).size !== requested.length) {
+      return { ok: false, error: { message: 'Invalid pinned Session order' } };
+    }
+    const selected = new Set(requested);
+    const slots = current.flatMap((id, index) => selected.has(id) ? [index] : []);
+    const ordered = current.slice();
+    slots.forEach((slot, index) => { ordered[slot] = requested[index]!; });
+    const revision = Math.max(0, ...mockSessions.map((session) => session.pinRevision ?? 0)) + 1;
+    applyMockPinnedOrder(ordered, revision);
+    return { ok: true, pinRevision: revision, sessionIds: ordered };
+  }
+  const pinMatch = path.match(/^\/api\/sessions\/([^/]+)\/pin$/);
+  if (pinMatch && method === 'POST') {
+    const sessionId = decodePathPart(pinMatch[1]!);
+    const session = findSession(sessionId);
+    if (!session) return { ok: false, error: { message: 'Session not found' } };
+    const values = body && typeof body === 'object' ? body as Record<string, unknown> : {};
+    const pinned = values.pinned === true;
+    const ordered = mockSessions
+      .filter((item) => item.pinned && item.id !== sessionId)
+      .sort((a, b) => (a.pinOrder ?? Number.MAX_SAFE_INTEGER) - (b.pinOrder ?? Number.MAX_SAFE_INTEGER))
+      .map((item) => item.id);
+    if (pinned) ordered.push(sessionId);
+    const revision = Math.max(0, ...mockSessions.map((item) => item.pinRevision ?? 0)) + 1;
+    applyMockPinnedOrder(ordered, revision);
+    return {
+      ok: true,
+      pinned,
+      pinOrder: pinned ? ordered.indexOf(sessionId) : null,
+      pinRevision: revision,
+      sessionIds: ordered,
+    };
   }
   const sessionMatch = path.match(/^\/api\/sessions\/([^/]+)$/);
   if (sessionMatch && method === 'GET') {
@@ -317,12 +451,28 @@ function handleMockRequest(method: string, path: string, body: unknown): unknown
     }
     return session ?? { error: 'not found' };
   }
+  // Relationship/Job transfer is a server operation; do not fake a successful handoff.
+  if (/^\/api\/sessions\/[^/]+\/handoff$/.test(path) && method === 'POST') {
+    return { error: 'Session handoff is unavailable in demo mode. Connect to an independent Pan instance.' };
+  }
   const historyMatch = path.match(/^\/api\/sessions\/([^/]+)\/history$/);
   if (historyMatch && method === 'GET') {
     const session = findSession(historyMatch[1]!);
     const history = session ? visibleMockHistory(session) : [];
-    return { history, hasMore: false, start: 0, total: history.length };
+    return {
+      history,
+      hasMore: false,
+      start: 0,
+      // The stored history may model a truncated client window while the
+      // session's own total/revision describe the full durable history.
+      total: session ? history.length : 0,
+      // Same identity fields the real history page carries: the client window
+      // needs the epoch/revision to prove terminal boundaries.
+      historyEpoch: session?.historyEpoch ?? null,
+      historyRevision: session?.historyRevision ?? 0,
+    };
   }
+  // Hide one visible history row (sidecar semantics; the mock never rewrites history).
   const historyMessageMatch = path.match(/^\/api\/sessions\/([^/]+)\/history\/([^/]+)$/);
   if (historyMessageMatch && method === 'DELETE') {
     const session = findSession(decodePathPart(historyMessageMatch[1]!));
@@ -352,6 +502,10 @@ function handleMockRequest(method: string, path: string, body: unknown): unknown
       const values = body && typeof body === 'object' ? body as Record<string, unknown> : {};
       const text = typeof values.text === 'string' ? values.text : '';
       const parts = Array.isArray(values.parts) ? values.parts : undefined;
+      if (values.locked !== undefined && typeof values.locked !== 'boolean') {
+        return { ok: false, error: 'locked must be a boolean' };
+      }
+      const locked = values.locked === true;
       if (!text.trim()) return { ok: false, error: '消息不能为空' };
       const clientMessageId = typeof values.clientMessageId === 'string'
         ? values.clientMessageId
@@ -378,7 +532,8 @@ function handleMockRequest(method: string, path: string, body: unknown): unknown
         ...(parts ? { parts: parts as AgentQueueItem['parts'] } : {}),
         createdAt: Date.now(),
         source: 'user',
-        meta: { dispatchState: 'queued', revision },
+        meta: { dispatchState: 'queued', revision,
+          locked, lockManual: locked, lockAutoReport: false },
       };
       mockQueues[sessionId] = [...queueForSession(sessionId), item];
       if (clientMessageId) {
@@ -410,6 +565,49 @@ function handleMockRequest(method: string, path: string, body: unknown): unknown
       ...item,
       meta: { ...item.meta, revision },
     }));
+    return queueResponse(sessionId);
+  }
+
+  const queueReportsPausedMatch = path.match(/^\/api\/sessions\/([^/]+)\/queue\/reports-paused$/);
+  if (queueReportsPausedMatch && method === 'PATCH') {
+    const sessionId = decodePathPart(queueReportsPausedMatch[1]!);
+    if (!findSession(sessionId)) return { ok: false, error: 'not found' };
+    const values = body && typeof body === 'object' ? body as Record<string, unknown> : {};
+    if (typeof values.paused !== 'boolean') return { ok: false, error: 'paused must be a boolean' };
+    mockAgentReportsPaused[sessionId] = values.paused;
+    mockQueues[sessionId] = queueForSession(sessionId).map((item) =>
+      item.kind === 'report' && item.source === 'report'
+        ? withMockQueueLock(item, undefined, values.paused as boolean)
+        : item);
+    bumpQueueRevision(sessionId);
+    return queueResponse(sessionId);
+  }
+
+  const queueLocksMatch = path.match(/^\/api\/sessions\/([^/]+)\/queue\/locks$/);
+  if (queueLocksMatch && method === 'PATCH') {
+    const sessionId = decodePathPart(queueLocksMatch[1]!);
+    if (!findSession(sessionId)) return { ok: false, error: 'not found' };
+    const values = body && typeof body === 'object' ? body as Record<string, unknown> : {};
+    if (typeof values.locked !== 'boolean') return { ok: false, error: 'locked must be a boolean' };
+    mockQueues[sessionId] = queueForSession(sessionId).map((item) =>
+      withMockQueueLock(item, values.locked as boolean, values.locked ? undefined : false));
+    bumpQueueRevision(sessionId);
+    return queueResponse(sessionId);
+  }
+
+  const queueItemLockMatch = path.match(/^\/api\/sessions\/([^/]+)\/queue\/([^/]+)\/lock$/);
+  if (queueItemLockMatch && method === 'PATCH') {
+    const sessionId = decodePathPart(queueItemLockMatch[1]!);
+    const itemId = decodePathPart(queueItemLockMatch[2]!);
+    if (!findSession(sessionId)) return { ok: false, error: 'not found' };
+    const values = body && typeof body === 'object' ? body as Record<string, unknown> : {};
+    if (typeof values.locked !== 'boolean') return { ok: false, error: 'locked must be a boolean' };
+    const current = queueForSession(sessionId);
+    if (!current.some((item) => item.id === itemId)) return { ok: false, error: 'not found' };
+    mockQueues[sessionId] = current.map((item) => item.id === itemId
+      ? withMockQueueLock(item, values.locked as boolean, values.locked ? undefined : false)
+      : item);
+    bumpQueueRevision(sessionId);
     return queueResponse(sessionId);
   }
 
@@ -451,6 +649,168 @@ function handleMockRequest(method: string, path: string, body: unknown): unknown
     return { deleted: 0 };
   }
 
+  // ── Explicit task report (mirrors POST /api/sessions/{id}/manual-report) ──
+  const manualReportMatch = path.match(/^\/api\/sessions\/([^/]+)\/manual-report$/);
+  if (manualReportMatch && method === 'POST') {
+    const sessionId = decodePathPart(manualReportMatch[1]!);
+    const session = findSession(sessionId);
+    if (!session) {
+      return { ok: false, error: { code: 'session_not_found', message: 'Session not found' } };
+    }
+    if (!session.managedBy) {
+      return { ok: false, error: { code: 'no_report_target', message: '该 Session 没有 manager，无法汇报' } };
+    }
+    const values = body && typeof body === 'object' ? body as Record<string, unknown> : {};
+    const messageId = values.messageId;
+    const taskId = values.taskId;
+    const taskSeq = values.taskSeq;
+    const resultCursor = values.resultCursor ?? null;
+    if (typeof messageId !== 'string' || !messageId) {
+      return { ok: false, error: { code: 'invalid_message_id', message: 'messageId is required' } };
+    }
+    if (taskId !== null && (typeof taskId !== 'string' || !taskId)) {
+      return { ok: false, error: { code: 'invalid_task_id', message: 'taskId must be a string or null' } };
+    }
+    if (taskSeq !== null && (!Number.isInteger(taskSeq) || (taskSeq as number) < 0)) {
+      return { ok: false, error: { code: 'invalid_task_seq', message: 'taskSeq must be a non-negative integer or null' } };
+    }
+    if (resultCursor !== null && (!Number.isInteger(resultCursor) || (resultCursor as number) < 0)) {
+      return { ok: false, error: { code: 'invalid_result_cursor', message: 'resultCursor must be a non-negative integer or null' } };
+    }
+    const deliveredTaskId = taskId as string | null;
+    const deliveredTaskSeq = taskSeq === null ? null : taskSeq as number;
+    const deliveredResultCursor = resultCursor === null ? null : resultCursor as number;
+    const attempt = {
+      sessionId,
+      taskId: deliveredTaskId,
+      taskSeq: deliveredTaskSeq,
+      resultCursor: deliveredResultCursor,
+      messageId,
+      outcome: 'dropped' as typeof mockManualReportAttempts[number]['outcome'],
+    };
+    mockManualReportAttempts.push(attempt);
+    const hook = window.__panMockManualReport;
+    if (hook?.mode === 'reject') {
+      attempt.outcome = 'rejected';
+      return { ok: false, retryable: true, error: { code: 'persist_failed', message: 'mock 汇报失败' } };
+    }
+    if (hook?.mode === 'drop') {
+      // The outcome is unknown: nothing was recorded before the transport
+      // failed, so the caller cannot tell send from non-send.
+      attempt.outcome = 'dropped';
+      throw new TypeError('Failed to fetch');
+    }
+    // Resolve the run's durable terminal the way the merged server does,
+    // never by "newest": only a POSITIVE resultCursor is a durable identity
+    // (production allocates max+1); a non-positive cursor is dropped as "not
+    // provided" so a legal taskSeq/taskId still decides.  The compat path
+    // requires a STORED taskSeq - an identity-less row can never be matched.
+    const candidates = (session.terminalResults ?? []).filter(
+      (terminal): terminal is NonNullable<typeof terminal> => !!terminal,
+    );
+    const effectiveCursor = deliveredResultCursor !== null && deliveredResultCursor > 0
+      ? deliveredResultCursor : null;
+    attempt.resultCursor = effectiveCursor;
+    let run: (typeof candidates)[number] | undefined;
+    if (effectiveCursor !== null) {
+      const exact = candidates.filter((terminal) => terminal.resultCursor === effectiveCursor);
+      const compat = exact.length === 0
+        ? candidates.filter((terminal) => terminal.resultCursor === undefined
+          && typeof terminal.taskSeq === 'number'
+          && terminal.taskSeq === effectiveCursor)
+        : [];
+      const match = exact.length === 1 ? exact[0] : compat.length === 1 ? compat[0] : undefined;
+      if (!match) {
+        attempt.outcome = 'rejected';
+        return { ok: false, error: { code: 'no_task_result', message: '该运行的终态结果不可用，无法汇报' } };
+      }
+      const matchTaskId = typeof match.taskId === 'string' && match.taskId ? match.taskId : null;
+      const matchTaskSeq = typeof match.taskSeq === 'number' ? match.taskSeq : null;
+      // Mirror the merged server exactly: a NON-null submitted identity must
+      // describe the same run as the cursor (a mismatch — including a terminal
+      // that lacks the field — is run_mismatch), while taskId null keeps its
+      // "plain run / not provided" meaning and is not compared.
+      const conflict = (deliveredTaskId !== null && deliveredTaskId !== matchTaskId)
+        || (deliveredTaskSeq !== null && matchTaskSeq !== deliveredTaskSeq);
+      if (conflict) {
+        attempt.outcome = 'rejected';
+        return { ok: false, error: { code: 'run_mismatch', message: '运行身份与 resultCursor 不一致，无法汇报' } };
+      }
+      run = match;
+    } else if (deliveredTaskSeq !== null || deliveredTaskId !== null) {
+      const runs = candidates.filter((terminal) =>
+        (typeof terminal.taskId === 'string' && terminal.taskId ? terminal.taskId : null) === deliveredTaskId
+        && (deliveredTaskSeq === null || terminal.taskSeq === deliveredTaskSeq));
+      run = runs[runs.length - 1];
+    } else {
+      attempt.outcome = 'rejected';
+      return { ok: false, error: { code: 'no_run_identity', message: '缺少运行身份（taskSeq/resultCursor），无法汇报' } };
+    }
+    if (!run) {
+      attempt.outcome = 'rejected';
+      return { ok: false, error: { code: 'no_task_result', message: '该运行的终态结果不可用，无法汇报' } };
+    }
+    // Delivery precondition: the resolved terminal must carry a provable
+    // durable identity (taskId, stored taskSeq, or a positive raw cursor).
+    const runTaskId = typeof run.taskId === 'string' && run.taskId ? run.taskId : null;
+    const runTaskSeq = typeof run.taskSeq === 'number' ? run.taskSeq : null;
+    const runCursor = typeof run.resultCursor === 'number' && run.resultCursor > 0
+      ? run.resultCursor : null;
+    if (!runTaskId && runTaskSeq === null && runCursor === null) {
+      attempt.outcome = 'rejected';
+      return { ok: false, error: { code: 'no_run_identity', message: '该终态没有可证明的持久运行身份，无法汇报' } };
+    }
+    // Mirror the server's durable tail-block proof: within an unchanged history
+    // epoch the run's final row offset is total - (revision - boundary).
+    const history = session.history ?? [];
+    const boundary = typeof run.historyRevision === 'number'
+      && run.historyEpoch === session.historyEpoch
+      ? history.length - ((session.historyRevision ?? 0) - run.historyRevision)
+      : -1;
+    let tailBlockId: string | null = null;
+    if (boundary >= 0 && boundary <= history.length) {
+      for (let index = Math.min(boundary, history.length - 1); index >= 0; index -= 1) {
+        const row = history[index];
+        if (row?.role === 'assistant' && typeof row.messageId === 'string') {
+          tailBlockId = row.messageId;
+          break;
+        }
+      }
+    }
+    if (tailBlockId === null) {
+      attempt.outcome = 'rejected';
+      return { ok: false, error: { code: 'block_unproven', message: '无法证明该消息属于该任务的末块，暂不能汇报' } };
+    }
+    if (tailBlockId !== messageId) {
+      attempt.outcome = 'rejected';
+      return { ok: false, error: { code: 'block_mismatch', message: '提交的消息不是该任务的末块，无法汇报' } };
+    }
+    // Dedup is keyed on the resolved run identity only: a client message id
+    // can never turn one run into several deliveries, and a cursor-only plain
+    // run keys by its durable cursor exactly like the server does.
+    const resolvedTaskId = runTaskId;
+    const runKey = runTaskSeq ?? (runCursor !== null ? `rc:${runCursor}` : '-');
+    const key = `manual:${sessionId}:${resolvedTaskId ?? '-'}:${runKey}`;
+    const alreadyReported = mockManualReports.some((report) => report.key === key);
+    if (!alreadyReported) {
+      mockManualReports.push({ key, sessionId, taskId: resolvedTaskId, messageId, at: Date.now() });
+    }
+    attempt.outcome = alreadyReported ? 'replayed' : 'delivered';
+    if (hook?.mode === 'lose_receipt') {
+      // Delivered, but the response never reaches the caller: a retry must be
+      // deduplicated by identity instead of sending a second report.
+      attempt.outcome = 'dropped_after_delivery';
+      throw new TypeError('Failed to fetch');
+    }
+    return {
+      ok: true,
+      sessionId,
+      managerId: session.managedBy ?? 'mock-manager',
+      queueItemId: `mock-q-${mockManualReports.length}`,
+      alreadyReported,
+    };
+  }
+
   // ── Infra stubs (keep banners/settings/modals quiet) ──
   if (path === '/api/cli/status') {
     return { adapters: cliAdapters, available: cliAdapters.map((a) => a.name), hasAvailable: true };
@@ -478,8 +838,12 @@ function handleMockRequest(method: string, path: string, body: unknown): unknown
       },
     };
   }
+  if (path === '/api/settings/workdir-retention/preview' || path === '/api/settings/workdir-retention/delete') {
+    return { candidates: [], results: [], scanned: 0, deleted: 0, skipped: 0, skipReasons: {}, error: null };
+  }
   if (path === '/api/settings/data-retention' && method === 'GET') {
     const policies = {
+      workdirs: { enabled: false, days: null },
       sessions: { enabled: false, days: null },
       attachments: { enabled: false, days: null },
       qq_history: { enabled: false, days: null },

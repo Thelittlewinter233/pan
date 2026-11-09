@@ -63,17 +63,28 @@ def _stream_setup(sid="ses_t041_stream"):
 def test_stream_persists_before_result_then_idle_and_does_not_wait_for_enrich(monkeypatch):
     _reset()
     s, w = _stream_setup()
+    w._execution_seq = 2  # Report turns have an execution cursor even without taskSeq.
     saves = []
     events = []
     timeline = []
     enrich_started = []
+    save_timings = []
+    event_timings = []
 
-    async def save(value):
+    original_save = _sess._save_body
+
+    def save(value, **kwargs):
         saves.append((value.last_result is not None, len(value.history)))
         timeline.append(("save", value.last_result is not None))
+        started = time.monotonic()
+        try:
+            return original_save(value, **kwargs)
+        finally:
+            save_timings.append(time.monotonic() - started)
 
     async def broadcast(value):
         events.append(value)
+        event_timings.append((value.get("type"), time.monotonic()))
         timeline.append(("broadcast", value.get("type"), value.get("status")))
 
     def slow_enrich(_session):
@@ -81,7 +92,7 @@ def test_stream_persists_before_result_then_idle_and_does_not_wait_for_enrich(mo
         time.sleep(0.15)
         return None
 
-    monkeypatch.setattr(_sess, "save_async", save)
+    monkeypatch.setattr(_sess, "_save_body", save)
     monkeypatch.setattr(w.adapter, "enrich_after_result", slow_enrich)
     worker.set_broadcaster(broadcast)
     w.process = _Process([
@@ -102,6 +113,10 @@ def test_stream_persists_before_result_then_idle_and_does_not_wait_for_enrich(mo
                           if e.get("type") == "worker.status"
                           and e.get("status") == "idle")
         assert result_index < idle_index
+        assert events[result_index]['executionSeq'] == 2
+        assert events[idle_index]['executionSeq'] == 2
+        assert s.last_result['executionSeq'] == 2
+        assert s.terminal_results[-1]['executionSeq'] == 2
         assert any(has_result for has_result, _ in saves)
         saved_terminal_index = next(
             i for i, item in enumerate(timeline)
@@ -112,7 +127,12 @@ def test_stream_persists_before_result_then_idle_and_does_not_wait_for_enrich(mo
             if item[0:2] == ("broadcast", "worker.result")
         )
         assert saved_terminal_index < result_timeline_index
-        assert elapsed < 0.12, f"terminal path waited for enrich: {elapsed:.3f}s"
+        assert elapsed < 0.12, (
+            f"terminal path waited for enrich: {elapsed:.3f}s; "
+            f"save_body_seconds={save_timings}; "
+            f"event_offsets={[(kind, stamp - started) for kind, stamp in event_timings]}; "
+            f"enrich_offsets={[stamp - started for stamp in enrich_started]}"
+        )
         # Let the scheduled task finish so this test also proves the call was
         # moved to a thread and remains eventual rather than being dropped.
         await worker._run_usage_enrichment(s.id)
@@ -124,6 +144,7 @@ def test_stream_persists_before_result_then_idle_and_does_not_wait_for_enrich(mo
         _reset()
 
 
+@pytest.mark.skip(reason="Oneshot mode retired by user; implementation retained")
 def test_oneshot_uses_same_terminal_result_idle_pair(monkeypatch, tmp_path):
     _reset()
     s = _sess.Session(id="ses_t041_oneshot", name="t041", adapter="cbc", model="m")
@@ -377,13 +398,13 @@ def test_base_terminal_save_failure_sends_no_completion(monkeypatch):
     s, w = _stream_setup("ses_t041_save_fail")
     events = []
 
-    async def fail_save(_session):
+    def fail_save(_session, *, offline_override=None):
         raise OSError("disk unavailable")
 
     async def broadcast(value):
         events.append(value)
 
-    monkeypatch.setattr(_sess, "save_async", fail_save)
+    monkeypatch.setattr(_sess, "_save_body", fail_save)
     worker.set_broadcaster(broadcast)
 
     async def scenario():

@@ -25,6 +25,7 @@ DEFAULT_CONFIG: dict = {
     # Data retention is opt-in. A null day count means never clean; there is
     # deliberately no implicit duration. Jobs settings belong to config.jobs.
     "data_retention": {
+        "workdirs": {"enabled": False, "days": None},
         "sessions": {"enabled": False, "days": None},
         "attachments": {"enabled": False, "days": None},
         "qq_history": {"enabled": False, "days": None},
@@ -109,6 +110,13 @@ DEFAULT_CONFIG: dict = {
         "backup_count": 7,
         # 是否同时在控制台输出
         "console": True,
+        # 整文件轮转（rename 后开新文件，不 truncate 活跃文件）：
+        # pan-console.out.log / pan-console.err.log（主进程 stdout/stderr 转发）
+        "console_max_bytes": 20971520,
+        "console_backup_count": 3,
+        # data/logs/session-errors.jsonl（错误样本 JSONL）
+        "session_error_max_bytes": 20971520,
+        "session_error_backup_count": 3,
     },
     "kimi": {
         "model": "moonshot-cn/kimi-k2.6",
@@ -180,6 +188,12 @@ DEFAULT_CONFIG: dict = {
         # 握手不通，http2 稳定。空串 = 不注入（沿用 cloudflared 默认 auto）。
         "protocol": "http2",
     },
+    # Independent authenticated MCP gateway + named tunnel; opt-in only.
+    "tailscale": {"startupEnabled": False, "protocol": "http", "port": 8768},
+    "lan": {"startupEnabled": False, "host": "", "port": 8780},
+    "mcp_remote": {"enabled": False, "port": 9742, "public_hostname": "",
+                   "access_issuer": "", "access_audience": "",
+                   "config_path": "", "binary_path": ""},
     # QQ 模块（packages/qq/bot.py，NoneBot，跑在独立解释器上）
     "qq": {
         # QQ bot 独立解释器路径（单一事实源）。空串 = 走默认解析链：
@@ -199,6 +213,11 @@ DEFAULT_CONFIG: dict = {
     "ui": {
         # 会话列表默认分组方式
         "defaultGroupBy": "none",
+        # 是否显示侧栏 Session 分组循环按钮
+        "showGroupBy": False,
+        # 桌面端侧栏边缘的浮动折叠/展开把手（移动端不渲染；
+        # 标题栏折叠按钮与折叠后导航栏的恢复按钮不受此设置影响）
+        "showSidebarCollapseHandle": True,
         # 新建 Session 默认归入当前 Workspace
         "defaultNewSessionToCurrentWorkspace": True,
         # 是否显示 meta-agent（////by agent）消息
@@ -207,9 +226,30 @@ DEFAULT_CONFIG: dict = {
         "showTaskAgent": True,
         # 是否显示 QQ（@@@@by qq）注入消息
         "showQQ": True,
+        # 用户主动 Kill running/queued Worker 时是否向 manager 报告 error
+        # （App Settings → Behavior；缺省/旧配置视为关闭）
+        "reportWorkerKillErrors": False,
+        # Behavior → Message auto force send：三类新入队消息是否自动复用
+        # Force send 能力路由（system=Job 终态、ma=MA/管理器消息、
+        # report=完成报告）。缺省三项全部关闭，保持既有排队行为。
+        "sessionErrorBridge": True,
+        "autoForceSend": {"system": False, "ma": False, "report": False},
+        # 自动完成报告策略；summary 是独立策略，决定报告是否附带本轮输入
+        # 正文的前 100 个 Unicode 字符（不调用模型）。四项来源开关默认全关，
+        # 且不会继承插件的 auto_report_default。
+        "autoReport": {"system": False, "ma": True, "user": False, "plugins": {},
+                       "summary": {"system": False, "ma": False, "user": False, "plugins": {}}},
         # 是否通过 Toast 显示 Codex CLI 原生 warning
         "notifications": {
             "codexWarningToast": True,
+            "lockerUnread": {"enabled": False, "system": False, "browser": False, "qqReport": False, "qqTargets": []},
+            "newError": {"enabled": False, "system": False, "browser": False, "qqReport": False, "qqTargets": []},
+            "completionBridge": {"system": True, "browser": False, "qqReport": False, "qqSubscribe": False, "qqTargets": []},
+            # 全局未读记录策略（packages/core/unread_policy.py 的单一谓词）：
+            # ["all"] 全部记录（旧配置默认）| ["none"] 不记录任何 Session |
+            # ["bell-on"]/["bell-off"]/["pinned"] 的并集。空集合规范化为
+            # ["none"]；bell-on 与 bell-off 互斥；all/none 独占。
+            "unreadRecording": ["all"],
         },
     },
 }

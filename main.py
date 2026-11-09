@@ -14,6 +14,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from packages.core import __version__
+from packages.jobs.window import command_window_options
 from packages.web.server import app
 
 _log = logging.getLogger("pan")
@@ -112,7 +113,12 @@ def _napcat_reachable(timeout: float = 1.0) -> bool:
     connection, or when no endpoint is configured (no degradation to report).
     Never raises; failures mean "unreachable".
     """
-    urls = _qq_ws_urls_from_env() or _qq_ws_urls_from_config()
+    try:
+        from packages.core.config import load_config
+        plugin_selected = bool((load_config().get("qq") or {}).get("plugin_id"))
+    except Exception:
+        plugin_selected = False
+    urls = (_qq_ws_urls_from_config() if plugin_selected else _qq_ws_urls_from_env()) or _qq_ws_urls_from_config()
     if not urls:
         return True
     for url in urls:
@@ -142,7 +148,7 @@ def _qq_health_check() -> None:
         # 子进程存活：NapCat 不可达时提示降级（bot.py 会自行每 3s 重试）。
         if not _napcat_reachable():
             _log.warning(
-                "[Pan] NapCat unreachable — QQ module runs degraded "
+                "[Pan] QQ gateway unreachable — QQ module runs degraded "
                 "(bot.py retries the OneBot WS connection every 3s)"
             )
         return
@@ -249,6 +255,8 @@ def _spawn_wechat_bot() -> None:
             [python, str(_WECHAT_BOT_PY)],
             cwd=str(_WECHAT_DIR),
             env={**os.environ, "PYTHONPATH": str(_PROJECT_ROOT)},
+            stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr,
+            **command_window_options(),
         )
     except Exception as e:  # noqa: BLE001
         _log.error("[Pan] WeChat bot spawn failed: %s", e)
@@ -284,9 +292,9 @@ def _resolve_qq_python() -> str:
 def _spawn_qq_bot() -> None:
     """Start the QQ bridge (packages/qq/bot.py) if config qq.enabled.
 
-    The QQ bot is a child of this process, so stopping main.py (e.g. via
-    stop_pan.bat's process-tree kill) takes the QQ bot down with it. A pid
-    file is written so the stop script can also target it directly.
+    The QQ bot is a child of this process.  The internal launcher records its
+    PID and creation time after readiness; normal Pan shutdown reaches this
+    function through the main process' atexit/lifespan path.
     """
     global _qq_proc
     from packages.core.config import load_config
@@ -296,16 +304,26 @@ def _spawn_qq_bot() -> None:
         _log.info("[Pan] QQ module disabled (qq.enabled=false), skipping bot.py")
         return
 
-    # Avoid double-spawning if a previous QQ bot is still alive (e.g. main.py
-    # was restarted without going through stop_pan.bat).
+    # Avoid double-spawning only when the recorded PID is still an actual bot
+    # from this checkout.  A bare pid_exists check would be unsafe under PID
+    # reuse and could silently suppress the QQ bridge.
     if _QQ_PID_FILE.exists():
         try:
             old_pid = int(_QQ_PID_FILE.read_text(encoding="utf-8").strip())
         except ValueError:
             old_pid = 0
         if old_pid and _is_pid_alive(old_pid):
-            _log.warning("[Pan] QQ bot pid %s still alive, skipping spawn — stop it first", old_pid)
-            return
+            try:
+                import psutil
+                old = psutil.Process(old_pid)
+                command = " ".join(old.cmdline() or []).replace("\\", "/").lower()
+                root_marker = str(_PROJECT_ROOT).replace("\\", "/").lower().rstrip("/") + "/"
+                if "bot.py" in command and root_marker in command:
+                    _log.warning("[Pan] QQ bot pid %s still belongs to this checkout; skipping spawn", old_pid)
+                    return
+            except Exception:
+                pass
+        _QQ_PID_FILE.unlink(missing_ok=True)
 
     python = _resolve_qq_python()
     try:
@@ -316,6 +334,8 @@ def _spawn_qq_bot() -> None:
             [python, str(_QQ_BOT_PY)],
             cwd=str(_QQ_DIR),
             env={**os.environ, "PYTHONPATH": str(_PROJECT_ROOT)},
+            stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr,
+            **command_window_options(),
         )
     except Exception as e:  # noqa: BLE001
         _log.error("[Pan] QQ bot spawn failed: %s", e)
@@ -328,6 +348,13 @@ def _spawn_qq_bot() -> None:
 
 
 if __name__ == "__main__":
+    from packages.core import console_logs
+    # Launcher-managed launches already installed this relay in the entry shim
+    # (console_bootstrap) before importing this module; the call is idempotent.
+    # It also covers a manual `python main.py` with the console paths exported.
+    console_logs.install()
+    from packages.core.host_console import console as host_console
+    host_console.initialize()
     import uvicorn
     from packages.core.cli_diagnostics import log_cli_preflight
     from packages.core.config import load_config
@@ -371,10 +398,18 @@ if __name__ == "__main__":
     atexit.register(_stop_wechat_bot)
 
     config = uvicorn.Config(app, host=host, port=port, log_level="info", access_log=False)
-    server = uvicorn.Server(config)
+    from packages.core.host_server import PanServer
+    server = PanServer(config)
+    # launcher.exit/restart requests this object through the loopback internal
+    # coordination endpoint.  Uvicorn then runs the normal lifespan teardown,
+    # which remains the sole graceful owner of Worker and QQ cleanup.
+    app.state.pan_uvicorn_server = server
+    from packages.web.server import _session_lifecycle_preferences
+    host_console.start_input(port, lambda: _session_lifecycle_preferences()["exitStrategy"])
     server.run()
 
     # uvicorn returns after a graceful shutdown (Ctrl+C / SIGTERM handled
     # internally); make sure the QQ bot is torn down too.
     _stop_qq_bot()
+    app.state.pan_uvicorn_server = None
     _stop_wechat_bot()

@@ -87,6 +87,14 @@ def _emit(event: dict) -> None:
                 close()
 
 
+async def _emit_strict(event: dict) -> bool:
+    """统一循环严格发射：直连 scheduler_api.emit_strict，不经吞异常的
+    on_event 链，把成功/失败如实返回给需要重试语义的调用方。"""
+    from packages.scheduler.api import emit_strict
+
+    return await emit_strict(event)
+
+
 async def _consume(awaitable) -> None:
     try:
         await awaitable
@@ -104,6 +112,7 @@ def _ensure_registered() -> None:
         root_resolver=lambda: str(store.data_root()),
         config_resolver=lambda: scheduler_config(),
         on_event=_emit,
+        on_event_strict=_emit_strict,
     )
 
 
@@ -169,15 +178,20 @@ async def run_now(task_id: str) -> dict:
     if job is None:
         return {"ok": False, "error": {"code": "not_found",
                                        "message": f"任务不存在：{task_id}"}}
+    from packages.jobs.action_runtime import is_protected_job as is_action_job
+    if is_action_job(job):
+        return {'ok':False,'error':{'code':'user_confirmation_required','message':'Use protected Action Job runtime'}}
     now = datetime.now().replace(microsecond=0)
     action = job.get("action")
     action_api = action.get("api", "assign") if isinstance(action, dict) else "assign"
-    if (action_api not in {"shell", background_jobs.RESUME_LEGAL_RUNNING_ACTION}
+    if (action_api not in {"shell", "send_qq",
+                           background_jobs.RESUME_LEGAL_RUNNING_ACTION}
             and not task.get("target_session_id")):
         return {"ok": False, "error": {"code": "invalid_argument",
                                        "message": "target session is required"}}
     dispatch_key = (f"{task_id}:manual:{uuid.uuid4().hex}"
-                    if action_api == "shell" else f"{task_id}:{int(now.timestamp())}")
+                    if action_api in {"shell", "send_qq"}
+                    else f"{task_id}:{int(now.timestamp())}")
     try:
         result = await background_jobs._run_job_action(
             job, task.get("target_session_id"), dispatch_key,

@@ -1,19 +1,24 @@
 // @vitest-environment jsdom
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { act, cleanup, fireEvent, render } from '@testing-library/react';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import type { RefObject } from 'react';
 import { MessageNavigationRail } from './MessageNavigationRail';
 import { MessageNavigationDock } from './MessageNavigationDock';
+import { createPortal } from 'react-dom';
 import { useSessionStore } from '@/stores/sessionStore';
+import { useBookmarkStore } from '@/stores/bookmarkStore';
 import { useAppSettingsStore, DEFAULT_SETTINGS } from '@/stores/appSettingsStore';
-import { fetchSessionHistory } from '@/services/api';
+import { fetchSessionNavigation } from '@/services/api';
 import type { Message } from '@/types';
+import * as messageOrdering from '@/stores/messageOrdering';
 
 vi.mock('@/services/api', () => ({
-  fetchSessionHistory: vi.fn(),
+  fetchSessionNavigation: vi.fn(),
 }));
 
-const mockedHistory = vi.mocked(fetchSessionHistory);
+const mockedHistory = vi.mocked(fetchSessionNavigation);
 
 const USER_MESSAGE: Message = { role: 'user', content: 'hello from the user' };
 const SCRUB_MESSAGES: Message[] = [
@@ -29,7 +34,7 @@ function historyPage(history: Message[], total = history.length, start = 0) {
     total,
     start,
     hasMore: start > 0,
-  } as Awaited<ReturnType<typeof fetchSessionHistory>>;
+  } as Awaited<ReturnType<typeof fetchSessionNavigation>>;
 }
 
 /** The rail indexes the whole history on mount, so every test needs a page. */
@@ -39,12 +44,15 @@ function seedSession(sessionId: string) {
     currentMessages: [USER_MESSAGE],
     historyLoadEnd: 0,
     hasMoreMessages: false,
-    sessions: [],
+    sessions: [{ id: sessionId, historyTotal: sessionId.startsWith('rail-scrub') ? 4 : 1 } as never],
+    sessionTranscripts: {},
   });
 }
 
 const markers = (container: HTMLElement) =>
   [...container.querySelectorAll<HTMLButtonElement>('button.message-navigation-marker')];
+
+const railStylesSource = readFileSync(resolve(process.cwd(), 'src/index.css'), 'utf8').replace(/\r\n/g, '\n');
 
 function moveTouchPointer(element: HTMLElement, pointerId: number, clientX: number, clientY: number) {
   const event = new Event('pointermove', { bubbles: true });
@@ -82,6 +90,32 @@ afterEach(() => {
 });
 
 describe('message navigation dock', () => {
+  it('ignores pointer, focus and Escape events from a physically external portal', async () => {
+    vi.useFakeTimers();
+    const target = document.createElement('div');
+    document.body.append(target);
+    const close = vi.fn();
+    const view = render(<MessageNavigationDock chatRef={{ current: null }} dockRef={{ current: null }}
+      isMobile={false} mobileExpanded={false} onMobileClose={close} onRestoreFocus={vi.fn()} showNavigation={false}>
+      {createPortal(<input aria-label="Portaled search" />, target)}
+    </MessageNavigationDock>);
+    try {
+      const dock = view.getByTestId('message-navigation-dock');
+      const input = view.getByRole('textbox', { name: 'Portaled search' });
+      fireEvent.pointerEnter(input, { pointerType: 'mouse' });
+      fireEvent.focus(input);
+      expect(dock.getAttribute('data-expanded')).toBe('false');
+      fireEvent.pointerEnter(dock, { pointerType: 'mouse' });
+      expect(dock.getAttribute('data-expanded')).toBe('true');
+      fireEvent.pointerLeave(dock, { pointerType: 'mouse', relatedTarget: input });
+      fireEvent.pointerEnter(input, { pointerType: 'mouse' });
+      await act(async () => { vi.advanceTimersByTime(120); });
+      expect(dock.getAttribute('data-expanded')).toBe('false');
+      fireEvent.pointerEnter(dock, { pointerType: 'mouse' });
+      fireEvent.keyDown(input, { key: 'Escape' });
+      expect(dock.getAttribute('data-expanded')).toBe('true');
+    } finally { view.unmount(); target.remove(); }
+  });
   it('waits to index until desktop hover and keeps the indexed rail mounted when folded', async () => {
     vi.useFakeTimers();
     const dockRef = { current: null } as RefObject<HTMLDivElement | null>;
@@ -120,6 +154,26 @@ describe('message navigation dock', () => {
     fireEvent.pointerEnter(dock, { pointerType: 'mouse' });
     expect(panel.getAttribute('aria-hidden')).toBe('false');
     expect(mockedHistory).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not scan a newly selected Session behind a dock opened for the previous Session', async () => {
+    vi.useFakeTimers();
+    const { container } = render(<MessageNavigationDock chatRef={{ current: null }} dockRef={{ current: null }}
+      isMobile={false} mobileExpanded={false} onMobileClose={() => {}} onRestoreFocus={() => {}} />);
+    const dock = container.querySelector<HTMLElement>('[data-testid="message-navigation-dock"]')!;
+    fireEvent.pointerEnter(dock, { pointerType: 'mouse' });
+    await act(async () => { await Promise.resolve(); });
+    fireEvent.pointerLeave(dock, { pointerType: 'mouse' });
+    await act(async () => { vi.advanceTimersByTime(100); });
+    const previousRequests = mockedHistory.mock.calls.length;
+    act(() => { useSessionStore.setState({ currentSessionId: 'cold-next', currentMessages: [] }); });
+    await act(async () => { await Promise.resolve(); });
+    expect(container.querySelector('.message-navigation-rail')).toBeNull();
+    expect(mockedHistory).toHaveBeenCalledTimes(previousRequests);
+    fireEvent.pointerEnter(dock, { pointerType: 'mouse' });
+    await act(async () => { await Promise.resolve(); });
+    expect(container.querySelector('.message-navigation-rail')).not.toBeNull();
+    expect(mockedHistory).toHaveBeenCalledTimes(previousRequests + 1);
   });
 
   it('stays open within the dock, then collapses after pointer click focus leaves', async () => {
@@ -175,10 +229,9 @@ describe('message navigation dock', () => {
     fireEvent.pointerEnter(dock, { pointerType: 'mouse' });
     await act(async () => { await Promise.resolve(); });
 
-    const filter = container.querySelector<HTMLButtonElement>('.message-navigation-filter')!;
-    fireEvent.pointerDown(filter, { pointerType: 'mouse' });
-    act(() => filter.focus());
-    fireEvent.click(filter, { detail: 1 });
+    const firstMarker = container.querySelector<HTMLButtonElement>('.message-navigation-marker')!;
+    fireEvent.pointerDown(firstMarker, { pointerType: 'mouse' });
+    act(() => firstMarker.focus());
     fireEvent.pointerLeave(dock, { pointerType: 'mouse' });
     await act(async () => { vi.advanceTimersByTime(90); });
     expect(dock.getAttribute('data-expanded')).toBe('false');
@@ -263,6 +316,7 @@ describe('mobile message navigation scrub', () => {
     vi.useFakeTimers();
     mockedHistory.mockResolvedValue(historyPage(SCRUB_MESSAGES));
     seedSession('rail-scrub');
+    useSessionStore.setState({ sessions: [{ id: 'rail-scrub', historyTotal: 4 } as never] });
   });
 
   async function renderOpenMobileRail() {
@@ -395,7 +449,7 @@ describe('mobile message navigation scrub', () => {
     expect(document.querySelector('[role="tooltip"]')).toBeNull();
   });
 
-  it('clears the gesture on session changes, rail close, and filter changes', async () => {
+  it('clears the gesture on session changes and rail close', async () => {
     const { container, rerender } = await renderOpenMobileRail();
     let marker = markers(container)[0]!;
     touchDown(marker);
@@ -432,8 +486,6 @@ describe('mobile message navigation scrub', () => {
     touchDown(marker, 9);
     await act(async () => { vi.advanceTimersByTime(450); });
     expect(document.querySelector('[role="tooltip"]')).not.toBeNull();
-    fireEvent.click(container.querySelector<HTMLButtonElement>('[role="tab"][aria-selected="false"]')!);
-    expect(document.querySelector('[role="tooltip"]')).toBeNull();
   });
 
   it('does not start scrubbing on desktop pointer interactions', async () => {
@@ -514,16 +566,507 @@ describe('jump single-flight lock across session switches', () => {
 });
 
 describe('rail mounting cost', () => {
-  it('indexes the full history when it is mounted', async () => {
+  it('does not rescan a complete transcript on streaming renders once the full index is ready', async () => {
+    const scan = vi.spyOn(messageOrdering, 'canonicalRowsWithOffsets');
+    const { container } = render(<MessageNavigationRail chatRef={{ current: null }} />);
+    await act(async () => { await Promise.resolve(); });
+    expect(container.querySelector('.message-navigation-rail')?.getAttribute('data-index-status')).toBe('ready');
+    scan.mockClear();
+    await act(async () => {
+      useSessionStore.setState({ currentMessages: Array.from({ length: 5000 }, (_, i) => ({ role: 'user', content: `row ${i}` })) });
+    });
+    expect(scan).not.toHaveBeenCalled();
+    expect(markers(container)).toHaveLength(1);
+  });
+
+  it('loads a bounded tail page without a reliable viewport', async () => {
     const { container } = render(<MessageNavigationRail chatRef={{ current: null }} />);
     await act(async () => {
       await Promise.resolve();
     });
 
-    // Mounting the rail is what triggers the full-history index — the cost the
-    // `Show message navigation rail` switch removes by not mounting it at all.
+    // Without a viewport handle, show a bounded useful page without highlighting.
     expect(mockedHistory).toHaveBeenCalled();
     expect(mockedHistory.mock.calls[0]![0]).toBe('rail-1');
     expect(container.querySelector('.message-navigation-rail')).not.toBeNull();
+  });
+});
+
+
+describe('open nearest canonical regression', () => {
+  const seedRows = (total: number, start: number, count: number, id = 'nearest') => {
+    const rows = Array.from({ length: count }, (_, i): Message => ({ role: (start + i) % 10 === 0 ? 'user' : 'assistant', content: `row ${start + i}`, messageId: `canonical-${start + i}` }));
+    rows.forEach((m, i) => messageOrdering.markDurableRow(m, start + i));
+    useSessionStore.setState({ currentSessionId: id, sessions: [{ id, historyTotal: total } as never], currentMessages: rows, sessionTranscripts: {} });
+    return rows;
+  };
+  const selected = (container: HTMLElement) => container.querySelector<HTMLElement>('.is-viewport-target')?.dataset.canonicalOffset;
+  it('locates from the loaded canonical window without history requests or body jumps; every reopen resnapshots', async () => {
+    seedRows(1000, 400, 200);
+    const snapshot = vi.fn().mockReturnValue({ start: 493, end: 506 });
+    const scrollToMessage = vi.fn();
+    const ref = { current: { getViewportHistoryRange: snapshot, scrollToMessage } } as never;
+    const view = render(<MessageNavigationRail chatRef={ref} expanded />);
+    await act(async () => { await Promise.resolve(); });
+    expect(selected(view.container)).toBe('500'); expect(scrollToMessage).not.toHaveBeenCalled();
+    snapshot.mockReturnValue({ start: 533, end: 546 });
+    view.rerender(<MessageNavigationRail chatRef={ref} expanded={false} />);
+    view.rerender(<MessageNavigationRail chatRef={ref} expanded />);
+    expect(selected(view.container)).toBe('540'); expect(snapshot).toHaveBeenCalledTimes(2);
+  });
+  it('does not count local Task completed as a canonical navigation row', async () => {
+    const rows = seedRows(1000, 490, 20);
+    const terminal: Message = { role: 'user', content: '[DONE] Task completed' };
+    messageOrdering.markLocalMarker(terminal);
+    useSessionStore.setState({ currentMessages: [...rows, terminal] });
+    const view = render(<MessageNavigationRail chatRef={{ current: { getViewportHistoryRange: () => ({ start: 499, end: 501 }) } as never }} />);
+    expect(selected(view.container)).toBe('500');
+    expect(markers(view.container).some(m => m.title.includes('Task completed'))).toBe(false);
+  });
+  it('converges from an initially unavailable viewport via a notification, once only', async () => {
+    seedRows(1000, 400, 200);
+    let notify: ((range: { start: number; end: number }) => void) | undefined;
+    const unsubscribe = vi.fn();
+    const view = render(<MessageNavigationRail chatRef={{ current: { getViewportHistoryRange: () => null,
+      observeViewportHistoryRange: (callback: typeof notify) => { notify = callback; return unsubscribe; } } as never }} />);
+    expect(selected(view.container)).toBeUndefined();
+    act(() => { notify?.({ start: 490, end: 510 }); });
+    expect(selected(view.container)).toBe('500'); expect(unsubscribe).toHaveBeenCalledTimes(1);
+    act(() => { notify?.({ start: 530, end: 550 }); });
+    expect(selected(view.container)).toBe('500');
+  });
+  it('programmatic scroll does not cancel pending pagination; genuine wheel does', async () => {
+    seedRows(1000, 400, 1);
+    let resolve!: (value: ReturnType<typeof historyPage>) => void;
+    mockedHistory.mockImplementation(() => new Promise(r => { resolve = r; }));
+    const view = render(<MessageNavigationRail chatRef={{ current: { getViewportHistoryRange: () => ({ start: 499, end: 501 }) } as never }} />);
+    fireEvent.scroll(window);
+    await act(async () => { resolve(historyPage(Array.from({ length: 200 }, (_, i) => ({ role: i === 100 ? 'user' : 'assistant', content: `fetched ${i}` })), 1000, 400)); });
+    expect(selected(view.container)).toBe('500');
+    view.unmount(); seedRows(1000, 400, 1);
+    const second = render(<MessageNavigationRail chatRef={{ current: { getViewportHistoryRange: () => ({ start: 499, end: 501 }) } as never }} />);
+    fireEvent.wheel(window);
+    await act(async () => { resolve(historyPage(Array.from({ length: 200 }, () => ({ role: 'user', content: 'late' })), 1000, 400)); });
+    expect(selected(second.container)).toBeUndefined();
+  });
+  it('bounds transient retry, retains local targets, and keyboard retry recovers single-flight', async () => {
+    vi.useFakeTimers(); seedRows(1000, 400, 1);
+    mockedHistory.mockRejectedValue(new Error('transient network'));
+    const view = render(<MessageNavigationRail chatRef={{ current: { getViewportHistoryRange: () => ({ start: 499, end: 501 }) } as never }} />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    expect(mockedHistory).toHaveBeenCalledTimes(3); expect(markers(view.container)).toHaveLength(1);
+    const retry = view.getByRole('button', { name: 'Retry message navigation' });
+    expect(view.getByRole('status').textContent).toContain('transient network');
+    mockedHistory.mockResolvedValue(historyPage(Array.from({ length: 200 }, (_, i) => ({ role: i === 100 ? 'user' : 'assistant', content: `recovered ${i}` })), 1000, 400));
+    await act(async () => { fireEvent.click(retry); fireEvent.click(retry); });
+    expect(mockedHistory).toHaveBeenCalledTimes(4); expect(selected(view.container)).toBe('500');
+    expect(view.queryByRole('button', { name: 'Retry message navigation' })).toBeNull();
+  });
+  it('aborts retries on close and rejects late responses after Session or filter changes', async () => {
+    vi.useFakeTimers(); seedRows(1000, 400, 1);
+    mockedHistory.mockRejectedValue(new Error('transient'));
+    const ref = { current: { getViewportHistoryRange: () => ({ start: 499, end: 501 }) } } as never;
+    const view = render(<MessageNavigationRail chatRef={ref} />);
+    await act(async () => { await Promise.resolve(); });
+    view.rerender(<MessageNavigationRail chatRef={ref} expanded={false} />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    expect(mockedHistory).toHaveBeenCalledTimes(1);
+    let resolve!: (value: ReturnType<typeof historyPage>) => void;
+    mockedHistory.mockImplementation(() => new Promise(r => { resolve = r; }));
+    view.rerender(<MessageNavigationRail chatRef={ref} />);
+    const oldResolve = resolve;
+    act(() => { seedRows(1000, 400, 200, 'new-session'); });
+    await act(async () => { oldResolve(historyPage(Array.from({ length: 200 }, () => ({ role: 'user', content: 'OLD' })), 1000, 400)); });
+    expect(markers(view.container).some(m => m.title === 'OLD')).toBe(false);
+    act(() => { useAppSettingsStore.setState({ showQQ: false }); });
+    expect(markers(view.container).some(m => m.title === 'OLD')).toBe(false);
+  });
+  it('same-epoch appends refresh fromEnd without another snapshot, request or rail scroll', async () => {
+    seedRows(1000, 0, 1000);
+    const snapshot = vi.fn().mockReturnValue({ start: 499, end: 501 });
+    const view = render(<MessageNavigationRail chatRef={{ current: { getViewportHistoryRange: snapshot } as never }} />);
+    expect(selected(view.container)).toBe('500');
+    const list = view.container.querySelector<HTMLElement>('.message-navigation-list')!;
+    list.scrollTop = 123;
+    act(() => { useSessionStore.setState({ sessions: [{ id: 'nearest', historyTotal: 1001 } as never] }); });
+    expect(snapshot).toHaveBeenCalledTimes(1); expect(list.scrollTop).toBe(123);
+    expect(view.container.querySelector<HTMLElement>('.is-viewport-target')?.dataset.fromEnd).toBe('500');
+    expect(mockedHistory).toHaveBeenCalledTimes(1);
+    expect(mockedHistory.mock.calls[0]?.slice(1,3)).toEqual([1001,1]);
+  });
+  it('history epoch invalidation cannot reuse cached offsets or a late old page', async () => {
+    seedRows(1000, 400, 1);
+    let oldResolve!: (value: ReturnType<typeof historyPage>) => void;
+    mockedHistory.mockImplementationOnce(() => new Promise(resolve => { oldResolve = resolve; }));
+    const ref = { current: { getViewportHistoryRange: () => ({ start: 499, end: 501 }) } } as never;
+    const view = render(<MessageNavigationRail chatRef={ref} />);
+    act(() => { useSessionStore.setState({ sessionTranscripts: { nearest: { window: { epoch: 'new', rows: new Map() } } as never } }); });
+    await act(async () => { oldResolve({ ...historyPage(Array.from({ length: 200 }, () => ({ role: 'user', content: 'OLD-EPOCH' })), 1000, 400), historyEpoch: 'old' }); });
+    expect(markers(view.container).some(m => m.title === 'OLD-EPOCH')).toBe(false);
+  });
+
+  it('loads a complete continuous index automatically without visible paging controls', async()=>{
+    vi.useFakeTimers();seedRows(1600,1400,200);
+    vi.stubGlobal('requestAnimationFrame',(callback:FrameRequestCallback)=>setTimeout(()=>callback(0),0));
+    mockedHistory.mockImplementation(async(_id,before=0,limit=500)=>{const start=Math.max(0,before-limit);return historyPage(Array.from({length:before-start},(_,i)=>({role:start+i>=1400&&(start+i)%10!==0?'assistant':'user',content:`row ${start+i}`,messageId:`canonical-${start+i}`})),1600,start);});
+    const view=render(<MessageNavigationRail chatRef={{current:{getViewportHistoryRange:()=>({start:1499,end:1501})} as never}}/>);
+    await act(async()=>{await vi.runAllTimersAsync();});
+    expect(view.container.querySelector('.message-navigation-rail')?.getAttribute('data-index-status')).toBe('ready');
+    expect(view.container.querySelector('.message-navigation-rail')?.getAttribute('data-indexed-targets')).toBe('1420');
+    expect(view.queryByRole('button',{name:'Load earlier navigation'})).toBeNull();expect(view.queryByRole('button',{name:'Load more nearby navigation'})).toBeNull();
+    expect(markers(view.container).length).toBeLessThan(100);
+  });
+});
+
+describe('clicked navigation tag reuses the nearest-tag highlight', () => {
+  const seedRows = (total: number, start: number, count: number, id = 'click-highlight') => {
+    const rows = Array.from({ length: count }, (_, i): Message => ({ role: (start + i) % 10 === 0 ? 'user' : 'assistant', content: `row ${start + i}`, messageId: `canonical-${start + i}` }));
+    rows.forEach((m, i) => messageOrdering.markDurableRow(m, start + i));
+    useSessionStore.setState({ currentSessionId: id, sessions: [{ id, historyTotal: total } as never], currentMessages: rows, sessionTranscripts: {} });
+    return rows;
+  };
+  const selected = (container: HTMLElement) => container.querySelector<HTMLElement>('.is-viewport-target')?.dataset.canonicalOffset;
+  const markerAt = (container: HTMLElement, offset: number) =>
+    container.querySelector<HTMLButtonElement>(`.message-navigation-marker[data-canonical-offset="${offset}"]`);
+
+  it('marks the clicked tag with the nearest-tag style until real input releases it', async () => {
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => { callback(performance.now()); return 1; });
+    seedRows(1000, 400, 200);
+    const scrollToMessage = vi.fn(() => true);
+    const ensureMessageLoaded = vi.fn().mockImplementation(async (fromEnd: number) => {
+      const offset = 999 - fromEnd;
+      return { role: (offset % 10 === 0 ? 'user' : 'assistant'), content: `row ${offset}`, messageId: `canonical-${offset}` } as Message;
+    });
+    useSessionStore.setState({ ensureMessageLoaded });
+    const ref = { current: { getViewportHistoryRange: () => ({ start: 499, end: 501 }), scrollToMessage } } as never;
+    const view = render(<MessageNavigationRail chatRef={ref} expanded />);
+    await act(async () => { await Promise.resolve(); });
+    expect(selected(view.container)).toBe('500');
+
+    const clicked = markerAt(view.container, 510)!;
+    await act(async () => { fireEvent.click(clicked); await Promise.resolve(); await Promise.resolve(); });
+    expect(scrollToMessage).toHaveBeenCalledWith(expect.objectContaining({ messageId: 'canonical-510' }), 510);
+    // The clicked tag takes the active highlight (same state/CSS as the
+    // located nearest); the previous nearest no longer carries it.
+    expect(selected(view.container)).toBe('510');
+    expect(markerAt(view.container, 510)?.getAttribute('aria-current')).toBe('location');
+
+    // Real user input releases the jump highlight; the existing
+    // locate-on-expansion rule moves it again instead of staying locked.
+    fireEvent.wheel(window);
+    expect(selected(view.container)).toBeUndefined();
+    view.rerender(<MessageNavigationRail chatRef={ref} expanded={false} />);
+    view.rerender(<MessageNavigationRail chatRef={ref} expanded />);
+    await act(async () => { await Promise.resolve(); });
+    expect(selected(view.container)).toBe('500');
+  });
+
+  it('keeps the located nearest highlight through scroll, and clears a jump highlight on session switch', async () => {
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => { callback(performance.now()); return 1; });
+    seedRows(1000, 400, 200);
+    const ensureMessageLoaded = vi.fn().mockImplementation(async (fromEnd: number) => {
+      const offset = 999 - fromEnd;
+      return { role: (offset % 10 === 0 ? 'user' : 'assistant'), content: `row ${offset}`, messageId: `canonical-${offset}` } as Message;
+    });
+    useSessionStore.setState({ ensureMessageLoaded });
+    const ref = { current: { getViewportHistoryRange: () => ({ start: 499, end: 501 }), scrollToMessage: () => true } } as never;
+    const view = render(<MessageNavigationRail chatRef={ref} expanded />);
+    await act(async () => { await Promise.resolve(); });
+    expect(selected(view.container)).toBe('500');
+    // Existing semantics preserved: a located nearest is not scroll-released.
+    fireEvent.wheel(window);
+    expect(selected(view.container)).toBe('500');
+
+    // A completed jump highlight never survives a session switch.
+    const clicked = markerAt(view.container, 510)!;
+    await act(async () => { fireEvent.click(clicked); await Promise.resolve(); await Promise.resolve(); });
+    expect(selected(view.container)).toBe('510');
+    act(() => { seedRows(1000, 400, 200, 'click-highlight-other'); });
+    await act(async () => { await Promise.resolve(); });
+    expect(selected(view.container)).toBe('500');
+  });
+});
+
+describe('bookmark rail decoration and tag filter', () => {
+  const seedBookmarkRows = (id = 'bookmark-deco') => {
+    const rows = Array.from({ length: 10 }, (_, i): Message => ({
+      role: i === 0 ? 'user' : 'assistant',
+      content: `row ${i}`,
+      messageId: `canonical-${i}`,
+    }));
+    rows.forEach((message, i) => messageOrdering.markDurableRow(message, i));
+    rows[0]!.bookmarked = true;          // existing user tag, bookmarked
+    rows[1]!.bookmarked = true;          // plain assistant block, bookmarked
+    useSessionStore.setState({
+      currentSessionId: id,
+      sessions: [{ id, historyTotal: 10 } as never],
+      currentMessages: rows,
+      sessionTranscripts: {},
+    });
+    mockedHistory.mockResolvedValue(historyPage(rows, 10, 0));
+    return rows;
+  };
+
+  it('decorates an existing tag and adds a bookmark tag without duplication', async () => {
+    seedBookmarkRows();
+    const view = render(<MessageNavigationRail
+      chatRef={{ current: { getViewportHistoryRange: () => ({ start: 0, end: 9 }) } as never }} />);
+    await act(async () => { await Promise.resolve(); });
+
+    const userMarker = view.container.querySelector<HTMLElement>('[data-kind="user"]')!;
+    expect(userMarker.getAttribute('data-bookmarked')).toBe('true');
+    expect(userMarker.getAttribute('aria-label')).toContain('User (Bookmark)');
+    expect(userMarker.querySelector('.message-navigation-marker-bookmark-badge')).not.toBeNull();
+
+    // The bookmarked plain assistant block gets its own bookmark tag in
+    // message order; nothing else is added.
+    const rendered = markers(view.container);
+    expect(rendered.map((marker) => marker.dataset.kind)).toEqual(['user', 'bookmark']);
+    expect(rendered[1]!.getAttribute('data-message-id')).toBe('canonical-1');
+    expect(rendered[1]!.getAttribute('aria-label')).toContain('Bookmark');
+    // No duplicate tag for the user block: exactly one marker per bookmarked row.
+    expect(view.container.querySelectorAll('[data-message-id="canonical-0"]')).toHaveLength(1);
+  });
+
+  it('applies the store overlay to the loaded window without a refetch', async () => {
+    const rows = seedBookmarkRows('bookmark-overlay');
+    rows[1]!.bookmarked = false;         // only the user row is bookmarked initially
+    useSessionStore.setState({ currentMessages: rows });
+    const view = render(<MessageNavigationRail
+      chatRef={{ current: { getViewportHistoryRange: () => ({ start: 0, end: 9 }) } as never }} />);
+    await act(async () => { await Promise.resolve(); });
+    expect(markers(view.container).map((marker) => marker.dataset.kind)).toEqual(['user']);
+
+    // An optimistic/dual-client mark for the plain block appears immediately.
+    act(() => {
+      useBookmarkStore.setState({
+        sessions: { 'bookmark-overlay': {
+          appliedThrough: 1, snapshotRevision: 1,
+          authoritativeMarks: { 'canonical-1': true },
+          authoritativeTouched: { 'canonical-1': 1 }, pendingEvents: [],
+          marks: { 'canonical-1': true }, loaded: true, transactions: {}, error: null,
+        } },
+      });
+    });
+    await act(async () => { await Promise.resolve(); });
+    expect(markers(view.container).map((marker) => marker.dataset.kind)).toEqual(['user', 'bookmark']);
+    // Removing the user bookmark through the overlay undecorates the tag.
+    act(() => {
+      useBookmarkStore.setState({
+        sessions: { 'bookmark-overlay': {
+          appliedThrough: 2, snapshotRevision: 2,
+          authoritativeMarks: { 'canonical-0': false, 'canonical-1': true },
+          authoritativeTouched: { 'canonical-0': 2, 'canonical-1': 2 }, pendingEvents: [],
+          marks: { 'canonical-0': false, 'canonical-1': true },
+          loaded: true, transactions: {}, error: null,
+        } },
+      });
+    });
+    await act(async () => { await Promise.resolve(); });
+    const userMarker = view.container.querySelector<HTMLElement>('[data-kind="user"]')!;
+    expect(userMarker.getAttribute('data-bookmarked')).toBe('false');
+    expect(userMarker.getAttribute('aria-label')).not.toContain('(Bookmark)');
+    expect(userMarker.querySelector('.message-navigation-marker-bookmark-badge')).toBeNull();
+  });
+
+  it('filters kinds with OR semantics and clears back to everything', async () => {
+    seedBookmarkRows('bookmark-filter');
+    const view = render(<MessageNavigationRail
+      chatRef={{ current: { getViewportHistoryRange: () => ({ start: 0, end: 9 }) } as never }} />);
+    await act(async () => { await Promise.resolve(); });
+    expect(markers(view.container)).toHaveLength(2);
+
+    fireEvent.click(view.getByRole('button', { name: 'Filter navigation tags by type' }));
+    const menu = document.querySelector('[data-navigation-filter-menu]')!;
+    expect(menu).not.toBeNull();
+    expect(document.querySelectorAll('[data-navigation-filter-kind]')).toHaveLength(6);
+    fireEvent.click(document.querySelector('[data-navigation-filter-kind="bookmark"]')!);
+    expect(markers(view.container).map((marker) => marker.dataset.kind)).toEqual(['bookmark']);
+    expect(view.container.querySelector('.message-navigation-rail')?.getAttribute('data-visible-targets')).toBe('1');
+    fireEvent.click(document.querySelector('[data-navigation-filter-kind="user"]')!);
+    expect(markers(view.container).map((marker) => marker.dataset.kind)).toEqual(['user', 'bookmark']);
+    fireEvent.click(document.querySelector('[data-navigation-filter-clear]')!);
+    expect(markers(view.container)).toHaveLength(2);
+    expect(document.querySelector('[data-navigation-filter-clear]')?.hasAttribute('disabled')).toBe(true);
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(document.querySelector('[data-navigation-filter-menu]')).toBeNull();
+  });
+
+  it('the highlight state keeps the bookmark badge layered with semantic colors', () => {
+    // jsdom cannot resolve color-mix(), so this is the deterministic source
+    // contract for the inverted highlight state; the measured contrast and
+    // screenshots (both themes) come from the real-browser rail e2e.
+    // Inverted marker: glyph takes the surface color on a saturated plate.
+    expect(railStylesSource).toMatch(
+      /\.message-navigation-marker\.is-viewport-target\s*\{[^}]*color:\s*var\(--color-bg-primary\)/);
+    // The badge must NOT keep the flat plate there (near-black glyph on the
+    // dark plate = one blob; washed-out on the light one): it inverts into a
+    // solid surface chip whose glyph carries the kind's semantic color.
+    expect(railStylesSource).toMatch(
+      /\.message-navigation-marker\.is-viewport-target \.message-navigation-marker-bookmark-badge\s*\{[^}]*color:\s*var\(--navigation-marker-highlight\)/);
+    expect(railStylesSource).toMatch(
+      /\.message-navigation-marker\.is-viewport-target \.message-navigation-marker-bookmark-badge\s*\{[^}]*background:\s*var\(--color-bg-primary\)/);
+    // The normal (non-highlight) badge keeps the unified inherited color.
+    expect(railStylesSource).toMatch(
+      /\.message-navigation-marker-bookmark-badge\s*\{[^}]*color:\s*inherit/);
+  });
+});
+
+describe('navigation filter keeps the folding dock open', () => {
+  const dockElement = (showNavigation: boolean) => (
+    <MessageNavigationDock
+      chatRef={{ current: null }}
+      dockRef={{ current: null }}
+      isMobile={false}
+      mobileExpanded={false}
+      onMobileClose={() => {}}
+      onRestoreFocus={() => {}}
+      showNavigation={showNavigation}
+    />
+  );
+  const filterMenu = () => document.querySelector<HTMLElement>('[data-navigation-filter-menu]');
+
+  /** Open the dock, let the lazily mounted rail index, and return the dock. */
+  const openDock = async (view: ReturnType<typeof render>) => {
+    const dock = view.getByTestId('message-navigation-dock');
+    fireEvent.pointerEnter(dock, { pointerType: 'mouse' });
+    await act(async () => { await Promise.resolve(); });
+    return dock;
+  };
+  const openFilter = (view: ReturnType<typeof render>) => {
+    fireEvent.click(view.getByRole('button', { name: 'Filter navigation tags by type' }));
+    return filterMenu()!;
+  };
+  const tick = async (ms: number) => {
+    await act(async () => { vi.advanceTimersByTime(ms); });
+  };
+
+  it('holds the dock open while the body-portaled filter menu is open, then restores the leave fold', async () => {
+    vi.useFakeTimers();
+    seedSession('rail-filter-hold');
+    const view = render(dockElement(true));
+    try {
+      const dock = await openDock(view);
+      expect(dock.getAttribute('data-expanded')).toBe('true');
+      const menu = openFilter(view);
+      expect(menu).not.toBeNull();
+      expect(view.container.querySelector('.message-navigation-rail')).not.toBeNull();
+
+      // Leaving the dock for the menu (a body portal, so outside the dock DOM)
+      // must not fold the panel while the menu is on screen.
+      fireEvent.pointerOut(dock, { pointerType: 'mouse', relatedTarget: menu });
+      fireEvent.pointerLeave(dock, { pointerType: 'mouse', relatedTarget: menu });
+      await tick(200);
+      expect(dock.getAttribute('data-expanded')).toBe('true');
+      expect(filterMenu()).not.toBeNull();
+      expect(view.container.querySelector('.message-navigation-rail')).not.toBeNull();
+
+      // A menu row is also outside the dock and must not fold it either.
+      fireEvent.click(document.querySelector('[data-navigation-filter-kind="user"]')!);
+      await tick(200);
+      expect(dock.getAttribute('data-expanded')).toBe('true');
+      expect(filterMenu()).not.toBeNull();
+
+      // Closing restores the original mouse-leave behavior: the pointer is
+      // outside, so the next fold is the plain 90 ms one.
+      fireEvent.keyDown(window, { key: 'Escape' });
+      expect(filterMenu()).toBeNull();
+      await tick(200);
+      expect(dock.getAttribute('data-expanded')).toBe('false');
+
+      // Hovering again expands exactly as before.
+      fireEvent.pointerEnter(dock, { pointerType: 'mouse' });
+      expect(dock.getAttribute('data-expanded')).toBe('true');
+    } finally {
+      view.unmount();
+    }
+  });
+
+  it('cancels a fold queued before the menu opened instead of collapsing under it', async () => {
+    vi.useFakeTimers();
+    seedSession('rail-filter-hold');
+    const view = render(dockElement(true));
+    try {
+      const dock = await openDock(view);
+      // Leaving queues the 90 ms fold from the existing pointer-leave rule.
+      fireEvent.pointerLeave(dock, { pointerType: 'mouse', relatedTarget: document.body });
+      await tick(40);
+      expect(dock.getAttribute('data-expanded')).toBe('true');
+
+      // Opening the menu inside that window cancels the queued fold.
+      openFilter(view);
+      await tick(300);
+      expect(dock.getAttribute('data-expanded')).toBe('true');
+      expect(filterMenu()).not.toBeNull();
+
+      // The lock is not sticky: closing with the pointer outside folds again.
+      fireEvent.click(view.getByRole('button', { name: 'Filter navigation tags by type' }));
+      expect(filterMenu()).toBeNull();
+      await tick(200);
+      expect(dock.getAttribute('data-expanded')).toBe('false');
+    } finally {
+      view.unmount();
+    }
+  });
+
+  it('lets the dock handle still fold the panel manually while the menu is open', async () => {
+    vi.useFakeTimers();
+    seedSession('rail-filter-hold');
+    const view = render(dockElement(true));
+    try {
+      const dock = await openDock(view);
+      openFilter(view);
+      const handle = view.container.querySelector<HTMLButtonElement>('.message-navigation-dock__handle')!;
+      // A real click starts with an outside pointerdown (which closes the
+      // menu), then toggles the dock; the hold must not keep it open.
+      fireEvent.pointerDown(handle, { pointerType: 'mouse' });
+      fireEvent.click(handle);
+      expect(filterMenu()).toBeNull();
+      expect(dock.getAttribute('data-expanded')).toBe('false');
+      await tick(200);
+      expect(dock.getAttribute('data-expanded')).toBe('false');
+    } finally {
+      view.unmount();
+    }
+  });
+
+  it('closes the menu on Escape even when the folding host stops that key', async () => {
+    vi.useFakeTimers();
+    seedSession('rail-filter-hold');
+    const view = render(dockElement(true));
+    try {
+      const dock = await openDock(view);
+      openFilter(view);
+      // The dock handles Escape itself (and stops propagation) whenever the
+      // focus is inside it: the menu must still be the thing that closes.
+      fireEvent.keyDown(view.getByRole('button', { name: 'Filter navigation tags by type' }), { key: 'Escape' });
+      expect(filterMenu()).toBeNull();
+      await tick(200);
+      // Releasing restores the plain rules: the pointer is gone and the host
+      // dismissed itself, so the next state is folded.
+      expect(dock.getAttribute('data-expanded')).toBe('false');
+    } finally {
+      view.unmount();
+    }
+  });
+
+  it('releases the hold when the rail unmounts with the menu still open', async () => {
+    vi.useFakeTimers();
+    seedSession('rail-filter-hold');
+    const view = render(dockElement(true));
+    try {
+      const dock = await openDock(view);
+      openFilter(view);
+      fireEvent.pointerLeave(dock, { pointerType: 'mouse', relatedTarget: document.body });
+      await tick(50);
+      expect(dock.getAttribute('data-expanded')).toBe('true');
+
+      view.rerender(dockElement(false));
+      expect(filterMenu()).toBeNull();
+      await tick(200);
+      expect(view.getByTestId('message-navigation-dock').getAttribute('data-expanded')).toBe('false');
+    } finally {
+      view.unmount();
+    }
   });
 });

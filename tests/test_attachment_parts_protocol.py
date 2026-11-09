@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -256,11 +259,38 @@ def test_queue_edit_cannot_make_text_disagree_with_parts(monkeypatch, tmp_path):
         "editToken": edit_token, "expectedRevision": 1,
     }))
     assert locked["ok"] is True
+    before = json.loads(json.dumps(first.queue_pending))
     conflict = asyncio.run(srv.api_session_queue_update(first.id, item_id, {
         "text": "different", "expectedRevision": 1, "editToken": edit_token,
     }))
     assert conflict["ok"] is False
-    assert conflict["error"]["code"] == "parts_text_conflict"
+    # The current structured editor returns the full JSON template. Plain text
+    # is invalid input, not a competing canonical-text field in the old API.
+    assert locked["bodyFormat"] == "parts"
+    assert conflict["error"]["code"] == "invalid_queue_body"
+    assert first.queue_pending == before
+    assert srv.worker.queue_item_edit_locked(first, item_id) is True
+
+    edited_parts = json.loads(locked["text"])
+    attachment_before = next(part for part in edited_parts if part["type"] == "attachment")
+    forged = json.loads(locked["text"])
+    next(part for part in forged if part["type"] == "attachment")["attachmentId"] = "foreign"
+    refused = asyncio.run(srv.api_session_queue_update(first.id, item_id, {
+        "text": json.dumps(forged), "expectedRevision": 1, "editToken": edit_token,
+    }))
+    assert refused["error"]["code"] == "invalid_queue_body"
+    assert first.queue_pending == before
+
+    edited_parts[0]["text"] = "prefix "
+    accepted = asyncio.run(srv.api_session_queue_update(first.id, item_id, {
+        "text": json.dumps(edited_parts), "expectedRevision": 1, "editToken": edit_token,
+    }))
+    assert accepted["ok"] is True
+    after_attachment = next(part for part in first.queue_pending[0]["parts"]
+                            if part["type"] == "attachment")
+    assert {key: value for key, value in after_attachment.items()
+            if key != "__serverPath"} == attachment_before
+    assert first.queue_pending[0]["text"].startswith("prefix ")
 
 
 def test_history_projects_existing_local_link_to_opaque_editor_reference(monkeypatch, tmp_path):
@@ -314,6 +344,97 @@ def test_live_result_and_stream_projection_match_history_projection(monkeypatch,
     assert "/api/attachments/editor/att_" not in srv._session_summary(first)["lastMessage"]
 
 
+def test_editor_projection_does_not_resolve_unrelated_registry_paths(monkeypatch, tmp_path):
+    first, _ = _setup(tmp_path, monkeypatch)
+    source = tmp_path / "live.md"
+    source.write_text("body", encoding="utf-8")
+    canonical = str(source.resolve())
+    registry = {
+        f"att_{index:032x}": {
+            "source": "server_file", "path": str(tmp_path / f"missing-{index}.md"),
+            "line": None, "endLine": None, "completed": True,
+        } for index in range(1000)
+    }
+    identity = "att_" + "f" * 32
+    registry[identity] = {"source": "server_file", "path": canonical,
+                          "line": None, "endLine": None, "completed": True}
+    monkeypatch.setattr(srv, "_read_attachment_registry", lambda _sid: registry)
+    original = Path.resolve
+    resolved = []
+
+    def resolve(path, *args, **kwargs):
+        resolved.append(str(path))
+        assert "missing-" not in str(path), "unrelated registry path touched"
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+    assert srv._editor_reference_id(first.id, canonical, None, None) == identity
+    assert resolved == [canonical]
+
+
+def test_repeated_live_links_resolve_once_per_content(monkeypatch, tmp_path):
+    first, _ = _setup(tmp_path, monkeypatch)
+    source = tmp_path / "repeat.md"
+    source.write_text("body", encoding="utf-8")
+    original = srv._resolve_attachment_source_path
+    calls = []
+
+    def resolve(sid, path):
+        calls.append(path)
+        return original(sid, path)
+
+    monkeypatch.setattr(srv, "_resolve_attachment_source_path", resolve)
+    content = " ".join(f"[label-{i}](repeat.md)" for i in range(100))
+    result = srv._project_editor_links(first.id, content)
+    assert calls == ["repeat.md"]
+    assert result.count("/api/attachments/editor/att_") == 100
+    assert "label-99" in result
+    assert len(srv._read_attachment_registry(first.id)) == 1
+
+
+def test_live_link_projection_keeps_event_loop_responsive(monkeypatch):
+    main_thread = threading.get_ident()
+    threads = []
+
+    def project(data):
+        threads.append(threading.get_ident())
+        time.sleep(0.1)  # Model a slow filesystem path without touching one.
+        return data
+
+    monkeypatch.setattr(srv, "_project_worker_event", project)
+    monkeypatch.setattr(srv, "_attach_session_summary_patch", lambda data: data)
+    monkeypatch.setattr(srv, "ws_clients", set())
+    monkeypatch.setattr(srv, "agent_clients", set())
+
+    async def scenario():
+        task = asyncio.create_task(srv.broadcast({"type": "worker.stream"}))
+        await asyncio.sleep(0.02)
+        try:
+            assert not task.done(), "projection blocked the event loop"
+            assert (await srv.health())["status"] == "ok"
+        finally:
+            await task
+
+    asyncio.run(scenario())
+    assert threads and all(thread != main_thread for thread in threads)
+
+
+def test_concurrent_editor_projections_reuse_one_reference(monkeypatch, tmp_path):
+    first, _ = _setup(tmp_path, monkeypatch)
+    source = tmp_path / "concurrent.md"
+    source.write_text("body", encoding="utf-8")
+
+    async def scenario():
+        return await asyncio.gather(*[
+            asyncio.to_thread(srv._project_editor_links, first.id,
+                              "[file](concurrent.md#L1)") for _ in range(8)
+        ])
+
+    results = asyncio.run(scenario())
+    assert len(set(results)) == 1
+    assert len(srv._read_attachment_registry(first.id)) == 1
+
+
 def test_attachment_source_rejects_relative_workdir_escape(tmp_path):
     session = _sess.Session(id="ses_escape", name="Escape", workdir=str(tmp_path / "work"))
     session.workdir and Path(session.workdir).mkdir()
@@ -353,3 +474,25 @@ def test_text_fallback_cannot_use_a_foreign_session_attachment_link(monkeypatch,
         "code": "attachment_session_mismatch",
         "message": "Attachment belongs to another session",
     }
+
+def test_raw_body_survives_history_and_live_projection(monkeypatch, tmp_path):
+    first, _ = _setup(tmp_path, monkeypatch)
+    (tmp_path / 'raw.md').write_text('file', encoding='utf-8')
+    raw = '```html\n<b>literal</b>\n```\n[local](raw.md) [web](https://example.test/x)'
+    history = srv._api_history(first.id, [{'role': 'assistant', 'content': raw}])
+    assert history[0]['rawContent'] == raw
+    assert '/api/attachments/editor/' in history[0]['content']
+    stream = srv._project_worker_event({'type': 'worker.stream', 'sessionId': first.id,
+        'event': {'type': 'assistant', 'content': raw}})
+    assert stream['event']['rawEvent']['content'] == raw
+    result = srv._project_worker_event({'type': 'worker.result', 'sessionId': first.id, 'result': raw})
+    assert result['rawResult'] == raw
+
+@pytest.mark.parametrize('body', [b'\xff\xfe\x80', b'UTF8\x00binary'])
+def test_binary_preview_rejected_download_preserves_bytes(monkeypatch, tmp_path, body):
+    first, _ = _setup(tmp_path, monkeypatch)
+    target = tmp_path / 'binary.bin'
+    target.write_bytes(body)
+    assert asyncio.run(srv.api_fs_read(first.id, 'binary.bin')) == {'error': 'Cannot read binary file'}
+    response = asyncio.run(srv.api_fs_read(first.id, 'binary.bin', download=True))
+    assert Path(response.path).read_bytes() == body

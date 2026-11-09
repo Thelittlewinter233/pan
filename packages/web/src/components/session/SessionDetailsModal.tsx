@@ -5,8 +5,10 @@ import {
   fetchCodexQuota,
   fetchSession,
   fetchSessionUsage,
-  syncSessionLegalWorkerState,
+  markSessionIllegal,
+  markSessionSafelyOffline,
 } from '@/services/api';
+import { useSessionStore } from '@/stores/sessionStore';
 import { useUIStore } from '@/stores/uiStore';
 import type { Session, SessionUsageView } from '@/types';
 import { copyText } from '@/utils/clipboard';
@@ -104,6 +106,7 @@ function hasQuotaDetails(window: CodexQuotaWindow | undefined): window is CodexQ
 export function SessionDetailsModal({ session, onClose }: SessionDetailsModalProps) {
   const showToast = useUIStore((s) => s.showToast);
   const sessionId = session?.id;
+  const liveSession = useSessionStore(state => state.sessions.find(item => item.id === sessionId));
   const [usageExpanded, setUsageExpanded] = useState(false);
   const [usage, setUsage] = useState<SessionUsageView | null>(null);
   const [usageLoading, setUsageLoading] = useState(false);
@@ -114,7 +117,8 @@ export function SessionDetailsModal({ session, onClose }: SessionDetailsModalPro
   const [detailSession, setDetailSession] = useState<Session | null>(null);
   const usageRequestId = useRef(0);
   const detailRequestId = useRef(0);
-  const legalSyncRequestId = useRef(0);
+  const legalStateRequestId = useRef(0);
+  const legalStateBusyRef = useRef(false);
   const activeSessionIdRef = useRef(sessionId);
   activeSessionIdRef.current = sessionId;
   const detailCache = useRef(new Map<string, Session>());
@@ -123,7 +127,7 @@ export function SessionDetailsModal({ session, onClose }: SessionDetailsModalPro
   const [detailError, setDetailError] = useState<string | null>(null);
   const [detailRetrySeq, setDetailRetrySeq] = useState(0);
   const [usageRetrySeq, setUsageRetrySeq] = useState(0);
-  const [legalSyncBusy, setLegalSyncBusy] = useState(false);
+  const [legalStateBusy, setLegalStateBusy] = useState(false);
   const [legalSyncFeedback, setLegalSyncFeedback] = useState<{
     kind: 'success' | 'error';
     message: string;
@@ -131,7 +135,8 @@ export function SessionDetailsModal({ session, onClose }: SessionDetailsModalPro
 
   useEffect(() => {
     usageRequestId.current += 1;
-    legalSyncRequestId.current += 1;
+    legalStateRequestId.current += 1;
+    legalStateBusyRef.current = false;
     const cached = sessionId ? getSessionUsageCache(sessionId) : undefined;
     setUsageExpanded(false);
     setUsage(cached?.usage ?? null);
@@ -144,7 +149,7 @@ export function SessionDetailsModal({ session, onClose }: SessionDetailsModalPro
     setDetailLoading(false);
     setDetailRefreshing(false);
     setDetailError(null);
-    setLegalSyncBusy(false);
+    setLegalStateBusy(false);
     setLegalSyncFeedback(null);
   }, [sessionId]);
 
@@ -245,6 +250,9 @@ export function SessionDetailsModal({ session, onClose }: SessionDetailsModalPro
   // the complete session fetched for this open modal once it arrives.
   const currentDetailSession = detailSession?.id === sessionId ? detailSession : null;
   const displayedSession = currentDetailSession ?? session;
+  const legalitySession = liveSession?.legalityDiagnostics
+    && liveSession.legalityDiagnostics.revision > (currentDetailSession?.legalityDiagnostics?.revision ?? -1)
+    ? liveSession : currentDetailSession;
   const usageView = usage ?? fallbackUsage(displayedSession);
   const quotaRefreshError = usageView.codexQuota?.refreshError;
   const detailFreshness: FreshnessState = detailError
@@ -276,53 +284,73 @@ export function SessionDetailsModal({ session, onClose }: SessionDetailsModalPro
       : 'unknown';
   const usageUpdatedAt = usage?.updatedAt ?? usageCache?.cachedAt ?? null;
   const retryUsage = () => setUsageRetrySeq((value) => value + 1);
-  const syncLegalState = async () => {
-    if (!sessionId || !currentDetailSession || legalSyncBusy) return;
+  const runLegalStateAction = async (
+    action: () => ReturnType<typeof markSessionSafelyOffline>,
+    successLabel: (state: string, runtimeStatus?: string) => string,
+
+  ) => {
+    if (!sessionId || !currentDetailSession || legalStateBusyRef.current) return;
     const targetSessionId = sessionId;
-    const requestId = ++legalSyncRequestId.current;
-    setLegalSyncBusy(true);
+    const requestId = ++legalStateRequestId.current;
+    legalStateBusyRef.current = true;
+    setLegalStateBusy(true);
     setLegalSyncFeedback(null);
     try {
-      const result = await syncSessionLegalWorkerState(targetSessionId);
-      if (legalSyncRequestId.current !== requestId
+      const result = await action();
+      if (legalStateRequestId.current !== requestId
           || activeSessionIdRef.current !== targetSessionId) return;
       if (result.sessionId !== targetSessionId) {
-        setLegalSyncFeedback({ kind: 'error', message: 'Sync returned a different Session.' });
-      } else if (result.status === 'updated' && result.legalWorkerState) {
+        setLegalSyncFeedback({ kind: 'error', message: 'Legal state update returned a different Session.' });
+      } else if (result.status === 'updated' && typeof result.illegalOffline === 'boolean') {
         const latest = detailCache.current.get(targetSessionId) ?? currentDetailSession;
-        const updated = { ...latest, lastLegalWorkerState: result.legalWorkerState };
+        const patch = { legalOffline: result.legalOffline, illegalOffline: result.illegalOffline, legalityDiagnostics: result.legalityDiagnostics };
+        const updated = { ...latest, ...patch };
         detailCache.current.set(targetSessionId, updated);
+        useSessionStore.getState().updateSession(
+          targetSessionId,
+          patch,
+          true,
+        );
         setDetailSession((current) => current?.id === targetSessionId
-          ? { ...current, lastLegalWorkerState: result.legalWorkerState }
+          ? { ...current, ...patch }
           : current);
         // A metadata request that started before the sync must not overwrite
         // the helper's newer persisted result when it settles later.
         detailRequestId.current += 1;
         setLegalSyncFeedback({
           kind: 'success',
-          message: `Legal state updated to ${result.legalWorkerState}`
-            + (result.runtimeWorkerStatus ? ` (runtime: ${result.runtimeWorkerStatus})` : ''),
+          message: successLabel(result.illegalOffline ? "Illegal / Pending recovery" : "Safely offline", result.runtimeWorkerStatus),
         });
       } else {
         setLegalSyncFeedback({
           kind: 'error',
-          message: result.error || 'Could not synchronize the legal Worker state.',
+          message: result.error || 'Could not update execution legality.',
         });
       }
     } catch (error) {
-      if (legalSyncRequestId.current !== requestId
+      if (legalStateRequestId.current !== requestId
           || activeSessionIdRef.current !== targetSessionId) return;
       setLegalSyncFeedback({
         kind: 'error',
         message: error instanceof Error ? error.message : String(error),
       });
     } finally {
-      if (legalSyncRequestId.current === requestId
+      if (legalStateRequestId.current === requestId
           && activeSessionIdRef.current === targetSessionId) {
-        setLegalSyncBusy(false);
+        legalStateBusyRef.current = false;
+        setLegalStateBusy(false);
       }
     }
   };
+  const syncLegalState = () => runLegalStateAction(
+    () => markSessionSafelyOffline(sessionId!),
+    (state, runtimeStatus) => `Session marked: ${state}`
+      + (runtimeStatus ? ` (runtime: ${runtimeStatus})` : ''),
+  );
+  const setLegalStateRunning = () => runLegalStateAction(
+    () => markSessionIllegal(sessionId!),
+    (state) => `Session marked: ${state}`,
+  );
   const copyValue = (label: string, value: string | undefined) => {
     if (!value) {
       showToast(`${label} 暂无可复制内容`, 'error');
@@ -401,25 +429,49 @@ export function SessionDetailsModal({ session, onClose }: SessionDetailsModalPro
             </div>
           );
         })}
-        <section aria-label="Legal Worker state" className="rounded border border-border-default px-3 py-2">
-          <div className="flex items-start justify-between gap-3">
+        <section aria-label="Execution legality" className="rounded border border-border-default px-3 py-2">
+          <div className="flex flex-col items-start justify-between gap-3 sm:flex-row">
             <div className="min-w-0">
-              <div className="text-xs text-text-tertiary mb-1">Last legal Worker state</div>
+              <div className="text-xs text-text-tertiary mb-1">Execution legality</div>
               <div className="text-sm text-text-primary break-words">
                 {currentDetailSession
-                  ? displayValue(currentDetailSession.lastLegalWorkerState, 'Not recorded')
+                  ? legalitySession?.illegalOffline ? 'Illegal' : legalitySession?.legalOffline === true ? 'Safe' : 'Unresolved execution'
                   : detailLoading ? 'Loading Session metadata…' : 'Unavailable'}
               </div>
             </div>
-            <button
-              type="button"
-              onClick={() => void syncLegalState()}
-              disabled={!currentDetailSession || detailLoading || legalSyncBusy}
-              className="shrink-0 rounded border border-border-default px-2.5 py-1.5 text-[11px] text-text-secondary hover:bg-bg-hover disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              {legalSyncBusy ? 'Updating…' : 'Update to actual state'}
-            </button>
+            <div className="flex flex-wrap items-start justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => void syncLegalState()}
+                disabled={!currentDetailSession || detailLoading || legalStateBusy}
+                className="shrink-0 rounded border border-border-default px-2.5 py-1.5 text-[11px] text-text-secondary hover:bg-bg-hover disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {legalStateBusy ? 'Updating…' : 'Mark as safely offline'}
+              </button>
+              <button
+                type="button"
+                aria-label="Mark as Illegal / Pending recovery"
+                aria-describedby="execution-legality-actions-help"
+                onClick={() => void setLegalStateRunning()}
+                disabled={!currentDetailSession || detailLoading || legalStateBusy}
+                className="shrink-0 rounded border border-border-default px-2.5 py-1.5 text-[11px] text-text-secondary hover:bg-bg-hover disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                Mark as Illegal / Pending recovery
+              </button>
+            </div>
           </div>
+          <p id="execution-legality-actions-help" className="mt-2 text-[11px] text-text-tertiary">
+            Illegal means pending recovery. Marking safely offline clears prior Illegal incidents and their automatic locks; Manual locks remain. Neither action starts a Worker.
+          </p>
+          {legalitySession?.legalityDiagnostics && (
+            <div className="mt-2 text-xs text-text-secondary" aria-label="Legality diagnostics">
+              <p>Scope: {legalitySession.legalityDiagnostics.coverage}; revision: {legalitySession.legalityDiagnostics.revision}</p>
+              {legalitySession.legalityDiagnostics.migrationUncertainty && <p>{legalitySession.legalityDiagnostics.migrationUncertainty}</p>}
+              {legalitySession.legalityDiagnostics.outstanding.map(op => (
+                <p key={op.operationId}>{op.kind}: {op.state} — {op.reason || 'Awaiting safe completion'} ({op.operationId})</p>
+              ))}
+            </div>
+          )}
           {legalSyncFeedback && (
             <p
               role={legalSyncFeedback.kind === 'error' ? 'alert' : 'status'}

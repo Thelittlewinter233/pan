@@ -91,7 +91,7 @@ def test_restart_or_start_restarts_live_worker_without_creating(monkeypatch):
     restart = AsyncMock(return_value=None)
     monkeypatch.setattr(worker, "_create_worker", create)
     monkeypatch.setattr(worker, "_restart_worker_unlocked", restart)
-    monkeypatch.setattr(worker, "find_alive_worker_by_session", lambda _: live)
+    monkeypatch.setattr(worker, "_find_control_worker", lambda _: live)
 
     result = asyncio.run(worker.restart_or_start_worker("ses_control"))
 
@@ -138,6 +138,7 @@ def test_global_watchdog_tick_skips_live_worker(monkeypatch):
     _cleanup()
 
 
+@pytest.mark.skip(reason="Oneshot mode retired by user; implementation retained")
 def test_global_watchdog_tick_skips_active_oneshot_worker(monkeypatch):
     """CBC one-shot 执行期间 process=None，不能被 watchdog 重复 spawn。"""
     _cleanup()
@@ -415,7 +416,10 @@ def test_wake_worker_auto_spawn_registered_dead_process(monkeypatch):
 def test_wake_worker_auto_spawn_skips_live_worker(monkeypatch):
     """有活 worker + auto_spawn=True → 只发信号不 spawn。"""
     _cleanup()
-    _setup_session("ses_qq")
+    _setup_session("ses_qq", queue_pending=[{
+        "type": "task", "id": "task-1", "text": "queued work",
+        "source": "user", "deliveryState": "queued",
+    }])
     w = _setup_worker("ses_qq")
     spawned = []
 

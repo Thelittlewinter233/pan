@@ -206,8 +206,9 @@ def test_report_and_qq_same_content_get_distinct_native_ids(monkeypatch):
     _cleanup()
 
 
-def test_queue_api_edits_only_queued_user_and_reorders_all_sources(monkeypatch):
+def test_queue_api_requires_own_edit_lease_and_reorders_all_sources(monkeypatch):
     _cleanup()
+
     monkeypatch.setattr(sess, "save_async", _save)
     value = _session()
     user, _ = asyncio.run(worker._persist_task_item(value, "user", "user", None, None, "u"))
@@ -243,10 +244,30 @@ def test_queue_api_edits_only_queued_user_and_reorders_all_sources(monkeypatch):
     assert events[-1]["item"]["text"] == "user edited"
     denied = asyncio.run(server.api_session_queue_update(
         value.id, agent_id, {"text": "spoof", "editToken": "browser-edit-1"}))
-    assert denied["error"]["code"] == "queue_item_readonly"
+    assert denied["error"]["code"] == "queue_item_edit_expired"
+    assert agent["text"] == "agent"
     report_denied = asyncio.run(server.api_session_queue_update(
         value.id, "q-report", {"text": "spoof", "editToken": "browser-edit-1"}))
-    assert report_denied["error"]["code"] == "queue_item_readonly"
+    assert report_denied["error"]["code"] == "queue_item_edit_expired"
+    assert report["result"] == "report"
+
+    # Current main supports all queued body kinds. Each target needs its own
+    # lease; a consumed user-item lease cannot authorize another row.
+    for item_id, field, replacement in [(agent_id, "text", "agent edited"),
+                                         ("q-report", "result", "report edited")]:
+        token = "own-edit-" + item_id
+        acquired = asyncio.run(server.api_session_queue_edit_lock(
+            value.id, item_id, {"editToken": token, "expectedRevision": 1}))
+        assert acquired["ok"] is True
+        original = next(item for item in value.queue_pending if item["id"] == item_id)
+        identity = {key: original.get(key) for key in ("id", "kind", "source", "type")}
+        updated = asyncio.run(server.api_session_queue_update(value.id, item_id, {
+            "text": replacement, "expectedRevision": 1, "editToken": token,
+        }))
+        assert updated["ok"] is True
+        assert original[field] == replacement
+        assert {key: original.get(key) for key in identity} == identity
+        assert value.queue_delivery_ledger[item_id][field] == replacement
 
     ordered = asyncio.run(server.api_session_queue_order(
         value.id, {"orderedIds": ["q-report", agent_id, user_id],
@@ -359,6 +380,57 @@ def _write_worker(value, item, stdin):
     return current
 
 
+@pytest.mark.parametrize("kind", ["task", "report"])
+@pytest.mark.parametrize("lost_owner", ["generation", "dead", "inactive", "context", "session", "missing", "invalid_id"])
+def test_queue_get_preserves_live_handoff_and_recovers_lost_owner(monkeypatch, kind, lost_owner):
+    _cleanup()
+    monkeypatch.setattr(sess, "save_async", _save)
+    value = _session()
+    item = {"type": kind, "kind": kind, "queueItemId": "q-live",
+            "id": "q-live", "source": "user" if kind == "task" else "report",
+            "text": "live", "result": "live", "deliveryState": "queued", "revision": 1}
+    current = _write_worker(value, item, _Stdin())
+    current._queue_unit_active = True
+    if kind == "report":
+        current._current_queue_item = None
+        current._current_report_items = [item]
+
+    async def scenario():
+        await worker._reserve_queue_unit(current, value, [item], "live", expected_revisions=[1])
+        assert item["deliveryState"] == "writing"
+        for _ in range(2):
+            snapshot = await server.api_session_queue(value.id)
+            assert snapshot["items"] == []  # active handoffs are not editable pending rows
+            assert item["deliveryState"] == "writing"
+            assert item["reservedBy"] == current.worker_id
+            assert value.queue_delivery_ledger["q-live"]["deliveryState"] == "reserved"
+            assert item.get("deliveryAttempts", 0) == 0
+        # Recover the same receipt when ownership is lost; merely finding a
+        # Worker with the reserved id must never suppress crash recovery.
+        if lost_owner == "generation":
+            current.generation += 1
+        elif lost_owner == "dead":
+            current.process.returncode = 1
+        elif lost_owner == "inactive":
+            current._queue_unit_active = False
+        elif lost_owner == "context":
+            current._current_queue_item = None
+            current._current_report_items = []
+        elif lost_owner == "session":
+            current.session_id = "another-session"
+        elif lost_owner == "invalid_id":
+            item["reservedBy"] = [current.worker_id]
+        else:
+            worker.workers.pop(current.worker_id)
+        await server.api_session_queue(value.id)
+        assert item["deliveryState"] == "queued"
+        assert "reservedBy" not in item
+        assert value.queue_delivery_ledger["q-live"]["deliveryState"] == "queued"
+
+    asyncio.run(scenario())
+    _cleanup()
+
+
 @pytest.mark.parametrize("mode,expected", [
     ("ok", "sent_to_cli"),
     ("fail", "queued"),
@@ -399,6 +471,7 @@ def test_successful_delivery_broadcasts_user_message_after_durable_commit(monkey
             "id": "q-event", "source": "user", "text": "shown",
             "deliveryState": "reserved", "revision": 1}
     current = _write_worker(value, item, _Stdin("ok"))
+    current._execution_seq = 12
     events = []
 
     async def capture(event):
@@ -414,10 +487,21 @@ def test_successful_delivery_broadcasts_user_message_after_durable_commit(monkey
     assert value.queue_delivery_ledger["q-event"]["deliveryState"] == "sent_to_cli"
     assert delivered["queueItemIds"] == ["q-event"]
     assert delivered["queueRevision"] == value.queue_revision
-    assert delivered["messages"] == [{
+    assert delivered["workerId"] == current.worker_id
+    assert delivered["generation"] == current.generation
+    assert delivered["executionSeq"] == 12
+    assert len(delivered["messages"]) == 1
+    message = delivered["messages"][0]
+    assert set(message) == {"role", "content", "queueItemIds", "deliveryKeys", "source",
+                            "kind", "messageId", "ts", "queueEnvelopes"}
+    assert {key: message[key] for key in ("role", "content", "queueItemIds", "deliveryKeys", "source")} == {
         "role": "user", "content": "shown", "queueItemIds": ["q-event"],
-        "deliveryKeys": ["task:q-event"],
-    }]
+        "deliveryKeys": ["task:q-event"], "source": "user",
+    }
+    assert message["kind"] == "task"
+    assert message["messageId"] == value.history[-1]["messageId"]
+    assert message["ts"] == value.history[-1]["ts"]
+    assert message["queueEnvelopes"] == [item]
     assert delivered_index < next(i for i, event in enumerate(events)
                                   if event.get("type") == "queue.snapshot")
     _cleanup()
@@ -448,6 +532,7 @@ def _queue_item(value, qid, *, source="user", kind="task", text="x"):
     return item
 
 
+@pytest.mark.skip(reason="Oneshot mode retired by user; implementation retained")
 def test_one_shot_spawn_success_dequeues_after_argv_handoff(monkeypatch):
     _cleanup()
     monkeypatch.setattr(sess, "save_async", _save)
@@ -477,6 +562,7 @@ def test_one_shot_spawn_success_dequeues_after_argv_handoff(monkeypatch):
     _cleanup()
 
 
+@pytest.mark.skip(reason="Oneshot mode retired by user; implementation retained")
 def test_one_shot_spawn_failure_requeues_same_item(monkeypatch):
     _cleanup()
     monkeypatch.setattr(sess, "save_async", _save)
@@ -573,4 +659,42 @@ def test_claim_and_delete_are_serialized_without_double_dispatch(monkeypatch):
         assert value.queue_pending == []
     if claimed is not None:
         assert value.queue_delivery_ledger[item["id"]]["deliveryState"] == "reserved"
+    _cleanup()
+
+
+def test_composer_edit_reorders_occurrences_preserves_metadata_and_checks_revision(monkeypatch):
+    _cleanup()
+    monkeypatch.setattr(sess, "save_async", _save)
+    value = _session()
+    item, _ = asyncio.run(worker._persist_task_item(value, "body", "user", None, None, "composer"))
+    item_id = item["queueItemId"]
+    item["parts"] = [
+        {"type": "attachment", "attachmentId": "resource", "occurrenceId": "first", "location": {"line": 2}, "custom": "retain"},
+        {"type": "text", "text": "between"},
+        {"type": "attachment", "attachmentId": "resource", "occurrenceId": "second"},
+    ]
+    # Registry/normalization is stubbed here; the HTTP/Chromium suite uses real
+    # uploaded bytes and registry. This unit isolates lease/CAS/occurrence rules.
+    def normalize(_sid, parts):
+        return [({"type": "attachment", "attachmentId": p["attachmentId"], "displayName": "real.txt", "size": 9,
+                  "__serverPath": "owned-file"} if p["type"] == "attachment" else {"type": "text", "text": p["text"]})
+                for p in parts], "canonical", None
+    monkeypatch.setattr(server, "_normalize_message_parts", normalize)
+    asyncio.run(server.api_session_queue_edit_lock(value.id, item_id, {"editToken": "lease", "expectedRevision": 1}))
+    parts = [{"type": "attachment", "attachmentId": "resource", "occurrenceId": "second"},
+             {"type": "text", "text": "edited"},
+             {"type": "attachment", "attachmentId": "resource", "occurrenceId": "first", "displayName": "spoof"}]
+    denied = asyncio.run(server.api_session_queue_update(value.id, item_id, {
+        "text": "unused", "composerParts": parts, "editToken": "lease", "expectedRevision": 99}))
+    assert denied["error"]["code"] == "queue_revision_conflict"
+    assert item["parts"][0]["occurrenceId"] == "first"
+    result = asyncio.run(server.api_session_queue_update(value.id, item_id, {
+        "text": "unused", "composerParts": parts, "editToken": "lease", "expectedRevision": 1}))
+    assert result["ok"]
+    assert [p.get("occurrenceId") for p in item["parts"]] == ["second", None, "first"]
+    assert item["parts"][2]["location"] == {"line": 2}
+    assert item["parts"][2]["custom"] == "retain"
+    assert item["parts"][2]["displayName"] == "real.txt"
+    assert item["queueItemId"] == item_id and item["revision"] == 2
+    assert value.queue_edit_locks == {}
     _cleanup()

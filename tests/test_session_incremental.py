@@ -85,8 +85,10 @@ def _jsonl_lines(sid: str) -> list[dict]:
 
 
 def _no_ts(entries) -> list[dict]:
-    """剥掉 append_history 打的 ts 字段，便于断言消息本体。"""
-    return [{k: v for k, v in e.items() if k != "ts"} for e in entries]
+    """剥掉追加边界字段，便于断言 provider/history 消息本体。"""
+    return [{k: v for k, v in e.items()
+             if k not in {"ts", "messageId", "clientMessageId"}}
+            for e in entries]
 
 
 # ══════════════════════════════════════════════════════════════════════════ #
@@ -323,6 +325,7 @@ def test_history_ts_stamped_on_append_only(tmp_path, monkeypatch):
     """ts 在 append_history 打点（本地 ISO-8601）：新追加条目带 ts；迁移/导入
     进来的旧条目不补写；已有 ts 不被 setdefault 覆盖——时间不确定就不显示。"""
     _cleanup()
+
     session_dir = tmp_path / "sessions"
     session_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(_sess, "SESSION_DIR", session_dir)
@@ -360,6 +363,50 @@ def test_history_ts_stamped_on_append_only(tmp_path, monkeypatch):
     monkeypatch.setattr(_sess, "SESSION_DIR", session_dir)
     r = _sess.get(sid)
     assert r.history[0]["ts"] == "2026-01-01T08:00:00"
+    _cleanup()
+
+
+def test_append_history_persists_unique_pan_ids_for_searchable_bodies(tmp_path, monkeypatch):
+    """New text blocks get durable IDs; transport/context metadata does not."""
+    _cleanup()
+    monkeypatch.setattr(_sess, "SESSION_DIR", tmp_path / "sessions")
+    s = _sess.create(name="message-ids")
+    rows = [
+        {"role": "user", "content": "same body"},
+        {"role": "assistant", "content": "same body"},
+        {"role": "user", "content": "same body"},
+        {"role": "thinking", "content": "private thought"},
+        {"role": "tool", "content": "Command({})"},
+        {"role": "system", "content": "system context"},
+        {"role": "error", "content": "provider error"},
+        {"role": "user", "content": "initial prompt", "source": "system_prompt"},
+    ]
+    for row in rows:
+        _sess.append_history(s, row)
+    preserved_id = _sess.assign_pan_message_ids([
+        {"role": "assistant", "content": "continued block"},
+    ])[0]["messageId"]
+    continued = {
+        "role": "assistant", "content": "continued block",
+        "messageId": preserved_id,
+    }
+    _sess.append_history(s, continued)
+
+    body_ids = [row.get("messageId") for row in s.history[:5]]
+    assert all(_sess.is_pan_message_id(message_id) for message_id in body_ids)
+    assert len(set(body_ids)) == 5, "independent text blocks need distinct IDs"
+    assert all("messageId" not in row for row in s.history[5:-1])
+    assert s.history[-1]["messageId"] == preserved_id
+
+    expected_ids = list(body_ids)
+    sid = s.id
+    _sess.save(s)
+    _cleanup()
+    loaded = _sess.get(sid)
+    assert loaded is not None
+    assert [row.get("messageId") for row in loaded.history[:5]] == expected_ids
+    assert all("messageId" not in row for row in loaded.history[5:-1])
+    assert loaded.history[-1]["messageId"] == preserved_id
     _cleanup()
 
 
@@ -409,15 +456,23 @@ def test_history_ts_not_fabricated_for_imported_or_forked_history(tmp_path, monk
     parsed = [{"role": "user", "content": "p0"},
               {"role": "assistant", "content": "p1"}]
 
-    imported = _sess.create(name="imported",
-                            history=[dict(row) for row in parsed])
-    assert [("ts" in row) for row in _jsonl_lines(imported.id)] == [False, False]
+    imported = _sess.create(
+        name="imported",
+        history=_sess.assign_pan_message_ids([dict(row) for row in parsed]),
+    )
+    imported_rows = _jsonl_lines(imported.id)
+    assert [("ts" in row) for row in imported_rows] == [False, False]
+    assert all(_sess.is_pan_message_id(row["messageId"]) for row in imported_rows)
 
     # fork 序列：先建空会话（server.api_branch 的新会话），再整体替换 + 落盘
     forked = _sess.create(name="forked")
-    _sess.replace_history(forked, [dict(row) for row in parsed])
+    _sess.replace_history(
+        forked, _sess.assign_pan_message_ids([dict(row) for row in parsed]),
+    )
     asyncio.run(_sess.save_async(forked))
-    assert [("ts" in row) for row in _jsonl_lines(forked.id)] == [False, False]
+    forked_rows = _jsonl_lines(forked.id)
+    assert [("ts" in row) for row in forked_rows] == [False, False]
+    assert all(_sess.is_pan_message_id(row["messageId"]) for row in forked_rows)
 
     # fork 之后新产生的消息：带 ts；复制进来的历史保持无 ts
     _sess.append_history(forked, {"role": "assistant", "content": "new"})
@@ -628,28 +683,40 @@ def test_perf_incremental_vs_full(tmp_path, monkeypatch):
     # - big N 取 20000：全量成本转为由 CPU 侧 json.dumps 主导（与页缓存冷热无关），
     #   与恒定的增量成本拉开 10x+ 余量；增量仍严格 O(1)。
     # - 采样前各 warmup 一次：排除首次写（冷分配 / 首次元数据重写）的一次性尖峰。
-    def _warmed_median(fn, reps=7):
-        fn()  # warmup：路径落定、_last_meta_sig 就位，一次性开销不进采样
-        return sorted(fn() for _ in range(reps))[reps // 2]
-
     small_n, big_n = 100, 20000
     s_small = _sess.Session(id=f"ses_chk_{small_n}", name="perf", adapter="cbc")
     s_small.history = [{"role": "user", "content": f"m{i}",
                         "extra": "x" * 120} for i in range(small_n)]
     s_small._hist_persisted = small_n
     _sess._write_jsonl(_sess._history_path(s_small.id), s_small.history)
-    new_small = _warmed_median(lambda: _new_incremental_save_ms(s_small))
-    old_small = _warmed_median(
-        lambda: _old_full_save_ms(s_small, _sess._path(s_small.id)))
-
     s_big = _sess.Session(id=f"ses_chk_{big_n}", name="perf", adapter="cbc")
     s_big.history = [{"role": "user", "content": f"m{i}",
                       "extra": "x" * 120} for i in range(big_n)]
     s_big._hist_persisted = big_n
     _sess._write_jsonl(_sess._history_path(s_big.id), s_big.history)
-    new_big = _warmed_median(lambda: _new_incremental_save_ms(s_big))
-    old_big = _warmed_median(
-        lambda: _old_full_save_ms(s_big, _sess._path(s_big.id)))
+    # Interleave sizes in the SAME measurement window instead of comparing an
+    # earlier small-file burst against a later big-file burst. Alternate order
+    # so antivirus/OS scheduling drift cannot systematically favor one size.
+    # Keep all original performance thresholds; also test bounded work below.
+    operations = {
+        "new_small": lambda: _new_incremental_save_ms(s_small),
+        "new_big": lambda: _new_incremental_save_ms(s_big),
+        "old_small": lambda: _old_full_save_ms(s_small, _sess._path(s_small.id)),
+        "old_big": lambda: _old_full_save_ms(s_big, _sess._path(s_big.id)),
+    }
+    for operation in operations.values():
+        operation()  # warm every path before measuring
+    samples = {key: [] for key in operations}
+    for round_index in range(21):
+        keys = list(operations)
+        if round_index % 2:
+            keys.reverse()
+        for key in keys:
+            samples[key].append(operations[key]())
+    new_small, new_big, old_small, old_big = (
+        sorted(samples[key])[10]
+        for key in ("new_small", "new_big", "old_small", "old_big")
+    )
 
     assert old_big > 2 * old_small, \
         f"old full save should scale with N ({small_n}→{big_n}), " \
@@ -665,6 +732,46 @@ def test_perf_incremental_vs_full(tmp_path, monkeypatch):
     _sess.save_full(s_big)
     assert _sess._path(s_big.id).stat().st_size < 50 * 1024, \
         "main file should stay small (metadata + tail)"
+    _cleanup()
+
+
+def test_incremental_save_never_scans_persisted_history(tmp_path, monkeypatch):
+    """Deterministic O(delta + bounded tail) guard, independent of disk timing."""
+    _cleanup()
+    monkeypatch.setattr(_sess, "SESSION_DIR", tmp_path / "sessions")
+    real_append = _sess._append_jsonl
+    observed = []
+
+    def append_spy(path, rows):
+        observed.append(len(rows))
+        return real_append(path, rows)
+
+    monkeypatch.setattr(_sess, "_append_jsonl", append_spy)
+
+    class NoScanHistory(list):
+        def __iter__(self):
+            raise AssertionError("incremental save traversed persisted history")
+
+        def __getitem__(self, key):
+            if isinstance(key, slice):
+                start, stop, step = key.indices(len(self))
+                assert step == 1
+                assert stop - start <= _sess._MAIN_HISTORY_TAIL
+            return super().__getitem__(key)
+
+    for size in (100, 20000):
+        s = _sess.Session(id=f"ses_bounded_{size}", name="bounded", adapter="cbc")
+        s.history = [{"role": "user", "content": f"m{i}"} for i in range(size)]
+        _sess.save(s)  # establish the persisted baseline and summary first
+        s.history = NoScanHistory(s.history)
+        observed.clear()
+        s.history.append({"role": "user", "content": "new tail"})
+        _sess.save(s)
+        assert observed == [1]
+        assert s._hist_persisted == size + 1
+        assert s.summary_projection["history_total"] == size + 1
+        assert _sess._read_jsonl(_sess._history_path(s.id))[-1]["content"] == "new tail"
+        assert _sess._path(s.id).stat().st_size < 50 * 1024
     _cleanup()
 
 

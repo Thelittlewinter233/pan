@@ -1,9 +1,36 @@
-import { useEffect, useRef, useState } from 'react';
+import { UserCardReminderSettings } from './UserCardReminderSettings';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Bell, Database, Eye, Settings, SlidersHorizontal, X } from 'lucide-react';
+import { McpRemoteSettings } from './McpRemoteSettings';
+import { TailscaleSettings } from './TailscaleSettings';
+import { LanSettings } from './LanSettings';
+import { RemoteSettingsSection, RemoteStatus } from './RemoteSettingsSection';
+import { Button } from '@/components/ui/Button';
+import { LoginStartupSettings } from './LoginStartupSettings';
+import { AutoReportSettingsGroup } from './AutoReportSettingsGroup';
+import {
+  Bell,
+  Database,
+  KeyRound,
+  Eye,
+  Globe,
+  Keyboard,
+  Power,
+  Puzzle,
+  SlidersHorizontal,
+  ToggleLeft,
+  X,
+} from 'lucide-react';
+import type { LucideIcon } from 'lucide-react';
+import { SETTINGS_TABS } from './settingsCategories';
+import type { SettingsTab } from './settingsCategories';
 import { useAppSettingsStore } from '@/stores/appSettingsStore';
+import type { AutoForceSendSettings } from '@/stores/appSettingsStore';
+import { useCapability, usePlatformStore } from '@/stores/platformStore';
+import { platformLabel } from '@/utils/platformCapabilities';
 import { useUIStore } from '@/stores/uiStore';
 import { JobRetentionSettings } from '@/components/jobs/JobRetentionSettings';
+import { AuthorizationSettings } from './AuthorizationSettings';
 import {
   reloadConfig,
   fetchRemoteStatus,
@@ -37,6 +64,22 @@ import type {
 } from '@/types';
 import type { GroupMode } from '@/stores/uiStore';
 import { DataSettingsPanel } from './DataSettingsPanel';
+import { SourceNotificationPanel } from './SourceNotificationPanel';
+import { SessionErrorBridgeSetting } from './SessionErrorBridgeSetting';
+import { CompletionBridgeDefaultsPanel } from './CompletionBridgeDefaultsPanel';
+import { UnreadRecordingPanel } from './UnreadRecordingPanel';
+import { QqPluginsPanel } from './QqPluginsPanel';
+import { LocalPluginPanelsSettings } from './LocalPluginPanelsSettings';
+import { ShortcutsSettings } from './ShortcutsSettings';
+import { CodexNativePassthrough } from '@/components/session/CodexNativePassthrough';
+import {
+  lockerNotificationPermission,
+  requestLockerNotificationPermission,
+} from '@/services/lockerDesktopNotify';
+import type { LockerNotificationPermission } from '@/services/lockerDesktopNotify';
+import { useCurrentSession } from '@/stores/sessionStore';
+import { reorderViewEntryIds, useViewEntries } from './viewEntries';
+import { resolveDropZone } from '@/components/session/sessionDrag';
 
 interface AppSettingsModalProps {
   open: boolean;
@@ -54,54 +97,121 @@ const WORKER_KEYS = ['timeout_sec', 'task_timeout_sec', 'idle_sec'] as const;
 const DEFAULT_SESSION_LIFECYCLE: ApiSessionLifecyclePreferences = {
   exitStrategy: 'ask',
   startupPreference: 'ask',
+  wakeMessage: '继续',
 };
 
 function normalizeSessionLifecyclePreferences(
   value: ApiSessionLifecyclePreferences,
 ): ApiSessionLifecyclePreferences {
   return {
+    wakeMessage: value?.wakeMessage || '继续',
     exitStrategy: ['ask', 'offline', 'preserve-running'].includes(value?.exitStrategy)
       ? value.exitStrategy
       : 'ask',
-    startupPreference: ['ask', 'wake-running', 'sync-actual', 'preserve-running'].includes(value?.startupPreference)
+    startupPreference: ['ask', 'wake-running', 'clear-illegal', 'preserve-running'].includes(value?.startupPreference)
       ? value.startupPreference
       : 'ask',
   };
 }
 
-type SettingsTab = 'general' | 'preferences' | 'appearance' | 'notifications' | 'adapter' | 'data';
-const SETTINGS_TABS: SettingsTab[] = [
-  'general',
-  'preferences',
-  'appearance',
-  'notifications',
-  'adapter',
-  'data',
-];
+function mainLifecycleOptions(
+  strategy: ApiSessionExitStrategy,
+  markRunningOffline: boolean | null,
+): { markRunningSessionsOffline: boolean } | undefined | null {
+  if (strategy !== 'ask') return undefined;
+  return markRunningOffline === null
+    ? null
+    : { markRunningSessionsOffline: markRunningOffline };
+}
+
+function MainLifecycleRunningChoice({
+  strategy,
+  markRunningOffline,
+  onChange,
+  inputName,
+}: {
+  strategy: ApiSessionExitStrategy;
+  markRunningOffline: boolean | null;
+  onChange: (value: boolean) => void;
+  inputName: string;
+}) {
+  if (strategy !== 'ask') {
+    return (
+      <p className="mt-3 text-[11px] text-text-secondary">
+        Saved policy: stop all Workers and {strategy === 'offline'
+          ? 'safely retire stopped execution.'
+          : 'preserve unfinished execution as Illegal.'}
+      </p>
+    );
+  }
+
+  return (
+    <fieldset className="mt-3 space-y-2">
+      <legend className="text-[11px] text-text-secondary">
+        For Sessions with outstanding execution or Illegal status:
+      </legend>
+      <label className="flex items-start gap-2 text-[11px] text-text-primary">
+        <input
+          type="radio"
+          name={inputName}
+          checked={markRunningOffline === true}
+          onChange={() => onChange(true)}
+        />
+        <span>Safely retire execution after all Workers have stopped.</span>
+      </label>
+      <label className="flex items-start gap-2 text-[11px] text-text-primary">
+        <input
+          type="radio"
+          name={inputName}
+          checked={markRunningOffline === false}
+          onChange={() => onChange(false)}
+        />
+        <span>Stop Workers and preserve unfinished execution as Illegal.</span>
+      </label>
+    </fieldset>
+  );
+}
+
+const SETTINGS_TAB_META: Record<SettingsTab, { label: string; Icon: LucideIcon }> = {
+  lifecycle: { label: 'Lifecycle', Icon: Power },
+  behavior: { label: 'Behavior', Icon: ToggleLeft },
+  remote: { label: 'Remote', Icon: Globe },
+  appearance: { label: 'Appearance', Icon: Eye },
+  shortcuts: { label: 'Shortcuts', Icon: Keyboard },
+  notifications: { label: 'Notifications', Icon: Bell },
+  adapters: { label: 'Adapters', Icon: SlidersHorizontal },
+  plugins: { label: 'Plugins', Icon: Puzzle },
+  data: { label: 'Data', Icon: Database },
+  authorization: { label: 'Authorization', Icon: KeyRound },
+};
 
 type ReloadScope = 'adapters' | 'worker' | 'plugin' | 'memory';
 type MainRestartState =
   'idle' | 'confirming' | 'restarting' | 'restored' | 'timeout' | 'cancelled' | 'error';
 type MainExitState = 'idle' | 'confirming' | 'exiting' | 'exited' | 'error';
+type BehaviorAnchor = 'exit-strategy' | 'startup-preference';
 
 function SwitchRow({
   label,
   hint,
   checked,
   onChange,
+  disabled = false,
 }: {
   label: string;
   hint?: string;
   checked: boolean;
   onChange: (v: boolean) => void;
+  disabled?: boolean;
 }) {
   return (
     <button
       type="button"
       role="switch"
       aria-checked={checked}
+      disabled={disabled}
       onClick={() => onChange(!checked)}
-      className="w-full flex items-center justify-between gap-3 px-3 py-2 text-left hover:bg-bg-hover transition-colors"
+      className="w-full flex items-center justify-between gap-3 px-3 py-2 text-left hover:bg-bg-hover transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
     >
       <span className="min-w-0">
         <span className="block text-xs text-text-primary">{label}</span>
@@ -121,6 +231,54 @@ function SwitchRow({
         />
       </span>
     </button>
+  );
+}
+
+const CHAT_VIEW_OPTIONS = [
+  { value: 'tui', label: 'TUI', hint: 'Full-width role-bar rows with rendered Markdown (default).' },
+  { value: 'bubble', label: 'Bubble', hint: 'Shrink-to-fit bubbles with rendered Markdown.' },
+  { value: 'raw', label: 'Raw', hint: 'TUI rows, but each message body shows its original text, unrendered.' },
+] as const;
+
+/**
+ * Explicit three-mode picker for the chat presentation. Persisted through the
+ * same `setChatViewStyle`/config.json path as the TopBar selector, so the two
+ * surfaces always agree and Raw is never confused with Bubble.
+ */
+function ChatViewSelect({
+  value,
+  onChange,
+}: {
+  value: 'tui' | 'bubble' | 'raw';
+  onChange: (v: 'tui' | 'bubble' | 'raw') => void;
+}) {
+  const activeHint = CHAT_VIEW_OPTIONS.find((option) => option.value === value)?.hint ?? '';
+  return (
+    <div className="px-3 py-3">
+      <div
+        role="radiogroup"
+        aria-label="Chat view"
+        className="flex gap-1 rounded border border-border-default bg-bg-tertiary p-1"
+      >
+        {CHAT_VIEW_OPTIONS.map((option) => (
+          <button
+            key={option.value}
+            type="button"
+            role="radio"
+            aria-checked={value === option.value}
+            onClick={() => onChange(option.value)}
+            className={`flex-1 rounded px-2 py-1.5 text-xs transition-colors ${
+              value === option.value
+                ? 'bg-bg-primary text-text-primary shadow-sm'
+                : 'text-text-secondary hover:text-text-primary'
+            }`}
+          >
+            {option.label}
+          </button>
+        ))}
+      </div>
+      <p className="mt-1.5 text-[11px] text-text-tertiary leading-relaxed">{activeHint}</p>
+    </div>
   );
 }
 
@@ -314,19 +472,29 @@ function PluginResult({ plugin }: { plugin: NonNullable<ApiConfigReloadResponse[
  * `position: fixed` descendants and clamp the overlay to the sidebar width.
  */
 export function AppSettingsModal({ open, onClose }: AppSettingsModalProps) {
+  const currentSession = useCurrentSession();
   const {
     defaultGroupBy,
+    showGroupBy,
+    showChatViewSwitcher,
+    showSidebarCollapseHandle,
     defaultNewSessionToCurrentWorkspace,
     showMetaAgent,
     showTaskAgent,
     showQQ,
     showCodexTerminalInput,
+    reportWorkerKillErrors,
+    autoForceSend,
     mergeConsecutiveNonBodyBlocks,
     keepScrollOnSessionSwitch,
     showMessageNavigationRail,
+    showHistorySearch,
     chatViewStyle,
     notifications,
     setDefaultGroupBy,
+    setShowGroupBy,
+    setShowChatViewSwitcher,
+    setShowSidebarCollapseHandle,
     setDefaultNewSessionToCurrentWorkspace,
     setShowMetaAgent,
     setShowTaskAgent,
@@ -335,14 +503,53 @@ export function AppSettingsModal({ open, onClose }: AppSettingsModalProps) {
     setMergeConsecutiveNonBodyBlocks,
     setKeepScrollOnSessionSwitch,
     setShowMessageNavigationRail,
+    setShowHistorySearch,
     setChatViewStyle,
     setCodexWarningToast,
+    setLockerDesktop,
     setConfirmCrossWorkspaceManagement,
+    setConfirmAgentSystemQueueEdit,
+    saveReportWorkerKillErrors,
+    saveAutoForceSend,
     resetSettings,
+    setViewEntryOrder,
   } = useAppSettingsStore();
+  const viewEntries = useViewEntries();
+  const [dragEntry, setDragEntry] = useState<string | null>(null);
+  const [dropEntry, setDropEntry] = useState<{ id: string; zone: 'before' | 'after' } | null>(null);
+  const orderedEntries = viewEntries;
+  const moveEntry = (id: string, delta: number) => {
+    const ids = orderedEntries.map((entry) => entry.id);
+    const index = ids.indexOf(id); const target = index + delta;
+    if (index < 0 || target < 0 || target >= ids.length) return;
+    const current = ids[index]!;
+    ids[index] = ids[target]!;
+    ids[target] = current;
+    setViewEntryOrder(ids);
+  };
+  const dropOrder = (targetId: string, zone: 'before' | 'after') => {
+    if (!dragEntry || dragEntry === targetId) return;
+    const ids = reorderViewEntryIds(orderedEntries.map((entry) => entry.id), dragEntry, targetId, zone);
+    setViewEntryOrder(ids); setDragEntry(null); setDropEntry(null);
+  };
 
-  const [activeTab, setActiveTab] = useState<SettingsTab>('general');
+  const [activeTab, setActiveTab] = useState<SettingsTab>('lifecycle');
+  const [behaviorAnchor, setBehaviorAnchor] = useState<BehaviorAnchor | null>(null);
   const tabListRef = useRef<HTMLDivElement>(null);
+  const behaviorSessionRef = useRef<HTMLElement>(null);
+
+  // Reopening the modal always starts at Lifecycle; the two Lifecycle policy
+  // shortcuts below switch to Behavior only for that interaction.
+  useEffect(() => {
+    if (!open) return;
+    setActiveTab('lifecycle');
+    setBehaviorAnchor(null);
+  }, [open]);
+
+  const openBehaviorSessionPolicy = (anchor: BehaviorAnchor) => {
+    setBehaviorAnchor(anchor);
+    setActiveTab('behavior');
+  };
 
   useEffect(() => {
     const tabList = tabListRef.current;
@@ -360,7 +567,7 @@ export function AppSettingsModal({ open, onClose }: AppSettingsModalProps) {
 
   const [reloadScope, setReloadScope] = useState<ReloadScope | null>(null);
   // Keep each reload outcome with the page and controls that own it.
-  const [reloadSection, setReloadSection] = useState<'adapters' | 'worker' | 'other' | null>(null);
+  const [reloadSection, setReloadSection] = useState<ReloadScope | null>(null);
   const [reloadResult, setReloadResult] = useState<ApiConfigReloadResponse | null>(null);
   const [reloadError, setReloadError] = useState<string | null>(null);
 
@@ -381,6 +588,66 @@ export function AppSettingsModal({ open, onClose }: AppSettingsModalProps) {
   const [dataRetentionError, setDataRetentionError] = useState<string | null>(null);
   const [dataRetentionSaving, setDataRetentionSaving] = useState(false);
   const [dataRetentionSaveError, setDataRetentionSaveError] = useState<string | null>(null);
+
+  // Behavior → user-kill error reports. Persisted through the global ui
+  // settings; a failed PUT rejects and leaves the store on the last saved
+  // value, which the switch then honestly keeps showing.
+  const [killReportSaving, setKillReportSaving] = useState(false);
+  const [killReportError, setKillReportError] = useState<string | null>(null);
+
+  // Locker desktop notifications: the switch stores a preference, the browser
+  // owns the permission. Re-read it on every open, because the user can change
+  // it in the browser's site settings while Pan is running.
+  const [lockerPermission, setLockerPermission] = useState<LockerNotificationPermission>(
+    lockerNotificationPermission,
+  );
+  useEffect(() => {
+    if (open) setLockerPermission(lockerNotificationPermission());
+  }, [open]);
+
+  const toggleLockerDesktopNotify = async (next: boolean) => {
+    setLockerDesktop(next);
+    if (!next) return;
+    // Permission must be requested inside the switch's user gesture. A denied
+    // answer keeps the stored preference: allowing the site later starts the
+    // alerts without another visit to this panel.
+    setLockerPermission(await requestLockerNotificationPermission());
+  };
+
+  const toggleReportWorkerKillErrors = useCallback(async (value: boolean) => {
+    if (killReportSaving) return;
+    setKillReportSaving(true);
+    setKillReportError(null);
+    try {
+      await saveReportWorkerKillErrors(value);
+    } catch (error) {
+      setKillReportError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setKillReportSaving(false);
+    }
+  }, [killReportSaving, saveReportWorkerKillErrors]);
+
+  // Behavior → message auto force send. The store only changes after the
+  // server confirms the write, so a failed save keeps the previous switch
+  // position and shows an inline error instead of pretending success.
+  const [autoForceSaving, setAutoForceSaving] = useState<keyof AutoForceSendSettings | null>(null);
+  const [autoForceError, setAutoForceError] = useState<string | null>(null);
+
+  const toggleAutoForceSend = useCallback(async (
+    key: keyof AutoForceSendSettings,
+    value: boolean,
+  ) => {
+    if (autoForceSaving) return;
+    setAutoForceSaving(key);
+    setAutoForceError(null);
+    try {
+      await saveAutoForceSend({ ...autoForceSend, [key]: value });
+    } catch (error) {
+      setAutoForceError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setAutoForceSaving(null);
+    }
+  }, [autoForceSend, autoForceSaving, saveAutoForceSend]);
 
   // Worker config edit dialog — opened from the "Edit worker config" row.
   // Prefills current values (reloadConfig('worker').before — idempotent),
@@ -404,21 +671,134 @@ export function AppSettingsModal({ open, onClose }: AppSettingsModalProps) {
   const [mainRestartStatus, setMainRestartStatus] = useState<ApiMainRestartStatusResponse | null>(
     null,
   );
+  // Restart/exit need a supervisor that can stop and respawn this process.
+  // The platform probe states whether the server implements that at all; an
+  // unanswered probe leaves the existing status-driven behavior untouched.
+  const serviceLifecycle = useCapability('service.lifecycle');
+  const platform = usePlatformStore((state) => state.platform);
+  const lifecycleUnavailableLabel = `Not available on this platform (${platformLabel(platform)})`;
   const [mainRestartState, setMainRestartState] = useState<MainRestartState>('idle');
+  const [mainRestartHealthCheckActive, setMainRestartHealthCheckActive] = useState(false);
   const [mainRestartError, setMainRestartError] = useState<string | null>(null);
   const [mainExitStatus, setMainExitStatus] = useState<ApiMainExitStatusResponse | null>(null);
   const [mainExitState, setMainExitState] = useState<MainExitState>('idle');
   const [mainExitError, setMainExitError] = useState<string | null>(null);
-  const [mainExitMarkRunningOffline, setMainExitMarkRunningOffline] = useState<boolean | null>(null);
+  const [mainLifecycleMarkRunningOffline, setMainLifecycleMarkRunningOffline] =
+    useState<boolean | null>(null);
+  const [mainLifecycleStatusLoading, setMainLifecycleStatusLoading] = useState(false);
+  const [mainLifecycleStatusError, setMainLifecycleStatusError] = useState<string | null>(null);
   const [sessionLifecycle, setSessionLifecycle] = useState(DEFAULT_SESSION_LIFECYCLE);
   const [sessionLifecycleLoaded, setSessionLifecycleLoaded] = useState(false);
   const [sessionLifecycleLoading, setSessionLifecycleLoading] = useState(false);
   const [sessionLifecycleSaving, setSessionLifecycleSaving] = useState(false);
   const [sessionLifecycleError, setSessionLifecycleError] = useState<string | null>(null);
   const [sessionLifecycleReloadSeq, setSessionLifecycleReloadSeq] = useState(0);
+
+  useEffect(() => {
+    if (!open || activeTab !== 'behavior' || behaviorAnchor === null) return;
+    const selectId =
+      behaviorAnchor === 'exit-strategy' ? 'session-exit-strategy' : 'session-startup-preference';
+    const control = document.getElementById(selectId);
+    if (control) {
+      control.scrollIntoView?.({ block: 'center' });
+      control.focus({ preventScroll: true });
+      setBehaviorAnchor(null);
+      return;
+    }
+    // Preferences load asynchronously. Once loading settles without the
+    // control (load error), land keyboard users on the section and its Retry.
+    if (sessionLifecycleLoaded || sessionLifecycleError) {
+      behaviorSessionRef.current?.scrollIntoView?.({ block: 'center' });
+      behaviorSessionRef.current?.focus({ preventScroll: true });
+      setBehaviorAnchor(null);
+    }
+  }, [open, activeTab, behaviorAnchor, sessionLifecycleLoaded, sessionLifecycleError]);
+
   const recoveryAbortRef = useRef<AbortController | null>(null);
   const recoveryCancelledRef = useRef(false);
+  const mainLifecycleGenerationRef = useRef(0);
+  const mainLifecycleActionInFlightRef = useRef(false);
+  const modalOpenRef = useRef(open);
+  modalOpenRef.current = open;
   const showToast = useUIStore((s) => s.showToast);
+
+  const refreshMainLifecycleStatus = useCallback(async (
+    requestedGeneration?: number,
+    preserveActionError?: { operation: 'restart' | 'exit'; message: string },
+  ) => {
+    const generation = requestedGeneration ?? ++mainLifecycleGenerationRef.current;
+    setMainLifecycleStatusLoading(true);
+    setMainLifecycleStatusError(null);
+    try {
+      const [restartStatus, exitStatus] = await Promise.all([
+        fetchMainRestartStatus(),
+        fetchMainExitStatus(),
+      ]);
+      if (mainLifecycleGenerationRef.current !== generation) return;
+      setMainRestartStatus(restartStatus);
+      setMainExitStatus(exitStatus);
+      const restartPending = restartStatus.pending && restartStatus.operation !== 'exit';
+      const restartFailed = restartStatus.phase === 'failed' ||
+        restartStatus.phase === 'timed_out';
+      const exitFailed = exitStatus.phase === 'failed' || exitStatus.phase === 'timed_out';
+      const restartErrorMessage = restartStatus.error ||
+        (preserveActionError?.operation === 'restart' ? preserveActionError.message : null) ||
+        (restartFailed
+          ? restartStatus.phase === 'timed_out'
+            ? 'Pan restart supervisor timed out.'
+            : 'Pan restart failed in the supervisor.'
+          : null);
+      const exitErrorMessage = exitStatus.error ||
+        (preserveActionError?.operation === 'exit' ? preserveActionError.message : null) ||
+        (exitFailed ? 'Pan Exit failed in the lifecycle supervisor.' : null);
+      setMainRestartState(restartPending
+        ? 'restarting'
+        : restartStatus.phase === 'timed_out'
+          ? 'timeout'
+          : restartFailed || preserveActionError?.operation === 'restart'
+            ? 'error'
+            : 'idle');
+      setMainRestartError(restartPending
+        ? null
+        : restartErrorMessage);
+      setMainExitState(exitStatus.pending
+        ? 'exiting'
+        : exitFailed || preserveActionError?.operation === 'exit'
+          ? 'error'
+          : 'idle');
+      setMainExitError(exitStatus.pending
+        ? null
+        : exitErrorMessage);
+      setMainLifecycleMarkRunningOffline(null);
+    } catch (error) {
+      if (mainLifecycleGenerationRef.current !== generation) return;
+      const reason = error instanceof Error ? error.message : String(error);
+      setMainRestartStatus({
+        available: false,
+        pending: false,
+        platform: 'unknown',
+        reason,
+      });
+      setMainExitStatus({
+        available: false,
+        pending: false,
+        platform: 'unknown',
+        stage: 'error',
+        reason,
+      });
+      setMainRestartState('idle');
+      setMainRestartHealthCheckActive(false);
+      setMainExitState('idle');
+      setMainLifecycleStatusError(
+        'Could not refresh Pan lifecycle status: ' + reason +
+          '. Refresh status before scheduling Restart or Exit.',
+      );
+    } finally {
+      if (mainLifecycleGenerationRef.current === generation) {
+        setMainLifecycleStatusLoading(false);
+      }
+    }
+  }, []);
 
   useEffect(() => {
     if (!open) return;
@@ -461,71 +841,34 @@ export function AppSettingsModal({ open, onClose }: AppSettingsModalProps) {
   }, [open, sessionLifecycleReloadSeq]);
 
   useEffect(() => {
-    if (!open) return;
-    let cancelled = false;
-    fetchMainExitStatus()
-      .then((s) => {
-        if (!cancelled) {
-          setMainExitStatus(s);
-          if (s.pending) setMainExitState('exiting');
-        }
-      })
-      .catch((e) => {
-        if (!cancelled) {
-          setMainExitStatus({
-            available: false,
-            pending: false,
-            platform: 'unknown',
-            stage: 'error',
-            reason: e instanceof Error ? e.message : String(e),
-          });
-        }
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [open]);
-
-  useEffect(() => {
-    if (!open) return;
-    let cancelled = false;
-    fetchMainRestartStatus()
-      .then((s) => {
-        if (!cancelled) {
-          setMainRestartStatus(s);
-          if (s.pending) {
-            setMainRestartState('restarting');
-          } else {
-            setMainRestartError(null);
-          }
-        }
-      })
-      .catch((e) => {
-        if (!cancelled) {
-          setMainRestartStatus({
-            available: false,
-            pending: false,
-            platform: 'unknown',
-            reason: e instanceof Error ? e.message : String(e),
-          });
-        }
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [open]);
-
-  // Closing the modal stops only the browser-side health check.  It cannot
-  // cancel a restart already accepted by the server, which is intentional.
-  useEffect(() => {
-    if (open) return;
+    const generation = ++mainLifecycleGenerationRef.current;
     recoveryCancelledRef.current = true;
     recoveryAbortRef.current?.abort();
     recoveryAbortRef.current = null;
-  }, [open]);
+    if (open) {
+      setMainRestartStatus(null);
+      setMainRestartState('idle');
+      setMainRestartHealthCheckActive(false);
+      setMainRestartError(null);
+      setMainExitStatus(null);
+      setMainExitState('idle');
+      setMainExitError(null);
+      setMainLifecycleMarkRunningOffline(null);
+      setMainLifecycleStatusError(null);
+      void refreshMainLifecycleStatus(generation);
+    }
+    return () => {
+      if (mainLifecycleGenerationRef.current === generation) {
+        mainLifecycleGenerationRef.current += 1;
+      }
+      recoveryCancelledRef.current = true;
+      recoveryAbortRef.current?.abort();
+      recoveryAbortRef.current = null;
+    };
+  }, [open, refreshMainLifecycleStatus]);
 
   useEffect(() => {
-    if (!open || activeTab !== 'adapter') return;
+    if (!open || activeTab !== 'adapters') return;
     let cancelled = false;
     setCodexModelsLoading(true);
     fetchCodexModels()
@@ -656,6 +999,7 @@ export function AppSettingsModal({ open, onClose }: AppSettingsModalProps) {
   };
 
   const cancelMainRestartCheck = () => {
+    if (!mainRestartHealthCheckActive) return;
     recoveryCancelledRef.current = true;
     recoveryAbortRef.current?.abort();
     recoveryAbortRef.current = null;
@@ -663,9 +1007,12 @@ export function AppSettingsModal({ open, onClose }: AppSettingsModalProps) {
     setMainRestartError(null);
   };
 
-  const waitForMainRestartRecovery = async () => {
+  const waitForMainRestartRecovery = async (generation: number) => {
     const controller = new AbortController();
     recoveryAbortRef.current = controller;
+    setMainRestartHealthCheckActive(true);
+    const isCurrent = () =>
+      mainLifecycleGenerationRef.current === generation && modalOpenRef.current;
     const wait = (milliseconds: number) =>
       new Promise<void>((resolve, reject) => {
         const timer = window.setTimeout(resolve, milliseconds);
@@ -680,43 +1027,98 @@ export function AppSettingsModal({ open, onClose }: AppSettingsModalProps) {
       // Avoid treating the still-running old process as the recovered one.
       await wait(1000);
       for (let attempt = 0; attempt < 20; attempt += 1) {
-        if (controller.signal.aborted)
+        if (controller.signal.aborted || !isCurrent())
           throw new DOMException('Health check cancelled', 'AbortError');
         const probe = new AbortController();
         const forwardAbort = () => probe.abort();
         controller.signal.addEventListener('abort', forwardAbort, { once: true });
         const timeout = window.setTimeout(() => probe.abort(), 1000);
+        let healthy = false;
         try {
           await fetchHealth(probe.signal);
-          if (!controller.signal.aborted) {
-            const persisted = await fetchMainRestartStatus().catch(() => null);
-            if (persisted?.phase === 'failed' || persisted?.phase === 'timed_out') {
-              setMainRestartStatus(persisted);
-              setMainRestartState(persisted.phase === 'timed_out' ? 'timeout' : 'error');
-              setMainRestartError(persisted.error || 'Pan restart failed in the supervisor.');
-              showToast(persisted.error || 'Pan restart failed', 'error');
-              return;
-            }
-            setMainRestartState('restored');
-            setMainRestartStatus((previous) =>
-              previous ? { ...previous, pending: false } : previous,
-            );
-            showToast('Pan main service is back online', 'info');
-          }
-          return;
+          healthy = true;
         } catch {
           // The expected connection refusal during stop/start is retried.
         } finally {
           window.clearTimeout(timeout);
         }
+        if (healthy && !controller.signal.aborted && isCurrent()) {
+          let persisted: ApiMainRestartStatusResponse;
+          try {
+            persisted = await fetchMainRestartStatus();
+          } catch (error) {
+            if (isCurrent()) {
+              const reason = error instanceof Error ? error.message : String(error);
+              const message = 'Could not refresh Pan lifecycle status: ' + reason +
+                '. Refresh status before scheduling Restart or Exit.';
+              setMainLifecycleStatusError(
+                message,
+              );
+              setMainRestartStatus({
+                available: false, pending: false, platform: 'unknown', reason,
+              });
+              setMainExitStatus({
+                available: false, pending: false, platform: 'unknown',
+                stage: 'error', reason,
+              });
+              setMainRestartState('error');
+              setMainRestartError(message);
+              setMainExitState('idle');
+            }
+            return;
+          }
+          if (!isCurrent() || controller.signal.aborted) return;
+          setMainRestartStatus(persisted);
+          if (persisted.phase === 'failed' || persisted.phase === 'timed_out') {
+            const message = persisted.error || 'Pan restart failed in the supervisor.';
+            setMainRestartState(persisted.phase === 'timed_out' ? 'timeout' : 'error');
+            setMainRestartError(message);
+            showToast(message, 'error');
+            return;
+          }
+          if (persisted.pending) {
+            setMainRestartState('restarting');
+            await wait(750);
+            continue;
+          }
+          setMainRestartState('restored');
+          setMainRestartError(null);
+          showToast('Pan main service is back online', 'info');
+          return;
+        }
         await wait(750);
       }
-      const persisted = await fetchMainRestartStatus().catch(() => null);
+      let persisted: ApiMainRestartStatusResponse | null;
+      try {
+        persisted = await fetchMainRestartStatus();
+      } catch (error) {
+        if (isCurrent()) {
+          const reason = error instanceof Error ? error.message : String(error);
+          const message = 'Could not refresh Pan lifecycle status: ' + reason +
+            '. Refresh status before scheduling Restart or Exit.';
+          setMainRestartStatus({
+            available: false, pending: false, platform: 'unknown', reason,
+          });
+          setMainExitStatus({
+            available: false, pending: false, platform: 'unknown', stage: 'error', reason,
+          });
+          setMainLifecycleStatusError(message);
+          setMainRestartState('error');
+          setMainRestartError(message);
+          setMainExitState('idle');
+        }
+        return;
+      }
+      if (!isCurrent()) return;
+      if (persisted) setMainRestartStatus(persisted);
       if (persisted?.phase === 'failed' || persisted?.phase === 'timed_out') {
         setMainRestartStatus(persisted);
         setMainRestartState(persisted.phase === 'timed_out' ? 'timeout' : 'error');
         setMainRestartError(persisted.error || 'Pan restart failed in the supervisor.');
         showToast(persisted.error || 'Pan restart failed', 'error');
+      } else if (persisted?.pending) {
+        setMainRestartState('restarting');
+        setMainRestartError('Pan restart is still pending. Refresh lifecycle status to check again.');
       } else {
         setMainRestartState('timeout');
         setMainRestartError('Pan was restarted, but health check timed out after 16 seconds.');
@@ -724,49 +1126,100 @@ export function AppSettingsModal({ open, onClose }: AppSettingsModalProps) {
       }
     } catch (e) {
       if (e instanceof DOMException && e.name === 'AbortError') return;
-      setMainRestartState('error');
-      setMainRestartError(e instanceof Error ? e.message : String(e));
+      if (isCurrent()) {
+        setMainRestartState('error');
+        setMainRestartError(e instanceof Error ? e.message : String(e));
+      }
     } finally {
       if (recoveryAbortRef.current === controller) recoveryAbortRef.current = null;
+      if (isCurrent()) setMainRestartHealthCheckActive(false);
     }
   };
 
   const handleMainRestart = async () => {
+    if (
+      !serviceLifecycle ||
+      mainLifecycleActionInFlightRef.current ||
+      mainLifecycleStatusLoading ||
+      mainLifecycleStatusError ||
+      !mainRestartStatus?.available ||
+      !mainExitStatus?.available ||
+      mainRestartStatus.pending ||
+      mainExitStatus.pending ||
+      !sessionLifecycleLoaded ||
+      sessionLifecycleSaving
+    ) return;
+    const options = mainLifecycleOptions(
+      sessionLifecycle.exitStrategy,
+      mainLifecycleMarkRunningOffline,
+    );
+    if (options === null) return;
+    mainLifecycleActionInFlightRef.current = true;
+    const generation = ++mainLifecycleGenerationRef.current;
     recoveryCancelledRef.current = false;
     setMainRestartState('restarting');
     setMainRestartError(null);
     setMainRestartStatus((previous) => (previous ? { ...previous, pending: true } : previous));
     try {
-      await restartMainService();
-      if (recoveryCancelledRef.current) return;
+      await restartMainService(options);
+      if (mainLifecycleGenerationRef.current !== generation || recoveryCancelledRef.current) return;
       showToast('Pan restart scheduled; waiting for service recovery', 'info');
-      void waitForMainRestartRecovery();
+      void waitForMainRestartRecovery(generation);
     } catch (e) {
-      setMainRestartStatus((previous) => (previous ? { ...previous, pending: false } : previous));
-      setMainRestartState('error');
-      setMainRestartError(e instanceof Error ? e.message : String(e));
+      const message = e instanceof Error ? e.message : String(e);
+      if (mainLifecycleGenerationRef.current === generation) {
+        setMainRestartState('error');
+        setMainRestartError(message);
+        await refreshMainLifecycleStatus(generation, { operation: 'restart', message });
+      }
+    } finally {
+      mainLifecycleActionInFlightRef.current = false;
+      if (mainLifecycleGenerationRef.current !== generation && modalOpenRef.current) {
+        void refreshMainLifecycleStatus();
+      }
     }
   };
 
   const handleMainExit = async () => {
-    if (!sessionLifecycleLoaded || sessionLifecycleSaving) return;
-    const options = sessionLifecycle.exitStrategy === 'ask'
-      ? mainExitMarkRunningOffline === null
-        ? null
-        : { markRunningSessionsOffline: mainExitMarkRunningOffline }
-      : undefined;
+    if (
+      !serviceLifecycle ||
+      mainLifecycleActionInFlightRef.current ||
+      mainLifecycleStatusLoading ||
+      mainLifecycleStatusError ||
+      !mainRestartStatus?.available ||
+      !mainExitStatus?.available ||
+      mainRestartStatus.pending ||
+      mainExitStatus.pending ||
+      !sessionLifecycleLoaded ||
+      sessionLifecycleSaving
+    ) return;
+    const options = mainLifecycleOptions(
+      sessionLifecycle.exitStrategy,
+      mainLifecycleMarkRunningOffline,
+    );
     if (options === null) return;
+    mainLifecycleActionInFlightRef.current = true;
+    const generation = ++mainLifecycleGenerationRef.current;
     setMainExitState('exiting');
     setMainExitError(null);
     setMainExitStatus((previous) => (previous ? { ...previous, pending: true } : previous));
     try {
       await exitMainService(options);
+      if (mainLifecycleGenerationRef.current !== generation) return;
       setMainExitState('exited');
       showToast('Pan exit scheduled; this service will stop', 'info');
     } catch (e) {
-      setMainExitStatus((previous) => (previous ? { ...previous, pending: false } : previous));
-      setMainExitState('error');
-      setMainExitError(e instanceof Error ? e.message : String(e));
+      const message = e instanceof Error ? e.message : String(e);
+      if (mainLifecycleGenerationRef.current === generation) {
+        setMainExitState('error');
+        setMainExitError(message);
+        await refreshMainLifecycleStatus(generation, { operation: 'exit', message });
+      }
+    } finally {
+      mainLifecycleActionInFlightRef.current = false;
+      if (mainLifecycleGenerationRef.current !== generation && modalOpenRef.current) {
+        void refreshMainLifecycleStatus();
+      }
     }
   };
 
@@ -792,7 +1245,7 @@ export function AppSettingsModal({ open, onClose }: AppSettingsModalProps) {
 
   const handleReload = async (scope: ReloadScope) => {
     setReloadScope(scope);
-    setReloadSection(scope === 'plugin' || scope === 'memory' ? 'other' : scope);
+    setReloadSection(scope);
     setReloadResult(null);
     setReloadError(null);
     try {
@@ -924,108 +1377,30 @@ export function AppSettingsModal({ open, onClose }: AppSettingsModalProps) {
             setActiveTab(nextTab);
           }}
         >
-          <button
-            type="button"
-            role="tab"
-            id="app-settings-tab-general"
-            aria-controls="app-settings-tabpanel"
-            aria-selected={activeTab === 'general'}
-            tabIndex={activeTab === 'general' ? 0 : -1}
-            onClick={() => setActiveTab('general')}
-            className={`inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap border-b-2 px-3 py-2.5 text-xs transition-colors ${
-              activeTab === 'general'
-                ? 'border-accent text-text-primary'
-                : 'border-transparent text-text-tertiary hover:text-text-primary'
-            }`}
-          >
-            <Settings size={14} />
-            General
-          </button>
-          <button
-            type="button"
-            role="tab"
-            id="app-settings-tab-preferences"
-            aria-controls="app-settings-tabpanel"
-            aria-selected={activeTab === 'preferences'}
-            tabIndex={activeTab === 'preferences' ? 0 : -1}
-            onClick={() => setActiveTab('preferences')}
-            className={`inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap border-b-2 px-3 py-2.5 text-xs transition-colors ${
-              activeTab === 'preferences'
-                ? 'border-accent text-text-primary'
-                : 'border-transparent text-text-tertiary hover:text-text-primary'
-            }`}
-          >
-            <SlidersHorizontal size={14} />
-            Preferences
-          </button>
-          <button
-            type="button"
-            role="tab"
-            id="app-settings-tab-appearance"
-            aria-controls="app-settings-tabpanel"
-            aria-selected={activeTab === 'appearance'}
-            tabIndex={activeTab === 'appearance' ? 0 : -1}
-            onClick={() => setActiveTab('appearance')}
-            className={`inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap border-b-2 px-3 py-2.5 text-xs transition-colors ${
-              activeTab === 'appearance'
-                ? 'border-accent text-text-primary'
-                : 'border-transparent text-text-tertiary hover:text-text-primary'
-            }`}
-          >
-            <Eye size={14} />
-            Appearance
-          </button>
-          <button
-            type="button"
-            role="tab"
-            id="app-settings-tab-notifications"
-            aria-controls="app-settings-tabpanel"
-            aria-selected={activeTab === 'notifications'}
-            tabIndex={activeTab === 'notifications' ? 0 : -1}
-            onClick={() => setActiveTab('notifications')}
-            className={`inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap border-b-2 px-3 py-2.5 text-xs transition-colors ${
-              activeTab === 'notifications'
-                ? 'border-accent text-text-primary'
-                : 'border-transparent text-text-tertiary hover:text-text-primary'
-            }`}
-          >
-            <Bell size={14} />
-            Notification
-          </button>
-          <button
-            type="button"
-            role="tab"
-            id="app-settings-tab-adapter"
-            aria-controls="app-settings-tabpanel"
-            aria-selected={activeTab === 'adapter'}
-            tabIndex={activeTab === 'adapter' ? 0 : -1}
-            onClick={() => setActiveTab('adapter')}
-            className={`inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap border-b-2 px-3 py-2.5 text-xs transition-colors ${
-              activeTab === 'adapter'
-                ? 'border-accent text-text-primary'
-                : 'border-transparent text-text-tertiary hover:text-text-primary'
-            }`}
-          >
-            <SlidersHorizontal size={14} />
-            Adapter
-          </button>
-          <button
-            type="button"
-            role="tab"
-            id="app-settings-tab-data"
-            aria-controls="app-settings-tabpanel"
-            aria-selected={activeTab === 'data'}
-            tabIndex={activeTab === 'data' ? 0 : -1}
-            onClick={() => setActiveTab('data')}
-            className={`inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap border-b-2 px-3 py-2.5 text-xs transition-colors ${
-              activeTab === 'data'
-                ? 'border-accent text-text-primary'
-                : 'border-transparent text-text-tertiary hover:text-text-primary'
-            }`}
-          >
-            <Database size={14} />
-            Data
-          </button>
+          {SETTINGS_TABS.map((tab) => {
+            const { label, Icon } = SETTINGS_TAB_META[tab];
+            const selected = activeTab === tab;
+            return (
+              <button
+                key={tab}
+                type="button"
+                role="tab"
+                id={`app-settings-tab-${tab}`}
+                aria-controls="app-settings-tabpanel"
+                aria-selected={selected}
+                tabIndex={selected ? 0 : -1}
+                onClick={() => setActiveTab(tab)}
+                className={`inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap border-b-2 px-3 py-2.5 text-xs transition-colors ${
+                  selected
+                    ? 'border-accent text-text-primary'
+                    : 'border-transparent text-text-tertiary hover:text-text-primary'
+                }`}
+              >
+                <Icon size={14} />
+                {label}
+              </button>
+            );
+          })}
         </div>
 
         {/* Body */}
@@ -1036,7 +1411,9 @@ export function AppSettingsModal({ open, onClose }: AppSettingsModalProps) {
           tabIndex={0}
           className="flex-1 overflow-y-auto px-4 py-4 md:px-6 md:py-5 space-y-6"
         >
-          {activeTab === 'adapter' ? (
+          {activeTab === 'authorization' ? (
+            <AuthorizationSettings />
+          ) : activeTab === 'adapters' ? (
             <>
             <section>
               <h3 className="text-xs font-semibold uppercase tracking-wide text-text-tertiary mb-2">
@@ -1048,6 +1425,9 @@ export function AppSettingsModal({ open, onClose }: AppSettingsModalProps) {
                   hint="默认隐藏；Codex 子进程等待终端输入时显示输入框"
                   checked={showCodexTerminalInput}
                   onChange={setShowCodexTerminalInput}
+                />
+                <CodexNativePassthrough
+                  sessionId={currentSession?.adapter === 'codex' && !currentSession.readonlySession ? currentSession.id : null}
                 />
                 <div className="px-3 py-2">
                   <div className="text-xs text-text-primary">Model whitelist</div>
@@ -1121,6 +1501,44 @@ export function AppSettingsModal({ open, onClose }: AppSettingsModalProps) {
             </>
           ) : activeTab === 'notifications' ? (
             <section>
+              <CompletionBridgeDefaultsPanel />
+              <SourceNotificationPanel source="lockerUnread" />
+              <SourceNotificationPanel source="newError" />
+              <UnreadRecordingPanel />
+              <div className="mb-5" data-testid="locker-desktop-notify-section">
+                <h3 className="text-xs font-semibold uppercase tracking-wide text-text-tertiary mb-2">
+                  Locker
+                </h3>
+                <div className="rounded-md border border-border-muted divide-y divide-border-muted bg-bg-primary">
+                  <SwitchRow
+                    label="Locker new messages"
+                    hint={
+                      lockerPermission === 'unsupported'
+                        ? 'This browser does not support system notifications.'
+                        : 'System notification only while this page is in the background.'
+                    }
+                    checked={notifications.lockerDesktop}
+                    disabled={lockerPermission === 'unsupported'}
+                    onChange={(v) => void toggleLockerDesktopNotify(v)}
+                  />
+                </div>
+                <p className="mt-1.5 text-[11px] text-text-tertiary leading-relaxed">
+                  Off by default. Reuses the 30-second Locker unread poll: one notification per
+                  increase while Pan is in the background, never on first load and never when
+                  messages are read. Clicking the notification opens Locker.
+                </p>
+                {notifications.lockerDesktop && lockerPermission === 'denied' && (
+                  <div
+                    role="alert"
+                    data-testid="locker-notification-denied"
+                    className="mt-2 rounded-md border border-danger/30 bg-danger/10 px-3 py-2 text-[11px] text-danger"
+                  >
+                    Browser notification permission is denied for this site. Locker alerts stay
+                    silent until notifications are allowed in the browser's site settings; the
+                    switch keeps your preference.
+                  </div>
+                )}
+              </div>
               <h3 className="text-xs font-semibold uppercase tracking-wide text-text-tertiary mb-2">
                 CLI adapter warnings
               </h3>
@@ -1130,12 +1548,6 @@ export function AppSettingsModal({ open, onClose }: AppSettingsModalProps) {
                   hint="Native Codex error, MCP startup failure, and model reroute warnings"
                   checked={notifications.codexWarningToast}
                   onChange={setCodexWarningToast}
-                />
-                <SwitchRow
-                  label="Confirm management changes across workspaces"
-                  hint="Moving a managed Session subtree to another workspace detaches it from its current manager."
-                  checked={notifications.confirmCrossWorkspaceManagement}
-                  onChange={setConfirmCrossWorkspaceManagement}
                 />
                 <div className="w-full flex items-center justify-between gap-3 px-3 py-2 text-left opacity-60">
                   <span className="min-w-0">
@@ -1148,23 +1560,94 @@ export function AppSettingsModal({ open, onClose }: AppSettingsModalProps) {
                 </div>
               </div>
               <p className="mt-1.5 text-[11px] text-text-tertiary leading-relaxed">
-                These settings only control warning Toasts. Other adapter status, chat output, and
-                interactive prompts are unchanged.
+                These settings control warning Toasts, completion delivery defaults, and unread
+                recording. Confirmation prompts live on Behavior.
               </p>
             </section>
           ) : activeTab === 'appearance' ? (
             <>
               <section>
+                <h3 className="text-xs font-semibold uppercase tracking-wide text-text-tertiary mb-2">Panel order</h3>
+                <div data-testid="panel-order-list" className="rounded-md border border-border-muted bg-bg-primary divide-y divide-border-muted">
+                  {orderedEntries.map((entry, index) => <div key={entry.id}
+                    className={`relative flex items-center gap-2 px-3 py-2 text-xs ${dropEntry?.id === entry.id ? (dropEntry.zone === 'before' ? 'border-t-2' : 'border-b-2') + ' border-accent' : ''}`}
+                    draggable onDragStart={() => setDragEntry(entry.id)}
+                    onDragOver={(event) => { event.preventDefault(); const rect = event.currentTarget.getBoundingClientRect(); const zone = resolveDropZone(rect.top, rect.height, event.clientY); setDropEntry(zone === 'center' ? null : { id: entry.id, zone }); }}
+                    onDragEnd={() => { setDragEntry(null); setDropEntry(null); }}
+                    onDrop={(event) => { event.preventDefault(); if (dropEntry?.id === entry.id) dropOrder(entry.id, dropEntry.zone); }}>
+                    <entry.icon size={14} className="shrink-0 text-text-tertiary" /><span className="min-w-0 flex-1 truncate">{entry.label}</span>
+                    <button type="button" aria-label={`Move ${entry.label} up`} disabled={index === 0} onClick={() => moveEntry(entry.id, -1)} className="px-1 disabled:opacity-30">↑</button>
+                    <button type="button" aria-label={`Move ${entry.label} down`} disabled={index === orderedEntries.length - 1} onClick={() => moveEntry(entry.id, 1)} className="px-1 disabled:opacity-30">↓</button>
+                  </div>)}
+                </div>
+                <p className="mt-1.5 text-[11px] text-text-tertiary">Drag an entry to the insertion line, or use the move buttons. This order also controls navigation pages, the collapsed rail, and panel shortcut display.</p>
+              </section>
+              <section>
                 <h3 className="text-xs font-semibold uppercase tracking-wide text-text-tertiary mb-2">
                   Chat view
                 </h3>
                 <div className="rounded-md border border-border-muted divide-y divide-border-muted bg-bg-primary">
+                  <ChatViewSelect value={chatViewStyle} onChange={setChatViewStyle} />
                   <SwitchRow
-                    label="Use Bubble chat view"
-                    hint="Off by default: TUI rows remain the standard chat presentation."
-                    checked={chatViewStyle === 'bubble'}
-                    onChange={(enabled) => setChatViewStyle(enabled ? 'bubble' : 'tui')}
+                    label="Show chat view switcher"
+                    hint="The TUI / Bubble / Raw selector in the Chat top bar. Terminal TUI / Upgrades stays available."
+                    checked={showChatViewSwitcher}
+                    onChange={setShowChatViewSwitcher}
                   />
+                </div>
+                <p className="mt-1.5 text-[11px] text-text-tertiary leading-relaxed">
+                  On by default. Hiding the switcher only removes that control; viewing the chat,
+                  Terminal TUI / Upgrades, and every navigation route stay available.
+                </p>
+              </section>
+              <section>
+                <h3 className="text-xs font-semibold uppercase tracking-wide text-text-tertiary mb-2">
+                  Sidebar
+                </h3>
+                <div className="rounded-md border border-border-muted divide-y divide-border-muted bg-bg-primary">
+                  <SwitchRow
+                    label="Show sidebar collapse handle"
+                    hint="Floating handle on the desktop sidebar edge; the header and collapsed-rail buttons stay available."
+                    checked={showSidebarCollapseHandle}
+                    onChange={setShowSidebarCollapseHandle}
+                  />
+                </div>
+              </section>
+              <section>
+                <h3 className="text-xs font-semibold uppercase tracking-wide text-text-tertiary mb-2">
+                  Session list
+                </h3>
+                <div className="rounded-md border border-border-muted divide-y divide-border-muted bg-bg-primary">
+                  <SwitchRow
+                    label="Show Group by"
+                    hint="When hidden, the Session list always uses Manager grouping."
+                    checked={showGroupBy}
+                    onChange={setShowGroupBy}
+                  />
+                  <div className="px-3 py-2">
+                    <label
+                      htmlFor="app-settings-default-group-by"
+                      className="block text-xs text-text-secondary mb-1"
+                    >
+                      Default group by
+                    </label>
+                    <select
+                      id="app-settings-default-group-by"
+                      value={defaultGroupBy}
+                      onChange={(e) => setDefaultGroupBy(e.target.value as GroupMode)}
+                      className="w-full rounded border border-border-default bg-bg-tertiary px-2 py-1.5 text-xs text-text-primary outline-none focus:border-accent"
+                    >
+                      {GROUP_OPTIONS.map((o) => (
+                        <option key={o.value} value={o.value}>
+                          {o.label}
+                        </option>
+                      ))}
+                    </select>
+                    <p className="mt-1.5 text-[11px] text-text-tertiary leading-relaxed">
+                      Applies to the session list as the default grouping. You can still cycle
+                      grouping per view with the group button.
+                    </p>
+                  </div>
                 </div>
               </section>
               <section>
@@ -1236,69 +1719,157 @@ export function AppSettingsModal({ open, onClose }: AppSettingsModalProps) {
                   />
                 </div>
                 <p className="mt-1.5 text-[11px] text-text-tertiary leading-relaxed">
-                  Off by default. Turning this on adds the strip, including a background scan of the
-                  session history (one request per 200 messages), so enabling it costs more on long
-                  sessions.
+                  On by default. The strip includes a background scan of the session history (one
+                  request per 200 messages), so turning it off saves that cost on long sessions.
                 </p>
               </section>
-            </>
-          ) : activeTab === 'preferences' ? (
-            <section>
-              <h3 className="text-xs font-semibold uppercase tracking-wide text-text-tertiary mb-2">
-                New Sessions
-              </h3>
-              <div className="rounded-md border border-border-muted divide-y divide-border-muted bg-bg-primary">
-                <SwitchRow
-                  label="Place new Sessions in the current Workspace by default"
-                  hint="Sessions created from All or Ungrouped remain ungrouped."
-                  checked={defaultNewSessionToCurrentWorkspace}
-                  onChange={setDefaultNewSessionToCurrentWorkspace}
-                />
-              </div>
-            </section>
-          ) : activeTab === 'data' ? (
-            <DataSettingsPanel
-              catalog={dataCatalog}
-              loading={dataCatalogLoading}
-              error={dataCatalogError}
-              retention={dataRetention}
-              retentionDraft={dataRetentionDraft}
-              retentionLoading={dataRetentionLoading}
-              retentionError={dataRetentionError}
-              retentionSaving={dataRetentionSaving}
-              retentionSaveError={dataRetentionSaveError}
-              retentionDirty={dataRetentionDirty}
-              onRetentionChange={updateDataRetentionDraft}
-              onSaveRetention={() => void saveDataRetentionDraft()}
-              jobsRetentionSlot={<JobRetentionSettings />}
-            />
-          ) : (
-            <>
-              {/* Session list grouping */}
               <section>
                 <h3 className="text-xs font-semibold uppercase tracking-wide text-text-tertiary mb-2">
-                  Session list
+                  History search
                 </h3>
-                <label className="block text-xs text-text-secondary mb-1">Default group by</label>
-                <select
-                  value={defaultGroupBy}
-                  onChange={(e) => setDefaultGroupBy(e.target.value as GroupMode)}
-                  className="w-full rounded border border-border-default bg-bg-tertiary px-2 py-1.5 text-xs text-text-primary outline-none focus:border-accent"
-                >
-                  {GROUP_OPTIONS.map((o) => (
-                    <option key={o.value} value={o.value}>
-                      {o.label}
-                    </option>
-                  ))}
-                </select>
+                <div className="rounded-md border border-border-muted divide-y divide-border-muted bg-bg-primary">
+                  <SwitchRow
+                  label="Enable Session and global history search"
+                  hint="Search the current Session or search messages across all Sessions."
+                    checked={showHistorySearch}
+                    onChange={setShowHistorySearch}
+                  />
+                </div>
                 <p className="mt-1.5 text-[11px] text-text-tertiary leading-relaxed">
-                  Applies to the session list as the default grouping. You can still cycle grouping
-                  per view with the group button.
+                  On by default. Search starts only after you enter a query. Results use stable
+                  message IDs for navigation; older history without IDs may not appear.
                 </p>
               </section>
+              <section className="border-t border-border-muted pt-4">
+                <h3 className="text-xs font-semibold uppercase tracking-wide text-text-tertiary mb-2">
+                  Reset
+                </h3>
+                <p className="text-[11px] text-text-tertiary leading-relaxed">
+                  Resets the UI preferences saved in config.json: the Appearance options, the
+                  Notification options, and the related Behavior toggles (new-Session Workspace
+                  placement, automatic Force send, worker stop reports, confirmation prompts)
+                  plus the Codex terminal input popup on Adapters. It does not reset Pan lifecycle policies, worker
+                  timeouts, Data retention, Remote settings, adapter model lists, or plugins.
+                </p>
+                <button
+                  type="button"
+                  onClick={resetSettings}
+                  className="mt-2 text-[11px] text-text-tertiary hover:text-text-primary underline underline-offset-2"
+                >
+                  Reset saved UI preferences
+                </button>
+              </section>
+            </>
+          ) : activeTab === 'shortcuts' ? (
+            <ShortcutsSettings />
+          ) : activeTab === 'behavior' ? (
+            <>
+              <SessionErrorBridgeSetting />
+              <UserCardReminderSettings />
+              <AutoReportSettingsGroup />
+              <section
+                ref={behaviorSessionRef}
+                data-testid="behavior-session-section"
+                tabIndex={-1}
+                className="focus:outline-none"
+              >
+                <h3 className="text-xs font-semibold uppercase tracking-wide text-text-tertiary mb-2">
+                  Session legal-state lifecycle
+                </h3>
+                {sessionLifecycleLoading && !sessionLifecycleLoaded && (
+                  <p className="mb-2 text-[11px] text-text-tertiary">Loading lifecycle preferences…</p>
+                )}
+                {sessionLifecycleLoaded && (
+                  <div className="space-y-3">
+                    <div
+                      data-settings-anchor="exit-strategy"
+                      tabIndex={-1}
+                      className="rounded-md focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/40"
+                    >
+                      <label htmlFor="session-exit-strategy" className="mb-1 block text-xs text-text-secondary">
+                        Restart and Exit Session policy
+                      </label>
+                      <select
+                        id="session-exit-strategy"
+                        value={sessionLifecycle.exitStrategy}
+                        disabled={
+                          sessionLifecycleSaving ||
+                          mainExitState === 'confirming' ||
+                          mainExitState === 'exiting' ||
+                          mainRestartState === 'confirming' ||
+                          mainRestartState === 'restarting'
+                        }
+                        onChange={(event) => void saveSessionLifecycle({
+                          exitStrategy: event.target.value as ApiSessionExitStrategy,
+                        })}
+                        className="w-full rounded border border-border-default bg-bg-tertiary px-2 py-1.5 text-xs text-text-primary outline-none focus:border-accent disabled:opacity-60"
+                      >
+                        <option value="ask">Ask every time</option>
+                        <option value="offline">Default to safely retiring stopped execution</option>
+                        <option value="preserve-running">Default to preserving unfinished execution as Illegal</option>
+                      </select>
+                      <p className="mt-1 text-[10px] text-text-tertiary">
+                        Every option stops live Workers before Restart or Exit.
+                      </p>
+                    </div>
+                    <div>
+                      <label htmlFor="session-wake-message" className="mb-1 block text-xs text-text-secondary">Wake message</label>
+                      <textarea id="session-wake-message" key={sessionLifecycle.wakeMessage}
+                        defaultValue={sessionLifecycle.wakeMessage || '继续'} maxLength={32000}
+                        disabled={sessionLifecycleSaving}
+                        onBlur={(event) => {
+                          const wakeMessage = event.target.value;
+                          if (wakeMessage.trim() && wakeMessage !== sessionLifecycle.wakeMessage)
+                            void saveSessionLifecycle({ wakeMessage });
+                          else if (!wakeMessage.trim()) event.target.value = sessionLifecycle.wakeMessage || '继续';
+                        }}
+                        className="w-full rounded border border-border-default bg-bg-tertiary px-2 py-1.5 text-xs text-text-primary"
+                      />
+                      <p className="mt-1 text-[10px] text-text-tertiary">Wake enqueues this message, releases its Illegal lock and moves it to the front. Pause and other safety gates still apply. Saved when you leave this field.</p>
+                    </div>
+                    <div
+                      data-settings-anchor="startup-preference"
+                      tabIndex={-1}
+                      className="rounded-md focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/40"
+                    >
+                      <label htmlFor="session-startup-preference" className="mb-1 block text-xs text-text-secondary">
+                        Startup preference
+                      </label>
+                      <select
+                        id="session-startup-preference"
+                        value={sessionLifecycle.startupPreference}
+                        disabled={sessionLifecycleSaving}
+                        onChange={(event) => void saveSessionLifecycle({
+                          startupPreference: event.target.value as ApiStartupPreference,
+                        })}
+                        className="w-full rounded border border-border-default bg-bg-tertiary px-2 py-1.5 text-xs text-text-primary outline-none focus:border-accent disabled:opacity-60"
+                      >
+                        <option value="ask">Ask every time</option>
+                        <option value="wake-running">Automatically recover Illegal Sessions</option>
+                        <option value="clear-illegal">Clear Illegal status for all Sessions and treat them as safely offline</option>
+                        <option value="preserve-running">Keep Illegal Sessions pending recovery without waking them</option>
+                      </select>
+                      <p className="mt-1 text-[10px] text-text-tertiary">
+                        Clear Illegal retires previous incidents and releases their automatic locks; Manual locks and live or unknown owner protections remain.
+                      </p>
+                    </div>
+                  </div>
+                )}
+                {sessionLifecycleError && (
+                  <div role="alert" className="mt-2 rounded-md border border-danger/30 bg-danger/10 px-3 py-2 text-[11px] text-danger">
+                    {sessionLifecycleError}
+                    <button
+                      type="button"
+                      disabled={sessionLifecycleLoading}
+                      onClick={() => setSessionLifecycleReloadSeq((value) => value + 1)}
+                      className="ml-2 underline underline-offset-2 disabled:opacity-60"
+                    >
+                      Retry
+                    </button>
+                  </div>
+                )}
+              </section>
 
-              {/* Worker settings are edited and hot-applied here. Adapter
-              reload feedback is shown with adapter controls on the Adapter tab. */}
               <section>
                 <h3 className="text-xs font-semibold uppercase tracking-wide text-text-tertiary mb-2">
                   Worker configuration
@@ -1337,22 +1908,113 @@ export function AppSettingsModal({ open, onClose }: AppSettingsModalProps) {
                 </p>
               </section>
 
-              {/* Other hot-reload — newer POST /api/config/reload scopes.
-              plugin re-applies the plugin_manifests LIST from config.json,
-              so manifest files added to / removed from the list take effect
-              (/api/manifest/reload only re-reads the already-registered
-              files). memory re-reads the memory.enabled injection switch. */}
               <section>
                 <h3 className="text-xs font-semibold uppercase tracking-wide text-text-tertiary mb-2">
-                  Other hot-reload
+                  Worker stop reports
                 </h3>
                 <div className="rounded-md border border-border-muted divide-y divide-border-muted bg-bg-primary">
-                  <ReloadRow
-                    label="Reload plugin manifests"
-                    hint="plugin_manifests list in config.json (add/remove manifests)"
-                    busy={reloadScope === 'plugin'}
-                    onClick={() => handleReload('plugin')}
+                  <SwitchRow
+                    label="Report errors when stopping a running worker"
+                    hint="Applies when you stop a running or queued worker yourself."
+                    checked={reportWorkerKillErrors}
+                    onChange={(v) => void toggleReportWorkerKillErrors(v)}
                   />
+                </div>
+                <p className="mt-1.5 text-[11px] text-text-tertiary leading-relaxed">
+                  Off by default. While off, stopping a worker yourself never queues an error
+                  report for its Manager. Real crashes, abnormal exits, and watchdog timeouts
+                  are still reported. The stop itself, task cleanup, and queue state are
+                  unaffected either way.
+                </p>
+                {killReportError && (
+                  <div role="alert" className="mt-2 rounded-md border border-danger/30 bg-danger/10 px-3 py-2 text-[11px] text-danger">
+                    {killReportError}
+                  </div>
+                )}
+              </section>
+
+              <section data-testid="auto-force-send-section">
+                <h3 className="text-xs font-semibold uppercase tracking-wide text-text-tertiary mb-2">
+                  Message auto force send
+                </h3>
+                <div className="rounded-md border border-border-muted divide-y divide-border-muted bg-bg-primary">
+                  <SwitchRow
+                    label="Job terminal notifications"
+                    hint="background_job_terminal notices"
+                    checked={autoForceSend.system}
+                    disabled={autoForceSaving !== null}
+                    onChange={(v) => void toggleAutoForceSend('system', v)}
+                  />
+                  <SwitchRow
+                    label="Meta-agent (MA) messages"
+                    hint="sender is the target's manager/ancestor"
+                    checked={autoForceSend.ma}
+                    disabled={autoForceSaving !== null}
+                    onChange={(v) => void toggleAutoForceSend('ma', v)}
+                  />
+                  <SwitchRow
+                    label="Completion reports"
+                    hint="report / manual report items"
+                    checked={autoForceSend.report}
+                    disabled={autoForceSaving !== null}
+                    onChange={(v) => void toggleAutoForceSend('report', v)}
+                  />
+                </div>
+                <p className="mt-1.5 text-[11px] text-text-tertiary leading-relaxed">
+                  All off by default. Applies only to newly enqueued messages and reuses Force
+                  send routing: native Steer while running, otherwise move the original item to
+                  the queue head and restart. Idle Sessions use a normal send. Pause, read-only,
+                  Illegal locks, edit leases, delayed restarts, and unknown Steer outcomes are
+                  never bypassed (accepted means the CLI accepted it, not that the model consumed
+                  it). Original queue IDs, sources, tasks, attachments, and bodies are preserved;
+                  nothing is enqueued twice.
+                </p>
+                {autoForceError && (
+                  <div role="alert" className="mt-2 rounded-md border border-danger/30 bg-danger/10 px-3 py-2 text-[11px] text-danger">
+                    {autoForceError}
+                  </div>
+                )}
+              </section>
+
+              <section>
+                <h3 className="text-xs font-semibold uppercase tracking-wide text-text-tertiary mb-2">
+                  New Sessions
+                </h3>
+                <div className="rounded-md border border-border-muted divide-y divide-border-muted bg-bg-primary">
+                  <SwitchRow
+                    label="Place new Sessions in the current Workspace by default"
+                    hint="Sessions created from All or Ungrouped remain ungrouped."
+                    checked={defaultNewSessionToCurrentWorkspace}
+                    onChange={setDefaultNewSessionToCurrentWorkspace}
+                  />
+                </div>
+              </section>
+
+              <section>
+                <h3 className="text-xs font-semibold uppercase tracking-wide text-text-tertiary mb-2">
+                  Confirmations
+                </h3>
+                <div className="rounded-md border border-border-muted divide-y divide-border-muted bg-bg-primary">
+                  <SwitchRow
+                    label="修改 agent/系统队列消息前确认"
+                    hint="关闭仅跳过提醒，仍遵循队列编辑校验。"
+                    checked={notifications.confirmAgentSystemQueueEdit}
+                    onChange={setConfirmAgentSystemQueueEdit}
+                  />
+                  <SwitchRow
+                    label="Confirm management changes across workspaces"
+                    hint="Moving a managed Session subtree to another workspace detaches it from its current manager."
+                    checked={notifications.confirmCrossWorkspaceManagement}
+                    onChange={setConfirmCrossWorkspaceManagement}
+                  />
+                </div>
+              </section>
+
+              <section>
+                <h3 className="text-xs font-semibold uppercase tracking-wide text-text-tertiary mb-2">
+                  Memory advanced
+                </h3>
+                <div className="rounded-md border border-border-muted divide-y divide-border-muted bg-bg-primary">
                   <ReloadRow
                     label="Reload memory config"
                     hint="memory.enabled injection switch"
@@ -1360,14 +2022,13 @@ export function AppSettingsModal({ open, onClose }: AppSettingsModalProps) {
                     onClick={() => handleReload('memory')}
                   />
                 </div>
-                {reloadError && reloadSection === 'other' && (
+                {reloadError && reloadSection === 'memory' && (
                   <div className="mt-2 rounded-md border border-danger/30 bg-danger/10 px-3 py-2 text-[11px] text-danger">
                     {reloadError}
                   </div>
                 )}
-                {!reloadError && reloadResult && reloadSection === 'other' && (
+                {!reloadError && reloadResult && reloadSection === 'memory' && (
                   <div className="mt-2 rounded-md border border-border-muted bg-bg-tertiary px-3 py-2 text-[11px] font-mono text-text-secondary space-y-0.5">
-                    {reloadResult.plugin && <PluginResult plugin={reloadResult.plugin} />}
                     {reloadResult.memory && (
                       <div>
                         memory.enabled: {String(reloadResult.memory.before.enabled ?? '?')} →{' '}
@@ -1380,11 +2041,92 @@ export function AppSettingsModal({ open, onClose }: AppSettingsModalProps) {
                     )}
                   </div>
                 )}
+              </section>
+            </>
+          ) : activeTab === 'remote' ? (
+            <>
+              {/* Remote / Tunnel — cloudflared tunnel managed by the internal
+              Python launcher. Only rendered when config.json has a remote
+              section with enabled=true. Restart kills only Pan's own
+              launcher-recorded tunnel process and picks up port +
+              remote.protocol. */}
+              {remoteStatus?.available && remoteStatus.enabled && (
+                <RemoteSettingsSection
+                  id="remote-tunnel"
+                  testId="remote-tunnel-section"
+                  title="Remote / Tunnel"
+                  description="cloudflared 隧道，由 Pan 启动器托管；重启会按当前 config.json 重新拉起。"
+                  status={<RemoteStatus tone={remoteStatus.running ? 'ok' : 'off'}>
+                    cloudflared · {remoteStatus.running ? 'running' : 'stopped'}
+                    {remoteStatus.protocol ? ` · ${remoteStatus.protocol}` : ''}
+                    {remoteStatus.port ? ` · :${remoteStatus.port}` : ''}
+                  </RemoteStatus>}
+                >
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button size="sm" disabled={remoteBusy} onClick={handleRemoteRestart}>
+                      {remoteBusy ? 'Restarting…' : 'Restart tunnel'}
+                    </Button>
+                  </div>
+                  <p className="text-[11px] text-text-tertiary leading-relaxed">
+                    Stops Pan's own launcher-recorded cloudflared only — the cloudflared-ssh service
+                    is untouched — and restarts it with the current config.json.
+                  </p>
+                </RemoteSettingsSection>
+              )}
+              <McpRemoteSettings />
+              <TailscaleSettings />
+              <LanSettings />
+            </>
+          ) : activeTab === 'plugins' ? (
+            <>
+              <LocalPluginPanelsSettings />
+              <QqPluginsPanel />
+              <section>
+                <h3 className="text-xs font-semibold uppercase tracking-wide text-text-tertiary mb-2">
+                  Plugin manifests
+                </h3>
+                <div className="rounded-md border border-border-muted divide-y divide-border-muted bg-bg-primary">
+                  <ReloadRow
+                    label="Reload plugin manifests"
+                    hint="plugin_manifests list in config.json (add/remove manifests)"
+                    busy={reloadScope === 'plugin'}
+                    onClick={() => handleReload('plugin')}
+                  />
+                </div>
+                {reloadError && reloadSection === 'plugin' && (
+                  <div className="mt-2 rounded-md border border-danger/30 bg-danger/10 px-3 py-2 text-[11px] text-danger">
+                    {reloadError}
+                  </div>
+                )}
+                {!reloadError && reloadResult && reloadSection === 'plugin' && (
+                  <div className="mt-2 rounded-md border border-border-muted bg-bg-tertiary px-3 py-2 text-[11px] font-mono text-text-secondary space-y-0.5">
+                    {reloadResult.plugin && <PluginResult plugin={reloadResult.plugin} />}
+                  </div>
+                )}
                 <p className="mt-1.5 text-[11px] text-text-tertiary leading-relaxed">
-                  port / logging / remote are startup-frozen and need a server restart to apply.
+                  Re-applies the plugin_manifests list; port / logging / remote stay
+                  startup-frozen and need a server restart to apply.
                 </p>
               </section>
-
+            </>
+          ) : activeTab === 'data' ? (
+            <DataSettingsPanel
+              catalog={dataCatalog}
+              loading={dataCatalogLoading}
+              error={dataCatalogError}
+              retention={dataRetention}
+              retentionDraft={dataRetentionDraft}
+              retentionLoading={dataRetentionLoading}
+              retentionError={dataRetentionError}
+              retentionSaving={dataRetentionSaving}
+              retentionSaveError={dataRetentionSaveError}
+              retentionDirty={dataRetentionDirty}
+              onRetentionChange={updateDataRetentionDraft}
+              onSaveRetention={() => void saveDataRetentionDraft()}
+              jobsRetentionSlot={<JobRetentionSettings />}
+            />
+          ) : (
+            <>
               {/* Main Pan service — deliberately separate from worker and tunnel
               restarts. The API only schedules a detached supervisor; the
               browser expects a short disconnect while Pan is replaced. */}
@@ -1392,6 +2134,24 @@ export function AppSettingsModal({ open, onClose }: AppSettingsModalProps) {
                 <h3 className="text-xs font-semibold uppercase tracking-wide text-text-tertiary mb-2">
                   Pan service
                 </h3>
+                {mainLifecycleStatusLoading && (
+                  <p className="mb-2 text-[11px] text-text-tertiary">
+                    Checking current Pan lifecycle status…
+                  </p>
+                )}
+                {mainLifecycleStatusError && (
+                  <div role="alert" className="mb-2 rounded-md border border-danger/30 bg-danger/10 px-3 py-2 text-[11px] text-danger">
+                    {mainLifecycleStatusError}
+                    <button
+                      type="button"
+                      disabled={mainLifecycleStatusLoading}
+                      onClick={() => void refreshMainLifecycleStatus()}
+                      className="ml-2 underline underline-offset-2 disabled:opacity-60"
+                    >
+                      Refresh status
+                    </button>
+                  </div>
+                )}
                 {mainRestartState === 'confirming' ? (
                   <div className="rounded-md border border-warning/40 bg-warning/10 px-3 py-3">
                     <p className="text-xs text-text-primary">
@@ -1399,10 +2159,19 @@ export function AppSettingsModal({ open, onClose }: AppSettingsModalProps) {
                       workers will be stopped; durable queued work is recovered by the new service
                       process.
                     </p>
+                    <MainLifecycleRunningChoice
+                      strategy={sessionLifecycle.exitStrategy}
+                      markRunningOffline={mainLifecycleMarkRunningOffline}
+                      onChange={setMainLifecycleMarkRunningOffline}
+                      inputName="main-restart-running-session-state"
+                    />
                     <div className="mt-3 flex justify-end gap-2">
                       <button
                         type="button"
-                        onClick={() => setMainRestartState('idle')}
+                        onClick={() => {
+                          setMainLifecycleMarkRunningOffline(null);
+                          setMainRestartState('idle');
+                        }}
                         className="rounded border border-border-default px-3 py-1.5 text-xs text-text-secondary hover:bg-bg-hover"
                       >
                         Cancel
@@ -1410,6 +2179,20 @@ export function AppSettingsModal({ open, onClose }: AppSettingsModalProps) {
                       <button
                         type="button"
                         onClick={handleMainRestart}
+                        disabled={
+                          !serviceLifecycle ||
+                          (sessionLifecycle.exitStrategy === 'ask' &&
+                            mainLifecycleMarkRunningOffline === null) ||
+                          mainLifecycleStatusLoading ||
+                          Boolean(mainLifecycleStatusError) ||
+                          !mainRestartStatus?.available ||
+                          !mainExitStatus?.available ||
+                          Boolean(mainRestartStatus?.pending) ||
+                          Boolean(mainExitStatus?.pending) ||
+                          mainExitState === 'confirming' ||
+                          mainExitState === 'exiting' ||
+                          mainLifecycleActionInFlightRef.current
+                        }
                         className="rounded bg-warning px-3 py-1.5 text-xs text-black hover:opacity-90"
                       >
                         Confirm restart
@@ -1420,11 +2203,25 @@ export function AppSettingsModal({ open, onClose }: AppSettingsModalProps) {
                   <button
                     type="button"
                     disabled={
+                      !serviceLifecycle ||
+                      mainLifecycleStatusLoading ||
+                      Boolean(mainLifecycleStatusError) ||
                       !mainRestartStatus?.available ||
+                      !mainExitStatus?.available ||
+                      !sessionLifecycleLoaded ||
+                      sessionLifecycleLoading ||
+                      sessionLifecycleSaving ||
                       mainRestartState === 'restarting' ||
-                      Boolean(mainRestartStatus?.pending)
+                      Boolean(mainRestartStatus?.pending) ||
+                      Boolean(mainExitStatus?.pending) ||
+                      mainExitState === 'confirming' ||
+                      mainExitState === 'exiting' ||
+                      mainLifecycleActionInFlightRef.current
                     }
-                    onClick={() => setMainRestartState('confirming')}
+                    onClick={() => {
+                      setMainLifecycleMarkRunningOffline(null);
+                      setMainRestartState('confirming');
+                    }}
                     className="w-full flex items-center justify-between gap-3 rounded-md border border-border-muted bg-bg-primary px-3 py-2 text-left hover:bg-bg-hover transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                     <span className="min-w-0">
@@ -1433,10 +2230,16 @@ export function AppSettingsModal({ open, onClose }: AppSettingsModalProps) {
                       </span>
                       <span className="block text-[10px] text-text-tertiary font-mono mt-0.5">
                         {mainRestartState === 'restarting'
-                          ? 'Waiting for /api/health (max 16 seconds)'
-                          : mainRestartStatus?.available
-                            ? 'Applies startup-only config changes'
-                            : mainRestartStatus?.reason || 'Checking restart support…'}
+                          ? mainRestartHealthCheckActive
+                            ? 'Waiting for /api/health (max 16 seconds)'
+                            : mainRestartStatus?.pending
+                              ? 'Pan restart is in progress'
+                              : 'Scheduling Pan restart…'
+                          : !serviceLifecycle
+                            ? lifecycleUnavailableLabel
+                            : mainRestartStatus?.available
+                              ? 'Applies startup-only config changes'
+                              : mainRestartStatus?.reason || 'Checking restart support…'}
                       </span>
                     </span>
                     <span className="shrink-0 text-[11px] text-text-tertiary">
@@ -1444,7 +2247,7 @@ export function AppSettingsModal({ open, onClose }: AppSettingsModalProps) {
                     </span>
                   </button>
                 )}
-                {mainRestartState === 'restarting' && (
+                {mainRestartState === 'restarting' && mainRestartHealthCheckActive && (
                   <button
                     type="button"
                     onClick={cancelMainRestartCheck}
@@ -1474,74 +2277,53 @@ export function AppSettingsModal({ open, onClose }: AppSettingsModalProps) {
                 </p>
               </section>
 
-              <section>
+              {/* Both buttons only navigate to the real Behavior settings.
+              They never schedule Restart/Exit and never write a value. */}
+              <section aria-label="Session policy shortcuts">
                 <h3 className="text-xs font-semibold uppercase tracking-wide text-text-tertiary mb-2">
-                  Session legal-state lifecycle
+                  Session policy
                 </h3>
-                {sessionLifecycleLoading && !sessionLifecycleLoaded && (
-                  <p className="mb-2 text-[11px] text-text-tertiary">Loading lifecycle preferences…</p>
-                )}
-                {sessionLifecycleLoaded && (
-                  <div className="space-y-3">
-                    <div>
-                      <label htmlFor="session-exit-strategy" className="mb-1 block text-xs text-text-secondary">
-                        Exit strategy
-                      </label>
-                      <select
-                        id="session-exit-strategy"
-                        value={sessionLifecycle.exitStrategy}
-                        disabled={sessionLifecycleSaving || mainExitState === 'confirming' || mainExitState === 'exiting'}
-                        onChange={(event) => void saveSessionLifecycle({
-                          exitStrategy: event.target.value as ApiSessionExitStrategy,
-                        })}
-                        className="w-full rounded border border-border-default bg-bg-tertiary px-2 py-1.5 text-xs text-text-primary outline-none focus:border-accent disabled:opacity-60"
-                      >
-                        <option value="ask">Ask every time</option>
-                        <option value="offline">Default to marking legal running Sessions offline</option>
-                        <option value="preserve-running">Default to preserving legal running state</option>
-                      </select>
-                      <p className="mt-1 text-[10px] text-text-tertiary">
-                        Every option stops all live Workers when Exit is confirmed.
-                      </p>
-                    </div>
-                    <div>
-                      <label htmlFor="session-startup-preference" className="mb-1 block text-xs text-text-secondary">
-                        Startup preference
-                      </label>
-                      <select
-                        id="session-startup-preference"
-                        value={sessionLifecycle.startupPreference}
-                        disabled={sessionLifecycleSaving}
-                        onChange={(event) => void saveSessionLifecycle({
-                          startupPreference: event.target.value as ApiStartupPreference,
-                        })}
-                        className="w-full rounded border border-border-default bg-bg-tertiary px-2 py-1.5 text-xs text-text-primary outline-none focus:border-accent disabled:opacity-60"
-                      >
-                        <option value="ask">Ask every time</option>
-                        <option value="wake-running">Automatically wake legal running Sessions</option>
-                        <option value="sync-actual">Automatically update legal state to actual Worker state</option>
-                        <option value="preserve-running">Preserve legal state without waking Sessions</option>
-                      </select>
-                      <p className="mt-1 text-[10px] text-text-tertiary">
-                        Automatic choices run during Pan startup, before the dashboard loads.
-                      </p>
-                    </div>
-                  </div>
-                )}
-                {sessionLifecycleError && (
-                  <div role="alert" className="mt-2 rounded-md border border-danger/30 bg-danger/10 px-3 py-2 text-[11px] text-danger">
-                    {sessionLifecycleError}
-                    <button
-                      type="button"
-                      disabled={sessionLifecycleLoading}
-                      onClick={() => setSessionLifecycleReloadSeq((value) => value + 1)}
-                      className="ml-2 underline underline-offset-2 disabled:opacity-60"
-                    >
-                      Retry
-                    </button>
-                  </div>
-                )}
+                <div className="rounded-md border border-border-muted divide-y divide-border-muted bg-bg-primary">
+                  <button
+                    type="button"
+                    data-testid="open-exit-session-policy"
+                    onClick={() => openBehaviorSessionPolicy('exit-strategy')}
+                    className="w-full flex items-center justify-between gap-3 px-3 py-2 text-left hover:bg-bg-hover transition-colors"
+                  >
+                    <span className="min-w-0">
+                      <span className="block text-xs text-text-primary">
+                        退出/重启时的Session策略
+                      </span>
+                      <span className="block text-[10px] text-text-tertiary font-mono mt-0.5">
+                        Behavior → Restart and Exit Session policy
+                      </span>
+                    </span>
+                    <span className="shrink-0 text-[11px] text-text-tertiary">Open</span>
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="open-startup-session-policy"
+                    onClick={() => openBehaviorSessionPolicy('startup-preference')}
+                    className="w-full flex items-center justify-between gap-3 px-3 py-2 text-left hover:bg-bg-hover transition-colors"
+                  >
+                    <span className="min-w-0">
+                      <span className="block text-xs text-text-primary">
+                        启动后的Session恢复策略
+                      </span>
+                      <span className="block text-[10px] text-text-tertiary font-mono mt-0.5">
+                        Behavior → Startup preference
+                      </span>
+                    </span>
+                    <span className="shrink-0 text-[11px] text-text-tertiary">Open</span>
+                  </button>
+                </div>
+                <p className="mt-1.5 text-[11px] text-text-tertiary leading-relaxed">
+                  Opens the matching Behavior setting. It does not restart or exit Pan and does
+                  not change the saved policy.
+                </p>
               </section>
+
+              <LoginStartupSettings />
 
               {/* Stop-only Pan exit — intentionally has no health-recovery
               polling because this action makes the current service unavailable. */}
@@ -1555,42 +2337,17 @@ export function AppSettingsModal({ open, onClose }: AppSettingsModalProps) {
                       Stop this Pan service and all live Workers? Pan will not restart and the
                       dashboard will disconnect after the stop is scheduled.
                     </p>
-                    {sessionLifecycle.exitStrategy === 'ask' ? (
-                      <fieldset className="mt-3 space-y-2">
-                        <legend className="text-[11px] text-text-secondary">
-                          For Sessions whose last legal state is running:
-                        </legend>
-                        <label className="flex items-start gap-2 text-[11px] text-text-primary">
-                          <input
-                            type="radio"
-                            name="main-exit-running-session-state"
-                            checked={mainExitMarkRunningOffline === true}
-                            onChange={() => setMainExitMarkRunningOffline(true)}
-                          />
-                          <span>Yes, mark them offline when their Workers have stopped.</span>
-                        </label>
-                        <label className="flex items-start gap-2 text-[11px] text-text-primary">
-                          <input
-                            type="radio"
-                            name="main-exit-running-session-state"
-                            checked={mainExitMarkRunningOffline === false}
-                            onChange={() => setMainExitMarkRunningOffline(false)}
-                          />
-                          <span>No, stop the Workers but preserve their legal running state.</span>
-                        </label>
-                      </fieldset>
-                    ) : (
-                      <p className="mt-3 text-[11px] text-text-secondary">
-                        Saved policy: {sessionLifecycle.exitStrategy === 'offline'
-                          ? 'stop all Workers and mark legal running Sessions offline.'
-                          : 'stop all Workers and preserve legal running state.'}
-                      </p>
-                    )}
+                    <MainLifecycleRunningChoice
+                      strategy={sessionLifecycle.exitStrategy}
+                      markRunningOffline={mainLifecycleMarkRunningOffline}
+                      onChange={setMainLifecycleMarkRunningOffline}
+                      inputName="main-exit-running-session-state"
+                    />
                     <div className="mt-3 flex justify-end gap-2">
                       <button
                         type="button"
                         onClick={() => {
-                          setMainExitMarkRunningOffline(null);
+                          setMainLifecycleMarkRunningOffline(null);
                           setMainExitState('idle');
                         }}
                         className="rounded border border-border-default px-3 py-1.5 text-xs text-text-secondary hover:bg-bg-hover"
@@ -1600,7 +2357,20 @@ export function AppSettingsModal({ open, onClose }: AppSettingsModalProps) {
                       <button
                         type="button"
                         onClick={handleMainExit}
-                        disabled={sessionLifecycle.exitStrategy === 'ask' && mainExitMarkRunningOffline === null}
+                        disabled={
+                          !serviceLifecycle ||
+                          (sessionLifecycle.exitStrategy === 'ask' &&
+                            mainLifecycleMarkRunningOffline === null) ||
+                          mainLifecycleStatusLoading ||
+                          Boolean(mainLifecycleStatusError) ||
+                          !mainRestartStatus?.available ||
+                          !mainExitStatus?.available ||
+                          Boolean(mainRestartStatus?.pending) ||
+                          Boolean(mainExitStatus?.pending) ||
+                          mainRestartState === 'confirming' ||
+                          mainRestartState === 'restarting' ||
+                          mainLifecycleActionInFlightRef.current
+                        }
                         className="rounded bg-danger px-3 py-1.5 text-xs text-white hover:opacity-90"
                       >
                         Confirm exit
@@ -1611,7 +2381,10 @@ export function AppSettingsModal({ open, onClose }: AppSettingsModalProps) {
                   <button
                     type="button"
                     disabled={
+                      !serviceLifecycle ||
                       !mainExitStatus?.available ||
+                      mainLifecycleStatusLoading ||
+                      Boolean(mainLifecycleStatusError) ||
                       !sessionLifecycleLoaded ||
                       sessionLifecycleLoading ||
                       sessionLifecycleSaving ||
@@ -1619,10 +2392,12 @@ export function AppSettingsModal({ open, onClose }: AppSettingsModalProps) {
                       mainExitState === 'exited' ||
                       Boolean(mainExitStatus?.pending) ||
                       mainRestartState === 'restarting' ||
-                      Boolean(mainRestartStatus?.pending)
+                      mainRestartState === 'confirming' ||
+                      Boolean(mainRestartStatus?.pending) ||
+                      mainLifecycleActionInFlightRef.current
                     }
                     onClick={() => {
-                      setMainExitMarkRunningOffline(null);
+                      setMainLifecycleMarkRunningOffline(null);
                       setMainExitState('confirming');
                     }}
                     className="w-full flex items-center justify-between gap-3 rounded-md border border-danger/30 bg-bg-primary px-3 py-2 text-left hover:bg-bg-hover transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
@@ -1634,9 +2409,11 @@ export function AppSettingsModal({ open, onClose }: AppSettingsModalProps) {
                           ? 'Stopping Workers and Pan…'
                           : mainExitState === 'exited'
                             ? 'Exit scheduled; this service will go offline'
-                            : mainExitStatus?.available
-                              ? 'Stops this Pan instance without restarting it'
-                              : mainExitStatus?.reason || 'Checking exit support…'}
+                            : !serviceLifecycle
+                              ? lifecycleUnavailableLabel
+                              : mainExitStatus?.available
+                                ? 'Stops this Pan instance without restarting it'
+                                : mainExitStatus?.reason || 'Checking exit support…'}
                       </span>
                     </span>
                     <span className="shrink-0 text-[11px] text-text-tertiary">
@@ -1660,66 +2437,6 @@ export function AppSettingsModal({ open, onClose }: AppSettingsModalProps) {
                 </p>
               </section>
 
-              {/* Remote / Tunnel — cloudflared tunnel managed by the internal
-              Python launcher. Only rendered when config.json has a
-              remote section with enabled=true (the tunnel itself is optional;
-              without it the section would be dead UI). Restart kills only
-              Pan's own launcher-recorded tunnel process and picks up port +
-              remote.protocol. */}
-              {remoteStatus?.available && remoteStatus.enabled && (
-                <section>
-                  <h3 className="text-xs font-semibold uppercase tracking-wide text-text-tertiary mb-2">
-                    Remote / Tunnel
-                  </h3>
-                  <div className="rounded-md border border-border-muted divide-y divide-border-muted bg-bg-primary">
-                    <button
-                      type="button"
-                      disabled={remoteBusy}
-                      onClick={handleRemoteRestart}
-                      className="w-full flex items-center justify-between gap-3 px-3 py-2 text-left hover:bg-bg-hover transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                    >
-                      <span className="min-w-0">
-                        <span className="block text-xs text-text-primary">
-                          Restart tunnel
-                          <span
-                            className={`ml-2 inline-block h-1.5 w-1.5 rounded-full align-middle ${
-                              remoteStatus.running ? 'bg-success' : 'bg-danger'
-                            }`}
-                            aria-hidden
-                          />
-                        </span>
-                        <span className="block text-[10px] text-text-tertiary font-mono mt-0.5">
-                          cloudflared · {remoteStatus.running ? 'running' : 'stopped'}
-                          {remoteStatus.protocol ? ` · ${remoteStatus.protocol}` : ''}
-                          {remoteStatus.port ? ` · :${remoteStatus.port}` : ''}
-                        </span>
-                      </span>
-                      <span className="shrink-0 text-[11px] text-text-tertiary">
-                        {remoteBusy ? 'Restarting…' : 'Restart'}
-                      </span>
-                    </button>
-                  </div>
-                  <p className="mt-1.5 text-[11px] text-text-tertiary leading-relaxed">
-                    Stops Pan's own launcher-recorded cloudflared only — the cloudflared-ssh service
-                    is untouched — and restarts it with the current config.json.
-                  </p>
-                </section>
-              )}
-
-              {/* Reset */}
-              <div className="border-t border-border-muted pt-4 flex flex-col sm:flex-row sm:items-center sm:justify-start gap-3">
-                <p className="text-[11px] text-text-tertiary leading-relaxed sm:max-w-[32rem]">
-                  Hiding affects frontend display only — original messages stay in session history
-                  and reappear when toggled back on.
-                </p>
-                <button
-                  type="button"
-                  onClick={resetSettings}
-                  className="shrink-0 text-[11px] text-text-tertiary hover:text-text-primary underline underline-offset-2"
-                >
-                  Reset to defaults
-                </button>
-              </div>
             </>
           )}
         </div>

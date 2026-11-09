@@ -1,178 +1,331 @@
 # Pan User Manual
 
-> A beginner-oriented guide to installing Pan, creating the first Session, using an MA (meta-agent; SMA template), dispatching work asynchronously, receiving reports, and delivering changes. Claims here follow the current React Dashboard, `packages/mcp/server.py`, `packages/web/server.py`, `packages/core/worker.py`, and `manifest.json`.
+> For Pan users: installation, the Dashboard, Session and Workspace management, MA orchestration, Jobs, and lifecycle recovery. UI labels follow the current React Dashboard.
 
 **[中文](./USER_MANUAL.md) · English**
 
-## Contents
+**Contents:** [Pan basics](#overview) · [Install and start](#install) · [Create a Session](#first-session) · [Sessions and Workspaces](#workspaces) · [Relationships and access](#relationships) · [MA and reports](#orchestration) · [Jobs](#jobs) · [Workers and recovery](#lifecycle) · [QQ / SnowLuma](#qq) · [Integrations, troubleshooting, and security](#integrations)
 
-1. [Pan in one minute](#1-pan-in-one-minute)
-2. [Install, start, and ports](#2-install-start-and-ports)
-3. [Your first task](#3-your-first-task)
-4. [Two ways to create a Meta-Agent](#4-two-ways-to-create-a-meta-agent)
-5. [Dashboard guide](#5-dashboard-guide)
-6. [Manage and parent-child relationships](#6-manage-and-parent-child-relationships)
-7. [Subscribe and completion reports](#7-subscribe-and-completion-reports)
-8. [pan_access](#8-pan_access)
-9. [Choosing dispatch tools](#9-choosing-dispatch-tools)
-10. [Worker lifecycle and watchdog](#10-worker-lifecycle-and-watchdog)
-11. [Worktrees and delivery](#11-worktrees-and-delivery)
-12. [MCP and troubleshooting](#12-mcp-and-troubleshooting)
-13. [Security and cleanup](#13-security-and-cleanup)
+<a id="overview"></a>
+## 1. Pan basics
 
-## 1. Pan in one minute
-
-Pan organizes CLI Agents as a supervisor and executors. You talk to a single meta-agent (MA; Pan's built-in template is named SMA, Super Meta-Agent), which decomposes your goal, creates or reuses child Sessions, dispatches tasks asynchronously to task-agents (TA), subscribes to reports, verifies results, and summarizes delivery.
-
-> **Unified terminology — three layers: role (MA/TA) — identity (Session) — process (Worker).** MA/TA are responsibility roles; a Session is the persistent orchestration identity carrying an MA or a TA; a Worker is the temporary CLI process that actually runs an MA or TA session — **there are both MA Workers and TA Workers**; never equate a Worker with a TA.
+Pan manages long-lived CLI Agent identities separately from temporary processes. A **Session** keeps history, adapter, model, workdir, relationships, and queues. A **Worker** is the process that runs the CLI; it can stop and restart while its Session remains.
 
 | Term | Meaning |
 |---|---|
-| Agent (legacy term) | The historical name for the orchestration object; the object is now addressed as a `Session` (Agent = Session, kept for compatibility). MA/TA are the roles running on it |
-| Session | The persistent container (identity layer) carrying an MA or TA identity: history, model, adapter, workdir, relationships, and queues (`ses_...`) |
-| Worker | The temporary CLI process (process layer) running under a Session — both MA Workers and TA Workers exist; watchdog-reclaimable and re-spawnable; neither equals deleting the Session nor the TA itself |
-| Adapter | The CLI integration, currently including `cbc`, `kimi`, `opencode`, `claude`, and `codex` |
-| MA (meta-agent) / SMA | The supervisor role, not a different kind of process: a Session with Pan MCP and orchestration permissions (SMA is the built-in template); it decomposes, dispatches, subscribes to reports, and accepts results — and also runs in a Worker |
-| TA (task-agent) | The execution role: a Session carrying out concrete dev / test / research / doc tasks, dispatched by the MA via `agent_assign` |
+| Session | A persistent conversation identity that can carry an MA or TA role |
+| Worker | A temporary CLI process running a Session with either the MA or TA role; both MA Workers and TA Workers exist. Stopping a Worker does not delete the Session |
+| Adapter | Integration for a CLI such as cbc, kimi, opencode, claude, or codex; availability depends on local installation and PATH |
+| MA / TA | The MA (meta-agent) decomposes, assigns, and accepts work; a TA (task-agent) carries out a task. Both are Session roles |
+| Workspace / workdir | A Workspace organizes Sessions and shared directories; `workdir` is the Agent's actual working directory |
 
-Killing or watchdog-reclaiming a Worker does not delete its Session. Use a regular Session for a simple question; use SMA for parallel work, consolidated delivery, or long-running collaboration.
+Use a regular Session for a single task. Use an SMA template when one Session should assign work to several Sessions and collect their reports.
 
+<a id="install"></a>
 ## 2. Install, start, and ports
 
-Install at least one supported CLI and verify it in the same environment that starts Pan:
+### Prerequisites
+
+- Python 3.10 or newer.
+- Node.js 20 or newer and pnpm 9.7 to build the React Dashboard.
+- At least one supported CLI on the PATH visible to Pan: `cbc`, `kimi`, `opencode`, `claude`, or `codex`. Missing CLIs do not prevent the Pan service from starting, but their Adapters cannot start Workers.
+
+### Install and start
+
+Run these commands from the repository root. Windows PowerShell:
 
 ```powershell
-cbc --version
-kimi --version
-opencode --version
-claude --version
-codex --version
-```
-
-On Windows:
-
-```powershell
-pip install -r minimal-requirements.txt
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r minimal-requirements.txt
 Copy-Item config.example.json config.json
-Set-Location packages/web; pnpm install; pnpm build; Set-Location ../..
+Set-Location packages/web
+pnpm install
+pnpm build
+Set-Location ../..
 python main.py
 ```
 
-Open <http://127.0.0.1:8768>. The code/application default remains 8768; use 8767 or 8765 for `main`/`test` test or isolated runs. `PAN_PORT` overrides the server port and `PAN_API_URL` controls where the MCP server connects. For `report_subscribe`, the MCP target, `PAN_API_URL`, and the `PAN_AGENT_SESSION_ID` Session must belong to the same Pan instance and port.
+macOS/Linux:
 
-## 3. Your first task
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r minimal-requirements.txt
+cp config.example.json config.json
+cd packages/web && pnpm install && pnpm build && cd ../..
+python main.py
+```
 
-1. Click **New** in the Sidebar.
-2. Enter a name such as `first-task`.
-3. Choose an available **Adapter**, optionally a **Session Template**, and optionally a server-side **Workdir**.
-4. Select the Session and click **Start**, or send from the input box (a missing Worker is auto-spawned).
-5. Send a self-contained prompt:
+Open <http://127.0.0.1:8768>. You can also use the startup helpers: Windows `scripts\start_pan.bat`; macOS/Linux `bash scripts/start.sh`. The corresponding normal exit helpers are `scripts\stop.bat` and `bash scripts/stop.sh`. For a foreground process, run `python main.py` and press Ctrl+C to exit.
+
+`minimal-requirements.txt` installs Pan Core/API/MCP dependencies, not the QQ bridge dependencies. In the example config, `qq.enabled` defaults to `true`; set it to `false` in `config.json` to skip the QQ child process when you do not use QQ. To use QQ, install `packages/qq/requirements.txt` into the interpreter configured by `qq.python` or `PAN_QQ_PYTHON`, then configure a gateway. See the [QQ and SnowLuma guide](QQ_PLUGIN_SNOWLUMA.en.md). Memory / Character are currently shelved; their historical dependencies are not needed for everyday use.
+
+| Setting | Current default / purpose |
+|---|---|
+| Pan port | `config.json` defaults `port` to `8768`; `PAN_PORT` overrides it |
+| Listen address | `127.0.0.1` by default; existing `PAN_HOST` can bind an external address and is read only at startup |
+| `PAN_API_URL` | Address used by a standalone MCP server to reach Pan; keep it aligned if you use a non-default port |
+| Remote | `remote.enabled` is `false` in `config.example.json` |
+
+Identity-dependent MCP tools require `PAN_AGENT_SESSION_ID` to belong to that Pan instance. For `report_subscribe`, the MCP URL, `PAN_API_URL`, and the Session's Pan port must point to the same instance.
+
+<a id="first-session"></a>
+## 3. Create and use your first Session
+
+1. Open the Dashboard. **New** in the sidebar creates a Session with defaults; the adjacent settings button opens the full creation form. **Import** browses and imports supported CLI histories.
+2. In the full form, set a name and Adapter, plus any Session Template, model, permission mode, or workdir you need. The selected Adapter can start only when its CLI is available.
+3. Select the Session and click **Start** in the top bar. You can also send a message directly; Pan will try to start a Worker if none is live.
+4. Enter a task in Chat. Press Enter to send and Shift+Enter for a newline. Messages added while a Worker is busy enter its send queue and are handled when the current work yields.
+5. Use **Editor** to inspect files in the Session workdir. The top bar also has Worker controls such as **Restart, Interrupt, Takeover, and Kill**. These affect the Worker, not the Pan main service.
+
+Expand **服务端队列** below Chat. The lock button at the right of each row locks or unlocks that queued message. **Lock all / Unlock all** changes all items that are still `queued` in one operation. Locks never reorder the list or the durable queue. The Worker skips locked items and selects the next sendable item in the original order. An unlocked item participates again from its original position. Items already in `reserved` or `writing` cannot be recalled or locked.
+
+Click **new locked msg** to enter locked send mode for the current Session, or **cancel locked msg** to leave it. The Send button gains a red border and reads **put in queue**. Sending stores the text and attachments atomically as one locked user message. Success restores ordinary Send; confirmed rejection restores the draft and locked mode. Inspect an unconfirmed outcome before retrying. A locked message is persisted first even when the Worker is idle, and does not start a Worker by itself.
+
+**Pause reports / Resume reports** is a persisted per-Session rule using the same item locks. Enabling it locks queued child Agent completion, error, and abnormal-exit reports and automatically locks new reports of those kinds. It leaves system notices and QQ / WeChat reminders alone. You can unlock existing reports individually or with **Unlock all** while the rule stays enabled; future reports are still locked automatically. Disabling the rule removes only its automatic report locks and preserves manual locks.
+
+The default workdir is on the Pan server. For parallel changes to one repository, give each Session a different Git worktree; Pan does not create worktrees automatically.
+
+**Pause everything / Resume everything** persistently pauses/resumes subsequent delivery for the whole Session queue, independently of item locks and Pause reports. New messages can still queue. It does not interrupt the running task or recall an item already handed off. A supported running Adapter also offers **Steer** for live follow-up; queued-message Steer respects locks and the whole-queue pause. An unconfirmed handoff is not a reason to resend.
+
+Valid **Send / Steer** submissions clear the input immediately and show a pending spinner. Confirmed rejection restores the original draft; an unknown outcome retains the pending transaction and blocks duplicate submission. Check the queue/history and the displayed outcome before retrying. A cleared input or queued receipt does not prove task completion.
+
+### Session handoff and original prompt
+
+Choose **替身交接** (Session handoff) from the Session menu and enter a required handoff brief. The successor takes over relationships and settings with a fresh CLI identity; the source is archived. By default it inherits the original prompt. Enable **覆写原始提示** to replace it with the text below; an empty value clears it. Disabled overrides ignore residual text. The effective system prompt combines only the new brief and selected original prompt, preserving both source prompt fields. Failed requests retain the draft; closing/reopening or changing Sessions resets the form.
+
+<a id="workspaces"></a>
+## 4. Session lists and Workspaces
+
+### Work with the sidebar
+
+- Search filters Sessions. Sorting can use recent activity, name, or custom order; grouping can use workdir or manager relationships.
+- Right-click a Session for actions such as **Rename, Branch, Manage, msgBridge, Details, Select, and Delete**. **Reimport** is available for Sessions linked to imported CLI history.
+- Pinned Sessions appear ahead of unpinned Sessions in the current group. When dragging is enabled, use the handle to change custom order or reorder pinned items within a group; the Dashboard shows feedback for the current drop target.
+- **Select** mode supports moving multiple Sessions to a Workspace and batch deletion. If a selected Session has managed children, read the confirmation and choose whether to cascade.
+
+### Organize with Workspaces
+
+The Workspace rail on the left lists **All** and named Workspaces. You can create, rename, reorder, switch, or delete a Workspace. **All** is only a list scope; it does not assign Sessions to a Workspace. Use **Manage → Workspaces** to move a management-tree root Session into a Workspace. Managed children inherit the Workspace along their manager chain.
+
+A Workspace is not a Git branch or a directory move. A Session's `workdir` determines where its Agent works; a Workspace stores grouping and directory references. In **Editor → Directories**, add a directory shared by the current Workspace or add a temporary directory. Adding or removing a reference does not create, move, or delete the directory on disk.
+
+### Search, unread counts, and batch actions
+
+The list search matches Session name, ID, CLI history ID, workdir, or Adapter. The shared search independently matches Workspace names only while the **Workspace Bar** is expanded; when collapsed, it retains the original Session search. Filters include **has managed child Sessions, Is MetaAgent, Running state, Illegal state, Has unread, Has queued messages**. Session filters combine with AND. A Workspace satisfies each selected filter if at least one of its members satisfies it; different members may satisfy different filters. Search is distinct from Chat history search: **Search all Sessions** searches message history across Sessions, while the current-Session search stays within its history. Role filters and result navigation are available; expired results require a new search.
+
+Yellow counts indicate unread completions; adjacent queue counts are blue, or red when all pending items are locked. Opening the queue does not clear its count. A Workspace menu **Read all** marks its actual members read, including members hidden by search/filters; a completion arriving after the action remains unread. Multi-select **Actions** provides **Workspace, Read all, 群发, Bell on, Bell off** for the selected targets. 群发 creates a broadcast Job; inspect per-target results and any partial failure before retrying.
+
+Workspace scope includes **全部** (all) and **无工作区** (no Workspace). A Session belongs to at most one Workspace; managed descendants inherit the root membership. New/imported Sessions default to the active named Workspace. Moving a managed subtree across Workspaces may detach its manager relationship and asks for confirmation according to your settings.
+
+Use the Session row **Pin** quick action to pin/unpin; it is no longer a right-click menu entry. For **Codex Reimport**, an origin mismatch opens a summary for review. **取消** preserves current history. **确认强行覆盖** replaces it with native history and can lose unmatched Pan messages and their task/source/attachment information. If history changes during confirmation, use **重新检查** and review again.
+
+<a id="relationships"></a>
+## 5. Relationships and access
+
+The **Manage** panel edits a Session's management tree, Workspace, Pan Access, and MCP servers. If `ses_parent` manages `ses_child`, the parent's managed list contains the child and the child's `managedBy` points to the parent. A Session can have only one manager at a time.
+
+- **Manage** establishes the relationship and also subscribes to completion reports. **Managed** removes the relationship and report subscription; it does not delete the child Session.
+- **Subscribe / Subscribed** controls completion reports independently. Unsubscribing leaves the relationship in place.
+- `session_readonly` lets the current manager temporarily block tasks, messages, and notices from other Sessions. It is not filesystem read-only or HTTP authentication.
+- **Pan Access** settings `restrictToManaged`, `canClaimUnmanaged`, and `autoClaimCreated` limit Sessions available through MCP calls. They do not restrict direct Dashboard management.
+
+<a id="orchestration"></a>
+## 6. Create an MA and collect task reports
+
+In the full creation form, new users can choose:
+
+- `SMA(NoAdapter)`: loads the SMA orchestration template and lets you select the CLI Adapter.
+- `SMA(cbc)`: uses the same SMA template with cbc selected.
+
+Both current templates configure the `pan`, `pan-qq`, and `pan-wechat` MCP servers. The template provides MA guidance; each tool still depends on its CLI and optional channel dependencies.
+
+A common flow subscribes to a child Session before assigning its task:
 
 ```text
-Inspect src/utils.py, fix the null-pointer issue, run the relevant tests, and report changed files and test results.
+report_subscribe → agent_assign → Worker completes or errors → manager queue_pending → acceptance
 ```
 
-Press Enter to send and Shift+Enter for a newline. Continue in Chat, inspect files in **Editor**, or use the session context menu when finished.
+Use `agent_assign` for new work. Its `queued` response means accepted, not completed. Use `agent_send` for independent follow-up work explicitly intended to wait until the current task ends. Default to `agent_send_force` for additions, clarifications, corrections and constraints on the current task; Pan selects the delivery route by capability. Accepted means CLI admission only; never automatically replay an unknown result. `agent_notify` persistently reports a result from a background command or external task. Completion reports are stored in the manager's `queue_pending` inbox and can be read after a disconnect.
 
-## 4. Two ways to create a Meta-Agent
+From the Dashboard, click **Subscribe** for the target under the manager's **Manage → Relationship → Manages**. This is different from a QQ inbox subscription under **msgBridge**.
 
-### 4.1 Session Template (recommended for beginners)
+An existing Agent CLI can also enable the `pan` MCP server and select servers for its Pan Session under **Manage → MCP and Plugins**. Restart the Worker after changing its MCP selection. A standalone MCP server without a Pan-injected Session identity cannot call identity-dependent management or reporting tools.
 
-The root `manifest.json` currently provides `SMA(NoAdapter)` and `SMA(cbc)`. Both mount `pan` and `pan-qq`, include an SMA system prompt, and default to:
+**Stop reports / Start reports** controls automatic reporting to the manager without removing the management relationship. It differs from **Pause reports**, which locks reports in the receiving queue. A completed task’s final assistant block may offer **汇报** (manual report), even with automatic reporting off. Only tasks still within the retained, provable terminal-result window qualify; arbitrary messages and all historical tasks are not reportable. A newer running task does not by itself invalidate an older eligible result. Repeated reporting of the same task run is deduplicated.
 
-```json
-{"restrict_to_managed": false, "can_claim_unmanaged": true, "auto_claim_created": true}
-```
+For advanced Agents, the self queue MCP tools inspect and consume their own eligible queued messages during work. Reading does not consume; consuming can interrupt the current task. They cannot select another Session, bypass locks or Pause everything, or establish success from an unknown receipt. See the [orchestration handbook](skills/pan/SKILL.md) for integration details.
 
-Choose **New → Session Template → SMA(NoAdapter)**, then ask it to explain Pan or give it a real goal. `SMA(NoAdapter)` leaves the adapter selectable; `SMA(cbc)` pins `cbc`. Template values are a baseline: explicit creation fields override template values, which override system defaults.
+<a id="jobs"></a>
+## 7. Jobs and scheduled tasks
 
-### 4.2 Existing Agent + MCP + skill
+Open **Jobs** in the sidebar to filter by status or type, inspect details and run records, and create, pause/resume, or delete Jobs. The current user form offers:
 
-Enable the `pan` MCP server for the existing Agent. When it is a Pan Session, the adapter generates a session-scoped MCP config under `data/mcp-configs/` and injects `PAN_AGENT_SESSION_ID`. You can also run the stdio server directly:
+| Type | Use |
+|---|---|
+| **Scheduled task** | Assign work to a Session, send a Session message, or run a configured command on a schedule |
+| **Session message** | Send text to one Session at a chosen time or on a repeat schedule |
+| **Session broadcast** | Send the same text to several Sessions on a schedule |
+| **Background process** | Immediately start an argv command on the host running Pan; it is not a Session Worker and is not parsed through a shell |
 
-```powershell
-$env:PAN_API_URL = "http://127.0.0.1:8768"
-python -m packages.mcp.server --transport stdio
-```
+Schedules can use one-time triggers, repeat intervals, calendar/cron options, and similar form choices. The form previews upcoming fire times. You can run a scheduled task now, pause or resume it, and inspect run history or errors in its details. A task may become undeliverable if its target Session is removed or cannot be reached; inspect its details to resolve the target or Job.
 
-Install `docs/skills/pan/SKILL.md` into the Agent CLI’s skill location. Verify with `pan_handbook()`, then run a small `session_list(summary=true)` and a `report_subscribe` + `agent_assign` test. A standalone MCP process has no `PAN_AGENT_SESSION_ID`, so identity-dependent tools such as claim and report subscription are unavailable. Full MA (meta-agent) behavior needs MCP, the skill, and a Pan-managed Session.
+The Jobs **Settings** tab controls retention periods for completed, failed, timed-out, and cancelled Jobs and their log files. New configurations do not automatically clean these records; cleanup requires an enabled rule with a number of days.
 
-## 5. Dashboard guide
+Command Jobs run on the Pan host with paths and permissions available to the service process. Check the executable and working directory before submitting a command. Background processes use argv, not a shell string.
 
-The Sidebar lists Sessions; Chat talks to the selected Session; Editor accesses its workdir. The top bar exposes **Start**, **Restart**, **Interrupt**, **Takeover**, and **Kill**. A session context menu contains actions including **Manage** and **msgBridge**.
+Use a Job row menu **Pin / Unpin** to keep important Jobs ahead of unpinned rows. Pinning changes presentation only, not scheduling or execution; **Pin unavailable** means its metadata cannot currently be changed.
 
-Session cards support **drag & drop**: dragging within the same level changes the display order (persisted server-side, equivalent to the custom sort `POST /api/sessions/order`); dropping a card onto the center of another card quickly establishes/releases the managed relationship (equivalent to Manage/Managed in the Manage panel, via claim/unclaim).
+<a id="lifecycle"></a>
+## 8. Worker lifecycle, Exit, and startup recovery
 
-**Manage Sessions** has four areas: **Managed by** (parent manager), **Manages** (Manage/Managed relationship buttons and independent Subscribe/Subscribed report buttons), **Pan Access**, and **MCP Server** selection. **msgBridge** contains QQ inbox subscriptions plus System and Browser completion-notification settings; it is not Worker completion report subscription.
+**Start / Restart / Interrupt / Takeover / Kill** control the selected Session's Worker. If a Worker stops or the watchdog reclaims it, the Session and its history remain; you can start it again. Deleting a Session is a separate operation.
 
-## 6. Manage and parent-child relationships
+The main-service **Restart** and **Exit** controls are under App Settings → **General**. In supported launch modes, the settings page provides the main-service restart action; if it is unavailable, restart Pan through the same entry point used to start it. These controls are different from the Worker **Restart** in the top bar. The current default values for **Restart and Exit Session policy** and **Startup preference** are **Ask every time**. Restart or Exit stops live Workers; when a Session still has a persisted legal state of running, the configured policy can ask whether to mark it offline or preserve that state.
 
-If `ses_parent` manages `ses_child`:
+If Pan starts and finds Sessions still recorded as running but without a live Worker, the Dashboard shows **Continue previous Sessions?**, lists the candidates, and asks you to choose:
 
-```text
-ses_parent.managed  = ["ses_child"]
-ses_child.managedBy = "ses_parent"
-```
+1. **Restart these Sessions**: send “继续” (continue) to each candidate through the normal Session message path.
+2. **Keep their legal state as running**: do not start Workers; preserve the persisted state.
+3. **Update legal state to current Worker state**: do not restart; read the actual Worker state and update the persisted state.
 
-`managed` means “children I manage”; `managedBy` means “my parent manager”. A Session has one manager at a time, so a child already managed by another manager cannot be claimed. In UI, click **Manage** or **Managed**. MCP uses `session_claim` and `session_unclaim`. Unclaim removes the relationship and also unsubscribes reports, but does not delete the Session. `report_unsubscribe` stops reports while retaining the relationship. UI management is a direct high-privilege path; MCP `restrictToManaged` does not limit the Dashboard itself.
+Change later startup behavior under App Settings → General. If you choose to sync actual state, the Dashboard still requires an explicit startup recovery choice. An unexpected power loss or process crash is not the same as a confirmed Pan Exit; check the candidate Sessions before choosing.
 
-If a managed child should remain in the management tree but temporarily reject tasks, messages, and notices from other Sessions, the current manager can call `session_readonly(session_id="ses_child", enabled=true)`. Pass `enabled=false` to clear it. The operation never claims a Session and returns `readonly_session` to rejected senders. This is an orchestration state, not HTTP/API authentication or a filesystem read-only permission.
+<a id="qq"></a>
+## 9. QQ Bridge and SnowLuma
 
-## 7. Subscribe and completion reports
+NapCat, LLOneBot, and SnowLuma can be selected as OneBot gateways under **App Settings → Plugin**. The plugin list shipped with the repository includes SnowLuma as an optional entry. All three plugins in the shipped list have `autoStart: false`, and SnowLuma is not selected by default in the example config. The `qq.enabled` bridge switch and gateway auto-start are separate settings.
 
-The normal MA flow is:
+**Select** on the Plugin page saves the gateway choice; Pan indicates that the main service must restart before the QQ bridge connects to it. **Start / Stop** only manage plugin processes started by Pan. **Start with Pan** applies only to the selected plugin. **Running (Pan owned)** means Pan owns the process; **Endpoint in use** means the port responds but Pan does not manage the process; **Not installed** means the registered install paths do not contain the required files.
 
-```text
-report_subscribe → agent_assign → Worker done/error → manager queue_pending → session_get
-```
+See the [QQ and SnowLuma guide](QQ_PLUGIN_SNOWLUMA.en.md) for registry fields, WebSocket URL, token, prerequisites, and switching steps. A reachable gateway status does not confirm that desktop QQ is signed in or that real messages can be sent and received; follow the guide's end-to-end manual check.
 
-Reports are persisted in the manager’s `queue_pending`; the wake-up signal is not the report source. A report contains fields such as `status`, `result`, `sessionId`, `taskId`, and `workerId`. The Dashboard exposes this in **Manage → Manages**: **Subscribe** becomes **Subscribed**. Claiming a Session also auto-subscribes; unclaiming auto-unsubscribes.
+<a id="integrations"></a>
+## 10. Optional integrations, troubleshooting, and security
 
-`agent_notify(target_session_id, text)` is a real MCP tool for persistent, asynchronous notifications. Use it when a background command or long-running job (for example `nohup`, a long test run, a compiler, or an external script) finishes outside the current Agent/Worker lifetime. The job can report afterward:
+### Optional integrations
 
-```text
-agent_notify(target_session_id="ses_parent", text="Background tests finished: 128 passed; log is in artifacts/test.log.")
-```
+- **Memory / Character** are currently shelved. Historical dependencies and design notes do not establish an available user workflow.
+- **Remote** is disabled by default (`remote.enabled: false`). Enabling Cloudflare Remote creates an additional remote access path and expands the service's exposure.
+- **MCP and orchestration references**: see the [Pan skill](skills/pan/SKILL.md), [HTTP API reference](skills/pan/references/http-api.md), and [WebSocket protocol](skills/pan/references/ws-protocol.md). These are advanced integration references, not required for first startup.
 
-The notice is persisted in the target Session's `queue_pending`; if the target has no live Worker, Pan wakes/spawns it. It only delivers a reliable report: it does not grant extra permissions, bypass approvals, or bypass managed isolation. Do not confuse it with `/api/qq/notify`, an internal QQ-plugin route. Use `report_subscribe` for child-task completion/error reports, `agent_assign` for ordinary new tasks, `agent_send` for queued follow-up context, and `agent_send_force` for an urgent restart-and-send.
+### Notifications and unread recording
 
-If report subscription returns 404, the running server may not contain the route. Check version and port alignment; temporarily inspect `session_get.lastResult.status` (`queued → running → done/error`).
+**Behavior → Session errors → msgBridge** controls whether new Session errors use that Session's System, Browser and QQ Report connections. It defaults on to preserve QQ error reports. **Notifications → Locker new unread / New errors** provides two independent global sources, both off by default, with System, Browser and QQ Report target selection. New sources only forward notifications and have no QQ Subscribe or receiving Session; existing Session Subscribe/Report remains available. Session/global error routes deduplicate by event and channel/QQ target: enabling System in both produces one attempt. Re-enabling does not replay history. QQ/System work with the webpage closed; Browser requires an authenticated open page and previously granted permission. See the [notification source contract](design/notification-sources-v1.md) for exact error coverage, persistence and failure/unknown receipts.
 
-## 8. pan_access
+### Error notification exclusions
 
-`restrictToManaged` limits MCP operations to the caller and its managed Sessions. `canClaimUnmanaged` allows claiming Sessions with no manager, but never overrides another manager. `autoClaimCreated` automatically claims Sessions created by the caller. Ordinary Sessions default all three to false; both current SMA templates default to unrestricted access, unmanaged claiming, and auto-claiming. Unauthorized MCP calls return structured errors such as `permission_denied` or `missing_identity`. These are MCP boundaries, not HTTP authentication.
+Behavior's **Session errors → msgBridge** and Notifications' **New errors** share
+one exclusion setting. Enable exclusions, search the structured type catalog and
+check types to exclude. Changes save automatically; disabling retains selections.
+Types use server-known source/code identities such as
+`codex_error_payload/usageLimitExceeded`, without interpreting error prose.
+Unknown or missing structured types still forward. Exclusions affect only future
+error notification admission; error history, manager reports, Locker unread and
+previously admitted notifications remain intact.
 
-## 9. Choosing dispatch tools
+In **App Settings → Notification → Completion bell defaults**, choose System, Browser, QQ Report, or QQ Subscribe and **Save completion defaults**. QQ options require at least one default contact; search contacts by name or number. Defaults apply the next time an unlit Session bell is enabled and do not replace existing connections. Browser delivery also requires notification permission; QQ bots and selected contacts must be available when enabling the bell. QQ Report sends results; QQ Subscribe receives QQ inbox reminders.
 
-| Tool | Behavior | Use |
-|---|---|---|
-| `agent_assign(session_id, text, task_id?)` | New asynchronous task; returns `queued`; auto-spawns | Default for new work and parallel fan-out; reuse `task_id` on retry |
-| `agent_send(session_id, text)` | Queued multi-turn message; does not interrupt | Additional context or a follow-up |
-| `agent_send_force(session_id, text)` | Restart + send for a live Worker; queues if none | Urgent constraint, direction change, or stuck Worker |
-| `agent_notify(target_session_id, text)` | Persistent asynchronous notice for detached background work; auto-wakes/spawns the target when needed | Use for a later result/status report, not ordinary task dispatch |
+**Unread recording** defaults to All sessions and can select No sessions or categories such as Bell on/off and Pinned. Bell on and Bell off are mutually exclusive; Pinned can combine with either as a union. All sessions and No sessions are mutually exclusive and cannot be combined with categories. Excluded Sessions remain at zero; re-including starts with new completions and never restores older unread. A Session menu can enable its own tracking; saving the global policy or **Reapply settings** clears these overrides.
 
-`worker_*` names are compatibility aliases. Dispatch is asynchronous: `queued` means accepted, not complete. Wait for the report, then inspect and verify; do not repeatedly resend because the result is not immediate.
+Clicking a browser completion notification targets its Session while the Pan page is alive. Page notifications do not work with the browser fully closed. Windows System completion notifications use a real Windows toast (WinRT): the notification is recorded in the Windows notification center (Action Center) and persists there, and clicking the "open session" button opens the matching Session deep link through the system http handler (the default browser) — the button still works after the sender process exited (cold-starting a browser that is fully closed has not been tested yet). The notification body and result text never enter the URL; only a local loopback deep link is used. Completion notifications for the same Session replace each other in the notification center, and identical reminders are de-duplicated by content; no custom protocol or shortcut is registered at install or uninstall. Browser and System are separate channels; there is no “System only when Browser fails” option. Neither a dispatched notification nor the bell proves delivery.
 
-## 10. Worker lifecycle and watchdog
+### Tailscale fallback access
 
-`session_create` creates no Worker. Start/spawn creates one temporary CLI process per Session. Watchdogs reclaim queued silence, overlong stream tasks, and idle Workers; the global watchdog also recovers non-empty queues with no live Worker. `workerStatus: null` means no live process. Start again, `agent_spawn`, or `agent_assign` can recover it without deleting Session history. Use Kill for a stuck process or deliberate cleanup, not as a substitute for unclaiming.
+Under **App Settings → General → Tailscale 备用访问**, use an installed, signed-in Tailscale client on the same tailnet. Choose protocol/port, **保存配置**, then **开启当前访问** (or **应用已保存入口**). Saving alone does not start access. Pan keeps its loopback listener; this uses Serve, not public Funnel. Startup is disabled by default. HTTPS may require enabling Tailscale HTTPS first. Normal exit closes the owned mapping; a forced exit may leave it until recovery. External mappings are not taken over. A displayed running state does not prove reachability from another device. See [advanced access notes](tailscale-fallback-access.md).
 
-## 11. Worktrees and delivery
+### Direct LAN access
 
-Use one child Session and one Git worktree/branch per parallel code task. Give each Session an absolute `workdir`, keep merge ownership in one directory, and ask Workers to test, run `git diff --check`, commit, and not push:
+From the computer's loopback Pan URL, open **App Settings → General → 普通局域网访问（LAN）**. It is off by default. Select a local IPv4 address and an available port (default `8780`), save, then click **开启 LAN 访问**. Use the displayed URL on a trusted same-network device. Saving does not start/stop the listener; start/stop takes effect without restarting Pan. **下次启动 Pan 默认开启 LAN** controls startup. To change a running address/port, stop the current listener first. `0.0.0.0` covers every IPv4 interface, including VPN interfaces, rather than only the LAN.
 
-```text
-Modify only the specified worktree. Run relevant tests and git diff --check, create a clear commit, and do not push. Report changed files, verification, and commit hash.
-```
+Manage this listener through the local loopback entry. The LAN entry blocks local identity bridges, agent WebSocket, main-service control, global-settings writes, and managed/readonly management. It has no site-wide login protection and uses unencrypted HTTP. Directly setting `PAN_HOST` exposes the main listener at startup and does not provide this separate LAN isolation. Keep `PAN_HOST` at its loopback default for local management. Phone access, firewall behavior, and live coexistence with Cloudflare Tunnel / Tailscale have not been tested. See [LAN usage and limits](lan-access.md).
 
-Deleting a Session stops its Worker and removes Session metadata/config, but does not remove the ordinary workdir directory. Preserve or commit artifacts first.
+### Troubleshooting
 
-## 12. MCP and troubleshooting
+| Symptom | What to check |
+|---|---|
+| A Session will not start | Check CLI status in the Dashboard, confirm the CLI is on Pan's PATH, and inspect the selected Adapter and permission mode |
+| A Worker does not reply | Check Worker status and the send queue. If the message is queued, do not resend the same task repeatedly; inspect `data/logs/pan.log` if needed |
+| An MA report is missing | Confirm the manager subscribed to the target and that the MCP server, `PAN_API_URL`, and `PAN_AGENT_SESSION_ID` belong to the same Pan instance |
+| A Job does not fire | Check whether it is paused, its next fire time and timezone, and errors or delivery status in its details |
+| SnowLuma shows Not installed | Check absolute `cwd`, launch command, and WebSocket URL in `data/qq_plugins/manifest.json` |
 
-Confirm `pan` is enabled, restart the Worker after MCP changes, and ask the Agent to call `pan_handbook()`. Prefer `session_list(summary=true)` and targeted `session_get(limit=15)` instead of transferring full histories. For failures, check CLI availability, `workerStatus`, `data/logs/pan.log`, `PAN_API_URL`, the 8768/8767 instance, and whether `PAN_AGENT_SESSION_ID` belongs to that instance. MCP requests use snake_case; HTTP bodies use camelCase (`sessionId`, `panAccess`).
+### Security and cleanup
 
-## 13. Security and cleanup
+The API has no authentication by default and binds to loopback. Do not expose it to an untrusted network by changing `PAN_HOST` or opening a remote tunnel alone.
 
-The default API has no authentication and binds to loopback intentionally. Do not expose it publicly without an explicit security design. Do not delete Sessions you do not own or understand; unclaim is the reversible relationship operation. Do not mass-delete `ses_*`. Use `session_batch_delete` only for confirmed disposable child Sessions after delivery.
+Manual Session deletion stops its Worker and removes Session records and history, but preserves an ordinary workdir. A separate data-retention policy is disabled by default. Session auto-retention also preserves workdirs. Independent orphan workdir cleanup in Settings → Data uses its own N-day rule and protects all Session and Workspace references. Commit or back up important files before cleanup.
 
-For the complete reference, read [`SKILL.md`](skills/pan/SKILL.md), [`http-api.md`](skills/pan/references/http-api.md), [`ws-protocol.md`](skills/pan/references/ws-protocol.md), and the Chinese manual’s [`pan-user-manual-images.txt`](pan-user-manual-images.txt).
+### Mobile navigation and Codex Terminal TUI
+
+View entries come in groups of three: Chat / Editor / Jobs, then Terminal. Swipe the entry strip on mobile; desktop arrows or its wheel change groups. Changing the group does not itself navigate. Chat display modes **TUI / Bubble / Raw** change presentation, not the Agent control mode.
+
+Codex **Terminal TUI** is a separate native-control entry: desktop uses the top bar, mobile uses **Session Settings → More**. Older Sessions may offer an upgrade and wait until the next idle boundary; check the displayed pending/error state. This differs from **Takeover**, which stops the Worker and opens an external terminal, and from the independent shell on the Terminal page.
+
+## 11. Persistent terminals (Windows)
+
+The Dashboard **Terminal** page runs an independent shell without starting a model
+Session. Optional Workspace/Session IDs are association metadata, not permissions
+or lifecycle ownership.
+
+Create a terminal with an optional valid working directory, then claim input
+control. The default shell is `cmd.exe /q /d`. Install the minimal Python
+requirements and run `npm ci` inside `packages/core/terminal/emulator_sidecar`
+with Node available; use the committed exact-pinned dependencies, not global ones.
+New connections are observers. Only one connection controls input/PTY size at a
+time; a takeover revokes the previous control lease and never replays old input.
+
+Closing the page or reconnecting does not terminate the shell. Server screen
+recovery may be `partial`, which is not a promise of complete TUI fidelity. A gap
+rebuilds the display baseline explicitly without resetting the running shell.
+Ctrl-C is forwarded to the foreground program; the production Windows layout has
+been tested with a real control event and a surviving shell, but programs can
+ignore it or change input modes. Ctrl-D is not universal POSIX EOF.
+Ctrl-V uses browser clipboard paste, with xterm applying bracketed-paste framing
+when the program enables that mode, rather than sending the Ctrl-V control byte.
+Review pasted commands first: programs may execute multiple lines immediately.
+Git/MSYS programs such as less may require `TERM=xterm-256color` in that shell;
+this does not upgrade a partial snapshot into full TUI recovery.
+
+Ordinary terminals are cleaned up when Pan stops or its owner lease is lost.
+Choose **Detach** before stopping Pan to retain a shell across a Pan restart.
+The runner must prove independence from the host Job; restricted ancestors still
+cause a safe refusal. A new Pan instance verifies the original PID/raw FILETIME
+and local credential before reattaching the same shell. Old connection leases
+are revoked; reconnect and claim fresh control. Detach does not promise survival
+across logout, machine/sidecar restart, or explicit process termination.
+
+**Terminate** stops the owned process tree and removes its credential only after
+confirmation. Unconfirmed cleanup remains retryable, not falsely completed.
+
+When the shell itself exits, cleanup runs automatically. Final output is delivered
+before the actual exit code and exited state; root death does not prove complete
+output. The current panel retains the last rendered screen and refreshes the
+record, but an exited process cannot be reconnected. Screens are not permanently
+archived: selecting an exited record after leaving shows that limitation instead
+of pretending to restore old output. Copy any results you need to keep.
+
+Terminal REST/WS is a trusted-local interface with same-origin/Host checks.
+`PAN_TERMINAL_ALLOW_REMOTE` is not remote authentication: do not expose a shell to
+an untrusted network. Browsers never receive runner tokens. Credentials use
+same-user DPAPI and owner-only ACLs; do not delete secrets for live terminals.
+See the [service interface](design/PAN_TERMINAL_SERVICE_INTERFACES_20261003.md)
+and [durable validation](design/PAN_TERMINAL_DURABLE_MA_20261004.md) for exact limits.
+
+## Related documents
+
+- [README](../README.en.md): project overview and quick start.
+- [中文用户手册](./USER_MANUAL.md).
+- [QQ and SnowLuma guide](./QQ_PLUGIN_SNOWLUMA.en.md).
+
+
+### Orphan workdir cleanup (Settings → Data)
+
+Workdir cleanup is independent of Session retention. Deleting or expiring a Session always preserves its workdir. Configure `data_retention.workdirs` with `enabled` (default `false`) and `days` (integer 1–36500; `null` disables cleanup). Existing configurations remain opt-in. Automatic cleanup uses the existing daily retention scheduler.
+
+Set a day count and choose **Browse cleanup candidates** to inspect directory names, paths, latest recursive modification times and entry counts. Refresh, select individual rows or Select all, then Delete selected. Deletion is permanent; per-directory failures remain visible and can be refreshed. This action deletes orphan directories, never Sessions. Manual cleanup uses the displayed day count without requiring automatic cleanup to be enabled or settings to be saved.
+
+**The “no changes for N days” check may be inaccurate. Enable automatic cleanup with caution; manual cleanup is recommended.** Filesystem mtimes can be preserved by copies or changed by background tools; they do not prove that data is disposable.
+
+Only direct plain directories under Pan's default `data/workdirs` root are scanned. The newest mtime across every file and subdirectory must be older than N days. Any Session (including archived or offline Sessions), or Workspace directory referencing the same path, an ancestor or descendant protects it. Links/reparse points, hardlinks, special files, malformed reference records and scan errors prevent deletion. No arbitrary client path is accepted. All checks run again before deletion; preview is not deletion authority. Scan limits (2,000 root entries, 100,000 tree entries, 2,048 directories per tree and a 20-second tree traversal budget per request) fail closed and are reported with skip/error counts. Partial deletion failures can leave a directory partially cleaned; inspect failures before retrying.

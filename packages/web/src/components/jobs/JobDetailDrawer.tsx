@@ -2,6 +2,7 @@ import { useEffect, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { Check, Copy, Pause, Pencil, Play, Target, Trash2, X } from 'lucide-react';
 import { scheduleEntries, type Job, type JobRunRecord, type JobSource, type JobTimestamp } from '@/types/jobs';
+import { LegacyJobDetails } from './LegacyJobDetails';
 
 function pad(n: number): string {
   return String(n).padStart(2, '0');
@@ -29,6 +30,12 @@ function statusColor(status: string): string {
     case 'starting':
       return 'border-accent/50 bg-accent/10 text-accent';
     case 'scheduled':
+    case 'restarting':
+    case 'cleaning':
+    case 'cleanup_pending':
+    case 'deleting':
+    case 'unknown':
+    case 'uncertain':
     case 'partial':
     case 'undeliverable':
       return 'border-warning/50 bg-warning/10 text-warning';
@@ -169,9 +176,13 @@ export function JobDetailDrawer({
   onRunNow,
   onTogglePaused,
   onDelete,
+  onCancel,
+  cancelling,
   onChangeTarget,
   onEdit,
   onToggleEntryEnabled,
+  onRetry,
+  onConfirmRecovery,
 }: {
   job: Job;
   kindLabel: string;
@@ -182,9 +193,13 @@ export function JobDetailDrawer({
   onRunNow: () => void;
   onTogglePaused: () => void;
   onDelete: () => void;
+  onCancel?: () => void;
+  cancelling?: boolean;
   onChangeTarget: () => void;
   onEdit: () => void;
   onToggleEntryEnabled: (entryId: string) => void;
+  onRetry?: () => void;
+  onConfirmRecovery?: () => void;
 }) {
   const [deliveryExpanded, setDeliveryExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -202,16 +217,19 @@ export function JobDetailDrawer({
   const isScheduledTask = job.kind === 'scheduled-task';
   const hasTarget = !!job.target.sessionId;
   const canRunNow = job.action?.api === 'shell'
+    || Boolean(job.unified && !job.unified.compatibility && job.enabled)
     || job.action?.api === 'resume_legal_running'
+    || job.action?.api === 'send_qq'
     || hasTarget;
   const terminalMessage = (
     (job.kind === 'session-message' || job.kind === 'session-broadcast')
     && ['completed', 'failed', 'cancelled'].includes(job.status)
   );
-  const canChangeTarget = (job.kind === 'scheduled-task'
-    && job.action?.api !== 'resume_legal_running')
+  const canChangeTarget = !(job.unified && !job.unified.compatibility) && ((job.kind === 'scheduled-task'
+    && job.action?.api !== 'resume_legal_running'
+    && job.action?.api !== 'send_qq')
     || (job.kind === 'session-message' && !terminalMessage)
-    || job.kind === 'background-process';
+    || job.kind === 'background-process');
   const canEdit = !terminalMessage;
   const schedule = scheduleEntries(job.schedule);
   const legacyScheduleText = !Array.isArray(job.schedule) && job.schedule != null
@@ -249,6 +267,7 @@ export function JobDetailDrawer({
             <h2 className="min-w-0 truncate text-sm font-semibold text-text-primary">
               {job.name}
             </h2>
+            {job.label && <span title={job.label} className="min-w-0 max-w-[35%] truncate rounded border border-accent/50 bg-accent/10 px-1.5 py-px text-[11px] font-medium text-accent">{job.label}</span>}
             <StatusBadge status={job.status} />
           </div>
           <button
@@ -274,6 +293,9 @@ export function JobDetailDrawer({
 
             {/* Action group */}
             <div className="flex flex-wrap items-center gap-1.5">
+              {job.status === 'failed' && onRetry && <button className="rounded border border-warning/50 px-2 py-1 text-xs text-warning" onClick={onRetry}>Confirm failed Run retry</button>}
+              {['unknown','uncertain'].includes(job.status) && onConfirmRecovery && <button className="rounded border border-warning/50 px-2 py-1 text-xs text-warning" onClick={onConfirmRecovery}>Confirm uncertain Run recovery</button>}
+              {onCancel && (job.kind !== 'scheduled-task' || job.unified && !job.unified.compatibility) && ['pending', 'scheduled', 'starting', 'running', 'restarting'].includes(job.status) && <button type="button" onClick={onCancel} disabled={cancelling} className="rounded border border-warning/50 px-2 py-1 text-xs text-warning disabled:opacity-50">{cancelling ? 'Cancelling…' : 'Cancel job'}</button>}
               {isScheduledTask && (
                 <button
                   type="button"
@@ -326,6 +348,20 @@ export function JobDetailDrawer({
               )}
             </div>
 
+            {(!job.unified || job.unified.compatibility) && <LegacyJobDetails job={job} />}
+            {job.unified && !job.unified.compatibility && <Section title="Unified execution">
+              <KV label="Action reference">{job.unified.config.actionId}</KV>
+              <KV label="Configuration revision">{job.configRevision ?? 'legacy adapter'}</KV>
+              <KV label="Snapshot cleanup">{job.snapshotCleanup ?? 'none'}</KV>
+              {job.templateId && <KV label="Template origin">{job.templateId} · revision {job.templateRevision}</KV>}
+              {job.integrity?.status === 'incomplete' && <p role="alert" className="text-danger text-xs break-words">Incomplete: {job.integrity.issues.map((issue) => `${issue.actionId} at ${issue.position}: ${issue.error}`).join('; ')}</p>}
+              {job.integrity?.approvalRequired && <p role="alert" className="text-warning text-xs">Reference repair requires user confirmation; execution is disabled.</p>}
+              <KV label="Trigger">{job.unified.config.trigger?.kind ?? 'schedule'}</KV>
+              <KV label="Completion">{job.unified.config.completion?.kind ?? 'ordinary'}</KV>
+              <KV label="Recovery">{job.unified.config.recovery?.enabled ? 'enabled' : 'off'}</KV>
+              <KV label="Overlap">{job.unified.config.overlap?.mode ?? 'forbid'} · limit {job.unified.config.overlap?.parallelLimit ?? 3}</KV>
+              {job.attempts?.map((attempt) => <div key={attempt.id} className="rounded border border-border-default p-2 text-xs break-all">Run {attempt.runId}<br />Attempt {attempt.count}: <StatusBadge status={attempt.status} />{attempt.sideEffectUncertainty && <p>Side effect uncertain; automatic replay blocked.</p>}</div>)}
+            </Section>}
             {/* 1. Overview */}
             <Section title="Overview">
               {job.description && (
@@ -337,13 +373,16 @@ export function JobDetailDrawer({
                 <KV label="Target">
                   <span className="font-mono">
                     {job.action?.api === 'resume_legal_running'
-                      ? 'dynamic: legal running Sessions without a live Worker'
+                      ? 'dynamic: Illegal Sessions pending recovery without a live Worker'
+                      : job.action?.api === 'send_qq'
+                      ? `QQ ${job.action.args.targetType} ${job.action.args.targetId} · ${job.action.args.botUin
+                        ? `bot ${job.action.args.botUin}` : 'default bot'}`
                       : job.target.sessionIds?.length
                       ? job.target.sessionIds.join(', ')
                       : job.target.sessionId ?? 'no target'}
                   </span>
                 </KV>
-                <KV label="Run count">{job.runCount}</KV>
+                <KV label={job.unified && !job.unified.compatibility ? 'Run count' : 'Legacy execution count'}>{job.runCount ?? 0}</KV>
                 <KV label="Created">{formatDateTime(job.createdAt)}</KV>
                 <KV label="Updated">{formatDateTime(job.updatedAt)}</KV>
                 {job.paused && <KV label="Paused">Yes</KV>}
@@ -359,13 +398,13 @@ export function JobDetailDrawer({
                 <div className="flex flex-col gap-1 rounded border border-border-default bg-bg-primary p-2.5 text-xs">
                   {job.action?.api === 'resume_legal_running' ? (
                     <>
-                      <KV label="Mode">Wake legal running Sessions without a live Worker</KV>
+                      <KV label="Mode">Recover Illegal Sessions without a live Worker</KV>
                       <div className="text-[11px] text-text-tertiary">
-                        The server rescans current Sessions on every fire and uses normal message delivery.
+                        Each fire rescans Illegal Sessions and queues the configured wake message first, releasing only its Illegal lock.
                       </div>
                       <div className="text-[11px] text-text-tertiary">Message</div>
                       <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-words rounded bg-bg-tertiary p-2 text-text-secondary">
-                        继续
+                        Configured in Settings → Behavior → Wake message
                       </pre>
                     </>
                   ) : job.action?.api === 'shell' || job.shellCommand ? (
@@ -397,7 +436,11 @@ export function JobDetailDrawer({
                   ) : (
                     <>
                       <KV label="Mode">
-                        {job.action?.api === 'send_session' ? 'Session message' : 'Assign task to Session'}
+                        {job.action?.api === 'send_session'
+                          ? 'Session message'
+                          : job.action?.api === 'send_qq'
+                          ? 'Scheduled QQ text message'
+                          : 'Assign task to Session'}
                       </KV>
                       <div className="text-[11px] text-text-tertiary">Text</div>
                       <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-words rounded bg-bg-tertiary p-2 text-text-secondary">
@@ -539,7 +582,7 @@ export function JobDetailDrawer({
             </Section>
 
             {/* 4. Runs history */}
-            <Section title="Runs">
+            <Section title={job.unified && !job.unified.compatibility ? 'Runs' : 'Legacy execution history'}>
               {runs.length === 0 ? (
                 <div className="text-xs text-text-tertiary">
                   {runsLoading ? 'Loading…' : '—'}

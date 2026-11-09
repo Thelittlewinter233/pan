@@ -1,0 +1,287 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { Terminal } from '@xterm/xterm';
+import { FitAddon } from '@xterm/addon-fit';
+import '@xterm/xterm/css/xterm.css';
+import { terminalRequest } from '@/services/terminal';
+import type { TerminalView } from '@/services/terminal';
+import { TerminalStream } from '@/services/terminalWs';
+import { terminalKeyHandler } from '@/services/terminalKeyboard';
+import type { TerminalState } from '@/services/terminalWs';
+import { useCapability, usePlatformStore } from '@/stores/platformStore';
+import { platformLabel } from '@/utils/platformCapabilities';
+
+const initial: TerminalState = { connected: false, control: false, recovering: true, message: '请选择终端' };
+
+// Server-side static exit/reason vocabulary: a terminal that never booted is not a
+// cleanup failure and must not be described as one.
+const STARTUP_FAILURE_MESSAGES: Record<string, string> = {
+  'sidecar-dependency-missing': '终端引擎依赖未安装（emulator sidecar 的 npm 包缺失），本次没有启动任何 shell。',
+  'node-missing': '未找到 Node 运行时，终端引擎无法启动，本次没有启动任何 shell。',
+  'sidecar-script-missing': '终端引擎脚本缺失，无法启动，本次没有启动任何 shell。',
+  'unsupported-platform': '当前平台不支持常驻终端（仅 Windows 生产宿主）。',
+  'guard-create-failed': '终端引擎的进程守卫创建失败，无法启动，本次没有启动任何 shell。',
+  'engine-startup-failed': '终端引擎启动失败，本次没有启动任何 shell。',
+  'bootstrap-failed': '终端引导失败，本次没有启动任何 shell。',
+};
+
+function startupFailureMessage(reason?: string | null): string | undefined {
+  return reason ? STARTUP_FAILURE_MESSAGES[reason] : undefined;
+}
+
+/**
+ * Route guard: the POSIX backends do not implement the native PTY terminal
+ * yet, so the server advertises `terminal.native: false`. Navigating here
+ * directly must explain that instead of polling an API that answers
+ * "unsupported" and showing an empty shell that looks broken.
+ */
+export default function TerminalPanel() {
+  const supported = useCapability('terminal.native');
+  const platform = usePlatformStore((state) => state.platform);
+  if (!supported) {
+    return (
+      <section className="flex flex-1 items-center justify-center p-6" aria-label="全局终端">
+        <div
+          role="status"
+          data-testid="terminal-unsupported"
+          className="max-w-md rounded-xl border border-border-default bg-bg-secondary p-5 text-sm"
+        >
+          <h1 className="mb-2 font-semibold">当前平台暂不支持终端</h1>
+          <p className="text-text-secondary">
+            服务端运行在 {platformLabel(platform)} 上，尚未提供原生 PTY 终端（terminal.native）。
+            Session、Worker、编辑器与自动化不受影响；本入口不会创建任何进程。
+          </p>
+        </div>
+      </section>
+    );
+  }
+  return <TerminalWorkspace />;
+}
+
+function TerminalWorkspace() {
+  const [records, setRecords] = useState<TerminalView[]>([]);
+  const [showArchived, setShowArchived] = useState(false);
+  const [selected, setSelected] = useState('');
+  const [cwd, setCwd] = useState('');
+  const [workspaceId, setWorkspaceId] = useState('');
+  const [sessionId, setSessionId] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [revision, setRevision] = useState(0);
+  const [state, setState] = useState(initial);
+  const element = useRef<HTMLDivElement>(null);
+  const stream = useRef<TerminalStream | null>(null);
+  const endedSelection = useRef<{ status: string; reason?: string | null } | undefined>(undefined);
+  const refresh = useCallback(async () => {
+    try { setRecords(await terminalRequest<TerminalView[]>()); setError(''); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : '终端列表不可用'); }
+  }, []);
+  useEffect(() => { void refresh(); }, [refresh]);
+  useEffect(() => {
+    const timer = setInterval(() => void refresh(), 5000);
+    return () => clearInterval(timer);
+  }, [refresh]);
+  const selectedRecord = records.find((record) => record.terminal_id === selected);
+  const ended = selectedRecord?.status === 'exited' || selectedRecord?.status === 'lost';
+  useEffect(() => {
+    if (selectedRecord?.status === 'exited') {
+      setState((previous) => previous.terminalStatus === 'exited' ? previous : {
+        ...previous, connected: false, control: false, recovering: false, terminalStatus: 'exited',
+        message: startupFailureMessage(selectedRecord.exit?.reason)
+          ?? (selectedRecord.exit?.reason === 'externally-terminated'
+            ? '进程已被外部终止；可以归档记录。' : '终端已退出。'),
+      });
+    }
+  }, [selectedRecord]);
+
+  useEffect(() => {
+    if (!selected || !element.current) return;
+    if (endedSelection.current) {
+      const ended = endedSelection.current;
+      setState({ connected: false, control: false, recovering: false,
+        terminalStatus: ended.status,
+        message: (ended.status === 'exited' ? startupFailureMessage(ended.reason) : undefined)
+          ?? (ended.status === 'exited'
+            ? '终端已退出；历史屏幕未持久化，不能重连旧进程。'
+            : '终端记录为 lost；请核对服务端清理状态。') });
+      return;
+    }
+    let alive = true;
+    const terminal = new Terminal({ rows: 24, cols: 80, scrollback: 1000, fontSize: 13,
+      theme: { background: '#15171b', foreground: '#e7e9ee' }, allowProposedApi: false });
+    const fit = new FitAddon();
+    terminal.loadAddon(fit);
+    terminal.open(element.current);
+    terminal.attachCustomKeyEventHandler(terminalKeyHandler);
+    let wasControl = false;
+    let terminalRecordRefreshed = false;
+    const connection = new TerminalStream(selected, terminal, (next) => {
+      if (alive) {
+        setState(next);
+        if (next.control && !wasControl) fitScreen();
+        wasControl = next.control;
+        if (next.terminalStatus && !terminalRecordRefreshed) {
+          terminalRecordRefreshed = true;
+          void refresh(); // keep the selected tail screen; refresh record facts only
+        }
+      }
+    });
+    stream.current = connection;
+    const url = new URL(`/ws/terminal/${encodeURIComponent(selected)}?cursor=0`, location.href);
+    url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const socket = new WebSocket(url);
+    connection.bind(socket);
+    socket.onmessage = (event) => { if (alive && typeof event.data === 'string') connection.receive(event.data); };
+    socket.onclose = (event) => { if (alive) connection.disconnected(event.code === 1000); };
+    socket.onerror = () => { if (alive) setError('连接失败：请检查同源入口与终端状态'); };
+    const dataSubscription = terminal.onData((text) => connection.input(text));
+    let resizeTimer: ReturnType<typeof setTimeout> | undefined;
+    const fitScreen = () => {
+      if (!alive || !element.current?.clientWidth || !element.current?.clientHeight) return;
+      fit.fit();
+      connection.resize(terminal.rows, terminal.cols);
+    };
+    const observer = new ResizeObserver(() => {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(fitScreen, 100);
+    });
+    observer.observe(element.current);
+    fitScreen();
+    return () => {
+      alive = false;
+      clearTimeout(resizeTimer);
+      observer.disconnect();
+      dataSubscription.dispose();
+      connection.dispose(); // disconnect only, never close/detach the runtime
+      if (stream.current === connection) stream.current = null;
+      terminal.dispose();
+    };
+  }, [selected, revision, refresh]);
+
+  async function create() {
+    setBusy(true);
+    try {
+      const view = await terminalRequest<TerminalView>('', { rows: 24, cols: 80, ...(cwd ? { cwd } : {}),
+        ...(workspaceId ? { workspace_id: workspaceId } : {}), ...(sessionId ? { session_id: sessionId } : {}) });
+      await refresh();
+      endedSelection.current = undefined;
+      setSelected(view.terminal_id);
+      setWorkspaceId(view.scope?.workspace_id || '');
+      setSessionId(view.scope?.session_id || '');
+      setShowArchived(false);
+    } catch (reason) {
+      const code = reason instanceof Error ? reason.message : '';
+      setError(code === 'startup-failed'
+        ? '终端未启动（引擎启动失败）；记录已保留，可在列表中选择查看原因并删除后重试。'
+        : (code || '创建失败'));
+    }
+    finally { setBusy(false); }
+  }
+  async function lifecycle(action: 'close' | 'detach') {
+    if (!selected || !window.confirm(action === 'close' ? '终止此终端及其子进程？关闭面板不会终止它。' : '请求持久脱离？当前环境可能拒绝，拒绝时不会改变状态。')) return;
+    setBusy(true);
+    try {
+      await terminalRequest(`/${encodeURIComponent(selected)}/${action}`, {});
+      await refresh();
+      if (action === 'close') {
+        setSelected('');
+        setState(initial);
+      }
+    } catch (reason) { setError(reason instanceof Error ? reason.message : '未确认完成；可以重试'); }
+    finally { setBusy(false); }
+  }
+
+  async function remove() {
+    const record = records.find((item) => item.terminal_id === selected);
+    if (!record || busy) return;
+    const ended = record.status === 'exited';
+    if (!window.confirm(ended ? '删除此终端记录？删除后不能恢复。'
+      : '终止此终端及其子进程，并删除记录？只有确认清理成功后才会删除。')) return;
+    setBusy(true);
+    try {
+      const id = selected;
+      if (!ended || record.cleanup_pending) await terminalRequest(`/${encodeURIComponent(id)}/close`, {});
+      const result = await terminalRequest<{ removed: boolean }>(`/${encodeURIComponent(id)}/remove`, {});
+      if (result.removed !== true) throw new Error('删除未确认；记录已保留，请刷新后重试');
+      setRecords((items) => items.filter((item) => item.terminal_id !== id));
+      endedSelection.current = undefined;
+      setSelected('');
+      setState(initial);
+      setError('');
+      await refresh();
+    } catch (reason) {
+      await refresh();
+      setError(reason instanceof Error ? reason.message : '删除失败；记录已保留，可以重试');
+    } finally { setBusy(false); }
+  }
+
+  async function metadata(action: 'archive' | 'scope') {
+    if (!selected || busy) return;
+    if (action === 'archive' && !selectedRecord?.archived && !window.confirm(
+      '归档仅从默认列表移除，不终止进程；清理线索会保留，可从“已归档”恢复。')) return;
+    setBusy(true);
+    try {
+      const view = await terminalRequest<TerminalView>(`/${encodeURIComponent(selected)}/${action}`,
+        action === 'archive' ? { archived: !selectedRecord?.archived }
+          : { workspace_id: workspaceId || null, session_id: sessionId || null });
+      if (action === 'scope') {
+        setWorkspaceId(view.scope?.workspace_id || '');
+        setSessionId(view.scope?.session_id || '');
+      } else {
+        setSelected(''); setState(initial); endedSelection.current = undefined;
+      }
+      await refresh();
+    } catch (reason) { setError(reason instanceof Error ? reason.message : '操作失败，记录已保留'); }
+    finally { setBusy(false); }
+  }
+
+  return <section className="flex flex-col flex-1 min-h-0 p-3 gap-2" aria-label="全局终端">
+    <header className="flex flex-wrap items-center gap-2 rounded-xl border border-border-default bg-bg-secondary p-3">
+      <h1 className="font-semibold mr-2">全局终端 <span className="text-xs font-normal text-text-tertiary">{records.filter(record => !record.archived).length} 个未归档 · {records.filter(record => record.archived).length} 个已归档</span></h1>
+      <input aria-label="工作目录" placeholder="工作目录（留空用默认值）" value={cwd} onChange={(event) => setCwd(event.target.value)}
+        className="bg-bg-tertiary border border-border-default rounded px-2 py-1 text-sm" />
+      <input aria-label="关联工作区 ID" placeholder="工作区 ID（解除 Session 绑定）" value={workspaceId} onChange={(event) => { setWorkspaceId(event.target.value); setSessionId(''); }}
+        className="bg-bg-tertiary border border-border-default rounded px-2 py-1 text-sm" />
+      <input aria-label="关联 Session ID" placeholder="Session ID（继承其工作区）" value={sessionId} onChange={(event) => { setSessionId(event.target.value); if (event.target.value) setWorkspaceId(''); }}
+        className="bg-bg-tertiary border border-border-default rounded px-2 py-1 text-sm" />
+      <button disabled={busy} onClick={() => void create()} className="px-2 py-1 rounded bg-accent/20">新建终端</button>
+      <button onClick={() => void refresh()} className="px-2 py-1">刷新列表</button>
+      <button disabled={!selected || busy} onClick={() => void metadata('scope')} className="px-2 py-1 rounded border border-border-default">应用绑定</button>
+    </header>
+    <div className="flex flex-wrap gap-3 items-center rounded-xl border border-border-default p-3 text-sm [&>button]:px-2 [&>button]:py-1 [&>button]:rounded [&>button:disabled]:opacity-40">
+      <label className="flex items-center gap-1 text-text-secondary"><input type="checkbox" checked={showArchived} onChange={(event) => {
+        setShowArchived(event.target.checked); setSelected(''); setState(initial); endedSelection.current = undefined;
+      }} />已归档</label>
+      <select aria-label="选择终端" value={selected} onChange={(event) => {
+        const selectedRecord = records.find(record => record.terminal_id === event.target.value);
+        endedSelection.current = selectedRecord && ['exited', 'lost'].includes(selectedRecord.status)
+          ? { status: selectedRecord.status, reason: selectedRecord.exit?.reason } : undefined;
+        setWorkspaceId(selectedRecord?.scope?.workspace_id || '');
+        setSessionId(selectedRecord?.scope?.session_id || '');
+        setSelected(event.target.value); setState(initial);
+      }}
+        className="bg-bg-tertiary border border-border-default rounded px-2 py-1">
+        <option value="">选择终端</option>
+        {records.filter(record => Boolean(record.archived) === showArchived).map((record) => <option key={record.terminal_id} value={record.terminal_id}>
+          {record.terminal_id} · {record.status}{record.detached ? ' · detached' : ''}
+          {record.scope?.workspace_id ? ` · 工作区 ${record.scope.workspace_id}` : ''}
+          {record.scope?.session_id ? ` · Session ${record.scope.session_id}` : ''}
+        </option>)}
+      </select>
+      <button disabled={!selected || ended || state.control || !state.connected} onClick={() => stream.current?.claim()}>取得输入控制权</button>
+      <button disabled={!state.control} onClick={() => stream.current?.release()}>释放控制权</button>
+      <button disabled={!selected || ended || !state.connected} onClick={() => stream.current?.snapshot()}>重取服务器屏幕</button>
+      <button disabled={!selected || ended || state.terminalStatus === 'exited' || state.terminalStatus === 'lost'} onClick={() => { setState(initial); setRevision((value) => value + 1); }}>重连</button>
+      <button disabled={!selected || busy || ended || state.terminalStatus === 'exited' || state.terminalStatus === 'lost'} onClick={() => void lifecycle('detach')}>持久脱离</button>
+      <button disabled={!selected || busy} onClick={() => void lifecycle('close')} className="text-red-400">终止终端</button>
+      <button disabled={!selected || busy} onClick={() => void remove()} className="text-red-400">删除终端</button>
+      <button disabled={!selected || busy} onClick={() => void metadata('archive')}>{selectedRecord?.archived ? '恢复到列表' : '归档终端'}</button>
+    </div>
+    <p role="status" className="text-xs text-text-secondary">{state.control ? '控制模式' : '只观察'} · {state.message}</p>
+    <p className="text-xs text-text-tertiary">屏幕恢复范围：{state.recovery || '未确认'}（控制权变化不会升级屏幕保真）</p>
+    {error && <p role="alert" className="text-sm text-red-400">{error}</p>}
+    {selectedRecord?.cleanup_pending && <p className="text-xs rounded border border-amber-500/30 bg-amber-500/10 p-2 text-amber-400">进程已退出，剩余资源清理尚未确认。可以归档或重试清理；归档不等于资源已释放。</p>}
+    <div ref={element} className="flex-1 min-h-40 min-w-0 overflow-hidden rounded bg-[#15171b] p-2" data-testid="terminal-screen" />
+    <p className="text-xs text-text-tertiary">离开本页或断线不会终止进程。屏幕恢复按服务器声明，partial 不等于完整保真；Ctrl-C 转交前台程序，具体响应由程序决定。</p>
+    <p className="text-xs text-text-tertiary">绑定 Session 时继承其有效工作区；手动绑定工作区会解除 Session 绑定。归档保留记录，删除仅用于已确认清理的终端。绑定不授予权限，也不改变终端寿命。</p>
+  </section>;
+}

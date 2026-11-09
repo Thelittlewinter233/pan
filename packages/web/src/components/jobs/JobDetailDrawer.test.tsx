@@ -51,7 +51,7 @@ describe('JobDetailDrawer width', () => {
       ...job,
       jobId: 'job_resume',
       kind: 'scheduled-task',
-      name: 'Resume legal running Sessions',
+      name: 'Recover Illegal Sessions',
       source: { type: 'system' },
       target: { sessionId: null },
       action: { api: 'resume_legal_running' },
@@ -78,8 +78,46 @@ describe('JobDetailDrawer width', () => {
 
     expect(screen.getByRole('button', { name: 'Run now' })).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'Change target' })).toBeNull();
-    expect(screen.getAllByText(/dynamic: legal running Sessions without a live Worker/).length)
+    expect(screen.getAllByText(/dynamic: Illegal Sessions pending recovery without a live Worker/).length)
       .toBeGreaterThan(0);
-    expect(screen.getByText('继续')).toBeTruthy();
+    expect(screen.getByText('Configured in Settings → Behavior → Wake message')).toBeTruthy();
+  });
+
+  it('shows the QQ contact and bot identity and permits run-now without a Session target', () => {
+    const qqJob: Job = {
+      ...job,
+      jobId: 'job_qq',
+      kind: 'scheduled-task',
+      name: 'Scheduled QQ message',
+      target: { sessionId: null },
+      action: { api: 'send_qq', args: {
+        targetType: 'group', targetId: '654321', botUin: '123456',
+      } },
+      text: 'Scheduled text',
+      status: 'scheduled',
+      schedule: [],
+    };
+    render(
+      <JobDetailDrawer
+        job={qqJob}
+        kindLabel="Scheduled task"
+        runs={[]}
+        runsLoading={false}
+        onLoadMoreRuns={vi.fn()}
+        onClose={vi.fn()}
+        onRunNow={vi.fn()}
+        onTogglePaused={vi.fn()}
+        onDelete={vi.fn()}
+        onChangeTarget={vi.fn()}
+        onEdit={vi.fn()}
+        onToggleEntryEnabled={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: 'Run now' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Change target' })).toBeNull();
+    expect(screen.getByText('QQ group 654321 · bot 123456')).toBeTruthy();
+    expect(screen.getByText('Scheduled QQ text message')).toBeTruthy();
+    expect(screen.queryByText('no target')).toBeNull();
   });
 });

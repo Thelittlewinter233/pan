@@ -1,5 +1,6 @@
+import { isLocalSessionIdentity } from './sessionCreation';
 import { create } from 'zustand';
-import type { AgentQueueItem, MessagePart, QueueDispatchState, QueuedEdit } from '@/types';
+import type { AgentQueueItem, MessagePart, QueueDispatchState, QueuedEdit, QueuedEditAttachment } from '@/types';
 import {
   acquireSessionQueueItemEdit,
   deleteSessionQueueItem,
@@ -7,20 +8,24 @@ import {
   fetchSessionQueue,
   releaseSessionQueueItemEdit,
   reorderSessionQueue,
+  setSessionAgentReportsPaused,
+  setSessionQueuePaused,
+  setSessionQueueItemLocked,
+  setSessionQueueItemsLocked,
   updateSessionQueueItem,
 } from '@/services/api';
 import { useSessionStore } from '@/stores/sessionStore';
-import { isRuntimeWorkerRunning } from '@/stores/workerStore';
 import { useUIStore } from '@/stores/uiStore';
+import { queueComposerFromBody, queueComposerToParts } from './queueComposerCodec';
+import type { ComposerValue } from '@/components/chat/RichTextComposer';
 
 /** The business queue is the server snapshot; localStorage is not a queue. */
 export interface EnqueueOptions {
-  /**
-   * Whether this send transaction may append the queued row to chat history.
-   * InputRow captures this at send start so a running→idle transition cannot
-   * turn a send that began in the live path into a duplicate optimistic row.
-   */
+  /** Legacy caller compatibility. Enqueue never appends a delivered chat row. */
   appendOptimisticHistory?: boolean;
+  locked?: boolean;
+  /** Composer needs the rejection/unknown distinction for transaction recovery. */
+  propagateFailure?: boolean;
 }
 
 interface QueueStore {
@@ -28,10 +33,26 @@ interface QueueStore {
   edits: Record<string, QueuedEdit | null>;
   batchSend: Record<string, boolean>;
   panelOpen: boolean;
+  /**
+   * Keyboard/pointer selection in the send-queue panel, keyed by Session.
+   * Stored here (not in the panel) because the shortcut actions must reach the
+   * same selection when the composer owns focus. The value is an item id, not
+   * an index: a reorder or a late server snapshot must never retarget it.
+   */
+  queueSelection: Record<string, string | null>;
+  setQueueSelection: (sessionId: string, itemId: string | null) => void;
   sendingId: string | null;
   agentQueues: Record<string, AgentQueueItem[]>;
   agentQueueLoadSeq: Record<string, number>;
   queueRevisions: Record<string, number>;
+  queuePaused: Record<string, boolean>;
+  queuePauseLoaded: Record<string, boolean>;
+  queuePauseUpdating: Record<string, boolean>;
+  agentReportsPaused: Record<string, boolean>;
+  agentReportsPauseLoaded: Record<string, boolean>;
+  agentReportsPauseUpdating: Record<string, boolean>;
+  queueLockUpdating: Record<string, boolean>;
+  lockedComposerModes: Record<string, boolean>;
   /** Durable projection guards for late ACKs and delivery/remove events. */
   queueTombstones: Record<string, Set<string>>;
   queueDeliveredIds: Record<string, Set<string>>;
@@ -44,8 +65,16 @@ interface QueueStore {
     queueItemIds?: string[];
     queueRevision?: number;
     item?: Record<string, unknown>;
+    items?: AgentQueueItem[];
     messages?: import('@/types').Message[];
+    agentReportsPaused?: boolean;
+    queuePaused?: boolean;
   }) => void;
+  setQueuePaused: (sessionId: string, paused: boolean) => Promise<void>;
+  setAgentReportsPaused: (sessionId: string, paused: boolean) => Promise<void>;
+  setQueueItemLocked: (sessionId: string, itemId: string, locked: boolean) => Promise<void>;
+  setQueueItemsLocked: (sessionId: string, locked: boolean) => Promise<void>;
+  setLockedComposerMode: (sessionId: string, locked: boolean) => void;
   enqueue: (
     text: string,
     parts?: MessagePart[],
@@ -56,6 +85,14 @@ interface QueueStore {
   remove: (id: string) => void;
   startEdit: (id: string) => void;
   updateEditDraft: (text: string) => void;
+  updateEditComposer: (value: ComposerValue) => void;
+  /** Replace the isolated queued-edit attachment occurrence list. The
+   *  session id is explicit: late upload/register responses must land on the
+   *  transaction they were started in, never on whatever Session is current. */
+  updateEditAttachments: (
+    sessionId: string,
+    update: (current: QueuedEditAttachment[]) => QueuedEditAttachment[],
+  ) => void;
   saveEdit: () => void;
   cancelEdit: () => void;
   move: (id: string, delta: number) => void;
@@ -102,7 +139,7 @@ function scheduleEditLeaseRenewal(
   stopEditLeaseRenewal(sessionId);
   const timer = setInterval(() => {
     const edit = readEdit();
-    if (!edit || edit.editToken !== editToken || !edit.serverToken) {
+    if (!edit || edit.editToken !== editToken || !edit.serverToken || edit.error) {
       stopEditLeaseRenewal(sessionId, editToken);
       return;
     }
@@ -120,6 +157,34 @@ function canonicalQueueId(id: string): string {
   return id.startsWith('queue:') ? id.slice('queue:'.length) : id;
 }
 
+/** Extract read-only existing attachments from the parts template returned by
+ *  the edit lease. Malformed templates degrade to an empty list — the server
+ *  remains authoritative for the saved item regardless. */
+function parseTemplateAttachments(
+  templateText: string,
+): Array<{ attachmentId: string; displayName: string }> {
+  try {
+    const parsed: unknown = JSON.parse(templateText);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter(
+        (part): part is { type: 'attachment'; attachmentId: string; displayName?: unknown } =>
+          !!part && typeof part === 'object'
+          && (part as Record<string, unknown>).type === 'attachment'
+          && typeof (part as Record<string, unknown>).attachmentId === 'string'
+          && (part as Record<string, unknown>).attachmentId !== '',
+      )
+      .map((part) => ({
+        attachmentId: part.attachmentId,
+        displayName: typeof part.displayName === 'string' && part.displayName
+          ? part.displayName
+          : part.attachmentId,
+      }));
+  } catch {
+    return [];
+  }
+}
+
 function queueIdMatches(a: string, b: string): boolean {
   return a === b || canonicalQueueId(a) === canonicalQueueId(b);
 }
@@ -130,6 +195,8 @@ function setSnapshot(
   items: AgentQueueItem[],
   revision?: number,
   allowEqualRevisionRepair = false,
+  reportsPaused?: boolean,
+  queuePaused?: boolean,
 ): boolean {
   let accepted = false;
   set((state) => {
@@ -143,7 +210,10 @@ function setSnapshot(
       // the caller proved this response is a fresh authoritative observation
       // of exactly the revision the projection already holds (the full-GET
       // repair path), in which case it fixes an incomplete/stale projection.
-      if (!allowEqualRevisionRepair) return state;
+      if (!allowEqualRevisionRepair) return queuePaused === undefined ? state : {
+        queuePaused: { ...state.queuePaused, [sessionId]: queuePaused },
+        queuePauseLoaded: { ...state.queuePauseLoaded, [sessionId]: true },
+      };
     }
     const tombstones = state.queueTombstones[sessionId] ?? new Set<string>();
     const delivered = state.queueDeliveredIds[sessionId] ?? new Set<string>();
@@ -160,10 +230,55 @@ function setSnapshot(
       ...(revision === undefined
         ? {}
         : { queueRevisions: { ...state.queueRevisions, [sessionId]: revision } }),
-      ...(editMissing ? { edits: { ...state.edits, [sessionId]: null } } : {}),
+      ...(editMissing ? { edits: { ...state.edits, [sessionId]: { ...edit, error: '条目已出队或删除，无法保存；请复制正文或取消编辑。' } } } : {}),
+      ...(queuePaused === undefined ? {} : {
+        queuePaused: { ...state.queuePaused, [sessionId]: queuePaused },
+        queuePauseLoaded: { ...state.queuePauseLoaded, [sessionId]: true },
+      }),
+      ...(reportsPaused === undefined ? {} : {
+        agentReportsPaused: { ...state.agentReportsPaused, [sessionId]: reportsPaused },
+        agentReportsPauseLoaded: { ...state.agentReportsPauseLoaded, [sessionId]: true },
+      }),
     };
   });
   return accepted;
+}
+
+function canApplyAgentReportsPause(
+  snapshotAccepted: boolean,
+  snapshotRevision: number | undefined,
+  currentRevision: number | undefined,
+): boolean {
+  if (snapshotRevision !== undefined
+      && currentRevision !== undefined
+      && snapshotRevision < currentRevision) {
+    return false;
+  }
+  // An accepted snapshot may update its pause bit. A rejected equal-revision
+  // snapshot is also authoritative for that bit because it names the exact
+  // queue version currently held by the store.
+  return snapshotAccepted || (
+    snapshotRevision !== undefined
+    && currentRevision !== undefined
+    && snapshotRevision === currentRevision
+  );
+}
+
+function setAgentReportsPauseState(
+  set: (fn: (state: QueueStore) => Partial<QueueStore>) => void,
+  sessionId: string,
+  paused: boolean,
+): void {
+  set((state) => ({
+    agentReportsPaused: {
+      ...state.agentReportsPaused,
+      [sessionId]: paused,
+    },
+    agentReportsPauseLoaded: {
+      ...state.agentReportsPauseLoaded,
+      [sessionId]: true,
+    },
+  }));
 }
 
 function normalizeQueueEventItem(raw: Record<string, unknown>): AgentQueueItem | null {
@@ -176,9 +291,11 @@ function normalizeQueueEventItem(raw: Record<string, unknown>): AgentQueueItem |
   const kind =
     rawKind === 'qq'
       ? 'qq'
-      : rawKind === 'report' || rawKind === 'notice' || rawKind === 'zombie'
-        ? 'report'
-        : 'task';
+      : rawKind === 'wechat'
+        ? 'wechat'
+        : rawKind === 'report' || rawKind === 'notice' || rawKind === 'zombie'
+          ? 'report'
+          : 'task';
   const text =
     typeof raw.text === 'string' ? raw.text : typeof raw.result === 'string' ? raw.result : '';
   const source =
@@ -186,9 +303,11 @@ function normalizeQueueEventItem(raw: Record<string, unknown>): AgentQueueItem |
       ? raw.source
       : kind === 'qq'
         ? 'qq'
-        : kind === 'task'
-          ? 'user'
-          : 'report';
+        : kind === 'wechat'
+          ? 'wechat'
+          : kind === 'task'
+            ? 'user'
+            : 'report';
   const state = raw.dispatchState ?? raw.deliveryState ?? meta.dispatchState ?? 'queued';
   const revision = raw.revision ?? meta.revision ?? 1;
   const parts = Array.isArray(raw.parts) ? (raw.parts as AgentQueueItem['parts']) : undefined;
@@ -205,6 +324,13 @@ function normalizeQueueEventItem(raw: Record<string, unknown>): AgentQueueItem |
       ...meta,
       dispatchState: state as QueueDispatchState,
       revision: typeof revision === 'number' ? revision : 1,
+      locked: Boolean(raw.queueLockSource === 'illegal' || raw.queueLockSource === 'manual'
+        || raw.queueLockManual || raw.queueLockAutoReport || meta.locked),
+      lockSource: raw.queueLockSource === 'illegal' || raw.queueLockSource === 'manual'
+        ? raw.queueLockSource : meta.lockSource,
+      illegalBatchId: raw.queueLockIllegalBatch ?? meta.illegalBatchId,
+      lockManual: Boolean(raw.queueLockSource === 'manual' || raw.queueLockManual || meta.lockManual),
+      lockAutoReport: Boolean(raw.queueLockAutoReport || meta.lockAutoReport),
     },
   } as AgentQueueItem;
 }
@@ -215,8 +341,7 @@ export const useQueueStore = create<QueueStore>((set, get) => {
       sessionId,
       editToken,
       () => get().edits[sessionId] ?? null,
-      (edit) => (get().queues[sessionId] ?? []).find((candidate) =>
-        queueIdMatches(candidate.id, edit.id))?.meta?.revision,
+      (edit) => edit.revision,
       (expiresAt) => {
         const active = get().edits[sessionId];
         if (!active || active.editToken !== editToken) return;
@@ -228,7 +353,7 @@ export const useQueueStore = create<QueueStore>((set, get) => {
         const active = get().edits[sessionId];
         if (!active || active.editToken !== editToken) return;
         stopEditLeaseRenewal(sessionId, editToken);
-        set((state) => ({ edits: { ...state.edits, [sessionId]: null } }));
+        set((state) => ({ edits: { ...state.edits, [sessionId]: { ...active, error: '编辑锁已失效，请复制正文后取消并重新编辑。' } } }));
         useUIStore.getState().showToast(
           `编辑锁已失效：${error instanceof Error ? error.message : String(error)}`,
           'error',
@@ -242,10 +367,19 @@ export const useQueueStore = create<QueueStore>((set, get) => {
   edits: {},
   batchSend: {},
   panelOpen: false,
+  queueSelection: {},
   sendingId: null,
   agentQueues: {},
   agentQueueLoadSeq: {},
   queueRevisions: {},
+  queuePaused: {},
+  queuePauseLoaded: {},
+  queuePauseUpdating: {},
+  agentReportsPaused: {},
+  agentReportsPauseLoaded: {},
+  agentReportsPauseUpdating: {},
+  queueLockUpdating: {},
+  lockedComposerModes: {},
   queueTombstones: {},
   queueDeliveredIds: {},
 
@@ -254,6 +388,7 @@ export const useQueueStore = create<QueueStore>((set, get) => {
   },
 
   loadAgentQueue: async (sessionId) => {
+    if (isLocalSessionIdentity(sessionId)) return;
     const requestSeq = (get().agentQueueLoadSeq[sessionId] ?? 0) + 1;
     set((state) => ({
       agentQueueLoadSeq: { ...state.agentQueueLoadSeq, [sessionId]: requestSeq },
@@ -281,12 +416,106 @@ export const useQueueStore = create<QueueStore>((set, get) => {
           && revisionAtRequest !== undefined
           && items.queueRevision === currentRevision
           && currentRevision === revisionAtRequest;
-        setSnapshot(set, sessionId, items, items.queueRevision, freshObservation);
+        const accepted = setSnapshot(set, sessionId, items, items.queueRevision,
+          freshObservation, items.agentReportsPaused, items.queuePaused);
+        if (!accepted && items.agentReportsPaused !== undefined
+            && canApplyAgentReportsPause(
+              accepted,
+              items.queueRevision,
+              get().queueRevisions[sessionId],
+            )) {
+          setAgentReportsPauseState(set, sessionId, items.agentReportsPaused);
+        }
       } catch {
         // Preserve the last authoritative snapshot; reconnect/session switch retries.
       }
     })();
     await request;
+  },
+
+  setQueuePaused: async (sessionId, paused) => {
+    if (get().queuePauseUpdating[sessionId]) return;
+    set((state) => ({ queuePauseUpdating: { ...state.queuePauseUpdating, [sessionId]: true } }));
+    try {
+      const items = await setSessionQueuePaused(sessionId, paused);
+      setSnapshot(set, sessionId, items, items.queueRevision, true, items.agentReportsPaused, items.queuePaused);
+    } catch (error) {
+      useUIStore.getState().showToast(
+        `队列暂停状态更新失败：${error instanceof Error ? error.message : String(error)}`, 'error',
+      );
+      await get().loadAgentQueue(sessionId);
+    } finally {
+      set((state) => ({ queuePauseUpdating: { ...state.queuePauseUpdating, [sessionId]: false } }));
+    }
+  },
+
+  setAgentReportsPaused: async (sessionId, paused) => {
+    set((state) => ({
+      agentReportsPauseUpdating: {
+        ...state.agentReportsPauseUpdating,
+        [sessionId]: true,
+      },
+    }));
+    try {
+      const items = await setSessionAgentReportsPaused(sessionId, paused);
+      const accepted = setSnapshot(set, sessionId, items, items.queueRevision,
+        true, items.agentReportsPaused, items.queuePaused);
+      if (!accepted && items.agentReportsPaused !== undefined
+          && canApplyAgentReportsPause(
+            accepted,
+            items.queueRevision,
+            get().queueRevisions[sessionId],
+          )) {
+        setAgentReportsPauseState(set, sessionId, items.agentReportsPaused);
+      }
+    } catch (error) {
+      useUIStore.getState().showToast(
+        `报告暂停状态更新失败：${error instanceof Error ? error.message : String(error)}`,
+        'error',
+      );
+      // The server may have committed before a connection failure. Reload the
+      // authoritative queue and pause state so this Session returns to truth.
+      await get().loadAgentQueue(sessionId);
+    } finally {
+      set((state) => ({
+        agentReportsPauseUpdating: {
+          ...state.agentReportsPauseUpdating,
+          [sessionId]: false,
+        },
+      }));
+    }
+  },
+
+  setQueueItemLocked: async (sessionId, itemId, locked) => {
+    set((state) => ({ queueLockUpdating: { ...state.queueLockUpdating, [sessionId]: true } }));
+    try {
+      const items = await setSessionQueueItemLocked(sessionId, itemId, locked);
+      setSnapshot(set, sessionId, items, items.queueRevision, true, items.agentReportsPaused, items.queuePaused);
+    } catch (error) {
+      useUIStore.getState().showToast(
+        `队列锁定失败：${error instanceof Error ? error.message : String(error)}`, 'error');
+      await get().loadAgentQueue(sessionId);
+    } finally {
+      set((state) => ({ queueLockUpdating: { ...state.queueLockUpdating, [sessionId]: false } }));
+    }
+  },
+
+  setQueueItemsLocked: async (sessionId, locked) => {
+    set((state) => ({ queueLockUpdating: { ...state.queueLockUpdating, [sessionId]: true } }));
+    try {
+      const items = await setSessionQueueItemsLocked(sessionId, locked);
+      setSnapshot(set, sessionId, items, items.queueRevision, true, items.agentReportsPaused, items.queuePaused);
+    } catch (error) {
+      useUIStore.getState().showToast(
+        `队列批量锁定失败：${error instanceof Error ? error.message : String(error)}`, 'error');
+      await get().loadAgentQueue(sessionId);
+    } finally {
+      set((state) => ({ queueLockUpdating: { ...state.queueLockUpdating, [sessionId]: false } }));
+    }
+  },
+
+  setLockedComposerMode: (sessionId, locked) => {
+    set((state) => ({ lockedComposerModes: { ...state.lockedComposerModes, [sessionId]: locked } }));
   },
 
   applyQueueEvent: (event) => {
@@ -296,9 +525,34 @@ export const useQueueStore = create<QueueStore>((set, get) => {
     if (
       event.queueRevision !== undefined &&
       currentRevision !== undefined &&
-      event.queueRevision <= currentRevision
-    )
+      event.queueRevision < currentRevision
+    ) return;
+    if (event.queuePaused !== undefined && event.queueRevision !== undefined) {
+      set((state) => ({
+        queuePaused: { ...state.queuePaused, [sid]: event.queuePaused! },
+        queuePauseLoaded: { ...state.queuePauseLoaded, [sid]: true },
+      }));
+    }
+    const missedRevision = event.queueRevision !== undefined
+      && (currentRevision === undefined || event.queueRevision > currentRevision + 1);
+    if (event.type === 'queue.snapshot' && Array.isArray(event.items)) {
+      const accepted = setSnapshot(set, sid, event.items, event.queueRevision,
+        true, event.agentReportsPaused, event.queuePaused);
+      if (!accepted && event.agentReportsPaused !== undefined
+          && canApplyAgentReportsPause(false, event.queueRevision, get().queueRevisions[sid])) {
+        setAgentReportsPauseState(set, sid, event.agentReportsPaused);
+      }
       return;
+    }
+    if (event.queueRevision !== undefined
+        && currentRevision !== undefined
+        && event.queueRevision === currentRevision) {
+      if (event.agentReportsPaused !== undefined
+          && canApplyAgentReportsPause(false, event.queueRevision, currentRevision)) {
+        setAgentReportsPauseState(set, sid, event.agentReportsPaused);
+      }
+      return;
+    }
     const current = get().queues[sid] ?? [];
     const id = event.queueItemId ?? event.item?.queueItemId ?? event.item?.id;
     let next = current;
@@ -310,12 +564,14 @@ export const useQueueStore = create<QueueStore>((set, get) => {
       );
       if (item && !blocked && item.meta?.dispatchState === 'queued') {
         const index = current.findIndex((candidate) => queueIdMatches(candidate.id, item.id));
-        next =
-          index < 0
-            ? [...current, item]
-            : current.map((candidate, candidateIndex) =>
-                candidateIndex === index ? item : candidate,
-              );
+        if (index < 0) {
+          const rawPosition = event.item.position;
+          const position = typeof rawPosition === 'number' && Number.isInteger(rawPosition)
+            ? Math.max(0, Math.min(rawPosition, current.length)) : current.length;
+          next = [...current.slice(0, position), item, ...current.slice(position)];
+        } else {
+          next = current.map((candidate, candidateIndex) => candidateIndex === index ? item : candidate);
+        }
       }
     } else if (event.type === 'queue.item_updated' && event.item && typeof id === 'string') {
       const item = normalizeQueueEventItem(event.item);
@@ -337,7 +593,7 @@ export const useQueueStore = create<QueueStore>((set, get) => {
         nextTombstones.add(canonical);
         const activeEdit = state.edits[sid];
         const edits = activeEdit && queueIdMatches(activeEdit.id, id)
-          ? { ...state.edits, [sid]: null }
+          ? { ...state.edits, [sid]: { ...activeEdit, error: '条目已删除，无法保存。' } }
           : state.edits;
         return {
           queueTombstones: { ...state.queueTombstones, [sid]: nextTombstones },
@@ -362,7 +618,7 @@ export const useQueueStore = create<QueueStore>((set, get) => {
           edits: state.edits[sid] && [...delivered].some((id) =>
             queueIdMatches(state.edits[sid]!.id, id),
           )
-            ? { ...state.edits, [sid]: null }
+            ? { ...state.edits, [sid]: { ...state.edits[sid]!, error: '条目已出队，无法保存。' } }
             : state.edits,
         }));
         next = current.filter((candidate) => ![...delivered].some((id) => queueIdMatches(candidate.id, id)));
@@ -370,7 +626,18 @@ export const useQueueStore = create<QueueStore>((set, get) => {
     }
     if (next !== current || event.queueRevision !== undefined) {
       const accepted = setSnapshot(set, sid, next, event.queueRevision);
+      if (event.agentReportsPaused !== undefined
+          && canApplyAgentReportsPause(
+            accepted,
+            event.queueRevision,
+            get().queueRevisions[sid],
+          )) {
+        setAgentReportsPauseState(set, sid, event.agentReportsPaused);
+      }
       if (!accepted) return;
+      // A later incremental event cannot reconstruct skipped lock/order
+      // mutations. Fetch the complete durable projection at this revision.
+      if (missedRevision) void get().loadAgentQueue(sid);
       if (event.type === 'queue.item_updated' && event.item) {
         const item = normalizeQueueEventItem(event.item);
         if (item?.meta?.dispatchState === 'queued') {
@@ -399,35 +666,38 @@ export const useQueueStore = create<QueueStore>((set, get) => {
     try {
       const messageId = clientId || clientMessageId();
       const result = parts
-        ? await enqueueSessionMessage(sid, text, messageId, parts)
-        : await enqueueSessionMessage(sid, text, messageId);
-      const current = get().queues[sid] ?? [];
-      const next = current.some((item) => queueIdMatches(item.id, result.item.id))
-        ? current
-        : [...current, result.item];
-      const accepted = setSnapshot(set, sid, next, result.queueRevision);
-      // Re-check the same cached, Session-keyed runtime registry at the
-      // append boundary.  This covers a non-running→running transition
-      // during HTTP enqueue without another request or an async wait.
-      // Unknown/null/mismatched entries intentionally retain the historical
-      // optimistic behavior; only a confirmed current-session `running`
-      // state suppresses the row.
-      if (accepted
-          && !get().queueTombstones[sid]?.has(canonicalQueueId(result.item.id))
-          && !get().queueDeliveredIds[sid]?.has(canonicalQueueId(result.item.id))
-          && options?.appendOptimisticHistory !== false
-          && !isRuntimeWorkerRunning(sid)) {
-        useSessionStore.getState().appendQueuedMessage(sid, result.item);
+        ? await enqueueSessionMessage(sid, text, messageId, parts, options?.locked)
+        : await enqueueSessionMessage(sid, text, messageId, undefined, options?.locked);
+      if (options?.locked && result.item.meta?.locked !== true) {
+        throw new Error('服务端未确认消息已锁定');
       }
+      const current = get().queues[sid] ?? [];
+      const next = result.items ?? (current.some((item) => queueIdMatches(item.id, result.item.id))
+        ? current
+        : [...current, result.item]);
+      const accepted = setSnapshot(set, sid, next, result.queueRevision,
+        Array.isArray(result.items), result.agentReportsPaused, result.queuePaused);
+      if (!accepted && result.agentReportsPaused !== undefined
+          && canApplyAgentReportsPause(
+            accepted,
+            result.queueRevision,
+            get().queueRevisions[sid],
+          )) {
+        setAgentReportsPauseState(set, sid, result.agentReportsPaused);
+      }
+      // An enqueue receipt proves persistence, never provider hand-off.
+      // Keep feedback in the queue/toast; only the server delivery event or
+      // canonical history may project a sent message into the conversation.
       useUIStore.getState().showToast('消息已进入服务端队列');
       return true;
     } catch (error) {
       useUIStore
         .getState()
         .showToast(
-          `消息尚未入队：${error instanceof Error ? error.message : String(error)}`,
+          `未确认消息入队：${error instanceof Error ? error.message : String(error)}`,
           'error',
         );
+      if (options?.propagateFailure) throw error;
       return false;
     }
   },
@@ -438,7 +708,7 @@ export const useQueueStore = create<QueueStore>((set, get) => {
 
   startEdit: (id) => {
     const sid = useSessionStore.getState().currentSessionId;
-    if (!sid) return;
+    if (!sid || useSessionStore.getState().sessions.find((session) => session.id === sid)?.readonlySession) return;
     // Preserve the first edit transaction, including an in-flight PATCH.
     // Repeated clicks must not replace its draft or token.
     if (get().edits[sid]) return;
@@ -446,8 +716,6 @@ export const useQueueStore = create<QueueStore>((set, get) => {
     const item = items.find((candidate) => queueIdMatches(candidate.id, id));
     if (
       !item ||
-      item.kind !== 'task' ||
-      item.source !== 'user' ||
       item.meta?.dispatchState !== 'queued'
     )
       return;
@@ -455,13 +723,18 @@ export const useQueueStore = create<QueueStore>((set, get) => {
     const serverToken = clientMessageId();
     const edit: QueuedEdit = {
       id: item.id,
-      text: item.text,
-      originalText: item.text,
+      // Never expose a truncated report preview as an editable body.
+      text: '',
+      originalText: '',
+      revision: item.meta?.revision,
       index: items.findIndex((candidate) => queueIdMatches(candidate.id, id)),
       createdAt: typeof item.createdAt === 'number' ? item.createdAt : Date.now(),
       editToken,
       serverToken,
       acquiring: true,
+      kind: item.kind,
+      originalAttachments: [],
+      attachments: [],
     };
     set((state) => ({
       edits: {
@@ -469,8 +742,11 @@ export const useQueueStore = create<QueueStore>((set, get) => {
         [sid]: edit,
       },
     }));
-    void acquireSessionQueueItemEdit(sid, item.id, serverToken, item.meta?.revision)
-      .then(({ expiresAt }) => {
+    void acquireSessionQueueItemEdit(sid, item.id, serverToken, item.meta?.revision, true)
+      .then(({ expiresAt, text, bodyFormat, revision }) => {
+        if (typeof text !== 'string' || typeof revision !== 'number') {
+          throw new Error('编辑锁未返回完整正文，无法安全编辑');
+        }
         const current = get().edits[sid];
         if (!current || current.editToken !== editToken) {
           // A canceled or removed edit may acquire its server lease after the
@@ -478,6 +754,9 @@ export const useQueueStore = create<QueueStore>((set, get) => {
           void releaseSessionQueueItemEdit(sid, item.id, serverToken).catch(() => {});
           return;
         }
+        const decoded = current.kind === 'task' && bodyFormat !== 'json'
+          ? queueComposerFromBody(text, bodyFormat, sid) : null;
+        const composerState = decoded ? { composerValue: decoded.value, attachments: decoded.attachments, originalAttachments: [] } : {};
         if (current.cancelRequested) {
           set((state) => ({
             edits: { ...state.edits, [sid]: { ...current, acquiring: false, releasing: true } },
@@ -498,7 +777,11 @@ export const useQueueStore = create<QueueStore>((set, get) => {
               set((state) => ({
                 edits: {
                   ...state.edits,
-                  [sid]: { ...latest, acquiring: false, releasing: false, cancelRequested: false },
+                  [sid]: {
+                    ...latest, acquiring: false, releasing: false, cancelRequested: false,
+                    text, originalText: text, bodyFormat, revision, leaseExpiresAt: expiresAt,
+                    ...composerState,
+                  },
                 },
               }));
               startLeaseRenewal(sid, editToken);
@@ -512,12 +795,26 @@ export const useQueueStore = create<QueueStore>((set, get) => {
         const acquired: QueuedEdit = {
           ...current,
           acquiring: false,
+          text,
+          originalText: text,
+          bodyFormat,
+          revision,
           leaseExpiresAt: expiresAt,
+          // Attachment parts already on the item: read-only chips, preserved
+          // server-side by identity/order on save. Parsed from the parts
+          // template returned under the lease (never from the row preview).
+          originalAttachments: bodyFormat === 'parts'
+            ? parseTemplateAttachments(text)
+            : [],
+          ...composerState,
         };
         set((state) => ({ edits: { ...state.edits, [sid]: acquired } }));
         startLeaseRenewal(sid, editToken);
       })
       .catch((error) => {
+        // A malformed body response can follow a successful lease acquisition,
+        // even after this Session/edit has disappeared. Release only our token.
+        void releaseSessionQueueItemEdit(sid, item.id, serverToken).catch(() => {});
         const current = get().edits[sid];
         if (!current || current.editToken !== editToken) return;
         stopEditLeaseRenewal(sid, editToken);
@@ -533,7 +830,31 @@ export const useQueueStore = create<QueueStore>((set, get) => {
     const sid = useSessionStore.getState().currentSessionId;
     const edit = sid ? get().edits[sid] : null;
     if (!sid || !edit || edit.saving || edit.acquiring || edit.releasing) return;
-    set((state) => ({ edits: { ...state.edits, [sid]: { ...edit, text } } }));
+    set((state) => ({ edits: { ...state.edits, [sid]: { ...edit, text,
+      ...(edit.composerValue && !edit.attachments?.length ? { composerValue: queueComposerFromBody(text, 'text').value } : {}),
+    } } }));
+  },
+
+  updateEditComposer: (composerValue) => {
+    const sid = useSessionStore.getState().currentSessionId;
+    const edit = sid ? get().edits[sid] : null;
+    if (!sid || !edit || edit.saving || edit.acquiring || edit.releasing) return;
+    set((state) => ({ edits: { ...state.edits, [sid]: { ...edit, composerValue } } }));
+  },
+
+  updateEditAttachments: (sessionId, update) => {
+    const edit = get().edits[sessionId];
+    if (!edit || edit.saving || edit.acquiring || edit.releasing) return;
+    set((state) => {
+      const currentEdit = state.edits[sessionId];
+      if (!currentEdit || currentEdit.saving) return state;
+      return {
+        edits: {
+          ...state.edits,
+          [sessionId]: { ...currentEdit, attachments: update(currentEdit.attachments ?? []) },
+        },
+      };
+    });
   },
 
   saveEdit: () => {
@@ -543,9 +864,27 @@ export const useQueueStore = create<QueueStore>((set, get) => {
       ? (get().queues[sid] ?? []).find((candidate) => edit && queueIdMatches(candidate.id, edit.id))
       : null;
     if (!sid || !edit || edit.saving || edit.acquiring || edit.releasing || !item
-        || !edit.serverToken) return;
+        || !edit.serverToken || edit.error || item.meta?.dispatchState !== 'queued'
+        || useSessionStore.getState().sessions.find((session) => session.id === sid)?.readonlySession) return;
+    // An unfinished upload/registration must never be committed, and a 'ready'
+    // chip without a server attachment id is an invariant break that must block
+    // saving rather than be silently dropped.
+    if ((edit.attachments ?? []).some(
+      (attachment) => attachment.status !== 'ready' || !attachment.attachmentId,
+    )) return;
+    // Only opaque attachment ids travel; the server resolves every other
+    // field from the Session attachment registry.
+    const newAttachmentParts = (edit.attachments ?? [])
+      .filter((attachment) => attachment.status === 'ready' && attachment.attachmentId)
+      .map((attachment) => ({ type: 'attachment' as const, attachmentId: attachment.attachmentId! }));
+    const requestedParts = newAttachmentParts.length > 0 ? newAttachmentParts : undefined;
+    if (edit.leaseExpiresAt !== undefined && edit.leaseExpiresAt * 1000 <= Date.now()) {
+      stopEditLeaseRenewal(sid, edit.editToken);
+      set((state) => ({ edits: { ...state.edits, [sid]: { ...edit, error: '编辑锁已过期，请复制正文后取消并重新编辑。' } } }));
+      return;
+    }
     const editToken = edit.editToken ?? ++editTokenSeq;
-    const text = edit.text.trim() ? edit.text : edit.originalText;
+    const text = edit.text;
     stopEditLeaseRenewal(sid, editToken);
     set((state) => {
       const current = state.edits[sid];
@@ -558,8 +897,10 @@ export const useQueueStore = create<QueueStore>((set, get) => {
           sid,
           edit.id,
           text,
-          item.meta?.revision,
+          edit.revision,
           edit.serverToken,
+          requestedParts,
+          edit.composerValue ? queueComposerToParts(edit.composerValue, edit.attachments ?? []) : undefined,
         );
         const active = get().edits[sid];
         if (!active || active.editToken !== editToken) return;
@@ -655,6 +996,13 @@ export const useQueueStore = create<QueueStore>((set, get) => {
   },
   togglePanel: () => set((state) => ({ panelOpen: !state.panelOpen })),
   setPanelOpen: (open) => set({ panelOpen: open }),
+  setQueueSelection: (sessionId, itemId) => {
+    if (!sessionId) return;
+    if ((get().queueSelection[sessionId] ?? null) === itemId) return;
+    set((state) => ({
+      queueSelection: { ...state.queueSelection, [sessionId]: itemId },
+    }));
+  },
   flush: () => {},
 
   removeSession: (sessionId) => {
@@ -676,10 +1024,33 @@ export const useQueueStore = create<QueueStore>((set, get) => {
       const queueTombstones = { ...state.queueTombstones };
       const queueDeliveredIds = { ...state.queueDeliveredIds };
       const queueRevisions = { ...state.queueRevisions };
+      const queuePaused = { ...state.queuePaused };
+      const queuePauseLoaded = { ...state.queuePauseLoaded };
+      const queuePauseUpdating = { ...state.queuePauseUpdating };
+      delete queuePaused[sessionId];
+      delete queuePauseLoaded[sessionId];
+      delete queuePauseUpdating[sessionId];
+      const agentReportsPaused = { ...state.agentReportsPaused };
+      const agentReportsPauseLoaded = { ...state.agentReportsPauseLoaded };
+      const agentReportsPauseUpdating = { ...state.agentReportsPauseUpdating };
+      const queueLockUpdating = { ...state.queueLockUpdating };
+      const lockedComposerModes = { ...state.lockedComposerModes };
+      const queueSelection = { ...state.queueSelection };
       delete queueTombstones[sessionId];
       delete queueDeliveredIds[sessionId];
       delete queueRevisions[sessionId];
-      return { queues, edits, agentQueues, queueTombstones, queueDeliveredIds, queueRevisions };
+      delete agentReportsPaused[sessionId];
+      delete agentReportsPauseLoaded[sessionId];
+      delete agentReportsPauseUpdating[sessionId];
+      delete queueLockUpdating[sessionId];
+      delete lockedComposerModes[sessionId];
+      delete queueSelection[sessionId];
+      return {
+        queues, edits, agentQueues, queueTombstones, queueDeliveredIds, queueRevisions,
+        queuePaused, queuePauseLoaded, queuePauseUpdating,
+        agentReportsPaused, agentReportsPauseLoaded, agentReportsPauseUpdating,
+        queueLockUpdating, lockedComposerModes, queueSelection,
+      };
     });
   },
 
@@ -729,7 +1100,7 @@ export const useQueueStore = create<QueueStore>((set, get) => {
         next.map((item) => item.id),
         get().queueRevisions[sid],
       );
-      setSnapshot(set, sid, items, items.queueRevision);
+      setSnapshot(set, sid, items, items.queueRevision, false, items.agentReportsPaused, items.queuePaused);
     } catch {
       await get().loadAgentQueue(sid);
     }

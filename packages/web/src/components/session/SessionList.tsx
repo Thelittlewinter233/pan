@@ -4,9 +4,10 @@ import { useSessionStore } from '@/stores/sessionStore';
 import { useUIStore } from '@/stores/uiStore';
 import { useAppSettingsStore } from '@/stores/appSettingsStore';
 import { SessionItem } from './SessionItem';
-import { effectiveWorkspaceIds, getSessionListCandidates, scopeSessionsByWorkspace } from '@/utils/sessionFilters';
+import { ALL_WORKSPACES, UNGROUPED_WORKSPACES, effectiveWorkspaceIds, getSessionListCandidates, scopeSessionsByWorkspace } from '@/utils/sessionFilters';
+import { useHistorySearchViewStore } from '@/stores/historySearchViewStore';
 import { CREATE_WORKSPACE_DROP_TARGET_ID, useWorkspaceStore } from '@/stores/workspaceStore';
-import { resolveDropZone, decideManagerDrop, DRAG_START_THRESHOLD_PX, buildManagerEdges, collectDescendants } from './sessionDrag';
+import { resolveDropZone, decideManagerDrop, DRAG_START_THRESHOLD_PX, buildManagerEdges, collectDescendants, movePinnedSessionId, orderPinnedWithinGroups, sessionPinGroupKey } from './sessionDrag';
 import type { DropZone } from './sessionDrag';
 import { isMockMode, applyMockSessionUpdate } from '@/demo/mockBackend';
 import { claimSession, unclaimSession, reorderSessions } from '@/services/api';
@@ -78,19 +79,6 @@ function buildManagerTree(sessions: Session[]): ManagerNode[] {
   return sessions
     .filter((s) => !parentOf.has(s.id))
     .map((s) => nodeMap.get(s.id)!);
-}
-
-/** All descendant ids of a tree node (excluding the node itself). */
-function collectDescendantIds(node: ManagerNode): string[] {
-  const ids: string[] = [];
-  const walk = (n: ManagerNode) => {
-    for (const c of n.children) {
-      ids.push(c.session.id);
-      walk(c);
-    }
-  };
-  walk(node);
-  return ids;
 }
 
 /** Full desired session order after an EDGE drop: the dragged session is
@@ -217,6 +205,8 @@ async function persistSessionDrop(p: RealDropParams): Promise<void> {
 }
 
 export function SessionList({ onSessionClick, onSessionMenu }: SessionListProps) {
+  const matchingSessionIds = useHistorySearchViewStore((state) => state.matchingSessionIds);
+  const historySearchPreparing = useHistorySearchViewStore((state) => state.preparing);
   const sessions = useSessionStore((s) => s.sessions);
   const sessionsLoading = useSessionStore((s) => s.sessionsLoading);
   const currentSessionId = useSessionStore((s) => s.currentSessionId);
@@ -229,12 +219,11 @@ export function SessionList({ onSessionClick, onSessionMenu }: SessionListProps)
     searchQuery,
     sortBy,
     specialFilters,
+    adapterFilters,
     hiddenSessionIds,
     collapsedGroups,
     customOrder,
     toggleGroupCollapse,
-    addCollapsedGroups,
-    removeCollapsedGroups,
     pruneCollapsedGroups,
     pruneHiddenSessions,
     showToast,
@@ -245,19 +234,27 @@ export function SessionList({ onSessionClick, onSessionMenu }: SessionListProps)
     searchQuery: s.searchQuery,
     sortBy: s.sortBy,
     specialFilters: s.specialFilters,
+    adapterFilters: s.adapterFilters,
     hiddenSessionIds: s.hiddenSessionIds,
     collapsedGroups: s.collapsedGroups,
     customOrder: s.customOrder,
     toggleGroupCollapse: s.toggleGroupCollapse,
-    addCollapsedGroups: s.addCollapsedGroups,
-    removeCollapsedGroups: s.removeCollapsedGroups,
     pruneCollapsedGroups: s.pruneCollapsedGroups,
     pruneHiddenSessions: s.pruneHiddenSessions,
     showToast: s.showToast,
     dragEnabled: s.dragEnabled,
     activeWorkspaceId: s.activeWorkspaceId,
   })));
-  const defaultGroupBy = useAppSettingsStore((s) => s.defaultGroupBy);
+  const { defaultGroupBy, showGroupBy, settingsLoaded } = useAppSettingsStore(useShallow((s) => ({
+    defaultGroupBy: s.defaultGroupBy,
+    showGroupBy: s.showGroupBy,
+    settingsLoaded: s.loaded,
+  })));
+  // Hiding the control also forces the list and drag grouping semantics to
+  // Manager, even while settings are still hydrating or legacy UI state says
+  // workdir/off. Keep this derived value synchronous to avoid a first-paint
+  // flash of the old grouping.
+  const effectiveGroupBy = showGroupBy ? groupBy : 'manager';
 
   // Default grouping: adopt the app-settings default as long as the user has
   // never manually picked a grouping (nothing persisted to pan:groupBy AND the
@@ -267,27 +264,48 @@ export function SessionList({ onSessionClick, onSessionMenu }: SessionListProps)
   // groups manually.
   useLayoutEffect(() => {
     const ui = useUIStore.getState();
+    if (!settingsLoaded) {
+      // If a user opens Preferences before the initial settings GET settles,
+      // showing the control still resumes from Manager instead of resurrecting
+      // an old browser-local mode.
+      if (showGroupBy && ui.groupBy !== 'manager') ui.setGroupBy('manager');
+      return;
+    }
+    if (!showGroupBy) {
+      if (ui.groupBy !== 'manager') ui.setGroupBy('manager');
+      return;
+    }
     if (localStorage.getItem('pan:groupBy') === null && ui.groupBy === 'none') {
       useUIStore.setState({ groupBy: defaultGroupBy });
     }
-  }, [defaultGroupBy]);
+  }, [defaultGroupBy, showGroupBy, settingsLoaded]);
 
-  // Keep collapsedGroups consistent with the live tree: drop stale keys left
-  // behind by session placeholders (`__pending_*`) or deleted sessions so a
-  // newly-joined manager group toggles immediately without a refresh.
+  // Keep collapsedGroups consistent with the live tree. The persisted set
+  // holds BOTH key namespaces — manager mode keys are session ids, workdir
+  // mode keys are normalized workdir paths — so the valid-key set here is the
+  // UNION across modes: pruning by the current grouping only would delete the
+  // other mode's saved collapse preferences on every groupBy switch. Guarded
+  // on sessions.length > 0 (like pruneHiddenSessions below) so the pre-fetch
+  // cold load never wipes persisted state. The valid set is built from the
+  // full session store list — NOT the search/filter/workspace-filtered view —
+  // so temporarily invisible sessions keep their collapse state; only keys
+  // whose session no longer exists (stale `__pending_*` placeholders, deleted
+  // sessions) or whose workdir has no remaining session are dropped.
   useEffect(() => {
-    if (groupBy !== 'manager' && groupBy !== 'workdir') return;
+    if (sessions.length === 0) return;
     const valid = new Set<string>();
-    if (groupBy === 'manager') {
-      for (const s of sessions) valid.add(s.id);
-    } else {
-      for (const s of sessions) {
-        if (s.workdir) valid.add(stripPrefix(s.workdir));
+    let hasNoWorkdir = false;
+    for (const s of sessions) {
+      valid.add(s.id);
+      if (s.workdir) {
+        valid.add(stripPrefix(s.workdir));
+      } else {
+        hasNoWorkdir = true;
       }
-      valid.add('__no_workdir');
     }
+    if (hasNoWorkdir) valid.add('__no_workdir');
     pruneCollapsedGroups(valid);
-  }, [sessions, groupBy, pruneCollapsedGroups]);
+  }, [sessions, pruneCollapsedGroups]);
 
   // Keep hiddenSessionIds consistent with the live list: drop ids of deleted
   // sessions. Guarded on sessions.length > 0 so a fresh page load (empty list
@@ -306,8 +324,21 @@ export function SessionList({ onSessionClick, onSessionMenu }: SessionListProps)
       hiddenSessionIds,
       searchQuery,
       specialFilters,
+      adapterFilters,
       activeWorkspaceId,
+      matchingSessionIds,
     })];
+
+    // Preview/status updates can rerun this sort during streaming. Build the
+    // ranks and timestamps once per list instead of rescanning/parsing them
+    // inside every comparator call.
+    const customRanks = sortBy === 'custom'
+      ? new Map(customOrder.map((id, index) => [id, index] as const))
+      : null;
+    const updatedTimes = sortBy === 'recent' ? new Map(filtered.map((session) => [
+      session.id,
+      session.updatedAt ? new Date(session.updatedAt).getTime() : 0,
+    ] as const)) : null;
 
     filtered.sort((a, b) => {
       if (sortBy === 'custom') {
@@ -316,10 +347,7 @@ export function SessionList({ onSessionClick, onSessionMenu }: SessionListProps)
         // ids keep their input (= authoritative server) relative order instead
         // of re-sorting by updatedAt, so the server-persisted order survives a
         // refresh even when customOrder is partial/stale.
-        const rank = (id: string) => {
-          const i = customOrder.indexOf(id);
-          return i === -1 ? Number.MAX_SAFE_INTEGER : i;
-        };
+        const rank = (id: string) => customRanks?.get(id) ?? Number.MAX_SAFE_INTEGER;
         const diff = rank(a.id) - rank(b.id);
         if (diff !== 0) return diff;
         if (rank(a.id) === Number.MAX_SAFE_INTEGER) return 0;
@@ -327,18 +355,19 @@ export function SessionList({ onSessionClick, onSessionMenu }: SessionListProps)
       if (sortBy === 'name') {
         return a.name.localeCompare(b.name);
       }
-      const aTime = a.updatedAt ? new Date(a.updatedAt).getTime() : 0;
-      const bTime = b.updatedAt ? new Date(b.updatedAt).getTime() : 0;
+      const aTime = updatedTimes?.get(a.id) ?? 0;
+      const bTime = updatedTimes?.get(b.id) ?? 0;
       if (aTime !== bTime) return bTime - aTime;
       return a.name.localeCompare(b.name);
     });
+    const pinnedOrdered = orderPinnedWithinGroups(filtered, effectiveGroupBy);
 
     const groups: { key: string; label: string; sessions: Session[] }[] = [];
-    if (groupBy === 'workdir') {
+    if (effectiveGroupBy === 'workdir') {
       const map = new Map<string, Session[]>();
       const uncategorized: Session[] = [];
 
-      for (const s of filtered) {
+      for (const s of pinnedOrdered) {
         if (s.workdir) {
           const dir = stripPrefix(s.workdir);
           const existing = map.get(dir);
@@ -366,7 +395,7 @@ export function SessionList({ onSessionClick, onSessionMenu }: SessionListProps)
       }
     }
 
-    const managerTree = groupBy === 'manager' ? buildManagerTree(filtered) : [];
+    const managerTree = effectiveGroupBy === 'manager' ? buildManagerTree(pinnedOrdered) : [];
 
     // Normal mode, sessions exist IN THE ACTIVE WORKSPACE, but every one of
     // them is hidden. Scoped so a fully-hidden workspace still explains itself.
@@ -376,8 +405,8 @@ export function SessionList({ onSessionClick, onSessionMenu }: SessionListProps)
       scopedSessions.length > 0 &&
       scopedSessions.every((session) => hiddenSessionIds.has(session.id));
 
-    return { filtered, grouped: groups, managerTree, allHidden };
-  }, [sessions, searchQuery, sortBy, customOrder, groupBy, specialFilters, hiddenSessionIds, multiSelectMode, activeWorkspaceId]);
+    return { filtered: pinnedOrdered, grouped: groups, managerTree, allHidden };
+  }, [sessions, searchQuery, sortBy, customOrder, effectiveGroupBy, specialFilters, adapterFilters, hiddenSessionIds, multiSelectMode, activeWorkspaceId, matchingSessionIds]);
 
   // ── 稳定回调：SessionItem 已 React.memo，靠这些引用稳定才不触发无关卡片重渲染 ──
   // multiSelectMode / toggleSelection / selectSession 通过 getState() 读取最新值，
@@ -429,6 +458,8 @@ export function SessionList({ onSessionClick, onSessionMenu }: SessionListProps)
   // ghost near the cursor plus per-card highlight (center band → manage,
   // edge band → insert line). Drop executes a local mock action.
   const [dragId, setDragId] = useState<string | null>(null);
+  const [dragMode, setDragMode] = useState<'session' | 'pin' | null>(null);
+  const dragModeRef = useRef<'session' | 'pin' | null>(null);
   const [centerTargetId, setCenterTargetId] = useState<string | null>(null);
   const [insertTarget, setInsertTarget] = useState<{
     id: string;
@@ -441,7 +472,9 @@ export function SessionList({ onSessionClick, onSessionMenu }: SessionListProps)
   const [railZone, setRailZone] = useState(false);
   const [railTarget, setRailTarget] = useState<string | null>(null);
   const railZoneRef = useRef(false);
-  const railTargetName = railTarget && railTarget !== 'all'
+  // 'all' and the virtual 'ungrouped' tab both mean "no membership"; neither
+  // resolves to a workspace name.
+  const railTargetName = railTarget && railTarget !== ALL_WORKSPACES && railTarget !== UNGROUPED_WORKSPACES
     ? workspaces.find((w) => w.id === railTarget)?.name ?? '工作区'
     : null;
   /** Currently highlighted rail tab element (Tailwind ring utilities). */
@@ -550,6 +583,7 @@ export function SessionList({ onSessionClick, onSessionMenu }: SessionListProps)
     x: number;
     y: number;
     dragging: boolean;
+    mode: 'session' | 'pin';
   } | null>(null);
   // True once a real drag ran; the click that follows a drag release must not
   // select the session. Cleared on the next press / after a short delay.
@@ -614,7 +648,10 @@ export function SessionList({ onSessionClick, onSessionMenu }: SessionListProps)
       if (rect.height === 0) continue;
       if (clientY >= rect.top && clientY < rect.bottom) {
         const id = el.dataset.sessionCardId!;
-        const zone = resolveDropZone(rect.top, rect.height, clientY);
+        let zone = resolveDropZone(rect.top, rect.height, clientY);
+        if (dragModeRef.current === 'pin' && zone === 'center') {
+          zone = clientY < rect.top + rect.height / 2 ? 'before' : 'after';
+        }
         dropTargetRef.current = { id, zone };
         setCenterTargetId(zone === 'center' ? id : null);
         setInsertTarget(
@@ -674,6 +711,8 @@ export function SessionList({ onSessionClick, onSessionMenu }: SessionListProps)
     stopAutoScroll();
     setDragId(null);
     dragIdRef.current = null;
+    setDragMode(null);
+    dragModeRef.current = null;
     pressRef.current = null;
     clearDragFeedback();
     // Rail drop state must not survive the drag either.
@@ -711,7 +750,9 @@ export function SessionList({ onSessionClick, onSessionMenu }: SessionListProps)
       press.dragging = true;
       didDragRef.current = true;
       dragIdRef.current = press.id;
+      dragModeRef.current = press.mode;
       setDragId(press.id);
+      setDragMode(press.mode);
     }
     positionGhost(e.clientX, e.clientY);
     if (updateRailHover(e.clientX, e.clientY)) {
@@ -735,6 +776,54 @@ export function SessionList({ onSessionClick, onSessionMenu }: SessionListProps)
     const target = dropTargetRef.current;
     if (!dragCurrent) {
       finishDrag();
+      return;
+    }
+    if (press.mode === 'pin') {
+      const state = useSessionStore.getState();
+      const dragged = state.sessions.find((session) => session.id === dragCurrent);
+      const droppedOnRail = railZoneRef.current;
+      let targetSession = target
+        ? state.sessions.find((session) => session.id === target.id)
+        : undefined;
+      let zone: 'before' | 'after' = target?.zone === 'before' ? 'before' : 'after';
+      if (!targetSession && !droppedOnRail && dragged) {
+        const groupKey = sessionPinGroupKey(dragged, effectiveGroupBy);
+        const siblings = filteredRef.current.filter(
+          (session) => sessionPinGroupKey(session, effectiveGroupBy) === groupKey,
+        );
+        targetSession = siblings.filter((session) => session.id !== dragged.id).at(-1);
+        zone = 'after';
+      }
+      finishDrag();
+      if (!dragged || dragged.id.startsWith('__pending_')) return;
+      const rejectCrossGroup = () => {
+        showToast(`${isMockMode() ? '[Mock] ' : ''}Pinned Sessions can only be reordered within the same group`, 'error');
+      };
+      if (droppedOnRail) {
+        rejectCrossGroup();
+        return;
+      }
+      if (!targetSession) return;
+      const currentGroupBy = effectiveGroupBy;
+      if (sessionPinGroupKey(dragged, currentGroupBy) !== sessionPinGroupKey(targetSession, currentGroupBy)) {
+        rejectCrossGroup();
+        return;
+      }
+      const groupKey = sessionPinGroupKey(dragged, currentGroupBy);
+      const pinnedIds = filteredRef.current
+        .filter((session) => session.pinned && sessionPinGroupKey(session, currentGroupBy) === groupKey)
+        .map((session) => session.id);
+      const nextIds = movePinnedSessionId(
+        pinnedIds,
+        dragged.id,
+        targetSession.id,
+        zone,
+        targetSession.pinned === true,
+      );
+      if (nextIds.length === pinnedIds.length && nextIds.every((id, index) => id === pinnedIds[index])) return;
+      void state.reorderPinned(nextIds).catch((error) => {
+        showToast(error instanceof Error ? error.message : 'Pinned Session reorder failed', 'error');
+      });
       return;
     }
     // Workspace drop: over a rail tab → move (single membership + cascade).
@@ -765,15 +854,20 @@ export function SessionList({ onSessionClick, onSessionMenu }: SessionListProps)
           });
         return;
       }
+      // The virtual scopes ('all' / 'ungrouped') are not workspace ids: both
+      // map to `null`, which moveSessions turns into the existing "no
+      // membership" request (`workspaceIds: []`). A sentinel must never be
+      // sent to the backend as a real workspace.
+      const clearsMembership = railTargetId === ALL_WORKSPACES || railTargetId === UNGROUPED_WORKSPACES;
       void useWorkspaceStore.getState()
-        .moveSessions([dragged.id], railTargetId === 'all' ? null : railTargetId)
+        .moveSessions([dragged.id], clearsMembership ? null : railTargetId)
         .then((changed) => {
           if (changed.length === 0) {
-            showToast(railTargetId === 'all' ? '该会话当前未归属任何工作区' : '该会话已在该工作区', 'error');
+            showToast(clearsMembership ? '该会话当前未归属任何工作区' : '该会话已在该工作区', 'error');
             return;
           }
           const followed = changed.length - 1;
-          const label = railTargetId === 'all'
+          const label = clearsMembership
             ? null
             : useWorkspaceStore.getState().workspaces.find((w) => w.id === railTargetId)?.name ?? '工作区';
           if (!label) showToast(`已将「${dragged.name}」移出工作区（未分组）`);
@@ -928,7 +1022,14 @@ export function SessionList({ onSessionClick, onSessionMenu }: SessionListProps)
       e.stopPropagation();
       if (didDragClearTimerRef.current) clearTimeout(didDragClearTimerRef.current);
       didDragRef.current = false;
-      pressRef.current = { id, x: e.clientX, y: e.clientY, dragging: false };
+      const session = useSessionStore.getState().sessions.find((item) => item.id === id);
+      pressRef.current = {
+        id,
+        x: e.clientX,
+        y: e.clientY,
+        dragging: false,
+        mode: session?.pinned ? 'pin' : 'session',
+      };
       window.addEventListener('pointermove', windowPointerMove);
       window.addEventListener('pointerup', windowPointerUp);
       window.addEventListener('pointercancel', windowPointerCancel);
@@ -951,13 +1052,13 @@ export function SessionList({ onSessionClick, onSessionMenu }: SessionListProps)
   // Drag works in the flat list AND the manager tree (same semantics:
   // center → manage, edge → sibling slot at the target row's level).
   // Grouped-by-dir lists stay non-draggable.
-  const dragEnabled = dragPreference && (groupBy === 'none' || groupBy === 'manager') && !multiSelectMode;
+  const dragEnabled = dragPreference && !multiSelectMode;
 
   // Per-card drag props for memoized SessionItem (stable refs + primitives
   // keep unrelated cards from re-rendering).
   const dragPropsFor = useCallback(
     (session: Session) =>
-      dragEnabled
+      dragEnabled && (session.pinned || effectiveGroupBy === 'none' || effectiveGroupBy === 'manager')
         ? {
             dragEnabled: true,
             onDragHandlePointerDown: handleDragPointerDown,
@@ -966,7 +1067,7 @@ export function SessionList({ onSessionClick, onSessionMenu }: SessionListProps)
             insertZone: insertTarget?.id === session.id ? insertTarget.zone : null,
           }
         : {},
-    [dragEnabled, handleDragPointerDown, dragId, centerTargetId, insertTarget],
+    [dragEnabled, effectiveGroupBy, handleDragPointerDown, dragId, centerTargetId, insertTarget],
   );
 
   // Ghost feedback: as the dragged session hovers a drop zone, preview on the
@@ -983,6 +1084,7 @@ export function SessionList({ onSessionClick, onSessionMenu }: SessionListProps)
     const draggedS = sessions.find((s) => s.id === dragId);
     const targetS = sessions.find((s) => s.id === targetId);
     if (!draggedS || !targetS) return null;
+    if (draggedS.pinned) return { blocked: false, manage: false, order: true };
     const { newManager, blockedByCycle } = decideManagerDrop(
       filtered,
       dragId,
@@ -1011,10 +1113,15 @@ export function SessionList({ onSessionClick, onSessionMenu }: SessionListProps)
       style={{ willChange: 'transform' }}
     >
       <div className="flex items-center gap-2">
-        <WorkerDot status={dragSession.workerStatus} />
+        <WorkerDot status={dragSession.workerStatus} illegalOffline={dragSession.illegalOffline} />
         <span className="text-sm text-text-primary font-medium truncate min-w-0 flex-1">
           {dragSession.name || 'Untitled'}
         </span>
+        {dragMode === 'pin' ? (
+          <span className="shrink-0 rounded px-1.5 py-px text-[10px] leading-tight bg-accent text-white font-medium">
+            Pin order
+          </span>
+        ) : <>
         {/* Outcome preview chips: 「管理」left, 「排序」right. */}
         <span
           data-ghost-manage
@@ -1049,13 +1156,16 @@ export function SessionList({ onSessionClick, onSessionMenu }: SessionListProps)
         >
           工作区
         </span>
+        </>}
       </div>
       <div className="mt-1 text-[10px] text-text-tertiary">
-        {railZone
+        {dragMode === 'pin'
+          ? 'Pinned Sessions reorder within the current group'
+          : railZone
           ? (railTarget === CREATE_WORKSPACE_DROP_TARGET_ID
             ? `新建「${dragSession?.name || 'Untitled'}」工作区（重名自动编号）`
-            : railTarget === 'all'
-            ? '放到「全部」= 移出工作区（未分组）'
+            : railTarget === ALL_WORKSPACES || railTarget === UNGROUPED_WORKSPACES
+            ? '放到「全部」或「无工作区」= 移出工作区（未分组）'
             : railTarget
               ? `移入「${railTargetName}」（管理者会话的子孙会跟随）`
               : '放到某个工作区标签上')
@@ -1064,19 +1174,15 @@ export function SessionList({ onSessionClick, onSessionMenu }: SessionListProps)
     </div>
   );
 
-  // Recursive collapse/expand: collapsing a manager node also collapses every
-  // descendant; expanding it expands the whole subtree (same for un-collapse).
+  // Per-node collapse toggle: expanding a node only clears ITS OWN key, so
+  // every level keeps its individual collapsed state — e.g. after
+  // "collapse all", re-expanding an outer group leaves its children collapsed
+  // (each child's key is still in the set) until expanded themselves.
   const handleToggleManagerNode = useCallback(
     (node: ManagerNode) => {
-      const ids = [node.session.id, ...collectDescendantIds(node)];
-      const isCollapsed = collapsedGroups.has(node.session.id);
-      if (isCollapsed) {
-        removeCollapsedGroups(ids);
-      } else {
-        addCollapsedGroups(ids);
-      }
+      toggleGroupCollapse(node.session.id);
     },
-    [collapsedGroups, removeCollapsedGroups, addCollapsedGroups],
+    [toggleGroupCollapse],
   );
 
   // Initial list fetch in flight + nothing to show yet → spinner, so an account
@@ -1116,7 +1222,10 @@ export function SessionList({ onSessionClick, onSessionMenu }: SessionListProps)
     );
   }
 
-  if (filtered.length === 0 && (searchQuery.trim() || specialFilters.size > 0)) {
+  // An active global search with zero visible hits is a no-match state too
+  // (the sidebar banner already reports "still searching…" while preparing).
+  if (filtered.length === 0 && (searchQuery.trim() || specialFilters.size > 0 || adapterFilters.size > 0
+    || (matchingSessionIds !== null && !historySearchPreparing))) {
     return (
       <div className="flex flex-col items-center justify-center py-8 px-4 gap-2">
         <p className="text-sm text-text-tertiary">No matching sessions</p>
@@ -1125,7 +1234,7 @@ export function SessionList({ onSessionClick, onSessionMenu }: SessionListProps)
     );
   }
 
-  if (groupBy === 'manager' && managerTree.length > 0) {
+  if (effectiveGroupBy === 'manager' && managerTree.length > 0) {
     return (
       <div className="flex flex-col" ref={listRef}>
         {managerTree.map((node) => (
@@ -1150,9 +1259,9 @@ export function SessionList({ onSessionClick, onSessionMenu }: SessionListProps)
     );
   }
 
-  if (groupBy === 'workdir' && grouped.length > 0) {
+  if (effectiveGroupBy === 'workdir' && grouped.length > 0) {
     return (
-      <div className="flex flex-col">
+      <div className="flex flex-col" ref={listRef}>
         {grouped.map((group) => (
           <GroupSection
             key={group.key}
@@ -1173,6 +1282,7 @@ export function SessionList({ onSessionClick, onSessionMenu }: SessionListProps)
                 onSelect={handleSelect}
                 onToggleSelect={handleToggleSelect}
                 onMenu={handleMenu}
+                {...dragPropsFor(session)}
               />
             ))}
           </GroupSection>

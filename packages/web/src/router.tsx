@@ -1,9 +1,22 @@
+import { lazy, Suspense } from 'react';
 import { createBrowserRouter, Navigate } from 'react-router-dom';
 import App from './App';
-import ChatView from './views/ChatView';
-import EditorView from './views/EditorView';
-import ManageView from './views/ManageView';
-import JobsView from './views/JobsView';
+import ChatRoute from './views/ChatRoute';
+import { deferredView } from './views/deferredView';
+
+const EditorView = deferredView(() => import('./views/EditorView'));
+
+const ManageView = lazy(() => import('./views/ManageView'));
+const JobsView = lazy(() => import('./views/JobsView'));
+const TerminalPanel = lazy(() => import('./views/TerminalPanel'));
+const PluginPanelView = lazy(() => import('./views/PluginPanelView'));
+const LockerView = lazy(() => import('./views/LockerView'));
+const ActionsView = lazy(() => import('./views/ActionsView'));
+const AutomationView = lazy(() => import('./views/AutomationView'));
+
+function deferredRoute(view: React.ReactNode) {
+  return <Suspense fallback={<div className="p-4 text-sm text-text-tertiary">Loading...</div>}>{view}</Suspense>;
+}
 
 const isProd = import.meta.env.PROD;
 const basename = isProd ? '/react' : '/';
@@ -14,9 +27,12 @@ export const router = createBrowserRouter(
       path: '/',
       element: <App />,
       children: [
+        { path: 'locker', element: deferredRoute(<LockerView />) },
+        { path: 'actions', element: deferredRoute(<ActionsView />) },
+        { path: 'automation', element: deferredRoute(<AutomationView />) },
         {
           index: true,
-          element: <ChatView />,
+          element: <ChatRoute />,
         },
         {
           path: 'editor',
@@ -24,11 +40,19 @@ export const router = createBrowserRouter(
         },
         {
           path: 'manage/:sessionId',
-          element: <ManageView />,
+          element: deferredRoute(<ManageView />),
         },
         {
           path: 'jobs',
-          element: <JobsView />,
+          element: deferredRoute(<JobsView />),
+        },
+        {
+          path: 'terminals',
+          element: deferredRoute(<TerminalPanel />),
+        },
+        {
+          path: 'plugins/:pluginId/:panelId',
+          element: deferredRoute(<PluginPanelView />),
         },
         {
           path: 'schedules',

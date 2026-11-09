@@ -1,12 +1,22 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useState } from 'react';
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { SessionMenu } from './SessionMenu';
+import { SessionItem } from './SessionItem';
 import { useSessionStore } from '@/stores/sessionStore';
 import { useUIStore } from '@/stores/uiStore';
 import { useWorkspaceStore } from '@/stores/workspaceStore';
 import type { Session, Workspace } from '@/types';
+
+const { sessionUnreadActionMock } = vi.hoisted(() => ({
+  sessionUnreadActionMock: vi.fn(),
+}));
+
+vi.mock('@/services/api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/services/api')>();
+  return { ...actual, sessionUnreadAction: sessionUnreadActionMock };
+});
 
 const session: Session = {
   id: 'ses-menu-test',
@@ -24,6 +34,10 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+beforeEach(() => {
+  sessionUnreadActionMock.mockReset();
+});
+
 function renderMenuWithCard(onClose: () => void) {
   vi.useFakeTimers();
   const view = render(
@@ -39,6 +53,14 @@ function renderMenuWithCard(onClose: () => void) {
 }
 
 describe('SessionMenu details entry', () => {
+  it('opens handoff for the menu Session after closing the menu', () => {
+    const events: string[] = [];
+    render(<SessionMenu session={session} position={{ x: 10, y: 10 }}
+      onClose={() => events.push('close')} onHandoff={(id) => events.push(id)} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Session Handoff' }));
+    expect(events).toEqual(['close', session.id]);
+  });
+
   it('offers Details and closes the menu before opening the modal', () => {
     const onClose = vi.fn();
     const onDetails = vi.fn();
@@ -149,6 +171,162 @@ describe('SessionMenu workspace entry removal', () => {
     } finally {
       useWorkspaceStore.setState({ moveSessions: originalMove });
     }
+  });
+});
+
+describe('Session card pin action (moved out of the menu)', () => {
+  it('offers Pin and sends the successful update without selecting the card', async () => {
+    const original = useSessionStore.getState().setSessionPinned;
+    const action = vi.fn(async () => {});
+    const onClose = vi.fn();
+    useSessionStore.setState({ setSessionPinned: action, sessions: [session], multiSelectMode: false });
+    useUIStore.setState({ toastQueue: [] });
+    try {
+      render(<SessionItem session={session} isActive={false} onSelect={onClose} />);
+      fireEvent.click(screen.getByRole('button', { name: /^Pin: off\./ }));
+      await act(async () => { await Promise.resolve(); });
+
+      expect(onClose).not.toHaveBeenCalled();
+      expect(action).toHaveBeenCalledWith(session.id, true);
+      expect(screen.getByRole('button', { name: /^Pin: off\./ }).hasAttribute('disabled')).toBe(false);
+    } finally {
+      useSessionStore.setState({ setSessionPinned: original });
+    }
+  });
+
+  it('offers Unpin and shows an error when the pin update fails', async () => {
+    const original = useSessionStore.getState().setSessionPinned;
+    const originalLoad = useSessionStore.getState().loadSessions;
+    const refresh = vi.fn(async () => {});
+    const action = vi.fn(async () => { throw new Error('server refused pin update'); });
+    const onClose = vi.fn();
+    useSessionStore.setState({ setSessionPinned: action, loadSessions: refresh, sessions: [{ ...session, pinned: true }], multiSelectMode: false });
+    useUIStore.setState({ toastQueue: [] });
+    try {
+      render(<SessionItem session={{ ...session, pinned: true }} isActive={false} onSelect={onClose} />);
+      fireEvent.click(screen.getByRole('button', { name: /^Pin: on\./ }));
+      await act(async () => { await Promise.resolve(); });
+
+      expect(onClose).not.toHaveBeenCalled();
+      expect(action).toHaveBeenCalledWith(session.id, false);
+      expect(refresh).toHaveBeenCalledWith({ throwOnError: true });
+      expect(screen.getByRole('button', { name: /^Pin: on\./ }).hasAttribute('disabled')).toBe(false);
+      expect(useUIStore.getState().toastQueue.some(
+        (toast) => toast.type === 'error' && toast.message === 'server refused pin update',
+      )).toBe(true);
+    } finally {
+      useSessionStore.setState({ setSessionPinned: original, loadSessions: originalLoad });
+    }
+  });
+});
+
+describe('SessionMenu unread action (dynamic per policy)', () => {
+  function renderMenu(overrides: Partial<Session>) {
+    vi.useFakeTimers();
+    const view = render(
+      <SessionMenu
+        session={{ ...session, ...overrides }}
+        position={{ x: 10, y: 10 }}
+        onClose={vi.fn()}
+      />,
+    );
+    act(() => vi.advanceTimersByTime(0));
+    return view;
+  }
+
+  it('offers Enable unread tracking for an excluded Session and persists the override', async () => {
+    const refresh = vi.fn(async () => {});
+    const originalLoad = useSessionStore.getState().loadSessions;
+    useSessionStore.setState({ loadSessions: refresh });
+    useUIStore.setState({ toastQueue: [] });
+    sessionUnreadActionMock.mockResolvedValueOnce(
+      { ok: true, unreadTracking: true, unreadDoneCount: 0 });
+    try {
+      renderMenu({ unreadTracking: false });
+      fireEvent.click(screen.getByRole('button', { name: 'Enable unread tracking' }));
+      await act(async () => { await Promise.resolve(); });
+      expect(sessionUnreadActionMock).toHaveBeenCalledWith(
+        session.id, 'enable-tracking', { expectedExcluded: true });
+      expect(refresh).toHaveBeenCalledWith({ throwOnError: true });
+      expect(useUIStore.getState().toastQueue.some(
+        (toast) => toast.message === 'Unread tracking enabled',
+      )).toBe(true);
+    } finally {
+      useSessionStore.setState({ loadSessions: originalLoad });
+    }
+  });
+
+  it('offers Mark as unread when recording with count 0 and sends the observed generation', async () => {
+    const refresh = vi.fn(async () => {});
+    const originalLoad = useSessionStore.getState().loadSessions;
+    useSessionStore.setState({ loadSessions: refresh });
+    useUIStore.setState({ toastQueue: [] });
+    sessionUnreadActionMock.mockResolvedValueOnce(
+      { ok: true, unreadTracking: true, unreadDoneCount: 1 });
+    try {
+      renderMenu({
+        unreadTracking: true, unreadDoneCount: 0, unreadDoneGeneration: 4,
+      });
+      expect(screen.queryByRole('button', { name: 'Clear unread' })).toBeNull();
+      fireEvent.click(screen.getByRole('button', { name: 'Mark as unread' }));
+      await act(async () => { await Promise.resolve(); });
+      expect(sessionUnreadActionMock).toHaveBeenCalledWith(
+        session.id, 'mark-unread', { expectedGeneration: 4 });
+      expect(useUIStore.getState().toastQueue.some(
+        (toast) => toast.message === 'Marked as unread',
+      )).toBe(true);
+    } finally {
+      useSessionStore.setState({ loadSessions: originalLoad });
+    }
+  });
+
+  it('offers Clear unread when recording with unread and never Mark', async () => {
+    const refresh = vi.fn(async () => {});
+    const originalLoad = useSessionStore.getState().loadSessions;
+    useSessionStore.setState({ loadSessions: refresh });
+    useUIStore.setState({ toastQueue: [] });
+    sessionUnreadActionMock.mockResolvedValueOnce(
+      { ok: true, unreadTracking: true, unreadDoneCount: 0 });
+    try {
+      renderMenu({
+        unreadTracking: true, unreadDoneCount: 2, unreadDoneGeneration: 6,
+      });
+      expect(screen.queryByRole('button', { name: 'Mark as unread' })).toBeNull();
+      fireEvent.click(screen.getByRole('button', { name: 'Clear unread' }));
+      await act(async () => { await Promise.resolve(); });
+      expect(sessionUnreadActionMock).toHaveBeenCalledWith(
+        session.id, 'clear-unread', { expectedGeneration: 6 });
+      expect(useUIStore.getState().toastQueue.some(
+        (toast) => toast.message === 'Unread cleared',
+      )).toBe(true);
+    } finally {
+      useSessionStore.setState({ loadSessions: originalLoad });
+    }
+  });
+
+  it('reports a stale-expectation failure and refreshes the authoritative state', async () => {
+    const refresh = vi.fn(async () => {});
+    const originalLoad = useSessionStore.getState().loadSessions;
+    useSessionStore.setState({ loadSessions: refresh });
+    useUIStore.setState({ toastQueue: [] });
+    sessionUnreadActionMock.mockRejectedValueOnce(new Error('Unread state changed; refresh and retry'));
+    try {
+      renderMenu({ unreadTracking: true, unreadDoneCount: 0, unreadDoneGeneration: 2 });
+      fireEvent.click(screen.getByRole('button', { name: 'Mark as unread' }));
+      await act(async () => { await Promise.resolve(); });
+      expect(refresh).toHaveBeenCalledWith({ throwOnError: true });
+      expect(useUIStore.getState().toastQueue.some(
+        (toast) => toast.type === 'error'
+          && toast.message === 'Unread state changed; refresh and retry',
+      )).toBe(true);
+    } finally {
+      useSessionStore.setState({ loadSessions: originalLoad });
+    }
+  });
+
+  it('keeps the legacy behavior for Sessions without the tracking projection', () => {
+    renderMenu({});
+    expect(screen.getByRole('button', { name: 'Mark as unread' })).toBeTruthy();
   });
 });
 

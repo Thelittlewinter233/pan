@@ -1,0 +1,27 @@
+
+[1m[7m[36m RUN [39m[27m[22m [36mv2.1.9 [39m[90mD:/project/pan-worktrees/select-lifecycle-actions-20261015/packages/web/src[39m
+
+ [32m✓[39m stores/workerStore.test.ts [2m([22m[2m8 tests[22m[2m)[22m[90m 5[2mms[22m[39m
+ [32m✓[39m components/session/selectedSessionActions.test.ts [2m([22m[2m10 tests[22m[2m)[22m[90m 7[2mms[22m[39m
+ [32m✓[39m components/session/SessionItem.test.tsx [2m([22m[2m7 tests[22m[2m)[22m[90m 69[2mms[22m[39m
+[90mstderr[2m | components/session/SessionList.selectMode.test.tsx[2m > [22m[2mSessionList select-mode interactions[2m > [22m[2mclicking the card body opens the session instead of changing selection
+[22m[39m[sessionStore] selectSession fresh-history fetch failed a
+
+ [32m✓[39m components/session/SelectedSessionActions.test.tsx [2m([22m[2m10 tests[22m[2m)[22m[90m 117[2mms[22m[39m
+ [32m✓[39m components/session/SessionList.selectMode.test.tsx [2m([22m[2m5 tests[22m[2m)[22m[90m 110[2mms[22m[39m
+ [32m✓[39m components/session/SessionMenu.test.tsx [2m([22m[2m19 tests[22m[2m)[22m[90m 270[2mms[22m[39m
+[90mstderr[2m | components/layout/Sidebar.test.tsx[2m > [22m[2mSidebar session navigation from Jobs[2m > [22m[2mopens the clicked session in Chat from Jobs, including when it is already selected
+[22m[39m[sessionStore] selectSession fresh-history fetch failed jobs-session
+[sessionStore] selectSession fresh-history fetch failed jobs-session
+
+[90mstderr[2m | components/layout/Sidebar.test.tsx[2m > [22m[2mSidebar session navigation from Jobs[2m > [22m[2mcloses an open mobile Sidebar after navigating from Jobs to Chat
+[22m[39m[sessionStore] selectSession fresh-history fetch failed jobs-session
+
+ [32m✓[39m components/layout/Sidebar.test.tsx [2m([22m[2m20 tests[22m[2m)[22m[33m 1515[2mms[22m[39m
+   [33m[2m✓[22m[39m Sidebar Session search controls[2m > [22mrenders the CWD root as a collapsible section labelled CWD [33m329[2mms[22m[39m
+
+[2m Test Files [22m [1m[32m7 passed[39m[22m[90m (7)[39m
+[2m      Tests [22m [1m[32m79 passed[39m[22m[90m (79)[39m
+[2m   Start at [22m 11:26:15
+[2m   Duration [22m 4.38s[2m (transform 781ms, setup 120ms, collect 3.55s, tests 2.09s, environment 6.39s, prepare 1.15s)[22m
+

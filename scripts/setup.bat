@@ -2,7 +2,7 @@
 setlocal EnableExtensions EnableDelayedExpansion
 REM ============================================================
 REM  Pan setup — Windows 简版 (setup.sh 的 Windows 对应物)
-REM  覆盖启动清单 1-5 步；单步失败不中断。仅输出提示，不改系统。
+REM  覆盖启动清单 1-5 步；单步失败不中断。自动注册当前用户 Pan CLI，不改系统级 PATH。
 REM  用法: scripts\setup.bat
 REM ============================================================
 
@@ -122,7 +122,24 @@ if %ERRORLEVEL% EQU 0 (
 )
 echo.
 
+REM Explicit user installation hook; failure never blocks the remaining setup.
+if defined VPY "%VPY%" "%ROOT%\scripts\register_pan_cli.py" auto --root "%ROOT%"
+
 echo ========== 汇总 ==========
+REM Terminal headless dependencies are separate from the React bundle.
+where npm >nul 2>&1
+if !ERRORLEVEL! EQU 0 (
+    pushd "%ROOT%\packages\core\terminal\emulator_sidecar"
+    call npm ci --no-audit --no-fund
+    if !ERRORLEVEL! NEQ 0 echo [FAIL] Terminal headless dependency installation failed
+    popd
+) else (
+    echo [FAIL] npm unavailable - Terminal headless engine cannot run
+)
+if defined VPY (
+    "%VPY%" "%ROOT%\scripts\check_terminal_deployment.py"
+    if !ERRORLEVEL! NEQ 0 echo [FAIL] Terminal/Rewind deployment check failed
+)
 echo 按上面 [OK]/[WARN]/[FAIL] 逐项处理；核心齐备后用 scripts\start_pan.bat 启动。
 endlocal
 exit /b 0

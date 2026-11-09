@@ -2,9 +2,9 @@
 
 This module is intentionally different from the TestClient and mocked worker
 tests already in the repository.  It starts a separate FastAPI/uvicorn
-process on 8767, uses a persistent temporary data root, talks to it through
-HTTP and WebSocket, and uses a deterministic local stream provider.  No real
-LLM, QQ bridge, Tunnel, or port 8768 is involved.
+process on 8767 by default (or PAN_TEST_HTTP_PORT), uses a persistent temporary
+data root, talks to it through HTTP and WebSocket, and uses a deterministic
+local stream provider. No real LLM, QQ bridge, Tunnel, or port 8768 is involved.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import json
 import os
 import socket
 import subprocess
+from packages.jobs.window import command_window_options
 import sys
 import threading
 import time
@@ -28,7 +29,9 @@ from websockets.exceptions import ConnectionClosed
 ROOT = Path(__file__).resolve().parent.parent
 SERVER_LAUNCHER = Path(__file__).resolve().parent / "support" / "isolated_http_server.py"
 FAKE_CLI = Path(__file__).resolve().parent / "support" / "fake_stream_cli.py"
-PORT = 8767
+PORT = int(os.environ.get("PAN_TEST_HTTP_PORT", "8767"))
+if PORT == 8768:
+    raise ValueError("PAN_TEST_HTTP_PORT must not use the practical service port")
 
 
 def _port_is_free(port: int) -> bool:
@@ -137,6 +140,7 @@ class _PanRuntime:
         self.process: subprocess.Popen | None = None
         self.pan_pids: list[int] = []
         self._owned_processes: list[tuple[int, float, str]] = []
+        self._ready = False
 
     @property
     def base_url(self) -> str:
@@ -162,25 +166,51 @@ class _PanRuntime:
             [sys.executable, str(SERVER_LAUNCHER), "--port", str(PORT),
              "--data-root", str(self.data_root)],
             cwd=str(ROOT), env=env, stdout=log, stderr=subprocess.STDOUT,
+            **command_window_options(),
         )
         self.pan_pids.append(self.process.pid)
         try:
+            self._capture_owned_processes()
             _wait_for(
                 lambda: self.process.poll() is None and self._health_ok(),
                 timeout=20,
                 label="isolated FastAPI readiness",
             )
-        except Exception:
+        except Exception as exc:
             details = (self.data_root / "pan.log").read_text(encoding="utf-8", errors="replace")
-            raise AssertionError(f"isolated server failed to start:\n{details[-4000:]}")
+            trace = self.data_root / 'startup-stacks.txt'
+            if trace.exists():
+                details += '\nStartup stacks:\n' + trace.read_text(encoding='utf-8', errors='replace')
+            self._capture_owned_processes()
+            try:
+                self.stop()
+            except Exception as cleanup:
+                raise ExceptionGroup('Isolated startup and owned cleanup failed', [exc, cleanup]) from exc
+            raise AssertionError(f"isolated server failed to start:\n{details[-8000:]}") from exc
         finally:
             log.close()
-        root_process = psutil.Process(self.process.pid)
-        owned = [root_process, *root_process.children(recursive=True)]
+        self._capture_owned_processes()
+        self._ready = True
+
+    def _capture_owned_processes(self):
+        if self.process is None:
+            return
+        try:
+            root_process = psutil.Process(self.process.pid)
+            created = root_process.create_time()
+            previous = next((born for pid, born, _ in self._owned_processes
+                             if pid == root_process.pid), created)
+            if abs(created - previous) > .01:
+                raise AssertionError('Owned startup root identity changed')
+            owned = [root_process, *root_process.children(recursive=True)]
+        except psutil.NoSuchProcess:
+            return
         for process in owned:
             try:
                 command_line = " ".join(process.cmdline())
-                self._owned_processes.append((process.pid, process.create_time(), command_line))
+                value = (process.pid, process.create_time(), command_line)
+                if value not in self._owned_processes:
+                    self._owned_processes.append(value)
             except psutil.Error:
                 continue
         self.pan_pids.extend(process.pid for process in owned if process.pid not in self.pan_pids)
@@ -196,14 +226,25 @@ class _PanRuntime:
             return False
 
     def stop(self):
+        self._capture_owned_processes()
         process = self.process
         self.process = None
         if process is None and not self._owned_processes:
             return
+        if self._ready and process is not None and process.poll() is None:
+            try:
+                response = httpx.post(self.base_url + '/__test/stop-owned-runtime',
+                                      timeout=.5, trust_env=False)
+                if response.is_success:
+                    process.wait(timeout=15)
+            except (httpx.HTTPError, subprocess.TimeoutExpired):
+                pass  # Fall back to the same identity-bound hard cleanup.
+        self._ready = False
         # On Windows the venv launcher can leave uvicorn as a child after the
         # Popen handle exits.  Stop only the exact PIDs/create-times captured
         # from this fixture's process tree; never scan or kill a generic
         # python/uvicorn process.
+        captured = []
         for pid, create_time, command_line in reversed(self._owned_processes):
             try:
                 owned = psutil.Process(pid)
@@ -211,6 +252,7 @@ class _PanRuntime:
                     continue
                 if str(SERVER_LAUNCHER) not in command_line and str(FAKE_CLI) not in command_line:
                     continue
+                captured.append(owned)
                 owned.terminate()
             except psutil.Error:
                 continue
@@ -229,6 +271,8 @@ class _PanRuntime:
                         owned.kill()
             except psutil.Error:
                 continue
+        _, remaining = psutil.wait_procs(captured, timeout=5)
+        assert not remaining, 'Owned HTTP fixture processes did not retire: ' + str([p.pid for p in remaining])
         self._owned_processes.clear()
         _wait_for(lambda: _port_is_free(PORT), timeout=5, label="isolated port release")
 
@@ -237,7 +281,11 @@ class _PanRuntime:
             base_url=self.base_url, timeout=15, trust_env=False, verify=False,
         ) as client:
             response = client.request(method, path, **kwargs)
-        assert response.status_code == 200, f"{method} {path}: {response.status_code} {response.text}"
+        if response.status_code != 200:
+            # Preserve the owned server traceback in JUnit, not just its 500 body.
+            log = self.data_root / 'pan.log'
+            details = log.read_text(encoding='utf-8', errors='replace')[-16000:] if log.exists() else ''
+            raise AssertionError(f"{method} {path}: {response.status_code} {response.text}\nOwned server log:\n{details}")
         return response.json()
 
     def get_delayed_queue(self, session_id: str, delay: float) -> dict:
@@ -595,3 +643,169 @@ def test_real_http_queue_fifo_races_sources_and_restart(isolated_runtime):
         for item in runtime.fake_records() if item.get("kind") == "received"
     ]
     print("REAL_HTTP_QUEUE_E2E " + json.dumps(evidence, ensure_ascii=False, sort_keys=True))
+
+
+def test_real_self_queue_original_item_restart_and_receipt(isolated_runtime, monkeypatch):
+    """No-Steer fake: real HTTP/MCP restart, stdin and original-ID receipt.
+
+    The launcher explicitly declares this provider's absent native capability.
+    Confirmed CBC admission/rejection/unknown are tested in test_cbc_steer.
+    """
+    from packages.mcp import server as mcp_server
+    runtime, recorder = isolated_runtime
+    session = _create(runtime, "real-fifo")
+    sid = session["id"]
+    _spawn(runtime, sid)
+    _enqueue(runtime, sid, "hold-A", "own-active")
+    _wait_for(lambda: _received(runtime, cwd=session["workdir"], text="hold-A"),
+              label="own active task started")
+    original_pid = _received(runtime, cwd=session["workdir"], text="hold-A")[0]["pid"]
+    first = _enqueue(runtime, sid, "earlier FIFO", "own-earlier")["item"]["queueItemId"]
+    chosen = _enqueue(runtime, sid, "chosen original", "own-chosen")["item"]["queueItemId"]
+    hidden = _enqueue(runtime, sid, "hidden original", "own-hidden")["item"]["queueItemId"]
+    runtime.request("PATCH", f"/api/sessions/{sid}/queue/{hidden}/lock", json={"locked": True})
+    monkeypatch.setenv("PAN_AGENT_SESSION_ID", sid)
+    monkeypatch.setattr(mcp_server, "_pan_api_url", runtime.base_url)
+    monkeypatch.setattr(mcp_server, "_terminal_transport", "stdio")
+    visible = mcp_server.self_queue_read()
+    assert [it["id"] for it in visible["items"]] == [first, chosen]
+    assert hidden not in json.dumps(visible) and "hidden original" not in json.dumps(visible)
+    assert mcp_server.self_queue_consume(hidden) == mcp_server.self_queue_consume("guessed")
+    before_path = runtime.data_root / "sessions" / f"{sid}.json"
+    before = json.loads(before_path.read_text(encoding="utf-8"))
+    original = next(it for it in before["queue_pending"] if it["id"] == chosen)
+    response = mcp_server.self_queue_consume(chosen)
+    assert response.get("status") in {"consumed", "pending"}
+    _wait_for(lambda: _received(runtime, cwd=session["workdir"], text="chosen original"),
+              label="chosen original reached replacement stdin")
+    records = _received(runtime, cwd=session["workdir"])
+    assert records[1]["text"] == "chosen original"
+    assert records[1]["pid"] != original_pid
+    _wait_for(lambda: chosen in json.loads(before_path.read_text(encoding="utf-8"))["queue_delivery_ledger"]
+              and json.loads(before_path.read_text(encoding="utf-8"))["queue_delivery_ledger"][chosen]["deliveryState"] == "sent_to_cli",
+              label="chosen durable handoff receipt")
+    assert mcp_server.self_queue_consume(chosen)["alreadyConsumed"]
+    assert len(_received(runtime, cwd=session["workdir"], text="chosen original")) == 1
+    after = json.loads(before_path.read_text(encoding="utf-8"))
+    receipt = after["queue_delivery_ledger"][chosen]
+    for field in ["id", "queueItemId", "source", "taskId", "clientMessageId", "text", "parts"]:
+        assert receipt.get(field) == original.get(field)
+    assert any(it["id"] == hidden for it in after["queue_pending"])
+    assert not _received(runtime, cwd=session["workdir"], text="hidden original")
+    print("REAL_SELF_QUEUE_E2E " + json.dumps({"port": PORT, "sessionId": sid,
+          "oldPid": original_pid, "newPid": records[1]["pid"], "originalId": chosen,
+          "receipt": receipt, "readIds": [it["id"] for it in visible["items"]]}, ensure_ascii=False))
+
+
+@pytest.mark.timeout(120)
+def test_real_http_locked_enqueue_is_not_handed_off_before_unlock(isolated_runtime):
+    """The composer shortcut's `locked: true` enqueue is atomic.
+
+    A live, idle worker must not receive the row while the lock is set.  This
+    reproduces the exact race the shortcut must avoid: enqueue first and lock
+    later would allow a reserved/writing handoff in between.
+    """
+    runtime, _recorder = isolated_runtime
+    session = _create(runtime, "locked-composer-shortcut")
+    sid = session["id"]
+    _spawn(runtime, sid)
+    marker = f"locked-before-handoff-{time.time_ns()}"
+    response = runtime.request(
+        "POST", f"/api/sessions/{sid}/queue",
+        json={
+            "text": marker,
+            "clientMessageId": f"cm-{marker}",
+            "locked": True,
+        },
+    )
+    item = response["item"]
+    queue_item_id = item.get("queueItemId") or item.get("id")
+    assert item["meta"]["locked"] is True
+    assert item["meta"]["dispatchState"] == "queued"
+
+    # Give the live worker more than enough time to consume an unlocked row.
+    time.sleep(0.8)
+    assert _received(runtime, text=marker) == []
+    queue = runtime.request("GET", f"/api/sessions/{sid}/queue")
+    row = next(
+        candidate for candidate in queue["items"]
+        if (candidate.get("queueItemId") or candidate.get("id")) == queue_item_id
+    )
+    assert row["meta"]["dispatchState"] == "queued"
+    assert row["meta"]["locked"] is True
+    assert row["meta"]["lockManual"] is True
+
+    runtime.request(
+        "PATCH", f"/api/sessions/{sid}/queue/{queue_item_id}/lock",
+        json={"locked": False},
+    )
+    _wait_for(
+        lambda: _received(runtime, text=marker),
+        timeout=15,
+        label="locked item delivered only after unlock",
+    )
+    print("REAL_LOCKED_ENQUEUE_E2E " + json.dumps({
+        "port": PORT,
+        "sessionId": sid,
+        "queueItemId": queue_item_id,
+        "handoffBeforeUnlock": False,
+        "deliveredAfterUnlock": True,
+    }))
+
+
+@pytest.mark.timeout(120)
+def test_real_http_report_and_bell_toggles_persist_across_restart(tmp_path):
+    """Selected-Session shortcut toggles reuse the card APIs and survive a restart."""
+    runtime = _PanRuntime(tmp_path / "shortcut-toggle-data")
+    runtime.start()
+    try:
+        manager = _create(runtime, "shortcut-manager")
+        child = _create(runtime, "shortcut-child")
+        manager_id = manager["id"]
+        child_id = child["id"]
+        runtime.request("POST", "/api/report-subscribe", json={
+            "managerId": manager_id,
+            "sessionId": child_id,
+        })
+        detail = runtime.request(
+            "GET", f"/api/sessions/{child_id}?view=metadata")
+        assert detail["managedBy"] == manager_id
+        assert detail["reportsToManager"] is True
+        assert isinstance(detail["msgBridgeEnabled"], bool)
+
+        stopped = runtime.request(
+            "PUT", f"/api/sessions/{child_id}/report-to-manager",
+            json={
+                "managerId": manager_id,
+                "enabled": False,
+                "expectedEnabled": True,
+            },
+        )
+        assert stopped["ok"] is True
+        assert stopped["reportsToManager"] is False
+
+        initial_bell = detail["msgBridgeEnabled"]
+        wanted_bell = not initial_bell
+        bell = runtime.request(
+            "PUT", f"/api/sessions/{child_id}/msg-bridge",
+            json={"enabled": wanted_bell, "expectedEnabled": initial_bell},
+        )
+        assert bell["ok"] is True
+        assert bell["msgBridgeEnabled"] is wanted_bell
+
+        runtime.stop()
+        runtime.start()
+        after = runtime.request(
+            "GET", f"/api/sessions/{child_id}?view=metadata")
+        assert after["managedBy"] == manager_id
+        assert after["reportsToManager"] is False
+        assert after["msgBridgeEnabled"] is wanted_bell
+        print("REAL_SESSION_TOGGLES_E2E " + json.dumps({
+            "port": PORT,
+            "managerId": manager_id,
+            "sessionId": child_id,
+            "reportsToManagerAfterRestart": after["reportsToManager"],
+            "msgBridgeEnabledAfterRestart": after["msgBridgeEnabled"],
+        }))
+    finally:
+        runtime.stop()

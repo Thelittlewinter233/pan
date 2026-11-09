@@ -7,11 +7,12 @@ import {
   type EditorRoot,
 } from './editorStore';
 import { useUIStore } from '@/stores/uiStore';
-import { deleteFs, listFiles, readFile, renameFs, writeFile } from '@/services/api';
+import { deleteFs, listFiles, readFile, renameFs, writeFile, fetchDirectories } from '@/services/api';
 import type { ApiFsGenericResponse, ApiFsWriteResponse, FileNode, FsEntry } from '@/types';
 
 vi.mock('@/services/api', () => ({
   listFiles: vi.fn(async () => []),
+  fetchDirectories: vi.fn(async () => { throw new Error('Not a directory'); }),
   readFile: vi.fn(async () => ''),
   writeFile: vi.fn(async () => undefined),
   renameFs: vi.fn(async () => undefined),
@@ -51,6 +52,7 @@ function seedEditor(workdir: string | null = WORKDIR, overrides: Partial<EditorS
     activePath: null,
     dirty: new Set(),
     contents: {},
+    previewErrors: {},
     imagePreviews: {},
     mdViewMode: {},
     pendingLocation: null,
@@ -72,8 +74,30 @@ beforeEach(() => {
   vi.clearAllMocks();
   resetEditorStoreOperationState();
   vi.mocked(listFiles).mockResolvedValue([]);
+  vi.mocked(fetchDirectories).mockRejectedValue(new Error('Not a directory'));
   seedEditor();
   useUIStore.setState({ toastQueue: [] });
+});
+
+describe('editorStore.openPath', () => {
+  it('reuses an existing directory root without creating a duplicate', async () => {
+    vi.mocked(fetchDirectories).mockResolvedValue({ current: WORKDIR, parent: null, entries: [] });
+    expect(await useEditorStore.getState().openPath(WORKDIR_NORM)).toBe(true);
+    expect(useEditorStore.getState().roots.map((root) => root.path)).toEqual([WORKDIR_NORM]);
+    expect(useEditorStore.getState().selectedPath).toBe(WORKDIR_NORM);
+    expect(readFile).not.toHaveBeenCalled();
+  });
+
+  it('does not let a late directory probe override a newer file navigation', async () => {
+    let resolve!: (value: Awaited<ReturnType<typeof fetchDirectories>>) => void;
+    vi.mocked(fetchDirectories).mockImplementationOnce(() => new Promise((done) => { resolve = done; }));
+    const pending = useEditorStore.getState().openPath('D:/old-directory');
+    await useEditorStore.getState().openFile('D:/new.md');
+    resolve({ current: 'D:/old-directory', parent: null, entries: [] });
+    expect(await pending).toBe(false);
+    expect(useEditorStore.getState().selectedPath).toBe('D:/new.md');
+    expect(useEditorStore.getState().roots.some((root) => root.path === 'D:/old-directory')).toBe(false);
+  });
 });
 
 describe('editorStore.setRoot', () => {
@@ -95,6 +119,7 @@ describe('editorStore.setRoot', () => {
       openPaths: [],
       activePath: null,
       contents: {},
+    previewErrors: {},
       mdViewMode: {},
     });
     expect(useEditorStore.getState().dirty).toEqual(new Set());
@@ -463,6 +488,7 @@ describe('editorStore async root protection', () => {
       openPaths: [],
       activePath: null,
       contents: {},
+    previewErrors: {},
     });
   });
 
@@ -777,6 +803,7 @@ describe('editorStore save/rename/delete serialization', () => {
       activePath: null,
       selectedPath: null,
       contents: {},
+    previewErrors: {},
     });
     expect(useEditorStore.getState().dirty).toEqual(new Set());
   });
@@ -982,3 +1009,49 @@ describe('editorStore save/rename/delete serialization', () => {
     });
   });
 });
+
+describe('unpreviewable file tabs', () => {
+  it.each(['File too large (max 5 MiB)', 'Cannot read binary file'])('opens read-only failure: %s', async (reason) => {
+    vi.mocked(readFile).mockRejectedValueOnce(new Error(reason));
+    expect(await useEditorStore.getState().openFile('raw.bin')).toBe(true);
+    expect(useEditorStore.getState().previewErrors['raw.bin']).toBe(reason);
+    expect(useEditorStore.getState().contents['raw.bin']).toBeUndefined();
+    useEditorStore.getState().markDirty('raw.bin', 'corrupt');
+    await useEditorStore.getState().saveFile();
+    expect(writeFile).not.toHaveBeenCalled();
+    useEditorStore.getState().closeFile('raw.bin');
+    expect(useEditorStore.getState().previewErrors['raw.bin']).toBeUndefined();
+  });
+});
+
+ it('does not open a stale failed preview after Session changes', async () => {
+   let reject!: (error: Error) => void;
+   vi.mocked(readFile).mockImplementationOnce(() => new Promise((_resolve, r) => { reject = r; }));
+   const pending = useEditorStore.getState().openFile('stale.bin');
+   seedEditor(null, {sessionId: 's2', rootGeneration: 1});
+   reject(new Error('Cannot read binary file'));
+   expect(await pending).toBe(false);
+   expect(useEditorStore.getState().openPaths).toEqual([]);
+   expect(useEditorStore.getState().previewErrors).toEqual({});
+ });
+
+ it('moves and clears failed-preview state through rename and delete', async () => {
+   vi.mocked(readFile).mockRejectedValueOnce(new Error('Cannot read binary file'));
+   await useEditorStore.getState().openFile('old.bin');
+   await useEditorStore.getState().renameFile('old.bin', 'new.bin');
+   expect(useEditorStore.getState().previewErrors).toEqual({'new.bin': 'Cannot read binary file'});
+   await useEditorStore.getState().deleteFile('new.bin');
+   expect(useEditorStore.getState().previewErrors).toEqual({});
+   expect(useEditorStore.getState().openPaths).toEqual([]);
+ });
+ it('does not let an older failed read steal a newer file selection', async () => {
+   let reject!: (error: Error) => void;
+   vi.mocked(readFile).mockImplementationOnce(() => new Promise((_resolve, r) => { reject = r; }));
+   const pending = useEditorStore.getState().openFile('old.bin');
+   vi.mocked(readFile).mockResolvedValueOnce('new text');
+   await useEditorStore.getState().openFile('new.txt');
+   reject(new Error('File too large (max 5 MiB)'));
+   expect(await pending).toBe(false);
+   expect(useEditorStore.getState().activePath).toBe('new.txt');
+   expect(useEditorStore.getState().previewErrors).toEqual({});
+ });

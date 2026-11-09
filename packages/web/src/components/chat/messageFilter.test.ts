@@ -1,10 +1,12 @@
 import { describe, it, expect } from 'vitest';
 import {
   filterVisibleMessages,
+  getNavigationKind,
   getQuickJumpIndexItems,
   getQuickJumpKind,
   getQuickJumpMessages,
   getQuickJumpPreview,
+  getMessageSourceTag,
 } from './messageFilter';
 import type { MessageVisibilitySettings } from './messageFilter';
 import type { Message } from '@/types';
@@ -18,6 +20,15 @@ const ALL_SHOWN: MessageVisibilitySettings = {
 };
 
 describe('filterVisibleMessages', () => {
+  it('uses structured Report provenance for explicit upstream messages and keeps MA visibility independent', () => {
+    for (const content of ['body without header', '////by agent : child | Child\nbody']) {
+      const message: Message = { role: 'user', content, source: 'report' };
+      expect(getQuickJumpKind(message)).toBe('worker');
+      expect(getMessageSourceTag(message)).toBe('ta-report');
+      expect(filterVisibleMessages([message], { ...ALL_SHOWN, showTaskAgent: false })).toEqual([]);
+      expect(filterVisibleMessages([message], { ...ALL_SHOWN, showMetaAgent: false })).toEqual([message]);
+    }
+  });
   it('keeps every message when all toggles are on', () => {
     const msgs = [
       mk('////by agent : ses_1 | T'),
@@ -142,3 +153,35 @@ describe('quick-location classification', () => {
   });
 });
 
+
+describe('bookmark navigation kind', () => {
+  it('classifies bookmarked bookmarkable rows without their own nav tag', () => {
+    // A quick-jump kind wins: a bookmarked user row stays `user`.
+    expect(getNavigationKind({ ...mk('hello', 'user'), bookmarked: true })).toBe('user');
+    expect(getNavigationKind({ ...mk('report', 'assistant'), content: '@@@@by agent : s | R', bookmarked: true })).toBe('worker');
+    // Plain bookmarked assistant / user rows become the bookmark kind.
+    expect(getNavigationKind({ ...mk('plain reply', 'assistant'), bookmarked: true })).toBe('bookmark');
+    expect(getNavigationKind({ ...mk('plain note', 'user'), bookmarked: true, source: 'automation' })).toBe('user');
+    // Not bookmarkable content never becomes a bookmark target.
+    expect(getNavigationKind({ ...mk('reasoning', 'thinking'), bookmarked: true })).toBeNull();
+    expect(getNavigationKind({ ...mk('Read(x)', 'tool'), bookmarked: true })).toBeNull();
+    expect(getNavigationKind(mk('plain reply', 'assistant'))).toBeNull();
+  });
+
+  it('carries the bookmarked flag into compact targets only when true', () => {
+    const targets = getQuickJumpIndexItems(
+      [
+        mk('old user', 'user'),
+        { ...mk('bookmarked reply', 'assistant'), bookmarked: true },
+        mk('plain reply', 'assistant'),
+      ],
+      3,
+      0,
+      ALL_SHOWN,
+    );
+    expect(targets).toEqual([
+      { fromEnd: 2, kind: 'user', preview: 'old user' },
+      { fromEnd: 1, kind: 'bookmark', preview: 'bookmarked reply', bookmarked: true },
+    ]);
+  });
+});

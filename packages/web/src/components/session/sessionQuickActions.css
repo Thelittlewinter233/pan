@@ -1,0 +1,329 @@
+.session-quick-action-rail {
+  position: relative;
+  flex: 0 0 72px;
+  width: 72px;
+  align-self: stretch;
+  margin-block: -0.5rem;
+}
+
+.session-quick-action-group {
+  position: absolute;
+  z-index: 2;
+  top: 1px;
+  left: 0;
+  display: grid;
+  grid-template-columns: repeat(4, 18px);
+  grid-template-rows: 22px;
+}
+
+.session-quick-action-button,
+.session-quick-action-control {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--color-text-tertiary);
+  cursor: pointer;
+  transition:
+    color 120ms ease,
+    background-color 120ms ease,
+    box-shadow 120ms ease,
+    opacity 120ms ease,
+    transform 80ms ease;
+}
+
+.session-quick-action-button {
+  position: relative;
+  z-index: 2;
+  width: 18px;
+  height: 22px;
+  opacity: 0.68;
+}
+
+.session-quick-action-button:hover,
+.session-quick-action-control:hover {
+  color: var(--color-text-primary);
+  background-color: var(--color-bg-hover);
+  opacity: 1;
+}
+
+.session-quick-action-button[data-quick-state='on'] {
+  color: var(--color-accent);
+  background-color: color-mix(in srgb, var(--color-accent) 14%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-accent) 44%, transparent);
+  opacity: 1;
+}
+
+.session-quick-action-button[data-quick-state='on']:hover {
+  background-color: color-mix(in srgb, var(--color-accent) 23%, transparent);
+}
+
+.session-quick-action-button[data-quick-action='readonly'][data-quick-state='on'],
+.session-quick-action-button[data-quick-action='stopReport'][data-quick-state='on'] {
+  color: var(--color-warning);
+  background-color: color-mix(in srgb, var(--color-warning) 14%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-warning) 44%, transparent);
+}
+
+.session-quick-action-button[data-quick-action='readonly'][data-quick-state='on']:hover,
+.session-quick-action-button[data-quick-action='stopReport'][data-quick-state='on']:hover {
+  background-color: color-mix(in srgb, var(--color-warning) 23%, transparent);
+}
+
+.session-quick-action-button[aria-disabled='true'] {
+  cursor: not-allowed;
+}
+
+.session-quick-action-button[aria-disabled='true']:hover {
+  opacity: 0.68;
+  background-color: transparent;
+}
+
+.session-quick-action-button[data-quick-state='on'][aria-disabled='true']:hover {
+  opacity: 1;
+  background-color: color-mix(in srgb, var(--color-accent) 14%, transparent);
+}
+
+.session-quick-action-button:focus-visible,
+.session-quick-action-control:focus-visible {
+  z-index: 3;
+  outline: 2px solid var(--color-accent);
+  outline-offset: 1px;
+}
+
+.session-quick-action-button:active {
+  transform: scale(0.88);
+  box-shadow: inset 0 0 0 1px currentColor;
+}
+
+.session-quick-action-control:active {
+  transform: scale(0.92);
+}
+
+.session-quick-action-control {
+  position: absolute;
+  z-index: 1;
+  top: 0;
+  bottom: 0;
+  width: 22px;
+  height: 100%;
+}
+
+.session-quick-action-chevron {
+  right: 26px;
+}
+
+.session-quick-action-settings {
+  right: 0;
+}
+
+/* 底行右侧（adapter 标签行）：未读 done 徽标在 adapter 标签左侧，二者同一
+   flex 行整体锚定右下角；徽标 0 时组件不渲染，该行退回只有 adapter 的原布局。
+   overflow:hidden 保证极端拥挤（多位数字 + 长 adapter + J 同时存在）时内容只在
+   rail 内裁剪，绝不溢出卡片遮挡正文或其他按钮；max-width 与 right:1px 内缩配对
+   （calc(100% - 1px)），满载行的左缘也不越出 rail，与 sessionInfoAreaFit 的
+   available = rail 宽 - 1 精确一致；所有项 flex 0 0 auto 均不压缩——数字徽标
+   永远完整，J 的显隐由 sessionInfoAreaFit.ts 按实际宽度整枚决定，裁剪至多落在
+   最右的 adapter 上。 */
+.session-quick-action-adapter-row {
+  position: absolute;
+  z-index: 4;
+  right: 1px;
+  bottom: 3px;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  max-width: calc(100% - 1px);
+  overflow: hidden;
+}
+
+.session-quick-action-adapter {
+  padding: 0 3px;
+  border: 1px solid var(--color-border-default);
+  border-radius: 4px;
+  color: var(--color-text-tertiary);
+  background: var(--color-bg-tertiary);
+  font-size: 9px;
+  line-height: 11px;
+  flex: 0 0 auto;
+  pointer-events: auto;
+}
+
+/* 未读 done 徽标：与 Session 卡片上方小组件按钮的激活态、工作区 Session 数徽标
+   同一视觉语言 —— 语义色高亮数字 + 同色系描边，底色为较深的同色系透明背景。
+   单数字为圆，多位自然放宽成胶囊（>99 显示 99+）。双击可清零，故保留 pointer。 */
+.session-unread-done-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 4px;
+  border-radius: 999px;
+  color: var(--color-warning);
+  background-color: color-mix(in srgb, var(--color-warning) 14%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-warning) 44%, transparent);
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0.2px;
+  cursor: pointer;
+  user-select: none;
+  pointer-events: auto;
+  transition:
+    background-color 120ms ease,
+    box-shadow 120ms ease;
+}
+
+.session-unread-done-badge:hover {
+  background-color: color-mix(in srgb, var(--color-warning) 24%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-warning) 60%, transparent);
+}
+
+/* 队列数徽标：只读展示，默认语义色为 accent；队列非空且每个待处理项都带真实锁
+   （手动锁/自动 report 锁）时切到 danger。cursor 保持 default 以区别于可双击清零的
+   done 徽标；点击/双击事件在组件里全部拦截，不会触发卡片选中或任何队列操作。 */
+.session-queue-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 4px;
+  border-radius: 999px;
+  color: var(--color-accent);
+  background-color: color-mix(in srgb, var(--color-accent) 14%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-accent) 44%, transparent);
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0.2px;
+  cursor: default;
+  user-select: none;
+  pointer-events: auto;
+  transition:
+    background-color 120ms ease,
+    box-shadow 120ms ease;
+}
+
+.session-queue-badge-locked {
+  color: var(--color-danger);
+  background-color: color-mix(in srgb, var(--color-danger) 14%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-danger) 44%, transparent);
+}
+
+/* Navigation Chat/Locker unread badge: same 14px geometry as the queue badge,
+   with the Session unread warning treatment rather than the Jobs accent. */
+.session-unread-entry-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 4px;
+  border-radius: 999px;
+  color: var(--color-warning);
+  background-color: color-mix(in srgb, var(--color-warning) 14%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-warning) 44%, transparent);
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0.2px;
+  cursor: default;
+  user-select: none;
+  pointer-events: auto;
+}
+
+/* Locker 未读跳转按钮：adapter 标签左侧的黄色实心胶囊（图标 + 计数）。
+   只在未读 > 0 时渲染，0 时整枚卸载、不占位；位于固定 72px rail 内，绝不
+   改变标题/模型行的可用宽度。文字用背景色（深色主题近黑、浅色主题近白）
+   保证在两种主题的 warning 底色上都有足够对比。 */
+.session-locker-jump {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  flex: 0 0 auto;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 4px;
+  border: 0;
+  border-radius: 999px;
+  color: var(--color-bg-primary);
+  background-color: var(--color-warning);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-warning) 62%, #000);
+  font-family: inherit;
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0.2px;
+  cursor: pointer;
+  user-select: none;
+  pointer-events: auto;
+  transition:
+    filter 120ms ease,
+    transform 80ms ease;
+}
+
+.session-locker-jump:hover {
+  filter: brightness(1.12);
+}
+
+.session-locker-jump:active {
+  transform: scale(0.9);
+}
+
+.session-locker-jump:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 1px;
+}
+
+/* 信息区 J 标识：target 为本 Session 的待调度/运行中 Job 聚合为单枚 J
+   （多 Job 时 running 优先）。几何与队列/未读徽标完全一致（14px 胶囊、
+   9px/700），仅语义色不同：scheduled 用 warning 黄，running 用 accent 蓝。
+   只读：事件全部拦截，不清零、不导航、不触发卡片选中。
+   显隐由 sessionInfoAreaFit.ts 按信息区实际可用宽度决定（放不下则组件整枚
+   卸载，无残胶囊/无预留 gap），不按 viewport 禁用；flex 0 0 auto 保证 J
+   永不压缩，行内空间只由 adapter 之外的布局与 overflow:hidden 兜底。 */
+.session-job-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  height: 14px;
+  padding: 0 4px;
+  border-radius: 999px;
+  color: var(--color-warning);
+  background-color: color-mix(in srgb, var(--color-warning) 14%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-warning) 44%, transparent);
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0.2px;
+  cursor: default;
+  user-select: none;
+  pointer-events: auto;
+}
+
+.session-job-badge[data-job-state='running'] {
+  color: var(--color-accent);
+  background-color: color-mix(in srgb, var(--color-accent) 14%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-accent) 44%, transparent);
+}
+
+/* J 自然宽度探针：与徽标完全同类（同字体度量），常驻 DOM；绝对定位脱离文档流
+   （不占布局、不产生 gap），visibility:hidden 不绘制且不进 a11y 树。徽标隐藏
+   （卸载）时它仍在——fonts.ready 重测在隐藏态也能读到新字形的 J 宽度，
+   避免缓存陈旧导致的两个方向误判（字体变窄应显示 / 变宽不得显示）。 */
+.session-job-badge[data-session-job-metric='probe'] {
+  position: absolute;
+  visibility: hidden;
+  pointer-events: none;
+}

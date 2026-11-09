@@ -9,6 +9,54 @@ vi.mock('@/services/api', async (original) => ({
 }));
 const row = (content: string): Message => ({ role: 'assistant', content });
 const meta = { workerId: 'w', generation: 0, taskSeq: 1 };
+it('places a late handoff receipt before its own live blocks without blocking native reorder', () => {
+  const execution = { ...meta, executionSeq: 12 };
+  const thinking: Message = { role: 'thinking', content: 'thinking', nativeItemId: 'think' };
+  const answer: Message = { role: 'assistant', content: 'answer', nativeItemId: 'answer' };
+  const tool: Message = { role: 'tool', content: 'tool', nativeItemId: 'tool' };
+  store().applyLiveStream('A', [thinking, answer], execution);
+  store().appendDeliveredMessages('A', [{ role: 'user', content: 'prompt', queueItemIds: ['q12'] }], execution);
+  expect(texts()).toEqual(['prompt', 'thinking', 'answer']);
+  store().applyLiveStream('A', [thinking, tool, answer], execution);
+  expect(texts()).toEqual(['prompt', 'thinking', 'tool', 'answer']);
+  void store().selectSession('B');
+  void store().selectSession('A');
+  expect(texts()).toEqual(['prompt', 'thinking', 'tool', 'answer']);
+});
+
+it('keeps a different execution receipt and Steer after the blocks already emitted', () => {
+  const execution = { ...meta, executionSeq: 12 };
+  const answer: Message = { role: 'assistant', content: 'answer', nativeItemId: 'answer' };
+  store().applyLiveStream('A', [answer], execution);
+  store().appendLocalMessage('A', { role: 'user', content: 'steer', messageId: 'steer:12' });
+  store().appendDeliveredMessages('A', [{ role: 'user', content: 'other', queueItemIds: ['q13'] }],
+    { ...execution, executionSeq: 13 });
+  expect(texts()).toEqual(['answer', 'steer', 'other']);
+});
+
+it('repairs the display when the queue projection has consumed the same receipt before its execution scope', () => {
+  const execution = { ...meta, executionSeq: 12 };
+  store().applyLiveStream('A', [{ role: 'assistant', content: 'answer', nativeItemId: 'answer' }], execution);
+  const receipt: Message[] = [{ role: 'user', content: 'prompt', queueItemIds: ['q12'] }];
+  store().appendDeliveredMessages('A', receipt);
+  expect(texts()).toEqual(['answer', 'prompt']);
+  store().appendDeliveredMessages('A', receipt, execution);
+  expect(texts()).toEqual(['prompt', 'answer']);
+});
+
+it('repairs a pending receipt while streaming in the background and ignores duplicate delivery', () => {
+  const execution = { ...meta, executionSeq: 12 };
+  const answer: Message = { role: 'assistant', content: 'answer', nativeItemId: 'answer' };
+  store().applyLiveStream('A', [answer], execution);
+  store().appendQueuedMessage('A', { id: 'q12', text: 'prompt' });
+  void store().selectSession('B');
+  const receipt: Message[] = [{ role: 'user', content: 'prompt', queueItemIds: ['q12'] }];
+  store().appendDeliveredMessages('A', receipt, execution);
+  store().appendDeliveredMessages('A', receipt, execution);
+  expect(texts()).toEqual([]);
+  void store().selectSession('A');
+  expect(texts()).toEqual(['prompt', 'answer']);
+});
 const store = () => useSessionStore.getState();
 const texts = () => store().currentMessages.map(m => m.content);
 beforeEach(() => {
@@ -45,12 +93,33 @@ it('converges a Steer user row inserted ahead of an unfinished tool by its messa
     role: 'user', content: 'steer now', messageId: 'steer:one',
   });
   store().applyHistoryPage('A', {
-    history: [first, second, { role: 'user', content: 'steer now', messageId: 'steer:one' }],
+    history: [first, second, {
+      role: 'user', content: 'steer now', messageId: 'pan:history-steer',
+      clientMessageId: 'steer:one',
+    }],
     start: 0, total: 3, hasMore: false, historyRevision: 3, historyEpoch: 'h',
   });
   expect(texts()).toEqual(['first', 'second', 'steer now', 'still streaming']);
+  expect(store().currentMessages.find((message) => message.content === 'steer now')?.messageId)
+    .toBe('pan:history-steer');
   store().applyLiveStream('A', [first, second, tool('tool-3', 'still streaming more')], meta);
   expect(texts()).toEqual(['first', 'second', 'steer now', 'still streaming more']);
+});
+
+it('keeps a canonical Pan Steer row when its optimistic alias arrives later', () => {
+  store().applyHistoryPage('A', {
+    history: [{
+      role: 'user', content: 'steer now', messageId: 'pan:history-steer',
+      clientMessageId: 'steer:one',
+    }],
+    start: 0, total: 1, hasMore: false, historyRevision: 1, historyEpoch: 'h',
+  });
+  store().appendLocalMessage('A', {
+    role: 'user', content: 'steer now', messageId: 'steer:one',
+  });
+
+  expect(texts()).toEqual(['steer now']);
+  expect(store().currentMessages[0]?.messageId).toBe('pan:history-steer');
 });
 
 it('converges a legacy id-less Steer row only within its local history boundary', () => {
@@ -311,4 +380,25 @@ it('unchanged live blocks keep their rendered object references', () => {
   const rendered = store().currentMessages[0];
   store().applyLiveStream('A', [first, row('second item grows')], meta);
   expect(store().currentMessages[0]).toBe(rendered);
+});
+
+
+it('keeps versioned canonical offsets when a delayed summary reports fewer rows', () => {
+  const history = Array.from({ length: 54 }, (_, index): Message => ({
+    role: index % 2 ? 'assistant' : 'user',
+    content: `history-${70 + index}`,
+    messageId: `legacy:A:h:${70 + index}`,
+  }));
+  store().applyHistoryPage('A', { history, start: 70, total: 124,
+    hasMore: true, historyEpoch: 'h', historyRevision: 124 });
+  // Summary freshness has a separate cursor and can lag a just-read tail.
+  // Older summary reconciliation also omitted the mirrored window start.
+  useSessionStore.setState((s) => ({ sessions: s.sessions.map(session =>
+    session.id === 'A' ? { ...session, historyTotal: 121, historyStart: undefined } : session) }));
+  store().applyHistoryPage('A', { history: history.slice(4), start: 74, total: 124,
+    hasMore: true, historyEpoch: 'h', historyRevision: 124 });
+  expect(store().sessionTranscripts.A!.window.rows.get(70)?.messageId).toBe('legacy:A:h:70');
+  expect(store().sessionTranscripts.A!.window.total).toBe(124);
+  expect(texts()).toEqual(history.map(message => message.content));
+  expect(store().historyLoadEnd).toBe(70);
 });

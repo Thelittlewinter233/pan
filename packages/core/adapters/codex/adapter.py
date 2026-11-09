@@ -146,6 +146,13 @@ class CodexAdapter:
     # Pan's interrupt endpoint to stop a turn without killing the whole native
     # thread/app-server process.
     supports_native_interrupt = True
+    supports_native_steer = True
+    supports_steer_receipt = True
+    # Terminal TUI (native control) capable: the app-server bridge is the
+    # native transport. Capability bit, not a name allow-list.
+    supports_native_control = True
+    # app-server turn/start admission commits the run before it runs.
+    supports_native_admission = True
     # codex reasoning effort（config: model_reasoning_effort）。空表示不覆盖。
     # models_cache.json may add xhigh/max/ultra; keep the fallback useful even
     # before Codex has populated its cache.
@@ -182,6 +189,10 @@ class CodexAdapter:
             if levels:
                 result[ident] = levels
         return result
+
+    def model_catalog_metadata(self) -> dict:
+        """Credential-free model declarations; do not refresh model discovery."""
+        return {"modelEfforts": self.model_efforts}
 
     # Settings are encoded into --codex-extra-args by build_spawn_args. The
     # wrapper itself intentionally does not accept CBC-style runtime flags.
@@ -298,6 +309,12 @@ class CodexAdapter:
     def build_spawn_args(self, s: Session,
                          extra_args: list[str] | None = None) -> list[str]:
         args = self.base_args()
+        # Private opt-in until lifecycle/control/UI integration is accepted.
+        # This changes only transport, never starts a second execution thread.
+        if s.adapter_config.get("native_control") is True:
+            args.append("--native-control")
+            if s.adapter_config.get("native_passthrough") is True:
+                args.append("--native-passthrough")
         # 所有 codex 级 option flag（model / permission / effort / mcp）汇总成一份
         # JSON 列表，经 wrapper 的 --codex-extra-args 透传给每次 codex exec 调用。
         codex_opts: list[str] = []
@@ -325,7 +342,8 @@ class CodexAdapter:
           args = ["...", "..."]
           [mcp_servers.<name>.env]
           KEY = "val"
-        URL server 用 url + transport。对应用 ``-c`` 内联表达。
+        URL server 只表达 ``url``（传输方式由 codex 依 url 推断，见下）。对应用
+        ``-c`` 内联表达。
         """
         servers = build_mcp_servers(s)
         if not servers:
@@ -334,11 +352,12 @@ class CodexAdapter:
         for name, entry in servers.items():
             env = dict(entry.get("env") or {})
             if entry.get("url"):
+                # 只透传 url：codex 由「是否存在 url」推断传输方式（实测
+                # codex-cli 0.162 调通 http MCP）。显式传
+                # mcp_servers.<name>.transport 会被 codex 判为未识别设置，
+                # 每次启动打印 `... transport is ignored` 警告（type 同理）。
                 opts.append("-c")
                 opts.append(_c_override(f"mcp_servers.{name}.url", entry["url"]))
-                transport = entry.get("transport") or "http"
-                opts.append("-c")
-                opts.append(_c_override(f"mcp_servers.{name}.transport", transport))
             else:
                 cmd = entry.get("command")
                 args = list(entry.get("args") or [])
@@ -500,7 +519,10 @@ class CodexAdapter:
                 if isinstance(b, dict) and b.get("type") == "text"
             )
             if text:
-                blocks.append({"role": "user", "content": text})
+                block = {"role": "user", "content": text}
+                if item.get("id") is not None:
+                    block["nativeItemId"] = str(item["id"])
+                blocks.append(block)
         else:
             # Keep newly introduced native item kinds visible and persisted
             # instead of silently dropping them until Pan learns a dedicated

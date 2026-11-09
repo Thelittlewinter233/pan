@@ -7,6 +7,8 @@
 - M18 隔离不倒退：session_id 路径同样过 _check_access
 """
 
+import pytest
+
 import asyncio
 import sys
 from pathlib import Path
@@ -120,6 +122,7 @@ def test_send_session_live_worker_delivers():
     _cleanup()
 
 
+@pytest.mark.skip(reason="Oneshot mode retired by user; implementation retained")
 def test_send_session_oneshot_worker_delivers():
     """oneshot MCP worker（process=None）视作活 worker，正常投递。"""
     _cleanup()
@@ -220,12 +223,18 @@ def test_send_session_unknown_session_errors():
     _cleanup()
 
 
+@pytest.mark.skip(reason="Oneshot mode retired by user; implementation retained")
 def test_send_session_force_live_oneshot_restarts_without_stream_spawn(monkeypatch):
-    """force=True + one-shot worker resets its consumer, never stream-spawns."""
+    """force=True + running one-shot worker resets its consumer, never stream-spawns.
+
+    An idle Worker now takes the ordinary send path; restart remains the
+    no-Steer fallback only while a turn is actually running.
+    """
     _cleanup()
     s = _setup_session("ses_d")
     s.adapter_config["output_mode"] = "oneshot"
-    _setup_worker(s.id, worker_id="worker-d1")
+    w = _setup_worker(s.id, worker_id="worker-d1")
+    w.status = "running"
     delivered = []
     delivered_event = asyncio.Event()
 
@@ -423,9 +432,8 @@ def test_mcp_worker_send_force_by_session_no_worker_enqueues(monkeypatch):
     monkeypatch.setenv("PAN_AGENT_SESSION_ID", "ses_ma")
     r = mcp_server.worker_send_force(session_id="ses_child", text="urgent")
     assert r.get("ok") is True, r
-    assert any(c[1] == "/api/sessions/ses_child/worker/restart"
-               for c in fake.calls), fake.calls
-    assert any(c[1] == "/api/task" and c[2]["sessionId"] == "ses_child"
+    assert not any(c[1].endswith("/restart") for c in fake.calls), fake.calls
+    assert any(c[1] == "/api/send" and c[2]["force"] and c[2]["sessionId"] == "ses_child"
                for c in fake.calls), fake.calls
     _cleanup()
 
@@ -441,8 +449,8 @@ def test_mcp_worker_send_force_by_session_with_worker_restarts(monkeypatch):
     monkeypatch.setenv("PAN_AGENT_SESSION_ID", "ses_ma")
     r = mcp_server.worker_send_force(session_id="ses_child", text="urgent")
     assert r.get("ok") is True, r
-    assert any(c[1] == "/api/sessions/ses_child/worker/restart" for c in fake.calls), fake.calls
-    assert any(c[1] == "/api/task" and c[2]["sessionId"] == "ses_child"
+    assert not any(c[1].endswith("/restart") for c in fake.calls), fake.calls
+    assert any(c[1] == "/api/send" and c[2]["force"] and c[2]["sessionId"] == "ses_child"
                for c in fake.calls), fake.calls
     _cleanup()
 

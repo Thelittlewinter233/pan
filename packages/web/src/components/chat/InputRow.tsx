@@ -1,19 +1,32 @@
+import { lockerRequest, LockerRequestError } from '@/views/lockerModel';
 import { useRef, useCallback, useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
+import { useNavigate } from 'react-router-dom';
 import {
   useSessionStore,
   useCurrentSession,
   type SessionSettingPatch,
 } from '@/stores/sessionStore';
-import { isRuntimeWorkerRunning, useWorkerStore } from '@/stores/workerStore';
+import { useWorkerStore } from '@/stores/workerStore';
 import { useUIStore } from '@/stores/uiStore';
 import { useAdapterStore } from '@/stores/adapterStore';
 import { useQueueStore } from '@/stores/queueStore';
+import {
+  canApplyLoadedDraft,
+  flushDraft,
+  installDraftLifecycleFlush,
+  loadDraft,
+  localDraftError,
+  recordDraft,
+  restorableLocalDraft,
+  subscribeDraftPersistence,
+} from '@/stores/composerDraftStore';
+import { fromDraft, toDraft } from '@/stores/composerDraftCodec';
 import { useMediaQuery } from '@/hooks/useMediaQuery';
 import { SendQueuePanel } from '@/components/chat/SendQueuePanel';
 import { SettingsPopover } from '@/components/chat/SettingsPopover';
 import { ModelSelect } from '@/components/ui/ModelSelect';
-import { DirectoryInput } from '@/components/session/DirectoryInput';
+import { ServerAttachmentPicker } from './ServerAttachmentPicker';
 import { Modal } from '@/components/ui/Modal';
 import {
   RichTextComposer,
@@ -21,11 +34,15 @@ import {
   type RichTextComposerHandle,
 } from '@/components/chat/RichTextComposer';
 import {
+  ApiRequestError,
+  SubmissionRejectedError,
   fetchDirectories,
   registerServerFileAttachment,
   uploadSessionAttachment,
 } from '@/services/api';
 import { attachmentMarkdown, serverFileDownloadHref } from '@/utils/attachmentMarkdown';
+import { composerUrlMarkdown } from '@/utils/composerUrl';
+import { openComposerAttachmentInEditor } from '@/utils/attachmentEditorOpen';
 import {
   isAttachmentPayloadForSession,
   type PanAttachmentPayload,
@@ -37,10 +54,16 @@ import {
   mockUploadSessionAttachment,
 } from '@/demo/mockBackend';
 import { directoryEntryExists, parentDirectory } from '@/utils/directoryInput';
+import { registerLockedEnqueueHandler } from '@/shortcuts/composerBridge';
+import { useAppSettingsStore } from '@/stores/appSettingsStore';
+import { getShortcutActions } from '@/shortcuts/registry';
+import { bindingFromEvent, findBindingConflicts, formatBinding, platformBinding, resolveBinding } from '@/shortcuts/bindings';
+import { hasOpenModal, isComposerShortcutTarget, isShortcutRecording } from '@/shortcuts/useGlobalShortcuts';
 import {
   ChevronDown,
   ChevronUp,
   CornerUpRight,
+  Loader2,
   Expand,
   File as FileIcon,
   Minimize2,
@@ -48,13 +71,16 @@ import {
   Settings,
   X,
 } from 'lucide-react';
-import type { AdapterConfig, MessagePart, PermissionMode } from '@/types';
+import type { AdapterConfig, MessagePart, PermissionMode, QueuedEditAttachment } from '@/types';
 import type { AttachmentLocation } from '@/types/attachment';
 
 const PILL_CLASS =
   'inline-flex items-center gap-1 px-2 py-1 text-xs rounded-md border border-border-default bg-bg-tertiary hover:bg-bg-hover cursor-pointer transition-colors';
 
 const DROPDOWN_ITEM = 'px-2 py-1 text-xs hover:bg-bg-hover cursor-pointer whitespace-nowrap';
+
+// 新增队列编辑附件的稳定空列表（chips 渲染回退值，保持引用稳定）。
+const EMPTY_QUEUE_EDIT_ATTACHMENTS: QueuedEditAttachment[] = [];
 
 // ── helpers ──
 
@@ -72,6 +98,7 @@ function permBorderClass(value: string): string {
 type AttachmentStatus = 'uploading' | 'registering' | 'ready' | 'error';
 
 interface PendingAttachment {
+  localFileId?: string;
   /** UI occurrence identity. Multiple occurrences may share attachmentId. */
   occurrenceId: string;
   /** Compatibility alias used by the existing chip/test selectors. */
@@ -118,6 +145,8 @@ function attachmentOccurrenceId(attachment: PendingAttachment): string {
 }
 
 interface SendSnapshot {
+  cardKind?: 'question' | 'task';
+  action: 'send' | 'steer';
   transactionId: string;
   clientMessageId: string;
   sessionId: string;
@@ -125,7 +154,7 @@ interface SendSnapshot {
   attachments: PendingAttachment[];
   message: string;
   parts?: MessagePart[];
-  appendOptimisticHistory: boolean;
+  locked: boolean;
 }
 
 interface SessionComposerDraft {
@@ -133,11 +162,49 @@ interface SessionComposerDraft {
   attachments: PendingAttachment[];
 }
 
+// The durable-draft wire contract (ordered parts, occurrence identity, and
+// recoverable attachment metadata) lives in composerDraftCodec, so the exact
+// shape that is persisted and the exact shape that is restored cannot drift
+// apart, and so the round trip can be exercised without mounting the composer.
+
 type AttachmentStateUpdate =
   PendingAttachment[] | ((current: PendingAttachment[]) => PendingAttachment[]);
 
 function composerPartOccurrenceId(part: ComposerValue['parts'][number]): string | null {
   return part.type === 'attachment' ? part.occurrenceId || part.attachmentId : null;
+}
+
+/** URL nodes are content even though they contribute no `text` and no
+ *  attachment occurrence id.  Every emptiness/recovery decision must ask this,
+ *  not `value.text` alone. */
+function composerValueHasContent(value: ComposerValue): boolean {
+  return (
+    !!value.text ||
+    value.occurrenceIds.length > 0 ||
+    value.parts.some((part) => part.type === 'url')
+  );
+}
+
+/** Order-sensitive identity of inline URL nodes for recovery comparisons. */
+function composerUrlStructureKey(value: ComposerValue): string {
+  return value.parts
+    .filter((part) => part.type === 'url')
+    .map((part) =>
+      part.type === 'url' ? `${part.id}\u0000${part.url}\u0000${part.label || ''}` : '',
+    )
+    .join('\u0001');
+}
+
+/** Text projection used by the queue editor, which has no attachment parts.
+ *  URL nodes are serialized as the same Markdown link the message would send. */
+function composerTextWithUrls(value: ComposerValue): string {
+  return value.parts
+    .map((part) => {
+      if (part.type === 'text') return part.value;
+      if (part.type === 'url') return composerUrlMarkdown(part.url, part.label);
+      return '';
+    })
+    .join('');
 }
 
 function emptyComposerValue(): ComposerValue {
@@ -160,8 +227,8 @@ function cloneComposerValue(value: ComposerValue): ComposerValue {
 }
 
 function appendComposerValues(current: ComposerValue, restored: ComposerValue): ComposerValue {
-  if (!current.text && current.occurrenceIds.length === 0) return cloneComposerValue(restored);
-  if (!restored.text && restored.occurrenceIds.length === 0) return cloneComposerValue(current);
+  if (!composerValueHasContent(current)) return cloneComposerValue(restored);
+  if (!composerValueHasContent(restored)) return cloneComposerValue(current);
   const separator: ComposerValue['parts'] = [{ type: 'text', value: '\n' }];
   const parts = [...current.parts, ...separator, ...restored.parts].map((part) => ({ ...part }));
   const occurrenceIds = parts.map(composerPartOccurrenceId).filter((id): id is string => !!id);
@@ -182,12 +249,14 @@ function ModelPill({
   sessionModel,
   defaultModel,
   models,
+  multipliers,
   show,
   onApply,
 }: {
   sessionModel: string;
   defaultModel: string;
   models: string[];
+  multipliers?: Record<string, number>;
   show: boolean;
   onApply: (key: string, value: string) => void;
 }) {
@@ -202,6 +271,7 @@ function ModelPill({
       <ModelSelect
         value={current}
         options={models}
+        multipliers={multipliers}
         onChange={(m) => onApply('model', m)}
         buttonClassName={PILL_CLASS + ' min-w-0 max-w-full font-semibold'}
         menuClassName="absolute left-0 bottom-full mb-1 z-40 min-w-[160px] w-max"
@@ -336,6 +406,7 @@ export function InputRow() {
   const resizeStartRef = useRef<{ y: number; height: number } | null>(null);
   const currentSessionId = useSessionStore((s) => s.currentSessionId);
   const currentSession = useCurrentSession();
+  const navigate = useNavigate();
   const appendLocalMessage = useSessionStore((s) => s.appendLocalMessage);
   const setInputDraft = useSessionStore((s) => s.setInputDraft);
   const steer = useWorkerStore((s) => s.steer);
@@ -366,6 +437,9 @@ export function InputRow() {
   const [attachmentBrowserOpen, setAttachmentBrowserOpen] = useState(false);
   const [attachmentBrowserPath, setAttachmentBrowserPath] = useState('');
   const [attachmentDirectoryError, setAttachmentDirectoryError] = useState<string | null>(null);
+  const [cardMode, setCardMode] = useState(false);
+  const [cardKind, setCardKind] = useState<'question' | 'task'>('question');
+  const cardDraftSessionRef = useRef<string | null>(null);
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const attachmentsRef = useRef<PendingAttachment[]>([]);
   const [composerText, setComposerText] = useState(() =>
@@ -377,26 +451,39 @@ export function InputRow() {
   const attachmentEpochRef = useRef(0);
   const activeAttachmentSessionRef = useRef<string | null>(currentSessionId);
   const draftsBySessionRef = useRef(new Map<string, SessionComposerDraft>());
+  const [pendingActions, setPendingActions] = useState<Record<string, 'send' | 'steer'>>({});
+  const pendingAction = currentSessionId ? pendingActions[currentSessionId] : undefined;
   const sendSnapshotsRef = useRef(new Map<string, SendSnapshot>());
   const recoveryBySessionRef = useRef(new Map<string, SendSnapshot>());
   const pendingRecoveryValueRef = useRef<ComposerValue | null>(null);
 
+  // Keep the complete composer draft (text + inline structure + attachment
+  // metadata) in the mounted InputRow, keyed by durable Session id. The
+  // session store still owns the plain-text projection for compatibility, but
+  // text alone cannot reconstruct inline occurrence ordering.
+  //
+  // This is also the single funnel every local composer edit passes through
+  // (keystrokes, attachment add/remove/upload, session switch, restore), so
+  // durable persistence hangs here rather than at each of those call sites.
+  // Recording is synchronous and network-free; the store debounces, rate
+  // limits and coalesces the actual writes.
   const rememberSessionDraft = useCallback(
     (sessionId: string, value: ComposerValue, nextAttachments: PendingAttachment[]) => {
       const clonedValue = cloneComposerValue(value);
       const clonedAttachments = nextAttachments.map((attachment) => ({ ...attachment }));
-      if (
-        !clonedValue.text &&
-        clonedValue.occurrenceIds.length === 0 &&
-        clonedAttachments.length === 0
-      ) {
+      if (!composerValueHasContent(clonedValue) && clonedAttachments.length === 0) {
         draftsBySessionRef.current.delete(sessionId);
+        // An empty composer is still persisted state: recording it writes a
+        // versioned tombstone so a reload cannot resurrect text the user
+        // already sent or deleted.
+        recordDraft(sessionId, null);
         return;
       }
       draftsBySessionRef.current.set(sessionId, {
         value: clonedValue,
         attachments: clonedAttachments,
       });
+      recordDraft(sessionId, toDraft(clonedValue, clonedAttachments, sessionId));
     },
     [],
   );
@@ -414,7 +501,10 @@ export function InputRow() {
     [rememberSessionDraft],
   );
   const enqueue = useQueueStore((s) => s.enqueue);
+  const lockedComposerMode = useQueueStore((s) =>
+    currentSessionId ? s.lockedComposerModes[currentSessionId] ?? false : false);
   const panelOpen = useQueueStore((s) => s.panelOpen);
+  const setPanelOpen = useQueueStore((s) => s.setPanelOpen);
   const togglePanel = useQueueStore((s) => s.togglePanel);
   // 计数只投影真正待发的队列项；编辑是同一项的状态，不是额外一条。
   const queueCount = useQueueStore((s) => {
@@ -422,13 +512,371 @@ export function InputRow() {
     const q = s.queues[currentSessionId];
     return q?.filter((item) => item.meta?.dispatchState === 'queued').length ?? 0;
   });
-  const queueEditActive = useQueueStore((s) =>
-    currentSessionId ? Boolean(s.edits[currentSessionId]) : false,
+  // 红色指示复用真实队列锁语义（manual / auto-report 均落在 meta.locked）：
+  // 队列非空且每一条待发消息都带锁时为全锁；不使用 running/paused 等运行态。
+  const queueAllLocked = useQueueStore((s) => {
+    if (!currentSessionId) return false;
+    const queued = s.queues[currentSessionId]?.filter(
+      (item) => item.meta?.dispatchState === 'queued',
+    );
+    return !!queued && queued.length > 0 && queued.every((item) => item.meta?.locked === true);
+  });
+  const queueEdit = useQueueStore((s) => currentSessionId ? s.edits[currentSessionId] : null);
+  const queueEditActive = !!queueEdit;
+  const saveQueueEdit = useQueueStore((s) => s.saveEdit);
+  const cancelQueueEdit = useQueueStore((s) => s.cancelEdit);
+  const updateQueueEdit = useQueueStore((s) => s.updateEditDraft);
+  // 队列编辑复用与普通输入一致的 RichTextComposer；正文/附件事务与普通草稿隔离。
+  const queueComposerRef = useRef<RichTextComposerHandle | null>(null);
+  const queueComposerFocusTokenRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!queueEdit || queueEdit.acquiring) return;
+    const focusToken = queueEdit.editToken ?? null;
+    if (queueComposerFocusTokenRef.current === focusToken) return;
+    queueComposerFocusTokenRef.current = focusToken;
+    queueComposerRef.current?.focus();
+  }, [queueEdit]);
+  const handleQueueComposerChange = useCallback(
+    // The queue editor owns one plain-text body, so URL nodes are projected to
+    // the exact Markdown link that will be sent (no attachment parts exist here).
+    (value: ComposerValue) => {
+      const edit = currentSessionId ? useQueueStore.getState().edits[currentSessionId] : null;
+      if (edit?.composerValue) useQueueStore.getState().updateEditComposer(value);
+      else updateQueueEdit(composerTextWithUrls(value));
+    },
+    [updateQueueEdit, currentSessionId],
   );
-  const queuedWhileBusy = currentSession?.workerStatus === 'running' && queueCount > 0;
+  // ── Queued-edit attachments（仅 task 来源；report/notice/channel 派发不消费
+  // parts，见 _deliver_queue_unit/_format_report_batch，故不提供附件入口）──
+  const updateQueueEditAttachments = useQueueStore((s) => s.updateEditAttachments);
+  const queueEditAttachments = queueEdit?.attachments ?? EMPTY_QUEUE_EDIT_ATTACHMENTS;
+  // Tracked per attempt: aborting one Session's edit must never touch another
+  // Session's in-flight upload, while unmount may cancel everything.
+  const queueUploadControllersRef = useRef(
+    new Map<string, { controller: AbortController; sessionId: string }>(),
+  );
+  // Shared attachment menu/browser target: the ordinary composer keeps its
+  // draft transaction; queue edits write the isolated edit attachment list.
+  const attachmentTargetRef = useRef<'composer' | 'queue-edit'>('composer');
+  const abortQueueEditUploads = useCallback((sessionId?: string) => {
+    for (const [occurrenceId, entry] of queueUploadControllersRef.current) {
+      if (sessionId === undefined || entry.sessionId === sessionId) {
+        entry.controller.abort();
+        queueUploadControllersRef.current.delete(occurrenceId);
+      }
+    }
+  }, []);
+  // Unmount cancels every tracked upload regardless of Session: nobody is
+  // left to consume their callbacks.
+  useEffect(() => () => abortQueueEditUploads(), [abortQueueEditUploads]);
+  const queueEditAttachmentLive = useCallback(
+    (sessionId: string, occurrenceId: string, token: number | undefined, controller?: AbortController) => {
+      // Bound to the transaction's session: a late response must land on the
+      // edit it was started in, never on whatever Session is current.
+      const edit = useQueueStore.getState().edits[sessionId];
+      if (!edit || edit.editToken !== token) return false;
+      // The chip must still exist: a retried attempt gets a fresh identity
+      // (or a fresh controller), so stale responses cannot overwrite it.
+      if (!edit.attachments?.some((item) => item.occurrenceId === occurrenceId)) return false;
+      if (controller) {
+        const entry = queueUploadControllersRef.current.get(occurrenceId);
+        if (!entry || entry.controller !== controller) return false;
+      }
+      return true;
+    },
+    [],
+  );
+  const uploadQueueEditAttachment = useCallback(
+    async (attachment: QueuedEditAttachment, token: number | undefined, sessionId: string) => {
+      if (!attachment.file) return;
+      const controller = new AbortController();
+      queueUploadControllersRef.current.set(attachment.occurrenceId, { controller, sessionId });
+      try {
+        const upload = isMockMode() ? mockUploadSessionAttachment : uploadSessionAttachment;
+        const uploaded = await upload(
+          sessionId,
+          attachment.file,
+          (loaded, total) => {
+            if (!queueEditAttachmentLive(sessionId, attachment.occurrenceId, token, controller)) return;
+            updateQueueEditAttachments(sessionId, (current) =>
+              current.map((item) =>
+                item.occurrenceId === attachment.occurrenceId
+                  ? { ...item, loadedBytes: loaded, totalBytes: total }
+                  : item,
+              ),
+            );
+          },
+          controller.signal,
+        );
+        if (!queueEditAttachmentLive(sessionId, attachment.occurrenceId, token, controller)) return;
+        updateQueueEditAttachments(sessionId, (current) =>
+          current.map((item) =>
+            item.occurrenceId === attachment.occurrenceId
+              ? {
+                  ...item,
+                  attachmentId: uploaded.attachmentId || uploaded.storageFilename,
+                  displayName: uploaded.displayName || uploaded.filename || item.displayName,
+                  path: uploaded.path,
+                  href: uploaded.href || serverFileDownloadHref(sessionId, uploaded.path),
+                  mimeType: attachment.file?.type || undefined,
+                  source: 'upload' as const,
+                  status: 'ready' as const,
+                  loadedBytes: uploaded.size,
+                  totalBytes: uploaded.size,
+                  error: undefined,
+                }
+              : item,
+          ),
+        );
+      } catch (error) {
+        // The controller identity is part of the liveness check: a retried
+        // attempt installs a fresh controller, so this stale AbortError (e.g.
+        // cancel -> release failure -> immediate retry) cannot overwrite the
+        // new attempt's uploading/ready state.
+        if (!queueEditAttachmentLive(sessionId, attachment.occurrenceId, token, controller)) return;
+        updateQueueEditAttachments(sessionId, (current) =>
+          current.map((item) =>
+            item.occurrenceId === attachment.occurrenceId
+              ? { ...item, status: 'error' as const, error: error instanceof Error ? error.message : String(error) }
+              : item,
+          ),
+        );
+      } finally {
+        const entry = queueUploadControllersRef.current.get(attachment.occurrenceId);
+        if (entry && entry.controller === controller) {
+          queueUploadControllersRef.current.delete(attachment.occurrenceId);
+        }
+      }
+    },
+    [queueEditAttachmentLive, updateQueueEditAttachments],
+  );
+  const registerQueueEditAttachment = useCallback(
+    (occurrenceId: string, path: string, token: number | undefined, sessionId: string) => {
+      void (async () => {
+        try {
+          const register = isMockMode() ? mockRegisterServerFileAttachment : registerServerFileAttachment;
+          const registered = await register(sessionId, path);
+          if (!queueEditAttachmentLive(sessionId, occurrenceId, token)) return;
+          updateQueueEditAttachments(sessionId, (current) =>
+            current.map((item) =>
+              item.occurrenceId === occurrenceId
+                ? {
+                    ...item,
+                    attachmentId: registered.attachmentId,
+                    displayName: registered.displayName,
+                    href: registered.href,
+                    path: registered.path,
+                    mimeType: registered.mimeType,
+                    source: 'server_file' as const,
+                    status: 'ready' as const,
+                  }
+                : item,
+            ),
+          );
+        } catch (error) {
+          if (!queueEditAttachmentLive(sessionId, occurrenceId, token)) return;
+          updateQueueEditAttachments(sessionId, (current) =>
+            current.map((item) =>
+              item.occurrenceId === occurrenceId
+                ? { ...item, status: 'error' as const, error: error instanceof Error ? error.message : '附件注册失败' }
+                : item,
+            ),
+          );
+        }
+      })();
+    },
+    [queueEditAttachmentLive, updateQueueEditAttachments],
+  );
+  const addQueueEditClientFiles = useCallback(
+    (files: File[]): string[] => {
+      if (!queueEdit || queueEdit.kind !== 'task' || files.length === 0) return [];
+      const token = queueEdit.editToken;
+      const sessionId = useSessionStore.getState().currentSessionId;
+      if (!sessionId) return [];
+      const selectedKeys = new Set(
+        queueEdit.attachments
+          ?.filter((attachment) => attachment.status !== 'error' && attachment.fileKey)
+          .map((attachment) => attachment.fileKey) ?? [],
+      );
+      const added = files
+        .filter((file) => {
+          const key = clientFileKey(file);
+          if (selectedKeys.has(key)) return false;
+          selectedKeys.add(key);
+          return true;
+        })
+        .map((file) => ({
+          occurrenceId: attachmentId(),
+          id: '',
+          displayName: file.name,
+          file,
+          fileKey: clientFileKey(file),
+          loadedBytes: 0,
+          totalBytes: file.size,
+          status: 'uploading' as const,
+          source: 'upload' as const,
+        }))
+        .map((attachment) => ({ ...attachment, id: attachment.occurrenceId }));
+      if (added.length === 0) return [];
+      updateQueueEditAttachments(sessionId, (current) => [...current, ...added]);
+      for (const attachment of added) {
+        void uploadQueueEditAttachment(attachment, token, sessionId);
+      }
+      return added.map((attachment) => attachment.occurrenceId);
+    },
+    [queueEdit, uploadQueueEditAttachment, updateQueueEditAttachments],
+  );
+  const handleQueueEditAttachmentDrop = useCallback(
+    (payload: PanAttachmentPayload): string | null => {
+      if (!queueEdit || queueEdit.kind !== 'task' || !currentSessionId) return null;
+      if (!isAttachmentPayloadForSession(payload, currentSessionId)) {
+        showToast('附件属于其他 Session，不能拖入当前输入框', 'error');
+        return null;
+      }
+      if (payload.attachmentId && (payload.source === 'composer' || payload.source === 'attachment-chip')) {
+        const existing = queueEdit.attachments?.find(item => item.occurrenceId === payload.attachmentId);
+        if (existing) return existing.occurrenceId;
+      }
+      const remoteId = payload.serverAttachmentId || uploadAttachmentIdFromHref(payload.href);
+      const needsRegistration = !remoteId && !!payload.path;
+      const token = queueEdit.editToken;
+      const sessionId = currentSessionId;
+      const occurrenceId = attachmentId();
+      updateQueueEditAttachments(sessionId, (current) => [
+        ...current,
+        {
+          occurrenceId,
+          id: occurrenceId,
+          attachmentId: remoteId,
+          displayName: payload.displayName,
+          path: payload.path,
+          href: payload.href,
+          status: needsRegistration ? 'registering' as const : 'ready' as const,
+          source: remoteId?.startsWith('upload_') ? 'upload' as const : 'server_file' as const,
+        },
+      ]);
+      if (needsRegistration) {
+        registerQueueEditAttachment(occurrenceId, payload.path!, token, sessionId);
+      }
+      return occurrenceId;
+    },
+    [queueEdit, currentSessionId, registerQueueEditAttachment, showToast, updateQueueEditAttachments],
+  );
+  const removeQueueEditAttachment = useCallback(
+    (sessionId: string | undefined, occurrenceId: string) => {
+      if (!sessionId) return;
+      const entry = queueUploadControllersRef.current.get(occurrenceId);
+      if (entry) {
+        entry.controller.abort();
+        queueUploadControllersRef.current.delete(occurrenceId);
+      }
+      updateQueueEditAttachments(sessionId, (current) =>
+        current.filter((item) => item.occurrenceId !== occurrenceId),
+      );
+      const edit = useQueueStore.getState().edits[sessionId];
+      if (edit?.composerValue && useSessionStore.getState().currentSessionId === sessionId) {
+        const value = edit.composerValue;
+        const next = { ...value,
+          parts: value.parts.filter(part => part.type !== 'attachment' || (part.occurrenceId || part.attachmentId) !== occurrenceId),
+          occurrenceIds: value.occurrenceIds.filter(id => id !== occurrenceId),
+          attachmentIds: value.attachmentIds.filter(id => id !== occurrenceId),
+        };
+        useQueueStore.getState().updateEditComposer(next);
+        queueComposerRef.current?.replaceValue(next);
+      }
+    },
+    [updateQueueEditAttachments],
+  );
+  const retryQueueEditAttachment = useCallback(
+    (sessionId: string | undefined, attachment: QueuedEditAttachment) => {
+      if (!sessionId) return;
+      const token = useQueueStore.getState().edits[sessionId]?.editToken;
+      if (token === undefined) return;
+      if (attachment.file) {
+        updateQueueEditAttachments(sessionId, (current) =>
+          current.map((item) =>
+            item.occurrenceId === attachment.occurrenceId
+              ? { ...item, status: 'uploading' as const, error: undefined, loadedBytes: 0 }
+              : item,
+          ),
+        );
+        void uploadQueueEditAttachment(attachment, token, sessionId);
+      } else if (attachment.path) {
+        // Path registration retry gets a FRESH occurrence id: the previous
+        // attempt's chip is replaced, so a late response from the old
+        // registration cannot overwrite the new attempt (the old occurrence
+        // no longer exists, failing the liveness check).
+        const nextOccurrenceId = attachmentId();
+        updateQueueEditAttachments(sessionId, (current) =>
+          current.flatMap((item) => {
+            if (item.occurrenceId !== attachment.occurrenceId) return [item];
+            return [{
+              ...item,
+              occurrenceId: nextOccurrenceId,
+              id: nextOccurrenceId,
+              status: 'registering' as const,
+              error: undefined,
+            }];
+          }),
+        );
+        registerQueueEditAttachment(nextOccurrenceId, attachment.path, token, sessionId);
+      }
+    },
+    [registerQueueEditAttachment, updateQueueEditAttachments, uploadQueueEditAttachment],
+  );
+  const handleQueueEditCancel = useCallback(() => {
+    const sid = useSessionStore.getState().currentSessionId;
+    if (sid) {
+      // Mark in-flight work as cancelled BEFORE aborting: the late AbortError
+      // lands after cancelEdit flipped releasing (or after the edit cleared),
+      // and if the lease release later fails the action guard would drop it,
+      // leaving a permanently 'uploading' chip and a dead Save button.
+      // Pre-marked error chips stay retryable/removable in every outcome.
+      const edit = useQueueStore.getState().edits[sid];
+      if (edit) {
+        updateQueueEditAttachments(sid, (current) =>
+          current.map((item) =>
+            item.status === 'uploading' || item.status === 'registering'
+              ? { ...item, status: 'error' as const, error: '已取消编辑；可重试或移除' }
+              : item,
+          ),
+        );
+      }
+    }
+    // Only this transaction's uploads: other Sessions' edits keep theirs.
+    abortQueueEditUploads(sid ?? undefined);
+    cancelQueueEdit();
+  }, [abortQueueEditUploads, cancelQueueEdit, updateQueueEditAttachments]);
+  const handleQueueComposerKeyDown = useCallback(
+    (event: React.KeyboardEvent<HTMLElement>) => {
+      if (event.nativeEvent.isComposing) return;
+      if (event.key === 'Enter' && !event.shiftKey) {
+        event.preventDefault();
+        saveQueueEdit();
+      } else if (event.key === 'Escape') {
+        event.preventDefault();
+        handleQueueEditCancel();
+      }
+    },
+    [saveQueueEdit, handleQueueEditCancel],
+  );
+  // Save stays blocked for any non-ready chip AND for a 'ready' chip that
+  // somehow lacks its server id: dropping it silently would lie to the user.
+  const queueEditAttachmentsPending = queueEditAttachments.some(
+    (attachment) => attachment.status !== 'ready' || !attachment.attachmentId,
+  );
+  const queueEditAttachmentsSupported = queueEdit?.kind === 'task'
+    && (queueEdit.bodyFormat === 'text' || queueEdit.bodyFormat === 'parts');
+  useEffect(() => {
+    if (!queueEditActive) return;
+    setAttachmentMenuOpen(false);
+    setAttachmentBrowserOpen(false);
+    setSettingsOpen(false);
+  }, [queueEditActive]);
 
   // ── Adapter settings ──
   const config = useAdapterStore((s) => s.getConfig());
+  const steerCapability = useAdapterStore((s) => s.adapters.find(a => a.name === currentSession?.adapter)?.supportsSteer);
   const loadConfig = useAdapterStore((s) => s.loadConfig);
   const applySettings = useAdapterStore((s) => s.applySettings);
   const loadSessions = useSessionStore((s) => s.loadSessions);
@@ -470,8 +918,25 @@ export function InputRow() {
   // text alone cannot reconstruct inline occurrence ordering.
   useEffect(() => {
     const previousSessionId = activeAttachmentSessionRef.current;
+    if (previousSessionId && previousSessionId !== currentSessionId && cardDraftSessionRef.current === previousSessionId) {
+      composerValueRef.current = emptyComposerValue();
+      attachmentsRef.current = [];
+      setInputDraft(previousSessionId, '');
+      recoveryBySessionRef.current.delete(previousSessionId);
+      cardDraftSessionRef.current = null;
+      setCardMode(false);
+      setCardKind('question');
+    }
     if (previousSessionId && previousSessionId !== currentSessionId) {
-      rememberSessionDraft(previousSessionId, composerValueRef.current, attachmentsRef.current);
+      const interrupted = attachmentsRef.current.map((attachment) =>
+        attachment.status === 'uploading' || attachment.status === 'registering'
+          ? { ...attachment, status: 'error' as const, error: '上传已中断，请重试' } : attachment);
+      rememberSessionDraft(previousSessionId, composerValueRef.current, interrupted);
+      // Leaving a Session is the last chance to persist it cheaply: the
+      // outgoing draft is complete and the user is not typing it any more, so
+      // skip the debounce and write now.  Fire-and-forget; navigation to the
+      // next Session must not wait on the network.
+      flushDraft(previousSessionId);
     }
 
     attachmentEpochRef.current += 1;
@@ -482,8 +947,24 @@ export function InputRow() {
     const recovery = currentSessionId
       ? recoveryBySessionRef.current.get(currentSessionId)
       : undefined;
+    // A route switch (Chat → Editor/Jobs/Terminal/plugin panel → Chat)
+    // unmounts this component, so the refs above are gone when it comes back.
+    // The draft store is module-scoped and already holds the last recorded
+    // value, including occurrence order and the localFileId of pending bytes;
+    // restoring from it is synchronous and independent of the server.
+    const recorded = !recovery && !stored && currentSessionId
+      ? (() => {
+          const local = restorableLocalDraft(currentSessionId);
+          return local ? fromDraft(local, draft || '') : null;
+        })()
+      : null;
+    if (recorded && currentSessionId) {
+      // Keep the in-memory copy authoritative for later in-component switches
+      // and for the next unmount, instead of re-reading the store each time.
+      draftsBySessionRef.current.set(currentSessionId, recorded);
+    }
     const value = recovery?.value ||
-      stored?.value || {
+      stored?.value || recorded?.value || {
         parts: draft
           ? [{ type: 'text' as const, value: draft }]
           : [{ type: 'text' as const, value: '' }],
@@ -491,7 +972,7 @@ export function InputRow() {
         occurrenceIds: [],
         attachmentIds: [],
       };
-    const restoredAttachments = recovery?.attachments || stored?.attachments || [];
+    const restoredAttachments = recovery?.attachments || stored?.attachments || recorded?.attachments || [];
     const clonedAttachments = restoredAttachments.map((attachment) => ({ ...attachment }));
     composerValueRef.current = cloneComposerValue(value);
     attachmentsRef.current = clonedAttachments;
@@ -503,9 +984,92 @@ export function InputRow() {
     return () => {
       if (activeAttachmentSessionRef.current === currentSessionId && currentSessionId) {
         rememberSessionDraft(currentSessionId, composerValueRef.current, attachmentsRef.current);
+        // Leaving the Session — including an unmount caused by a route change —
+        // is the last cheap moment to persist: the payload is complete and the
+        // user is no longer typing it. Fire-and-forget; navigation must not wait
+        // on the network, and the store coalesces this with any in-flight save.
+        flushDraft(currentSessionId);
       }
     };
   }, [currentSessionId, rememberSessionDraft]);
+
+  // Durable draft cold load.
+  //
+  // Priority is unchanged — a memory draft, a failed-send recovery, or the
+  // store's plain-text projection all win synchronously, so switching Sessions
+  // never waits on the network.  Only when none of those produced content does
+  // this fetch, and only for the one selected Session: no Session list scan,
+  // no prefetch, no work proportional to the number of Sessions.
+  //
+  // The selection epoch distinguishes "the same Session id, later in time"
+  // from "the Session this read was started for".  Without it an A→B→A switch
+  // lets the first A's slow response land in the second A's composer.
+  const selectionEpochRef = useRef(0);
+  useEffect(() => {
+    selectionEpochRef.current += 1;
+    const epoch = selectionEpochRef.current;
+    const sessionId = currentSessionId;
+    if (!sessionId) return;
+    // Registering the lifecycle flush here (idempotent) keeps it out of the
+    // store module's import side effects, so importing the store in a
+    // non-DOM context stays safe.
+    installDraftLifecycleFlush();
+    const hasLocalContent =
+      !!draftsBySessionRef.current.get(sessionId) ||
+      !!recoveryBySessionRef.current.get(sessionId) ||
+      !!restorableLocalDraft(sessionId) ||
+      !!useSessionStore.getState().inputDrafts[sessionId];
+    if (hasLocalContent) return;
+    let cancelled = false;
+    void loadDraft(sessionId).then((draft) => {
+      if (cancelled || !draft) return;
+      if (activeAttachmentSessionRef.current !== sessionId) return;
+      if (!canApplyLoadedDraft(sessionId, epoch, selectionEpochRef.current)) return;
+      const restored = fromDraft(
+        draft,
+        useSessionStore.getState().inputDrafts[sessionId] || '',
+      );
+      if (!restored) return;
+      composerValueRef.current = cloneComposerValue(restored.value);
+      const clonedAttachments = restored.attachments.map((attachment) => ({ ...attachment }));
+      attachmentsRef.current = clonedAttachments;
+      setAttachments(clonedAttachments);
+      setInputDraft(sessionId, restored.value.text);
+      pendingRecoveryValueRef.current = restored.value.occurrenceIds.length
+        ? cloneComposerValue(restored.value)
+        : null;
+      if (!pendingRecoveryValueRef.current) composerRef.current?.replaceValue(restored.value);
+      setComposerText(restored.value.text);
+      setComposerOccurrenceIds([...restored.value.occurrenceIds]);
+      // Keep the local projection authoritative so a later Session switch back
+      // restores from memory instead of re-reading.
+      draftsBySessionRef.current.set(sessionId, restored);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [currentSessionId, setInputDraft]);
+
+  // Surface a failed save once. Silently dropping the only copy of unsent text
+  // is the one unacceptable outcome here, so a bounded-retry exhaustion or a
+  // cross-tab conflict is reported instead.
+  useEffect(() => {
+    let lastError: string | null = null;
+    // A save can fail (transport retries exhausted, or a CAS conflict) while
+    // the Chat route is unmounted and no subscriber exists to hear it. Surface
+    // that standing error once when the composer comes back: the local copy is
+    // preserved, and the user must know it is not durable yet.
+    const standing = currentSessionId ? localDraftError(currentSessionId) : null;
+    if (standing) {
+      lastError = standing;
+      showToast(`${standing}`, 'error');
+    }
+    return subscribeDraftPersistence((sessionId, error) => {
+      if (sessionId !== currentSessionId || !error || error === lastError) return;
+      lastError = error;
+      showToast(`${error}`, 'error');
+    });
+  }, [currentSessionId, showToast]);
 
   useEffect(() => {
     const pending = pendingRecoveryValueRef.current;
@@ -621,6 +1185,23 @@ export function InputRow() {
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
   }, [isMobile, mobileFullscreen]);
+
+  // Fullscreen queue editing follows the visible viewport when a mobile
+  // keyboard opens. Keep the ordinary composer/fullscreen behavior intact.
+  const [queueEditViewport, setQueueEditViewport] = useState<{ height: number; top: number } | null>(null);
+  useEffect(() => {
+    if (!isMobile || !mobileFullscreen || !queueEditActive) return;
+    const viewport = window.visualViewport;
+    if (!viewport) return;
+    const update = () => setQueueEditViewport({ height: viewport.height, top: viewport.offsetTop });
+    update();
+    viewport.addEventListener('resize', update);
+    viewport.addEventListener('scroll', update);
+    return () => {
+      viewport.removeEventListener('resize', update);
+      viewport.removeEventListener('scroll', update);
+    };
+  }, [isMobile, mobileFullscreen, queueEditActive]);
 
   const handleResizePointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
     if (isMobile) return;
@@ -746,9 +1327,15 @@ export function InputRow() {
     (event: React.ChangeEvent<HTMLInputElement>) => {
       const files = Array.from(event.target.files || []);
       event.target.value = '';
+      // Shared file input: route by the menu target captured at open time so
+      // queue-edit picks never touch the ordinary draft attachment list.
+      if (attachmentTargetRef.current === 'queue-edit') {
+        addQueueEditClientFiles(files);
+        return;
+      }
       void queueClientFiles(files);
     },
-    [queueClientFiles],
+    [addQueueEditClientFiles, queueClientFiles],
   );
 
   const handleNativeFiles = useCallback(
@@ -780,7 +1367,8 @@ export function InputRow() {
         if (
           recovery &&
           (recovery.value.text !== value.text ||
-            recovery.value.occurrenceIds.join('\u0000') !== value.occurrenceIds.join('\u0000'))
+            recovery.value.occurrenceIds.join('\u0000') !== value.occurrenceIds.join('\u0000') ||
+            composerUrlStructureKey(recovery.value) !== composerUrlStructureKey(value))
         ) {
           recoveryBySessionRef.current.delete(currentSessionId);
         }
@@ -888,31 +1476,117 @@ export function InputRow() {
     [updateAttachments],
   );
 
+  // A native drag released from a standalone chip must not later fire the
+  // chip's click open. Cleared on the task after dragend so a subsequent
+  // unrelated click is never swallowed (same pattern as message file links).
+  const attachmentChipDraggedRef = useRef(false);
+  const attachmentChipDraggedResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const clearAttachmentChipDragSuppression = useCallback(() => {
+    if (attachmentChipDraggedResetRef.current !== null) {
+      clearTimeout(attachmentChipDraggedResetRef.current);
+    }
+    attachmentChipDraggedResetRef.current = setTimeout(() => {
+      attachmentChipDraggedRef.current = false;
+      attachmentChipDraggedResetRef.current = null;
+    }, 0);
+  }, []);
+  const beginAttachmentChipDragSuppression = useCallback(() => {
+    // Starting a drag is a new suppression lifecycle: cancel any pending
+    // reset from a previous drag so a late timer can never un-suppress an
+    // in-flight drag.
+    if (attachmentChipDraggedResetRef.current !== null) {
+      clearTimeout(attachmentChipDraggedResetRef.current);
+      attachmentChipDraggedResetRef.current = null;
+    }
+    attachmentChipDraggedRef.current = true;
+  }, []);
+  // Fallback for chip drags whose dragend never reaches the chip element
+  // (source node removed, drop elsewhere) and unmount cleanup for the timer.
+  useEffect(() => {
+    const clear = () => clearAttachmentChipDragSuppression();
+    window.addEventListener('dragend', clear);
+    window.addEventListener('drop', clear);
+    return () => {
+      window.removeEventListener('dragend', clear);
+      window.removeEventListener('drop', clear);
+      if (attachmentChipDraggedResetRef.current !== null) {
+        clearTimeout(attachmentChipDraggedResetRef.current);
+        attachmentChipDraggedResetRef.current = null;
+      }
+    };
+  }, [clearAttachmentChipDragSuppression]);
+
+  // Short click on a composer attachment (inline node or standalone chip)
+  // opens the underlying file through the existing Editor flow. Uploading,
+  // registering, and failed attachments have no server-openable identity yet
+  // and their chips already surface progress/errors, so those clicks no-op.
+  const openComposerAttachment = useCallback(
+    (occurrenceId: string) => {
+      const sessionId = currentSessionId;
+      const workdir = currentSession?.workdir;
+      if (!sessionId) {
+        showToast('当前没有可用的 Session，无法打开文件', 'error');
+        return;
+      }
+      if (!workdir) {
+        showToast('当前 Session 没有工作目录，无法打开文件', 'error');
+        return;
+      }
+      const attachment = attachmentsRef.current.find(
+        (item) => attachmentOccurrenceId(item) === occurrenceId,
+      );
+      if (!attachment || attachment.status !== 'ready') return;
+      void openComposerAttachmentInEditor(
+        {
+          serverAttachmentId: attachment.attachmentId,
+          href: attachment.href,
+          location: attachment.location,
+        },
+        { sessionId, workdir, navigate },
+      );
+    },
+    [currentSession?.workdir, currentSessionId, navigate, showToast],
+  );
+
   const restoreSubmission = useCallback(
     (snapshot: SendSnapshot) => {
       const activeSessionId = useSessionStore.getState().currentSessionId;
       const oldDraft = useSessionStore.getState().inputDrafts[snapshot.sessionId] || '';
       if (activeSessionId !== snapshot.sessionId) {
-        const existing = oldDraft
+        const storedDraft = draftsBySessionRef.current.get(snapshot.sessionId);
+        const existing = (storedDraft?.value.text === oldDraft ? storedDraft.value : undefined) ?? (oldDraft
           ? {
               parts: [{ type: 'text' as const, value: oldDraft }],
               text: oldDraft,
               occurrenceIds: [],
               attachmentIds: [],
             }
-          : emptyComposerValue();
+          : emptyComposerValue());
         const value = appendComposerValues(existing, snapshot.value);
         useSessionStore.getState().setInputDraft(snapshot.sessionId, value.text);
         // Keep the attachment-bearing recovery alongside the Session draft.
         // The old Session may already have a newer text draft when this
         // request settles, so restoring only the plain draft would lose
         // attachment occurrences.
-        recoveryBySessionRef.current.set(snapshot.sessionId, { ...snapshot, value });
+        const restoredAttachments = [
+          ...(draftsBySessionRef.current.get(snapshot.sessionId)?.attachments ?? []),
+          ...snapshot.attachments,
+        ];
+        recoveryBySessionRef.current.set(snapshot.sessionId, { ...snapshot, value, attachments: restoredAttachments });
+        // This Session is not mounted, so nothing else will reach the
+        // persistence funnel for it.  Record the recovered text here or a
+        // reload after a failed send loses exactly the message the user
+        // tried to send.
+        recordDraft(
+          snapshot.sessionId,
+          toDraft(value, restoredAttachments, snapshot.sessionId),
+        );
         return;
       }
 
+      const currentAttachments = attachmentsRef.current;
       const current = composerValueRef.current;
-      const hasCurrentInput = !!current.text || current.occurrenceIds.length > 0;
+      const hasCurrentInput = composerValueHasContent(current);
       const value = hasCurrentInput
         ? appendComposerValues(current, snapshot.value)
         : cloneComposerValue(snapshot.value);
@@ -927,7 +1601,7 @@ export function InputRow() {
       if (
         !value.occurrenceIds.length ||
         value.occurrenceIds.every((occurrenceId) =>
-          attachments.some((attachment) => attachmentOccurrenceId(attachment) === occurrenceId),
+          currentAttachments.some((attachment) => attachmentOccurrenceId(attachment) === occurrenceId),
         )
       ) {
         pendingRecoveryValueRef.current = null;
@@ -937,13 +1611,29 @@ export function InputRow() {
       // Keep a retryable snapshot even when new input was merged into the
       // failed submission.  A later Session switch or remount must restore
       // both the merged text and every attachment occurrence.
-      recoveryBySessionRef.current.set(snapshot.sessionId, { ...snapshot, value });
+      recoveryBySessionRef.current.set(snapshot.sessionId, { ...snapshot, value, attachments: [...currentAttachments, ...snapshot.attachments.filter((item) => !currentAttachments.some((current) => attachmentOccurrenceId(current) === attachmentOccurrenceId(item)))] });
+      // Record the merged draft explicitly.  `updateAttachments` above ran
+      // while composerValueRef still held the optimistically-cleared value, so
+      // the funnel recorded that instead; waiting for the composer's onChange
+      // round-trip would leave a window where the server holds a tombstone for
+      // text the user is still trying to send.
+      recordDraft(
+        snapshot.sessionId,
+        toDraft(value, [
+          ...currentAttachments.filter(
+            (attachment) => !snapshot.attachments.some(
+              (sent) => attachmentOccurrenceId(sent) === attachmentOccurrenceId(attachment),
+            ),
+          ),
+          ...snapshot.attachments,
+        ], snapshot.sessionId),
+      );
     },
-    [attachments, setInputDraft, updateAttachments],
+    [setInputDraft, updateAttachments],
   );
 
   const handleSend = useCallback(
-    (_text: string) => {
+    (_text: string, action: 'send' | 'steer' = 'send', options?: { forceLocked?: boolean }) => {
       if (!currentSessionId) {
         showToast('Select a session first');
         return;
@@ -952,10 +1642,16 @@ export function InputRow() {
         showToast('请先保存或取消队列消息编辑', 'error');
         return;
       }
+      if ([...sendSnapshotsRef.current.values()].some((pending) => pending.sessionId === currentSessionId)) return;
+      if (cardMode && (action !== 'send' || options?.forceLocked)) return;
+      const lockedSend = options?.forceLocked === true ||
+        useQueueStore.getState().lockedComposerModes[currentSessionId] === true;
+      if (lockedSend && [...sendSnapshotsRef.current.values()].some(
+        (pending) => pending.sessionId === currentSessionId && pending.locked,
+      )) return;
       // Read the cached, Session-keyed runtime registry synchronously at the
       // start of the send transaction.  Session summaries can lag worker
       // events; this must not add a request or wait before enqueueing.
-      const appendOptimisticHistory = !isRuntimeWorkerRunning(currentSessionId);
       if (attachments.some((attachment) => attachment.status === 'uploading')) {
         showToast('附件仍在上传，请稍候', 'error');
         return;
@@ -1002,6 +1698,7 @@ export function InputRow() {
       const composedText = value.parts
         .map((part) => {
           if (part.type === 'text') return part.value;
+          if (part.type === 'url') return composerUrlMarkdown(part.url, part.label);
           return linksById.get(composerPartOccurrenceId(part) || '') || '';
         })
         .join('');
@@ -1028,6 +1725,15 @@ export function InputRow() {
       for (const part of value.parts) {
         if (part.type === 'text') {
           structuredParts.push({ type: 'text', text: part.value });
+          continue;
+        }
+        if (part.type === 'url') {
+          // The agent reads the same Markdown link a plain-text client would
+          // see; there is no URL part in the provider protocol.
+          structuredParts.push({
+            type: 'text',
+            text: composerUrlMarkdown(part.url, part.label),
+          });
           continue;
         }
         const attachment = snapshotAttachments.find(
@@ -1062,21 +1768,26 @@ export function InputRow() {
       const recovery = recoveryBySessionRef.current.get(currentSessionId);
       const canReuseClientMessageId =
         !!recovery &&
+        recovery.cardKind === (cardMode ? cardKind : undefined) &&
         recovery.value.text === value.text &&
         recovery.value.occurrenceIds.join('\u0000') === value.occurrenceIds.join('\u0000') &&
+        composerUrlStructureKey(recovery.value) === composerUrlStructureKey(value) &&
         recovery.attachments.map(attachmentOccurrenceId).join('\u0000') ===
           snapshotAttachments.map(attachmentOccurrenceId).join('\u0000');
       const snapshot: SendSnapshot = {
+        cardKind: cardMode ? cardKind : undefined,
+        action,
         transactionId: attachmentId(),
-        clientMessageId: canReuseClientMessageId ? recovery!.clientMessageId : attachmentId(),
+        clientMessageId: canReuseClientMessageId && recovery?.action === action ? recovery.clientMessageId : `${action === 'steer' ? 'steer:' : ''}${attachmentId()}`,
         sessionId: currentSessionId,
         value,
         attachments: snapshotAttachments,
         message,
         parts: structuredParts.length > 0 ? structuredParts : undefined,
-        appendOptimisticHistory,
+        locked: lockedSend,
       };
       sendSnapshotsRef.current.set(snapshot.transactionId, snapshot);
+      setPendingActions((current) => ({ ...current, [snapshot.sessionId]: action }));
 
       // The user transaction is cleared synchronously.  All later async
       // work is tied to this snapshot and session, so new typing can never be
@@ -1093,6 +1804,7 @@ export function InputRow() {
       );
 
       void (async () => {
+        let submitted = false;
         try {
           const serverAttachments = snapshot.attachments.filter(
             (attachment) => !attachment.file && attachment.status === 'ready' && !!attachment.path,
@@ -1116,28 +1828,60 @@ export function InputRow() {
           if (useQueueStore.getState().edits[snapshot.sessionId]) {
             throw new Error('队列消息正在编辑');
           }
-          const ok = await enqueue(
-            snapshot.message,
-            snapshot.parts,
-            snapshot.sessionId,
-            snapshot.clientMessageId,
-            { appendOptimisticHistory: snapshot.appendOptimisticHistory },
-          );
-          if (!ok) throw new Error('消息尚未入队');
+          submitted = true;
+          if (snapshot.cardKind) {
+            await lockerRequest('/api/reminding-cards', 'POST', {
+              ownerSessionId: snapshot.sessionId,
+              requestKey: snapshot.clientMessageId,
+              kind: snapshot.cardKind,
+              body: composerTextWithUrls(snapshot.value),
+              attachments: snapshot.attachments.map((a) => ({
+                id: a.attachmentId!, name: a.displayName,
+                ...(a.mimeType ? { mimeType: a.mimeType } : {}),
+                ...(a.file ? { size: a.file.size } : {}),
+              })),
+            });
+          } else if (action === 'steer') {
+            await steer(snapshot.sessionId, snapshot.message, snapshot.clientMessageId);
+            appendLocalMessage(snapshot.sessionId, { role: 'user', content: snapshot.message,
+              parts: snapshot.parts, messageId: snapshot.clientMessageId, ts: new Date().toISOString() });
+          } else {
+            const ok = await enqueue(snapshot.message, snapshot.parts, snapshot.sessionId,
+              snapshot.clientMessageId, { locked: snapshot.locked, propagateFailure: true });
+            if (!ok) throw new SubmissionRejectedError('消息尚未入队');
+          }
           sendSnapshotsRef.current.delete(snapshot.transactionId);
           recoveryBySessionRef.current.delete(snapshot.sessionId);
-        } catch {
+          if (snapshot.locked && !snapshot.cardKind) {
+            useQueueStore.getState().setLockedComposerMode(snapshot.sessionId, false);
+          }
+        } catch (error) {
           if (sendSnapshotsRef.current.get(snapshot.transactionId) !== snapshot) return;
+          const rejected = !submitted || error instanceof SubmissionRejectedError ||
+            ((error instanceof ApiRequestError || error instanceof LockerRequestError) && error.status >= 400 && error.status < 500);
+          if (!rejected) {
+            showToast(`${action === 'steer' ? 'Steer' : 'Send'} 结果未确认，原事务保留，请勿重复发送`, 'error');
+            return;
+          }
           sendSnapshotsRef.current.delete(snapshot.transactionId);
           restoreSubmission(snapshot);
+          showToast(error instanceof Error ? error.message : '发送被拒绝，草稿已恢复', 'error');
+        } finally {
+          if (!sendSnapshotsRef.current.has(snapshot.transactionId)) {
+            setPendingActions((current) => { const next = { ...current }; delete next[snapshot.sessionId]; return next; });
+          }
         }
       })();
     },
     [
+      cardMode,
+      cardKind,
       currentSessionId,
       showToast,
       setInputDraft,
       enqueue,
+      steer,
+      appendLocalMessage,
       attachments,
       updateAttachments,
       restoreSubmission,
@@ -1148,51 +1892,75 @@ export function InputRow() {
     ],
   );
 
-  const handleSteer = useCallback(
-    async (text: string) => {
-      const steerSessionId = currentSessionId;
-      if (!steerSessionId || !text.trim()) return;
-      if (useQueueStore.getState().edits[steerSessionId]) {
-        showToast('请先保存或取消队列消息编辑', 'error');
-        return;
-      }
-      const draftState = useSessionStore.getState();
-      const draftRevision = draftState.inputDraftRevisions[steerSessionId] ?? 0;
-      const draftText = draftState.inputDrafts[steerSessionId] ?? text;
-      const attachmentRevision = attachments.map(attachmentOccurrenceId).join('\u0000');
-      const messageId = `steer:${attachmentId()}`;
-      try {
-        await steer(steerSessionId, text, messageId);
-        // The request may outlive a Session switch.  Only the original
-        // composer may be cleared; the message projection is always written
-        // to the captured target Session, never whichever Session is current
-        // when the provider control resolves.
-        const latest = useSessionStore.getState();
-        const draftStillOwnsTransaction =
-          latest.inputDraftRevisions[steerSessionId] === draftRevision
-          && (latest.inputDrafts[steerSessionId] ?? draftText) === draftText
-          && attachments.map(attachmentOccurrenceId).join('\u0000') === attachmentRevision;
-        const stillSelected = latest.currentSessionId === steerSessionId;
-        if (draftStillOwnsTransaction) {
-          if (stillSelected) composerRef.current?.replaceText('');
-          setInputDraft(steerSessionId, '');
-          if (stillSelected) updateAttachments(() => []);
-        }
-        // Optimistic append with a local ts; the server stamps the same
-        // moment into history (steer_worker appends + saves right after the
-        // control write).
-        appendLocalMessage(steerSessionId, { role: 'user', content: text, messageId, ts: new Date().toISOString() });
-      } catch (e) {
-        showToast((e as Error).message || 'Steer failed', 'error');
-      }
-    },
-    [currentSessionId, steer, setInputDraft, appendLocalMessage, showToast, attachments, updateAttachments],
-  );
+  // The global "enqueue as locked" shortcut reuses this exact send transaction
+  // (draft, URL nodes, attachment occurrences, idempotency key, failure
+  // recovery).  The handler is scoped to the mounted Session, so an async
+  // Session switch can never retarget the shortcut at its successor.
+  useEffect(() => {
+    if (!currentSessionId) return;
+    return registerLockedEnqueueHandler((sessionId) => {
+      if (sessionId !== currentSessionId) return false;
+      handleSend('', 'send', { forceLocked: true });
+      return true;
+    });
+  }, [currentSessionId, handleSend]);
+
+  const handleSteer = (text: string) => handleSend(text, 'steer');
+
+  const shortcutBindings = useAppSettingsStore((state) => state.shortcuts);
+  const sendButtonRef = useRef<HTMLButtonElement>(null);
+  const steerButtonRef = useRef<HTMLButtonElement>(null);
+  const shortcutActions = getShortcutActions();
+  const shortcutConflicts = findBindingConflicts(shortcutActions, shortcutBindings);
+  const composerBindingLabel = (id: string) => {
+    const action = shortcutActions.find((candidate) => candidate.id === id)!;
+    const binding = resolveBinding(id, action.defaultBinding, shortcutBindings);
+    return binding && shortcutConflicts.has(platformBinding(binding)) ? 'Conflict — inactive' : formatBinding(binding);
+  };
+  const composerHint = shortcutActions.filter((action) => action.composerOnly).map((action) => {
+    return `${composerBindingLabel(action.id)}: ${action.label}`;
+  }).join('; ');
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLElement>) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (e.key === 'Escape' && cardMode && !e.nativeEvent.isComposing) {
+      e.preventDefault(); setCardMode(false); return;
+    }
+    if (isShortcutRecording() || hasOpenModal() || e.defaultPrevented || e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
+    const binding = bindingFromEvent(e.nativeEvent);
+    if (!binding) return;
+    const owners = getShortcutActions().filter((action) => {
+      const value = resolveBinding(action.id, action.defaultBinding, shortcutBindings);
+      return value && platformBinding(value) === binding;
+    });
+    // Consume ambiguous composer bindings before the browser or global dispatcher can act.
+    if (owners.length > 1 && owners.some((action) => action.composerOnly)) {
       e.preventDefault();
-      handleSend(composerValueRef.current.text);
+      e.stopPropagation();
+      return;
+    }
+    const action = owners.length === 1 ? owners[0] : undefined;
+    if (!action?.composerOnly) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.repeat) return;
+    if (action.id === 'composer.send') sendButtonRef.current?.click();
+    if (action.id === 'composer.steer') steerButtonRef.current?.click();
+    if (action.id === 'composer.newline') {
+      // Browser editing commands preserve caret/selection, focus and native undo.
+      if (e.target instanceof HTMLTextAreaElement) {
+        const target = e.target;
+        if (!document.execCommand('insertText', false, '\n')) {
+          target.setRangeText('\n', target.selectionStart, target.selectionEnd, 'end');
+          const text = target.value;
+          composerValueRef.current = { parts: [{ type: 'text', value: text }], text, occurrenceIds: [], attachmentIds: [] };
+          setComposerText(text);
+          setComposerOccurrenceIds([]);
+          composerRef.current?.replaceText(text);
+          if (currentSessionId) setInputDraft(currentSessionId, text);
+        }
+      } else {
+        document.execCommand('insertLineBreak');
+      }
     }
   };
 
@@ -1216,7 +1984,9 @@ export function InputRow() {
         ? ''
         : (validEffortValues[0] ?? '');
   const canSteer =
-    currentSession?.adapter === 'codex' &&
+    (steerCapability ?? currentSession?.adapter === 'codex') &&
+    currentSession?.outputMode !== 'oneshot' &&
+    !(currentSession?.adapter === 'cbc' && currentSession.nativeControl) &&
     currentWorker?.status === 'running' &&
     !!currentWorker.id;
   // During the render between a Session id change and its restoration effect,
@@ -1272,7 +2042,12 @@ export function InputRow() {
           ? 'fixed inset-0 z-50 h-[100dvh] overflow-hidden pt-[var(--safe-top)]'
           : ''
       }`}
-      style={!isMobile ? { height: `${composerHeight}px` } : undefined}
+      style={!isMobile ? { height: `${composerHeight}px` }
+        : queueEditActive && mobileFullscreen && queueEditViewport
+          ? { height: `${queueEditViewport.height}px`, top: `${queueEditViewport.top}px`, bottom: 'auto' }
+          : queueEditActive && !mobileFullscreen
+            ? { height: 'min(260px, 60dvh)' }
+            : undefined}
     >
       {!isMobile && (
         <div
@@ -1289,12 +2064,146 @@ export function InputRow() {
       <div
         data-testid="send-queue-anchor"
         className={
-          isMobile && mobileFullscreen ? 'shrink-0' : 'absolute inset-x-0 bottom-full z-20'
+          isMobile && mobileFullscreen && !queueEditActive ? 'shrink-0' : 'absolute inset-x-0 bottom-full z-40'
         }
       >
-        <SendQueuePanel />
+        <SendQueuePanel remindingCardMode={cardMode} onNewRemindingCard={() => {
+          setPanelOpen(false);
+          setCardMode((current) => !current);
+          cardDraftSessionRef.current = currentSessionId;
+          composerRef.current?.focus();
+        }} />
       </div>
 
+      {queueEdit && (
+        <div
+          data-testid="queue-composer-edit"
+          className={`flex min-h-0 flex-1 flex-col gap-1.5 overflow-hidden bg-bg-primary px-3 pt-1.5 ${
+            isMobile ? 'pb-[max(6px,var(--safe-bottom))]' : 'pb-2'
+          }`}
+        >
+          <div className="flex shrink-0 items-center gap-1.5">
+            <p className="min-w-0 flex-1 truncate text-xs text-text-secondary" title="正在修改队列消息；原草稿与附件已保留。切换 Session 后可继续编辑。">正在修改队列消息；原草稿与附件已保留。</p>
+            {isMobile && (
+              <button
+                type="button"
+                data-testid="queue-edit-fullscreen"
+                aria-label={mobileFullscreen ? '退出全屏输入' : '全屏输入'}
+                title={mobileFullscreen ? '退出全屏输入' : '全屏输入'}
+                onClick={() => setMobileFullscreen((current) => !current)}
+                className="flex h-9 w-9 shrink-0 items-center justify-center rounded border border-border-default bg-bg-tertiary text-text-secondary hover:bg-bg-hover"
+              >
+                {mobileFullscreen ? <Minimize2 size={14} /> : <Expand size={14} />}
+              </button>
+            )}
+            <div className="flex shrink-0 items-center gap-1">
+              <button type="button" aria-label="取消队列编辑" title="取消" disabled={queueEdit.saving || queueEdit.releasing}
+                onClick={handleQueueEditCancel} className="h-9 w-9 rounded border border-border-default disabled:opacity-50 md:h-8 md:w-8">X</button>
+              <button type="button" aria-label="保存队列编辑" title={queueEditAttachmentsPending ? '等待附件上传/注册完成' : '确认保存'} disabled={queueEdit.acquiring || queueEdit.saving || queueEdit.releasing || !!queueEdit.error || queueEditAttachmentsPending || currentSession?.readonlySession}
+                onClick={saveQueueEdit} className="h-9 w-9 rounded bg-accent text-white disabled:opacity-50 md:h-8 md:w-8">√</button>
+            </div>
+          </div>
+          <div className="min-h-0 shrink overflow-y-auto max-h-[35%] space-y-2" data-testid="queue-edit-details">
+            {queueEdit.acquiring && <p className="shrink-0 text-xs text-text-secondary">正在取得编辑锁与完整正文…</p>}
+            {queueEdit.saving && <p className="shrink-0 text-xs text-text-secondary">正在保存…</p>}
+            {queueEdit.bodyFormat === 'json' && <p className="shrink-0 text-xs text-text-secondary">此报告正文为 JSON；请保留有效 JSON，保存时保留结构化值。</p>}
+
+            {queueEdit.error && <p role="alert" className="shrink-0 text-xs text-danger">{queueEdit.error}</p>}
+            {(queueEditAttachmentsSupported || queueEditAttachments.length > 0) && (
+              <div className="flex shrink-0 flex-wrap items-center gap-1.5" data-testid="queue-edit-attachments">
+                {(queueEdit.originalAttachments ?? []).map((attachment) => (
+                  <span
+                    key={attachment.attachmentId}
+                    title={`已有附件（保存时保持原样）：${attachment.displayName}`}
+                    className="inline-flex max-w-[220px] items-center gap-1 rounded border border-border-muted bg-bg-tertiary/60 px-1.5 py-0.5 text-[11px] text-text-secondary"
+                  >
+                    <Paperclip size={11} className="shrink-0" />
+                    <span className="truncate">{attachment.displayName}</span>
+                  </span>
+                ))}
+                {queueEditAttachments.map((attachment) => (
+                  <span
+                    key={attachment.occurrenceId}
+                    data-testid="queue-edit-attachment-chip"
+                    title={attachment.error || attachment.displayName}
+                    className="inline-flex max-w-[240px] items-center gap-1 rounded border border-border-default bg-bg-tertiary px-1.5 py-0.5 text-[11px] text-text-primary"
+                  >
+                    <Paperclip size={11} className="shrink-0" />
+                    <span className="truncate">{attachment.displayName}</span>
+                    {attachment.status === 'uploading' && (
+                      <span className="shrink-0 text-text-secondary">
+                        {attachment.totalBytes ? ` ${Math.round((attachment.loadedBytes ?? 0) / attachment.totalBytes * 100)}%` : ' 上传中'}
+                      </span>
+                    )}
+                    {attachment.status === 'registering' && <span className="shrink-0 text-text-secondary"> 注册中</span>}
+                    {attachment.status === 'error' && <span className="shrink-0 text-danger"> 失败</span>}
+                    {attachment.status === 'error' && (attachment.file || attachment.path) && (
+                      <button
+                        type="button"
+                        className="shrink-0 text-accent hover:underline disabled:cursor-not-allowed disabled:opacity-50"
+                        disabled={queueEdit.saving || queueEdit.releasing}
+                        onClick={() => retryQueueEditAttachment(currentSessionId || undefined, attachment)}
+                      >
+                        重试
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      aria-label={`移除附件 ${attachment.displayName}`}
+                      className="shrink-0 text-danger hover:text-danger/80 disabled:cursor-not-allowed disabled:opacity-50"
+                      disabled={queueEdit.saving || queueEdit.releasing}
+                      onClick={() => removeQueueEditAttachment(currentSessionId || undefined, attachment.occurrenceId)}
+                    >
+                      <X size={11} />
+                    </button>
+                  </span>
+                ))}
+                {queueEditAttachmentsSupported && (
+                  <button
+                    type="button"
+                    data-testid="queue-edit-attachment-button"
+                    aria-label="为队列消息添加附件"
+                    title="添加附件"
+                    disabled={queueEdit.saving || queueEdit.releasing}
+                    onClick={() => {
+                      attachmentTargetRef.current = 'queue-edit';
+                      setAttachmentMenuOpen((open) => !open);
+                    }}
+                    className="inline-flex items-center gap-1 rounded border border-border-default px-1.5 py-0.5 text-[11px] text-text-secondary transition-colors hover:bg-bg-hover hover:text-text-primary disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <Paperclip size={11} /> 添加附件
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+          <div className="flex min-h-0 min-w-0 flex-1 gap-2">
+            {/* 仅在 lease 取得完整正文后挂载编辑器：initialText 恒为服务端全文，
+                绝不把面板里的截断预览当作编辑正文。saving/releasing 时编辑器
+                真禁用（contentEditable=false + 键盘守卫），DOM 冻结，保存失败
+                解除后 DOM 与 store 草稿一致。附件与 URL 复用普通 composer 原子节点。 */}
+            {!queueEdit.acquiring && (
+              <RichTextComposer
+                key={`queue-edit:${currentSessionId ?? 'no-session'}:${queueEdit.editToken ?? 'none'}`}
+                ref={queueComposerRef}
+                editorTestId="queue-rich-text-composer"
+                initialText={queueEdit.composerValue ? undefined : queueEdit.text}
+                initialValue={queueEdit.composerValue}
+                attachments={queueEditAttachments}
+                sessionId={currentSessionId || undefined}
+                disabled={queueEdit.saving || queueEdit.releasing || currentSession?.readonlySession}
+                onChange={handleQueueComposerChange}
+                onAttachmentDrop={handleQueueEditAttachmentDrop}
+                onNativeFiles={addQueueEditClientFiles}
+                onNativeInputIssue={handleNativeInputIssue}
+                onRemoveAttachment={(id) => removeQueueEditAttachment(currentSessionId || undefined, id)}
+                onKeyDown={handleQueueComposerKeyDown}
+              />
+            )}
+          </div>
+        </div>
+      )}
+      <div className={queueEditActive ? "hidden" : "contents"}>
       {/* 左列：settings gear（有会话时）+ 队列开关 ^ 上下垂直紧凑堆叠，节省一行。
           右侧内容列：pill 行 + textarea/Send 行。 */}
       <div className="flex min-h-0 flex-1 gap-2 px-3 pt-2 pb-[max(16px,var(--safe-bottom))] md:pb-3">
@@ -1323,21 +2232,24 @@ export function InputRow() {
                   />
                 </div>
                 <div className="relative">
-                  {queuedWhileBusy && (
-                    <span
-                      data-testid="queued-while-busy"
-                      className="mr-1 hidden text-xs text-accent md:inline"
-                      title="Worker 正在处理上一条任务，当前消息将在之后处理"
-                    >
-                      排队中
-                    </span>
-                  )}
                   <button
                     id="send-queue-button"
+                    // The queue is an overlay above the composer, not a focus
+                    // destination. Preventing the mousedown default keeps the
+                    // caret (and any IME composition) in the input while the
+                    // panel expands or collapses; focus only moves when the
+                    // user actually clicks or tabs into a queue control.
+                    onMouseDown={(event) => {
+                      if (isComposerShortcutTarget(document.activeElement)) event.preventDefault();
+                    }}
                     onClick={togglePanel}
                     title={queueCount > 0 ? `发送队列（${queueCount} 条待发）` : '发送队列'}
                     aria-label={queueCount > 0 ? `发送队列（${queueCount} 条待发）` : '发送队列'}
-                    className={`relative flex h-7 w-7 shrink-0 items-center justify-center rounded border transition-colors md:h-8 md:w-auto md:px-2 ${panelOpen || queueCount > 0 ? 'border-accent/50 bg-accent/10 text-accent' : 'border-border-default bg-bg-tertiary text-text-secondary hover:bg-bg-hover'}`}
+                    className={`relative flex h-7 w-7 shrink-0 items-center justify-center rounded border transition-colors md:h-8 md:w-auto md:px-2 ${queueAllLocked
+                      ? 'border-danger/60 bg-danger/10 text-danger hover:bg-danger/15'
+                      : panelOpen || queueCount > 0
+                        ? 'border-accent/50 bg-accent/10 text-accent'
+                        : 'border-border-default bg-bg-tertiary text-text-secondary hover:bg-bg-hover'}`}
                   >
                     <ChevronUp
                       size={14}
@@ -1360,6 +2272,7 @@ export function InputRow() {
                 sessionModel={currentSession.model || ''}
                 defaultModel={config?.defaultModel || ''}
                 models={config?.models || []}
+                multipliers={config?.modelCreditMultipliers}
                 show={showModelPill}
                 onApply={applySetting}
               />
@@ -1399,7 +2312,10 @@ export function InputRow() {
                   type="button"
                   aria-label="添加附件"
                   title="添加附件"
-                  onClick={() => setAttachmentMenuOpen((open) => !open)}
+                  onClick={() => {
+                    attachmentTargetRef.current = 'composer';
+                    setAttachmentMenuOpen((open) => !open);
+                  }}
                   className={`flex h-7 w-7 items-center justify-center rounded border transition-colors ${attachmentMenuOpen ? 'border-accent/50 bg-accent/10 text-accent' : 'border-border-default bg-bg-tertiary text-text-secondary hover:bg-bg-hover'}`}
                 >
                   <Paperclip size={14} />
@@ -1484,6 +2400,7 @@ export function InputRow() {
                   }
                   onDragStart={(event) => {
                     if (attachment.status !== 'ready' || !attachment.href) return;
+                    beginAttachmentChipDragSuppression();
                     writePanAttachmentPayload(event.dataTransfer, {
                       displayName: attachment.displayName,
                       href: attachment.href,
@@ -1495,10 +2412,19 @@ export function InputRow() {
                       location: attachment.location,
                     });
                   }}
+                  onDragEnd={clearAttachmentChipDragSuppression}
+                  onClick={(event) => {
+                    // A completed or cancelled drag suppresses the trailing click.
+                    if (attachmentChipDraggedRef.current) return;
+                    const target = event.target instanceof Element ? event.target : null;
+                    // 重试/取消 buttons keep their own handlers; chip body opens.
+                    if (target?.closest('button')) return;
+                    openComposerAttachment(attachmentOccurrenceId(attachment));
+                  }}
                   role="group"
                   aria-label={`附件 ${attachment.displayName}`}
-                  className="inline-flex max-w-full items-center gap-1 rounded border border-border-default bg-bg-tertiary px-2 py-1 text-xs text-text-secondary"
-                  title={attachment.path || attachment.displayName}
+                  className={`inline-flex max-w-full items-center gap-1 rounded border border-border-default bg-bg-tertiary px-2 py-1 text-xs text-text-secondary ${attachment.status === 'ready' ? 'cursor-pointer' : ''}`}
+                  title={attachment.error || attachment.path || attachment.displayName}
                 >
                   <FileIcon size={13} className="shrink-0" aria-hidden="true" />
                   <span className="truncate">{attachment.displayName}</span>
@@ -1516,6 +2442,8 @@ export function InputRow() {
                       type="button"
                       className="text-danger hover:underline"
                       aria-label={`重试上传 ${attachment.displayName}`}
+                      title={attachment.error}
+                      disabled={!attachment.file && !attachment.path}
                       onClick={() => {
                         if (attachment.file) {
                           updateAttachments((current) =>
@@ -1625,24 +2553,130 @@ export function InputRow() {
             mobileFullscreen={isMobile}
             className="md:max-h-[90vh]"
           >
-            <div aria-label="Server attachment browser">
-              <DirectoryInput
+            {attachmentBrowserOpen && <div aria-label="Server attachment browser">
+              <ServerAttachmentPicker
+                key={`${currentSessionId}:${attachmentEpochRef.current}`}
+                sessionId={currentSessionId || ''}
                 value={attachmentBrowserPath}
                 onChange={(path) => {
                   setAttachmentDirectoryError(null);
                   setAttachmentBrowserPath(path);
                 }}
-                fileMode
-                showRootsWhenEmpty
                 onSelect={(selectedPath) => {
                   const selectedSessionId = currentSessionId;
                   const selectedEpoch = attachmentEpochRef.current;
+                  const queueEditToken = selectedSessionId
+                    ? useQueueStore.getState().edits[selectedSessionId]?.editToken
+                    : undefined;
+                  const queueEditTarget = attachmentTargetRef.current === 'queue-edit';
                   void (async () => {
                     try {
                       const register = isMockMode()
                         ? mockRegisterServerFileAttachment
                         : registerServerFileAttachment;
                       if (!selectedSessionId) return;
+                      if (queueEditTarget) {
+                        // Transaction binding: token captured now, chip owned
+                        // by selectedSessionId. The placeholder chip exists
+                        // before the await so Save stays blocked while the
+                        // registration is in flight, and a failure leaves a
+                        // retryable error chip instead of a silent loss.
+                        if (queueEditToken === undefined) return;
+                        // Busy picker guard: the edit may have entered
+                        // saving/releasing/acquiring between opening the
+                        // picker and selecting a file; the placeholder write
+                        // would be dropped and we'd fire a pointless request.
+                        const editAtSelect = useQueueStore.getState().edits[selectedSessionId];
+                        if (!editAtSelect
+                          || editAtSelect.editToken !== queueEditToken
+                          || editAtSelect.saving || editAtSelect.releasing || editAtSelect.acquiring) {
+                          return;
+                        }
+                        const occurrenceId = attachmentId();
+                        const displayName = selectedPath.split(/[\\/]/).pop() || selectedPath;
+                        updateQueueEditAttachments(selectedSessionId, (current) => [
+                          ...current,
+                          {
+                            occurrenceId,
+                            id: occurrenceId,
+                            displayName,
+                            path: selectedPath,
+                            status: 'registering' as const,
+                            source: 'server_file' as const,
+                          },
+                        ]);
+                        // The action guard can silently drop the placeholder;
+                        // only fire the request if it actually landed.
+                        const placed = useQueueStore.getState().edits[selectedSessionId]
+                          ?.attachments?.some((item) => item.occurrenceId === occurrenceId);
+                        if (!placed) return;
+                        let registered: Awaited<ReturnType<typeof registerServerFileAttachment>>;
+                        try {
+                          registered = await register(selectedSessionId, selectedPath);
+                        } catch (error) {
+                          // Data write stays bound to the originating edit; UI
+                          // side effects only touch the picker the user is
+                          // still looking at (same session, same epoch, same
+                          // target transaction).
+                          if (
+                            useQueueStore.getState().edits[selectedSessionId]?.editToken !== queueEditToken
+                          )
+                            return;
+                          updateQueueEditAttachments(selectedSessionId, (current) =>
+                            current.map((item) =>
+                              item.occurrenceId === occurrenceId
+                                ? {
+                                    ...item,
+                                    status: 'error' as const,
+                                    error: error instanceof Error ? error.message : '附件注册失败',
+                                  }
+                                : item,
+                            ),
+                          );
+                          if (
+                            useSessionStore.getState().currentSessionId === selectedSessionId
+                            && attachmentEpochRef.current === selectedEpoch
+                            && useQueueStore.getState().edits[selectedSessionId]?.editToken === queueEditToken
+                            && attachmentTargetRef.current === 'queue-edit'
+                          ) {
+                            setAttachmentDirectoryError(
+                              error instanceof Error ? error.message : '服务端附件注册失败',
+                            );
+                          }
+                          return;
+                        }
+                        if (
+                          useQueueStore.getState().edits[selectedSessionId]?.editToken !== queueEditToken
+                        )
+                          return;
+                        updateQueueEditAttachments(selectedSessionId, (current) =>
+                          current.map((item) =>
+                            item.occurrenceId === occurrenceId
+                              ? {
+                                  ...item,
+                                  attachmentId: registered.attachmentId,
+                                  displayName: registered.displayName,
+                                  href: registered.href,
+                                  path: registered.path,
+                                  mimeType: registered.mimeType,
+                                  source: 'server_file' as const,
+                                  status: 'ready' as const,
+                                }
+                              : item,
+                          ),
+                        );
+                        if (
+                          useSessionStore.getState().currentSessionId === selectedSessionId
+                          && attachmentEpochRef.current === selectedEpoch
+                          && useQueueStore.getState().edits[selectedSessionId]?.editToken === queueEditToken
+                          && attachmentTargetRef.current === 'queue-edit'
+                        ) {
+                          setAttachmentBrowserOpen(false);
+                          setAttachmentMenuOpen(false);
+                          setAttachmentDirectoryError(null);
+                        }
+                        return;
+                      }
                       const registered = await register(selectedSessionId, selectedPath);
                       if (
                         activeAttachmentSessionRef.current !== selectedSessionId ||
@@ -1685,9 +2719,19 @@ export function InputRow() {
                   {attachmentDirectoryError}
                 </p>
               )}
-            </div>
+            </div>}
           </Modal>
-          <div className="flex min-h-0 flex-1 gap-2">
+          {cardMode && (
+            <div data-testid="reminding-card-kind-row" className="relative z-10 flex w-full shrink-0 justify-end">
+              <div className="inline-flex gap-0.5 rounded-md border border-border-default bg-bg-secondary p-0.5" role="radiogroup" aria-label="Card type">
+                {(['question', 'task'] as const).map((kind) => <button key={kind} type="button" role="radio"
+                  aria-checked={cardKind === kind} onClick={() => setCardKind(kind)} className={`rounded px-2 py-0.5 text-[11px] transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent ${cardKind === kind ? 'bg-bg-tertiary text-accent font-medium' : 'text-text-secondary hover:bg-bg-hover'}`}>
+                  {kind === 'question' ? 'Question' : 'Task'}
+                </button>)}
+              </div>
+            </div>
+          )}
+          <div className={`flex min-h-0 flex-1 ${cardMode ? 'gap-1' : 'gap-2'}`}>
             <input
               ref={clientAttachmentInputRef}
               type="file"
@@ -1700,7 +2744,7 @@ export function InputRow() {
             <textarea
               ref={inputRef}
               id="chatInput"
-              placeholder="Type a message... (Enter to send, Shift+Enter for newline)"
+              placeholder={`Type a message... (${composerHint})`}
               value={composerText}
               tabIndex={-1}
               aria-hidden="true"
@@ -1721,6 +2765,7 @@ export function InputRow() {
               onKeyDown={handleKeyDown}
             />
             <RichTextComposer
+              placeholder={`Type a message... (${composerHint})`}
               key={currentSessionId || 'no-session'}
               ref={composerRef}
               initialText={sessionComposerText}
@@ -1749,38 +2794,53 @@ export function InputRow() {
               onNativeFiles={handleNativeFiles}
               onNativeInputIssue={handleNativeInputIssue}
               onRemoveAttachment={handleRemoveComposerAttachment}
+              onOpenAttachment={openComposerAttachment}
               onKeyDown={handleKeyDown}
             />
             <div className="flex flex-col gap-1 items-end">
-              {canSteer && (
+              {canSteer && !cardMode && !lockedComposerMode && (
                 <button
-                  disabled={queueEditActive}
+                  ref={steerButtonRef}
+                  disabled={attachmentsBlocked || queueEditActive || !!pendingAction}
+                  aria-busy={pendingAction === 'steer'}
                   onClick={() => handleSteer(composerValueRef.current.text)}
                   className="inline-flex items-center gap-1 rounded border border-accent/50 bg-accent/10 px-2 py-1 text-xs font-medium text-accent hover:bg-accent/20 transition-colors"
-                  title="Send an instruction to the running Codex turn"
+                  title={`Ask the CLI to accept an instruction for the current task (${composerBindingLabel('composer.steer')})`}
                 >
-                  <CornerUpRight size={13} />
+                  {pendingAction === 'steer' ? <Loader2 size={13} className="animate-spin" /> : <CornerUpRight size={13} />}
                   Steer
                 </button>
               )}
-              <div className="flex items-center gap-1">
+              <div className={`flex flex-col items-end ${cardMode ? 'min-w-[88px] gap-1' : 'gap-1'}`}>
                 <button
+                  ref={sendButtonRef}
                   type="button"
                   onClick={() => handleSend(composerValueRef.current.text)}
-                  disabled={attachmentsBlocked || queueEditActive}
+                  disabled={attachmentsBlocked || queueEditActive || !!pendingAction}
+                  aria-busy={pendingAction === 'send'}
                   title={queueEditActive
                     ? '请先保存或取消队列消息编辑'
                     : attachmentsBlocked
                       ? '请等待附件上传完成，或重试/取消失败附件'
-                      : 'Send'}
-                  className="rounded bg-accent px-4 py-2 text-sm font-medium text-white hover:bg-accent-hover transition-colors self-end disabled:cursor-not-allowed disabled:opacity-50"
+                      : `${cardMode ? 'create' : lockedComposerMode ? 'put in queue' : 'Send'} (${composerBindingLabel('composer.send')})`}
+                    className={`${cardMode ? 'h-6 max-w-[142px] px-2 py-0 text-xs leading-none sm:max-w-none' : 'px-4 py-2'} rounded border-2 text-sm font-medium text-white transition-colors self-end disabled:cursor-not-allowed disabled:opacity-50 ${lockedComposerMode
+                    ? 'border-danger bg-accent hover:bg-accent-hover'
+                    : 'border-transparent bg-accent hover:bg-accent-hover'}`}
                 >
-                  Send
+                  {pendingAction === 'send' && <Loader2 size={13} className="inline-block animate-spin mr-1" />}
+                  {cardMode ? 'create' : lockedComposerMode ? 'put in queue' : 'Send'}
                 </button>
+                {cardMode && (
+                  <button type="button" onClick={() => setCardMode(false)}
+                    className="h-6 w-full rounded border border-border-default px-2 py-0 text-xs leading-none font-medium text-text-secondary transition-colors hover:bg-bg-hover disabled:cursor-not-allowed disabled:opacity-50">
+                    cancel
+                  </button>
+                )}
               </div>
             </div>
           </div>
         </div>
+      </div>
       </div>
     </div>
   );

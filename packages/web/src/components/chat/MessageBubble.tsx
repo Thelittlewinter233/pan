@@ -1,6 +1,13 @@
 import type { Message } from '@/types';
-import { memo, useMemo, useState } from 'react';
-import { Loader2, Trash2, Undo2 } from 'lucide-react';
+import { HistoryTerminal } from './HistoryTerminal';
+import { memo, useEffect, useMemo, useState } from 'react';
+import { createPortal } from 'react-dom';
+import { Bookmark, BookmarkMinus, BookmarkPlus, Check, Copy, Send, Trash2, Undo2 } from 'lucide-react';
+import { copyText } from '@/utils/clipboard';
+import { useUIStore } from '@/stores/uiStore';
+import { fetchSessionMessageText } from '@/services/api';
+import { useSessionStore, manualTaskReportKey } from '@/stores/sessionStore';
+import { isPanMessageId, selectBookmarkMark, useBookmarkStore } from '@/stores/bookmarkStore';
 import { MarkdownRenderer } from './MarkdownRenderer';
 import { ThinkingBlock } from './ThinkingBlock';
 import { ThinkingGroup } from './ThinkingGroup';
@@ -9,14 +16,35 @@ import { NonBodyGroup } from './NonBodyGroup';
 import type { GroupDisplayItem } from '@/utils/messageIdentity';
 import { getMessageIdentity } from '@/utils/messageIdentity';
 import { isValidMessageTs } from '@/utils/messageTimestamp';
-import { getQuickJumpKind } from './messageFilter';
+import { getMessageSourceTag, type MessageSourceTag } from './messageFilter';
 import { MessageTimestamp } from './MessageTimestamp';
-import { useSessionStore } from '@/stores/sessionStore';
-import { useUIStore } from '@/stores/uiStore';
+import { useAppSettingsStore } from '@/stores/appSettingsStore';
+import { useCapability, usePlatformStore } from '@/stores/platformStore';
+import { platformLabel } from '@/utils/platformCapabilities';
+import type { ManualReportTarget } from './manualTaskReport';
 export { formatMessageTs } from '@/utils/messageTimestamp';
 
 export type GroupedItem = Message | GroupDisplayItem;
 type PrevRole = Message['role'] | 'tool' | null;
+
+/**
+ * Raw view body: the message text is a plain React text node inside a
+ * `white-space: pre-wrap` block. Newlines, runs of spaces, Markdown markers,
+ * code fences and literal HTML are preserved verbatim — nothing is parsed,
+ * highlighted or injected as markup. Copying the block yields the original
+ * text, including its line breaks. Long unbreakable tokens wrap with
+ * `overflow-wrap: anywhere` instead of widening the virtualized row.
+ */
+function RawMessageText({ content, className = '' }: { content: string; className?: string }) {
+  return (
+    <div
+      data-raw-message-text=""
+      className={`whitespace-pre-wrap [overflow-wrap:anywhere] ${className}`.trim()}
+    >
+      {content}
+    </div>
+  );
+}
 
 /** Role used for spacing decisions. Groups use the role of their member blocks. */
 export function getItemRole(item: GroupedItem): PrevRole {
@@ -47,77 +75,279 @@ function marginTopClass(role: PrevRole, prevRole: PrevRole): string {
 interface MessageBubbleProps {
   message: Message;
   prevRole?: PrevRole;
+  /** Binding for this completed task run's tail text block. */
+  manualReportTarget?: ManualReportTarget | null;
 }
 
-export const MessageBubble = memo(function MessageBubble({ message, prevRole = null }: MessageBubbleProps) {
+/** User-facing copy for the durable source tags (classification: messageFilter). */
+const SOURCE_TAG_LABELS: Record<MessageSourceTag, string> = {
+  'ta-report': 'TA report',
+  'ma-assign': 'MA assign',
+  system: 'System',
+};
+
+/** Tooltip/state copy for the explicit task-report action. */
+function manualReportCopy(
+  state: 'sending' | 'sent' | 'failed' | 'uncertain' | undefined,
+  error: string | undefined,
+): { label: string; title: string } {
+  if (state === 'sending') {
+    return { label: '汇报中…', title: '正在向 manager 汇报该任务' };
+  }
+  if (state === 'sent') {
+    return { label: '已汇报', title: '该任务已汇报给 manager（不影响自动汇报订阅）' };
+  }
+  if (state === 'failed') {
+    return { label: '重试汇报', title: error || '汇报失败，点击重试' };
+  }
+  if (state === 'uncertain') {
+    return {
+      label: '重试汇报',
+      title: '汇报结果不确定（可能已送达）：重试会按同一身份幂等确认，不会重复发送',
+    };
+  }
+  return { label: '汇报', title: '向 manager 手动汇报该任务（不影响自动汇报订阅）' };
+}
+
+export const MessageBubble = memo(function MessageBubble({ message, prevRole = null, manualReportTarget = null }: MessageBubbleProps) {
   const role = message.role;
   const mt = marginTopClass(role, prevRole);
+  // Raw view keeps the TUI rows and role bars but swaps the rendered Markdown
+  // body for the message's original text. Read straight from the store so a
+  // mode switch re-renders only this body — no prop drilling, no new context.
+  const rawViewEnabled = useAppSettingsStore((s) => s.chatViewStyle === 'raw');
   const attachmentIds = useMemo(
     () => message.parts?.flatMap((part) => part.type === 'attachment' ? [part.attachmentId] : []),
     [message.parts],
   );
-  const isWorkerReport = getQuickJumpKind(message) === 'worker';
-  const workerReportLabel = isWorkerReport ? (
-    <span className="worker-report-label" aria-label="Worker report">Worker report</span>
+  const sourceTag = getMessageSourceTag(message);
+  const sourceBadge = sourceTag ? (
+    <span
+      className="worker-report-label"
+      data-source-tag={sourceTag}
+      aria-label={SOURCE_TAG_LABELS[sourceTag]}
+    >
+      {SOURCE_TAG_LABELS[sourceTag]}
+    </span>
   ) : null;
-  const [deleting, setDeleting] = useState(false);
-  const [confirming, setConfirming] = useState(false);
-  const showToast = useUIStore((s) => s.showToast);
-  const removeMessage = useSessionStore((s) => s.deleteCurrentMessage);
-  const openRewind = useSessionStore((s) => s.openRewind);
-  const currentMessages = useSessionStore((s) => s.currentMessages);
-  const currentSession = useSessionStore((s) => s.sessions.find((session) => session.id === s.currentSessionId));
-  const sessionBusy = ['running', 'queued'].includes(currentSession?.workerStatus ?? '');
-  const latestIsStreaming = role === 'assistant'
-    && sessionBusy
-    && currentMessages[currentMessages.length - 1] === message;
-  const canDelete = (role === 'user' || role === 'assistant')
+  // The explicit report action belongs to each task's tail text block (not only
+  // the newest task).  The store entry is keyed by the binding's identity so a
+  // virtualized remount keeps the in-flight/sent state instead of restarting or
+  // losing it.
+  const manualReportKey = manualReportTarget && manualReportTarget.messageId === message.messageId
+    ? manualTaskReportKey(manualReportTarget.sessionId, manualReportTarget)
+    : null;
+  const manualReportEntry = useSessionStore((s) => (
+    manualReportKey ? s.manualTaskReports[manualReportKey] : undefined
+  ));
+  const reportTaskManually = useSessionStore((s) => s.reportTaskManually);
+  // ── Bookmark state and the shared block menu ──
+  // The bookmark entry exists only for converged, durable, bookmarkable rows:
+  // a streaming or unpersisted row has no addressable identity yet, and tool /
+  // thinking / system rows are not bookmark content (the backend rejects them
+  // with `message_not_bookmarkable`).  Proven store state wins over the
+  // projected flag, including proven absence after a removal.
+  const sessionId = useSessionStore((s) => s.currentSessionId);
+  // Proven store state (including proven ABSENCE after a removal) wins over
+  // the row's projected flag; the projection is only a fallback until this
+  // client has any evidence for the id.
+  const liftedBookmarked = useBookmarkStore(selectBookmarkMark(sessionId ?? '', message.messageId));
+  const bookmarked = liftedBookmarked ?? Boolean(message.bookmarked);
+  const addBookmark = useBookmarkStore((s) => s.addBookmark);
+  const removeBookmark = useBookmarkStore((s) => s.removeBookmark);
+  const bookmarkable = (role === 'user' || role === 'assistant')
     && !message.streaming
-    && !latestIsStreaming;
-  const onDelete = async () => {
-    if (deleting) return;
-    setDeleting(true);
-    try {
-      await removeMessage(message);
-      showToast('消息已删除');
-    } catch (error) {
-      showToast(error instanceof Error ? error.message : '消息删除失败', 'error');
-    } finally {
-      setDeleting(false);
-      setConfirming(false);
+    && isPanMessageId(message.messageId);
+  const [menuAt, setMenuAt] = useState<{ top: number; left: number } | null>(null);
+  const [confirmingHide, setConfirmingHide] = useState(false);
+  useEffect(() => {
+    if (!menuAt) {
+      setConfirmingHide(false);
+      return;
     }
-  };
+    const onKey = (event: KeyboardEvent) => { if (event.key === 'Escape') setMenuAt(null); };
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target;
+      if (target instanceof Element && target.closest('[data-message-block-menu]')) return;
+      setMenuAt(null);
+    };
+    window.addEventListener('keydown', onKey);
+    window.addEventListener('pointerdown', onPointerDown, true);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      window.removeEventListener('pointerdown', onPointerDown, true);
+    };
+  }, [menuAt]);
+  const openReportCopy = manualReportCopy(manualReportEntry?.state, manualReportEntry?.error);
+  const openRewind = useSessionStore((s) => s.openRewind);
+  // Non-destructive hide (sidecar record): allowed while a worker runs, only
+  // the target row's own streaming state disqualifies it.
+  const hideMessage = useSessionStore((s) => s.deleteCurrentMessage);
+  const sessionBusy = useSessionStore((s) => ['running', 'queued'].includes(
+    s.sessions.find((session) => session.id === s.currentSessionId)?.workerStatus ?? '',
+  ));
   // Rewind anchors are user-role only (worker report messages included, they
-  // land in history as role=user); canDelete also admits assistant messages,
-  // so it cannot be reused here. Busy sessions only disable rewind.
-  const showRewind = role === 'user' && !message.streaming;
-  const actions = (canDelete || showRewind) ? (
-    <div className="mt-1 flex items-center gap-2">
-      {showRewind && (
-        <button type="button" onClick={() => openRewind(message)} disabled={sessionBusy}
-          className="inline-flex items-center gap-1 text-xs text-text-tertiary hover:text-text-primary disabled:opacity-50"
-          title={sessionBusy ? '任务运行中，无法撤回' : '从此消息撤回并分叉'}>
-          <Undo2 size={13} /> 撤回
+  // land in history as role=user). Busy sessions grey the button out; a server
+  // without the rewind capability keeps the entry visible but disabled, so the
+  // limitation is stated instead of discovered by clicking.
+  const currentAdapter = useSessionStore((s) => s.sessions.find((session) => session.id === s.currentSessionId)?.adapter);
+  const rewindSupported = useCapability('rewind');
+  const platform = usePlatformStore((s) => s.platform);
+  const showRewind = currentAdapter === 'cbc' && role === 'user' && !message.streaming;
+  const rewindTitle = !rewindSupported
+    ? `当前平台（${platformLabel(platform)}）暂不支持撤回`
+    : sessionBusy ? '任务运行中，无法撤回' : '从此消息撤回并分叉';
+  const actions = showRewind ? (
+      <button type="button" onClick={() => openRewind(message)} disabled={sessionBusy || !rewindSupported}
+        className="inline-flex items-center gap-1 text-xs text-text-tertiary hover:text-text-primary disabled:opacity-50"
+        data-rewind-supported={rewindSupported}
+        title={rewindTitle}>
+        <Undo2 size={13} /> 撤回
+      </button>
+  ) : null;
+  // The row's left gutter is the only body-level hit target: from the
+  // leftmost edge to the block's colored vertical line (CSS keeps its width
+  // in step with the row padding).  Content, role rail and role glyph stay
+  // untouched — no added bar.  It appears when the row has any action:
+  // bookmarkable content, or a bound manual report (whose tail block may
+  // carry a non-pan canonical id).
+  // The report entry belongs to the assistant tail text block only (the
+  // binding contract; user rows never carried it), while the bookmark entry
+  // belongs to any bookmarkable row.
+  const hasManualReport = role === 'assistant' && Boolean(manualReportKey && manualReportTarget);
+  const showGutter = bookmarkable || hasManualReport;
+  const bookmarkGutter = showGutter ? (
+    <button
+      type="button"
+      className="chat-message-bookmark-gutter"
+      data-message-bookmark-gutter={message.messageId}
+      aria-label="Message actions"
+      aria-expanded={menuAt !== null}
+      onClick={(event) => {
+        setMenuAt({
+          top: Math.min(event.clientY + 8, Math.max(8, window.innerHeight - 132)),
+          left: Math.min(event.clientX + 8, Math.max(8, window.innerWidth - 184)),
+        });
+      }}
+    />
+  ) : null;
+  // Every bookmarked block carries the body bookmark tag below it.
+  const bookmarkTag = bookmarked ? (
+    <span className="chat-message-bookmark-tag" data-message-bookmark-tag="">
+      <Bookmark size={11} /> Bookmark
+    </span>
+  ) : null;
+  // One shared block menu: bookmark add/remove, plus 手动汇报 for the task's
+  // tail block (the button used to live in the message meta row).
+  const blockMenu = menuAt ? createPortal(
+    <div
+      className="message-block-menu"
+      data-message-block-menu
+      role="menu"
+      style={{ top: menuAt.top, left: menuAt.left }}
+      onPointerDown={(event) => event.stopPropagation()}
+    >
+      <button
+        type="button"
+        role="menuitem"
+        disabled={!message.content.trim() || !sessionId || !isPanMessageId(message.messageId)}
+        title={!message.content.trim() ? '消息正文为空' : !isPanMessageId(message.messageId)
+          ? '消息原文尚不可读取' : '复制消息原文（保留 Markdown）'}
+        onClick={() => {
+          setMenuAt(null);
+          // Capture the clicked identity before an async read or Session
+          // switch. Display content can contain rewritten editor links.
+          const id = message.messageId;
+          if (!message.content.trim() || !sessionId || !isPanMessageId(id)) return;
+          void fetchSessionMessageText(sessionId, id!).then(body => {
+            if (!body.trim()) throw new Error('Empty message body');
+            return copyText(body);
+          }).catch(() => {
+            useUIStore.getState().showToast('复制失败，请重试', 'error');
+          });
+        }}
+      >
+        <Copy size={12} /> 复制全文
+      </button>
+      {bookmarkable ? (
+        <button
+          type="button"
+          role="menuitem"
+          data-bookmark-action={bookmarked ? 'remove' : 'add'}
+          onClick={() => {
+            setMenuAt(null);
+            if (sessionId && message.messageId) {
+              void (bookmarked
+                ? removeBookmark(sessionId, message.messageId)
+                : addBookmark(sessionId, message.messageId));
+            }
+          }}
+        >
+          {bookmarked ? <BookmarkMinus size={12} /> : <BookmarkPlus size={12} />}
+          {bookmarked ? 'Remove bookmark' : 'Add bookmark'}
         </button>
-      )}
-      {canDelete && (!confirming ? (
-        <button type="button" onClick={() => setConfirming(true)} disabled={deleting}
-          className="inline-flex items-center gap-1 text-xs text-text-tertiary hover:text-danger disabled:opacity-50"
-          title="删除消息">
-          <Trash2 size={13} /> 删除
-        </button>
-      ) : (
-        <>
-          <span className="text-xs text-text-secondary">确认删除？</span>
-          <button type="button" onClick={() => void onDelete()} disabled={deleting}
-            className="inline-flex items-center gap-1 rounded border border-danger px-2 py-0.5 text-xs text-danger hover:bg-danger/10 disabled:opacity-50">
-            {deleting && <Loader2 size={13} className="animate-spin" />} 确认删除
+      ) : null}
+      {bookmarkable ? (
+        confirmingHide ? (
+          <button
+            type="button"
+            role="menuitem"
+            data-hide-confirm="true"
+            onClick={() => {
+              setMenuAt(null);
+              if (!sessionId) return;
+              void hideMessage(message).then(() => {
+                useUIStore.getState().showToast('消息已隐藏');
+              }).catch((error: unknown) => {
+                useUIStore.getState().showToast(
+                  error instanceof Error ? error.message : '消息隐藏失败', 'error');
+              });
+            }}
+          >
+            <Trash2 size={12} /> 确认隐藏？
           </button>
-          <button type="button" onClick={() => setConfirming(false)} disabled={deleting}
-            className="text-xs text-text-tertiary hover:text-text-primary disabled:opacity-50">取消</button>
-        </>
-      ))}
-    </div>
+        ) : (
+          <button
+            type="button"
+            role="menuitem"
+            data-hide-action="true"
+            title="从界面隐藏这条消息（不修改对话记录）"
+            onClick={() => setConfirmingHide(true)}
+          >
+            <Trash2 size={12} /> 隐藏消息
+          </button>
+        )
+      ) : null}
+      {bookmarkable && hasManualReport ? (
+        <div className="message-block-menu-divider" role="separator" />
+      ) : null}
+      {hasManualReport && manualReportKey && manualReportTarget ? (
+        <button
+          type="button"
+          role="menuitem"
+          data-manual-report={manualReportKey}
+          disabled={manualReportEntry?.state === 'sending' || manualReportEntry?.state === 'sent'}
+          title={openReportCopy.title}
+            onClick={() => {
+              setMenuAt(null);
+              void reportTaskManually(manualReportTarget.sessionId, {
+                taskId: manualReportTarget.taskId,
+                taskSeq: manualReportTarget.taskSeq,
+                messageId: manualReportTarget.messageId,
+                // The run's durable cursor travels with the identity: a plain
+                // run whose terminal has no taskSeq binds (and is reported)
+                // by its cursor alone.
+                ...(typeof manualReportTarget.resultCursor === 'number'
+                  ? { resultCursor: manualReportTarget.resultCursor } : {}),
+              });
+            }}
+        >
+          {manualReportEntry?.state === 'sent' ? <Check size={12} /> : <Send size={12} />}
+          {manualReportEntry?.state ? openReportCopy.label : '手动汇报'}
+        </button>
+      ) : null}
+    </div>,
+    document.body,
   ) : null;
 
   // Thinking blocks get their own component
@@ -138,9 +368,12 @@ export const MessageBubble = memo(function MessageBubble({ message, prevRole = n
   if (role === 'system') {
     return (
       <div className={`system-message flex justify-center py-2 ${mt}`}>
-        <span className="msg system text-xs text-text-tertiary bg-bg-tertiary rounded px-3 py-1">
-          {message.content}
-        </span>
+        <div className="inline-flex min-w-0 flex-col items-start">
+          {sourceBadge}
+          <span className="msg system text-xs text-text-tertiary bg-bg-tertiary rounded px-3 py-1">
+            {message.content}
+          </span>
+        </div>
       </div>
     );
   }
@@ -149,35 +382,65 @@ export const MessageBubble = memo(function MessageBubble({ message, prevRole = n
   // its full width without changing the measured wrapper's layout.
   if (role === 'user') {
     return (
-      <div className={`message-row message-row-user ${isWorkerReport ? 'message-row-worker-report' : ''} ${mt} px-3 sm:px-6 lg:px-8`}>
-        {workerReportLabel}
+      <div
+        className={`message-row message-row-user relative ${sourceTag ? 'message-row-worker-report' : ''} ${mt} px-3 sm:px-6 lg:px-8`}
+        data-bookmarked={bookmarked ? 'true' : 'false'}
+      >
+        {bookmarkGutter}
+        {sourceBadge}
         <div className="msg user text-sm">
-          <MarkdownRenderer
-            content={message.content}
-            attachmentIds={attachmentIds}
-            className="text-sm"
-          />
+          {rawViewEnabled ? (
+            <RawMessageText content={message.rawContent ?? message.content} className="text-sm" />
+          ) : (
+            <MarkdownRenderer
+              content={message.content}
+              attachmentIds={attachmentIds}
+              className="text-sm"
+            />
+          )}
         </div>
-        <MessageTimestamp ts={message.ts} className="mt-0.5" />
-        {actions}
+        {bookmarkTag}
+        <div className="mt-0.5 flex items-center justify-end gap-2 self-end" data-message-meta="">
+          {actions}
+          <MessageTimestamp ts={message.ts} />
+        </div>
+        {blockMenu}
       </div>
     );
   }
 
   // Assistant messages — no bubble, left-aligned, full-width markdown flow
   return (
-    <div className={`message-row message-row-assistant ${isWorkerReport ? 'message-row-worker-report' : ''} ${mt} px-3 sm:px-6 lg:px-8`}>
-      {workerReportLabel}
+    <div
+      className={`message-row message-row-assistant relative ${sourceTag ? 'message-row-worker-report' : ''} ${mt} px-3 sm:px-6 lg:px-8`}
+      data-bookmarked={bookmarked ? 'true' : 'false'}
+    >
+      {bookmarkGutter}
+      {sourceBadge}
       <div className="msg assistant text-sm leading-relaxed">
-        <MarkdownRenderer
-          content={message.content}
-          attachmentIds={attachmentIds}
-        />
+        {rawViewEnabled ? (
+          <RawMessageText content={message.rawContent ?? message.content} />
+        ) : (
+          <MarkdownRenderer
+            content={message.content}
+            attachmentIds={attachmentIds}
+          />
+        )}
       </div>
+      {bookmarkTag}
       <MessageTimestamp ts={message.ts} className="mt-0.5" />
-      {actions}
+      {blockMenu}
     </div>
   );
+}, (previous, next) => {
+  // A streaming sibling rebuilds the binding map. Equal authority fields do
+  // not require this settled row to rerender; changed bindings must still do so.
+  const a = previous.manualReportTarget;
+  const b = next.manualReportTarget;
+  const sameReport = a === b || (!!a && !!b
+    && a.sessionId === b.sessionId && a.taskId === b.taskId && a.taskSeq === b.taskSeq
+    && a.messageId === b.messageId && a.resultCursor === b.resultCursor && a.terminalKey === b.terminalKey);
+  return previous.message === next.message && previous.prevRole === next.prevRole && sameReport;
 });
 
 /**
@@ -188,6 +451,7 @@ export function groupMessages(
   messages: Message[],
   mergeConsecutiveNonBodyBlocks = false,
   timestampFlashMessages?: ReadonlySet<Message>,
+  searchTargetMessageId?: string | null,
 ): GroupedItem[] {
   const grouped: GroupedItem[] = [];
 
@@ -206,6 +470,11 @@ export function groupMessages(
     let currentNonBodyGroup: Message[] | null = null;
 
     for (const msg of messages) {
+      if (searchTargetMessageId && msg.messageId === searchTargetMessageId) {
+        currentNonBodyGroup = null;
+        grouped.push(msg);
+        continue;
+      }
       if (msg.role === 'tool' || msg.role === 'thinking') {
         if (!currentNonBodyGroup) {
           currentNonBodyGroup = [];
@@ -225,6 +494,12 @@ export function groupMessages(
   let currentThinkingGroup: Message[] | null = null;
 
   for (const msg of messages) {
+    if (searchTargetMessageId && msg.messageId === searchTargetMessageId) {
+      currentToolGroup = null;
+      currentThinkingGroup = null;
+      grouped.push(msg);
+      continue;
+    }
     if (msg.role === 'tool') {
       currentThinkingGroup = null;
       if (!currentToolGroup) {
@@ -253,13 +528,27 @@ interface MessageDisplayItemProps {
   item: GroupedItem;
   prevRole?: PrevRole;
   onTimestampFlashConsumed?: (flashKeys: readonly string[]) => void;
+  searchTargetMessageId?: string | null;
+  manualReportTarget?: ManualReportTarget | null;
 }
 
 export const MessageDisplayItem = memo(function MessageDisplayItem({
   item,
   prevRole = null,
   onTimestampFlashConsumed,
+  searchTargetMessageId,
+  manualReportTarget = null,
 }: MessageDisplayItemProps) {
+  if (!('type' in item) && item.kind === 'terminal' && item.terminal) {
+    return <HistoryTerminal terminal={item.terminal} />;
+  }
+  if (!('type' in item) && item.messageId === searchTargetMessageId &&
+      (item.role === 'tool' || item.role === 'thinking')) {
+    return <div className="px-3 sm:px-6 lg:px-8 py-2" data-search-expanded-role={item.role}>
+      <div className="text-xs text-text-tertiary">{item.role}</div>
+      <MarkdownRenderer content={item.content} />
+    </div>;
+  }
   if ('type' in item) {
     if (item.type === 'non_body_group') {
       const firstRole = item.items[0]?.role === 'thinking' ? 'thinking' : 'tool';
@@ -303,5 +592,5 @@ export const MessageDisplayItem = memo(function MessageDisplayItem({
       </div>
     );
   }
-  return <MessageBubble message={item as Message} prevRole={prevRole} />;
+  return <MessageBubble message={item as Message} prevRole={prevRole} manualReportTarget={manualReportTarget} />;
 });

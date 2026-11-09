@@ -24,6 +24,114 @@ import packages.web.server as server
 from packages.core import session as _sess
 
 
+@pytest.mark.parametrize('credential', ['anonymous', 'invalid-cookie', 'cookie', 'bearer'])
+def test_http_policies_stream_in_the_request_task_without_body_relay(monkeypatch, tmp_path, credential):
+    """Header/log policies must not create per-request task/stream graphs."""
+    monkeypatch.setattr(server, '_log', lambda line: None)
+    monkeypatch.setattr(server, '_LOG_SKIP', [])
+    from types import SimpleNamespace
+    from packages.automation.auth import UserAuth
+    auth = UserAuth(tmp_path / 'auth')
+    token = auth.login(auth.key())
+    async def io(fn, *args):
+        return await asyncio.to_thread(fn, *args)
+    monkeypatch.setattr(server.app.state, 'automation', SimpleNamespace(auth=auth, engine=SimpleNamespace(io=io)), raising=False)
+    headers = {
+        'anonymous': [],
+        'invalid-cookie': [(b'cookie', b'pan_automation_session=invalid.0')],
+        'cookie': [(b'cookie', ('pan_automation_session=' + token + '.0').encode())],
+        'bearer': [(b'authorization', ('Bearer ' + token).encode())],
+    }[credential]
+
+    async def run():
+        owner = asyncio.current_task()
+        seen = []
+        messages = []
+        never = asyncio.Event()
+
+        async def endpoint(scope, receive, send):
+            seen.append(asyncio.current_task())
+            await send({'type': 'http.response.start', 'status': 200, 'headers': []})
+            await send({'type': 'http.response.body', 'body': b'first', 'more_body': True})
+            await send({'type': 'http.response.body', 'body': b'last', 'more_body': False})
+
+        async def receive():
+            await never.wait()
+
+        async def send(message):
+            messages.append(message)
+
+        stack = endpoint
+        for middleware in reversed(server.app.user_middleware):
+            stack = middleware.cls(stack, *middleware.args, **middleware.kwargs)
+        await stack({'type': 'http', 'method': 'GET', 'path': '/api/sessions',
+                     'query_string': b'', 'headers': headers, 'http_version': '1.1',
+                     'scheme': 'http', 'server': ('test', 80)}, receive, send)
+        assert seen == [owner], 'HTTP policies created task/stream relay objects'
+        assert [(m.get('body'), m.get('more_body')) for m in messages[1:]] == [
+            (b'first', True), (b'last', False)]
+        assert dict(messages[0]['headers'])[b'cache-control'] == b'no-cache, no-store, must-revalidate'
+
+    asyncio.run(run())
+
+
+def test_session_binding_reconciliation_precedes_response_in_request_task(monkeypatch):
+    from types import SimpleNamespace
+
+    async def run():
+        owner = asyncio.current_task()
+        seen = []
+
+        async def reconcile():
+            assert asyncio.current_task() is owner
+            seen.append('reconciled')
+
+        async def endpoint(scope, receive, send):
+            await send({'type': 'http.response.start', 'status': 200, 'headers': []})
+            await send({'type': 'http.response.body', 'body': b'unchanged'})
+
+        async def send(message):
+            assert asyncio.current_task() is owner
+            seen.append(message['type'])
+
+        monkeypatch.setattr(server.app.state, 'plugin_events', SimpleNamespace(reconcile=reconcile), raising=False)
+        stack = server.PluginEventBindingsMiddleware(endpoint)
+        await stack({'type': 'http', 'method': 'PATCH', 'path': '/api/sessions/owned'}, None, send)
+        assert seen == ['reconciled', 'http.response.start', 'http.response.body']
+        seen.clear()
+        await stack({'type': 'http', 'method': 'GET', 'path': '/api/sessions/owned'}, None, send)
+        assert seen == ['http.response.start', 'http.response.body']
+
+    asyncio.run(run())
+
+
+def test_request_log_write_stays_off_the_event_loop(monkeypatch):
+    """A redirected stdout flush is blocking I/O even after response shaping."""
+    loop_thread = threading.get_ident()
+    writes = []
+
+    def log(line):
+        assert threading.get_ident() != loop_thread, 'stdout flush blocks dashboard heartbeats'
+        writes.append(line)
+
+    monkeypatch.setattr(server, '_log', log)
+    monkeypatch.setattr(server, '_LOG_SKIP', [])
+
+    async def run():
+        async def endpoint(scope, receive, send):
+            await send({'type': 'http.response.start', 'status': 200, 'headers': []})
+            await send({'type': 'http.response.body', 'body': b''})
+
+        async def send(message):
+            pass
+
+        await server.HTTPPolicyMiddleware(endpoint)(
+            {'type': 'http', 'method': 'GET', 'path': '/api/sessions'}, None, send)
+
+    asyncio.run(run())
+    assert len(writes) == 1 and '/api/sessions' in writes[0]
+
+
 ROW_SUFFIX = "x" * 80
 
 
@@ -535,6 +643,16 @@ def test_history_paging_semantics_are_unchanged():
     assert len(capped["history"]) == _sess.HISTORY_PAGE_MAX
     assert capped["start"] == 1_000 - _sess.HISTORY_PAGE_MAX
 
+    jump = asyncio.run(server.api_session_history(
+        "ses-paging", before=0, limit=99_999, searchJump=True))
+    assert len(jump["history"]) == _sess.HISTORY_SEARCH_JUMP_PAGE_MAX
+    assert jump["start"] == 0
+
+    # The larger cap is explicit and leaves the ordinary endpoint behavior intact.
+    capped_again = asyncio.run(server.api_session_history(
+        "ses-paging", before=0, limit=99_999))
+    assert len(capped_again["history"]) == _sess.HISTORY_PAGE_MAX
+
 
 def test_empty_history_page_semantics():
     _seed("ses-empty", [])
@@ -732,5 +850,58 @@ def test_offloaded_store_reads_stay_serialized(monkeypatch):
             assert len(item["history"]) == 50
 
 
+def test_cold_read_projection_keeps_config_and_bookmark_io_off_loop(monkeypatch):
+    """Even a warm history page must not perform its sidecar stat on the loop."""
+    _seed('ses-projection-io', _rows(60))
+    loop_thread = threading.get_ident()
+    config_reads = []
+    bookmark_reads = []
+    real_config = server.load_config
+    real_bookmarks = server.session_bookmarks.bookmarked_message_ids
+
+    def config():
+        assert threading.get_ident() != loop_thread, 'config read blocked the event loop'
+        config_reads.append(True)
+        return real_config()
+
+    def bookmarks(sid):
+        assert threading.get_ident() != loop_thread, 'bookmark stat/lock blocked the event loop'
+        bookmark_reads.append(sid)
+        return real_bookmarks(sid)
+
+    monkeypatch.setattr(server, 'load_config', config)
+    monkeypatch.setattr(server.session_bookmarks, 'bookmarked_message_ids', bookmarks)
+
+    async def scenario():
+        listing = await server.api_list_sessions(summary=0)
+        page = await server.api_session_history('ses-projection-io', limit=50)
+        assert len(listing['sessions'][0]['history']) == len(page['history']) == 50
+        assert '_bookmarkedMessageIds' not in page
+
+    asyncio.run(scenario())
+    assert config_reads
+    assert bookmark_reads == ['ses-projection-io', 'ses-projection-io']
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+def test_history_wire_projection_stays_off_event_loop(monkeypatch):
+    """Attachment compatibility projection includes regex/path/file work."""
+    _seed("ses-projection-thread", [{"role": "user", "content": "hello"}])
+    loop_thread = threading.get_ident()
+    original = server._api_history
+    projections = []
+
+    def project(*args, **kwargs):
+        projections.append(threading.get_ident())
+        assert threading.get_ident() != loop_thread, "history wire projection blocks heartbeats"
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(server, "_api_history", project)
+    result = asyncio.run(server.api_session_history("ses-projection-thread", limit=1))
+    assert len(projections) == 1
+    assert result["history"][0]["content"] == "hello"
+    assert result["history"][0]["messageId"]
+    assert result["total"] == 1 and result["start"] == 0 and not result["hasMore"]

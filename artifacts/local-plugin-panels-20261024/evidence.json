@@ -1,0 +1,38 @@
+{
+  "sourceSha": "c65a69defc3a2c1c7609ae9e214d9c79c6af0848",
+  "port": 63004,
+  "profile": "<owned temporary data root>",
+  "pluginDir": "<owned temporary example copy>",
+  "browser": {
+    "build": true,
+    "enable": true,
+    "iframeApi": true,
+    "oldLazyChunkAfterRebuild": true,
+    "newPageUsesNewBuild": true,
+    "failedRebuildRetained": true,
+    "disable": true,
+    "unbuild": true,
+    "pageErrors": []
+  },
+  "http": {
+    "mcpCatalogUnchanged": true,
+    "messageSourcesUnchanged": true,
+    "retainedBuildStatus": 200,
+    "unbuiltAssetStatus": 404,
+    "sourceFilesPreserved": true
+  },
+  "builds": {
+    "a": "20261024T220320-90f75244",
+    "b": "20261024T220323-4c9e27cb",
+    "assetA": "/panel-assets/react-console/console/20261024T220320-90f75244/",
+    "assetB": "/panel-assets/react-console/console/20261024T220323-4c9e27cb/",
+    "oldLazy": "Bundle A",
+    "newLazy": "Bundle B"
+  },
+  "portReleased": true,
+  "ownedDescendantsAfterStop": [],
+  "testedCommit": "5b643e582a8089eda86b7e05930493635ae5fded",
+  "testedTree": "e1fb4ba24930905cb33bc8c037622d7414b28e89",
+  "spawnTransactionCommit": "12ea7d702787948405bfd1e1ebaeb5cb6627801d",
+  "spawnTransactionTree": "5676b30ac1fdeb8207e752acad33bf089aaeb71a"
+}

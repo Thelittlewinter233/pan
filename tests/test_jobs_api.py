@@ -15,6 +15,7 @@ worker.assign/send_session 替身；不 spawn 进程、不写真实 data/。
 import asyncio
 import json
 import subprocess
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -36,7 +37,7 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_store, "DEFAULT_ROOT", tmp_path / "bg_jobs")
     monkeypatch.setattr(jobs, "_scheduled_task_hooks",
                         {"root_resolver": None, "config_resolver": None,
-                         "on_event": None})
+                         "on_event": None, "qq_send": None})
     yield
     scheduler_store.release_leader()
 
@@ -57,6 +58,12 @@ def fake_worker(monkeypatch):
         return {"status": "queued", "sessionId": session_id}
 
     monkeypatch.setattr(core_worker, "assign", fake_assign)
+    async def fake_wake(session_id, **kw):
+        calls.append({"api": "wake_session", "session_id": session_id,
+                      "text": core_worker.configured_wake_message(),
+                      "source": kw.get("source"), "client_message_id": kw.get("client_message_id")})
+        return {"status": "queued", "sessionId": session_id}
+    monkeypatch.setattr(core_worker, "wake_session", fake_wake)
     monkeypatch.setattr(core_worker, "send_session", fake_send)
     return calls
 
@@ -324,8 +331,11 @@ def test_resume_legal_running_job_rescans_and_run_now_sends_only_to_current_cand
         "unknown": isolated_session_repository.create(
             "resume-unknown", workdir=str(tmp_path)),
     }
-    sessions["eligible"].last_legal_worker_state = "running"
-    sessions["live"].last_legal_worker_state = "running"
+    from packages.core import legal_offline as legality
+    for key in ("eligible", "live"):
+        identity = {"token": key, "generation": 1, "executionSeq": 1}
+        legality.begin(sessions[key], identity)
+        legality.detect(sessions[key], "crash", eligible=lambda _: True, remember=lambda _: None)
     sessions["idle"].last_legal_worker_state = "idle"
     for session in sessions.values():
         isolated_session_repository.save(session)
@@ -435,7 +445,7 @@ def test_resume_legal_running_keeps_per_fire_client_message_id_stable(
     from packages.core import session as sess
 
     monkeypatch.setattr(sess, "list_all", lambda *, load_history=True: [
-        SimpleNamespace(id="ses_resume_retry", last_legal_worker_state="running"),
+        SimpleNamespace(id="ses_resume_retry", execution_operations={"failure": {"state": "illegal", "safeTerminal": False}}),
     ])
     monkeypatch.setattr(core_worker, "find_alive_worker_by_session", lambda _sid: None)
     job = {
@@ -446,8 +456,10 @@ def test_resume_legal_running_keeps_per_fire_client_message_id_stable(
         "action": {"api": "resume_legal_running"},
     }
 
-    first = asyncio.run(jobs._run_job_action(job, None, "task:entry:fire-1"))
-    retried = asyncio.run(jobs._run_job_action(job, None, "task:entry:fire-1"))
+    # Exercise the retained business sender below the new durable admission
+    # boundary. The unified dispatcher itself never replays an unknown effect.
+    first = asyncio.run(jobs._execute_job_action(job, None, "task:entry:fire-1"))
+    retried = asyncio.run(jobs._execute_job_action(job, None, "task:entry:fire-1"))
 
     assert first["status"] == retried["status"] == "dispatched"
     assert len(fake_worker) == 2  # the normal sender receives its durable idempotency key
@@ -517,6 +529,19 @@ def test_delete_job_routes_to_compat_for_scheduled_task(client, fake_worker):
     body = client.delete(f"/api/jobs/{job['jobId']}").json()
     assert body["ok"] is True
     assert scheduler_store.get_task(task["id"]) is None
+
+
+def test_delete_running_job_reports_cleanup_pending_failure(client, monkeypatch):
+    jobs._save({"jobId": "job_api_delete_running", "targetSessionId": "ses_target",
+                "status": "running", "pid": 10, "processCreatedAt": 1,
+                "createdAt": 1})
+    monkeypatch.setattr(jobs, "_terminate_job_processes",
+                        lambda records: {"confirmed": False, "reason": "receipt unknown"})
+    response = client.delete("/api/jobs/job_api_delete_running")
+    body = response.json()
+    assert body["ok"] is False
+    assert body["error"]["code"] == "job_busy"
+    assert jobs.get("job_api_delete_running")["status"] == "cleanup_pending"
 
 
 # ── partial_failed 事件 ──
@@ -624,6 +649,263 @@ def test_post_creates_scheduled_shell_action_without_target_or_runner(
     assert persisted["action"]["args"]["cwd"] == cwd
     assert scheduler_store.data_root().is_relative_to(tmp_path)
     assert popen_calls == []
+
+
+def _create_scheduled_qq_job(client, *, target_type="user", target_id="123456",
+                             bot_uin="987654", text="hello QQ"):
+    args = {"targetType": target_type, "targetId": target_id}
+    if bot_uin is not None:
+        args["botUin"] = bot_uin
+    return client.post("/api/jobs", json={
+        "kind": "scheduled-task",
+        "name": "QQ reminder",
+        "action": {"api": "send_qq", "args": args},
+        "text": text,
+        "schedule": [{"kind": "interval", "intervalSec": 3600}],
+        "misfirePolicy": "fire_now",
+        "maxRuns": 5,
+        "enabled": True,
+        "paused": False,
+    }).json()
+
+
+def test_post_scheduled_qq_action_persists_target_and_rejects_untrusted_fields(client):
+    created = _create_scheduled_qq_job(client)
+    assert created["ok"] is True, created
+    job = created["job"]
+    assert job["action"] == {"api": "send_qq", "args": {
+        "targetType": "user", "targetId": "123456", "botUin": "987654"}}
+    assert job["target"] == {"sessionId": None}
+    assert job["targetSessionId"] is None
+    assert job["text"] == "hello QQ"
+
+    invalid_bodies = [
+        {"action": {"api": "send_qq", "args": {
+            "targetType": "user", "targetId": "123"}}, "text": "x"},
+        {"action": {"api": "send_qq", "args": {
+            "targetType": "group", "targetId": "123456", "botUin": "abc"}},
+         "text": "x"},
+        {"action": {"api": "send_qq", "args": {
+            "targetType": "user", "targetId": "123456", "url": "http://host"}},
+         "text": "x"},
+        {"action": {"api": "send_qq", "args": {
+            "targetType": ["user"], "targetId": "123456"}}, "text": "x"},
+        {"action": {"api": "send_qq", "args": {
+            "targetType": "friend", "targetId": "123456"}}, "text": "x"},
+        {"action": {"api": "send_qq", "args": {
+            "targetType": "user", "targetId": "123456"}}, "text": "  "},
+        {"action": {"api": "send_qq", "args": {
+            "targetType": "user", "targetId": "123456"}},
+         "target": {"sessionId": "ses_arbitrary"}, "text": "x"},
+    ]
+    for fields in invalid_bodies:
+        body = client.post("/api/jobs", json={
+            "kind": "scheduled-task",
+            "schedule": [{"kind": "interval", "intervalSec": 3600}],
+            **fields,
+        }).json()
+        assert body["ok"] is False, fields
+        assert body["error"]["code"] == "invalid_argument"
+
+
+def test_patch_scheduled_qq_action_is_strict_and_editable(client):
+    created = _create_scheduled_qq_job(client)
+    assert created["ok"] is True, created
+    job_id = created["job"]["jobId"]
+
+    malformed = client.patch(f"/api/jobs/{job_id}", json={
+        "action": {"api": "send_qq", "args": {
+            "targetType": "group", "targetId": "123456", "command": "echo unsafe"}},
+    }).json()
+    malformed_bot = client.patch(f"/api/jobs/{job_id}", json={
+        "action": {"api": "send_qq", "args": {
+            "targetType": "user", "targetId": "123456", "botUin": "not-a-bot"}},
+    }).json()
+    malformed_recipient = client.patch(f"/api/jobs/{job_id}", json={
+        "action": {"api": "send_qq", "args": {
+            "targetType": "group", "targetId": "not-a-qq-id"}},
+    }).json()
+    empty_text = client.patch(f"/api/jobs/{job_id}", json={"text": "  "}).json()
+    session_target = client.patch(f"/api/jobs/{job_id}", json={
+        "target": {"sessionId": "ses_arbitrary"},
+    }).json()
+    assert malformed["ok"] is False
+    assert malformed_bot["ok"] is False
+    assert malformed_recipient["ok"] is False
+    assert empty_text["ok"] is False
+    assert session_target["ok"] is False
+
+    edited = client.patch(f"/api/jobs/{job_id}", json={
+        "name": "Updated QQ reminder",
+        "action": {"api": "send_qq", "args": {
+            "targetType": "group", "targetId": "456789", "botUin": "234567"}},
+        "text": "updated text",
+        "paused": True,
+    }).json()
+    assert edited["ok"] is True, edited
+    assert edited["job"]["action"] == {"api": "send_qq", "args": {
+        "targetType": "group", "targetId": "456789", "botUin": "234567"}}
+    assert edited["job"]["target"] == {"sessionId": None}
+    assert edited["job"]["text"] == "updated text"
+    assert edited["job"]["paused"] is True
+
+
+def test_scheduled_qq_fire_uses_selected_bot_and_records_success_or_offline_error(
+        client, monkeypatch):
+    _register_unified_hooks()
+    calls = []
+
+    async def fake_qq_send(*, target_type, target_id, text, bot_uin=None):
+        calls.append({"target_type": target_type, "target_id": target_id,
+                      "text": text, "bot_uin": bot_uin})
+        if bot_uin == "765432":
+            return {"ok": False, "error": {
+                "code": "bot_offline", "message": "selected QQ bot is offline"}}
+        return {"ok": True, "message_id": "msg-1"}
+
+    jobs.register_scheduled_tasks(qq_send=fake_qq_send)
+    success = _create_scheduled_qq_job(client, target_type="user", target_id="123456")
+    offline = _create_scheduled_qq_job(
+        client, target_type="group", target_id="654321", bot_uin="765432")
+    assert success["ok"] and offline["ok"]
+
+    for index, created in enumerate((success, offline)):
+        saved = scheduler_store._job_for_task(created["job"]["taskId"])
+        due = {**saved["schedule"][0],
+               "nextFireAt": (datetime.now() - timedelta(seconds=5)).isoformat()}
+        patch = {"schedule": [due]}
+        if index == 0:
+            # Recover a stale in-flight claim and retry its due targetless action.
+            patch.update(status="running", runStartedAt=time.time() - 60)
+        jobs._update(saved["jobId"], patch,
+                     registry_root=scheduler_store.data_root())
+
+    assert asyncio.run(jobs.run_due_scheduled_tasks()) == 2
+    success_job = jobs.get(success["job"]["jobId"], registry_root=scheduler_store.data_root())
+    offline_job = jobs.get(offline["job"]["jobId"], registry_root=scheduler_store.data_root())
+    assert success_job["targetSessionId"] is None
+    assert success_job["lastStatus"] == "completed"
+    assert success_job["lastDelivery"]["messageId"] == "msg-1"
+    assert offline_job["lastStatus"] == "error"
+    assert "offline" in offline_job["lastError"]
+    assert offline_job["undeliveredFires"] == []
+    success_run = jobs.list_run_records(
+        task_id=success["job"]["taskId"], registry_root=scheduler_store.data_root())[0]
+    offline_run = jobs.list_run_records(
+        task_id=offline["job"]["taskId"], registry_root=scheduler_store.data_root())[0]
+    assert success_run["status"] == "completed"
+    assert offline_run["status"] == "error"
+    assert {call["target_id"]: call for call in calls} == {
+        "123456": {"target_type": "private", "target_id": "123456",
+                   "text": "hello QQ", "bot_uin": "987654"},
+        "654321": {"target_type": "group", "target_id": "654321",
+                   "text": "hello QQ", "bot_uin": "765432"},
+    }
+
+
+def test_scheduled_qq_run_now_is_targetless_and_records_plugin_failure(client):
+    calls = []
+
+    async def fake_qq_send(*, target_type, target_id, text, bot_uin=None):
+        calls.append((target_type, target_id, text, bot_uin))
+        if bot_uin == "765432":
+            return {"ok": False, "error": {
+                "code": "connection_error", "message": "QQ plugin is unavailable"}}
+        return {"ok": True, "message_id": "manual-1"}
+
+    jobs.register_scheduled_tasks(qq_send=fake_qq_send)
+    success = _create_scheduled_qq_job(client)
+    offline = _create_scheduled_qq_job(client, bot_uin="765432")
+    assert success["ok"] and offline["ok"]
+
+    success_run = client.post(
+        f"/api/jobs/{success['job']['jobId']}/run-now").json()
+    offline_run = client.post(
+        f"/api/jobs/{offline['job']['jobId']}/run-now").json()
+    assert success_run["ok"] is True
+    assert success_run["run"]["status"] == "completed"
+    assert success_run["run"]["session_id"] is None
+    assert success_run["run"]["result"]["messageId"] == "manual-1"
+    assert offline_run["ok"] is True
+    assert offline_run["run"]["status"] == "error"
+    assert "unavailable" in offline_run["run"]["error"]
+    assert len(client.get(
+        f"/api/jobs/{offline['job']['jobId']}/runs").json()["runs"]) == 1
+    assert calls == [
+        ("private", "123456", "hello QQ", "987654"),
+        ("private", "123456", "hello QQ", "765432"),
+    ]
+
+
+def test_scheduled_qq_backlog_retry_runs_without_session_target(client):
+    calls = []
+
+    async def fake_qq_send(*, target_type, target_id, text, bot_uin=None):
+        calls.append((target_type, target_id, text, bot_uin))
+        return {"ok": True, "message_id": "replay-1"}
+
+    jobs.register_scheduled_tasks(qq_send=fake_qq_send)
+    created = _create_scheduled_qq_job(client)
+    assert created["ok"] is True
+    saved = jobs.get(created["job"]["jobId"], registry_root=scheduler_store.data_root())
+    note = {
+        "entryId": saved["schedule"][0]["id"],
+        "fireAt": (datetime.now() - timedelta(seconds=5)).isoformat(),
+        "dispatchKey": f"{saved['taskId']}:retry-fixture",
+        "text": saved["text"],
+        "error": "recovered pending QQ send",
+    }
+    saved = jobs._update(saved["jobId"], {
+        "undeliveredFires": [note],
+        "targetSessionId": None,
+    }, registry_root=scheduler_store.data_root())
+
+    assert asyncio.run(jobs._redeliver_undelivered(
+        saved, scheduler_store.data_root())) == 1
+    refreshed = jobs.get(saved["jobId"], registry_root=scheduler_store.data_root())
+    run = jobs.list_run_records(
+        task_id=saved["taskId"], registry_root=scheduler_store.data_root())[0]
+    assert calls == [("private", "123456", "hello QQ", "987654")]
+    assert refreshed["undeliveredFires"] == []
+    assert refreshed["lastStatus"] == "completed"
+    assert refreshed["lastDelivery"]["messageId"] == "replay-1"
+    assert run["status"] == "completed"
+
+
+def test_scheduled_qq_registered_callback_posts_only_to_plugin_send_route(monkeypatch):
+    from packages.web import server as web_server
+
+    requests = []
+
+    async def fake_post(path, body):
+        requests.append((path, body))
+        if body.get("bot_uin") == "765432":
+            return {"ok": False, "error": {
+                "code": "bot_offline", "message": "selected bot is offline"}}
+        return {"ok": True, "message_id": "plugin-message-1"}
+
+    monkeypatch.setattr(web_server, "_qq_plugin_post", fake_post)
+    sent = asyncio.run(web_server._send_scheduled_qq(
+        target_type="private", target_id="123456", text="fixed text",
+        bot_uin="987654"))
+    offline = asyncio.run(web_server._send_scheduled_qq(
+        target_type="group", target_id="654321", text="fixed text",
+        bot_uin="765432"))
+    default = asyncio.run(web_server._send_scheduled_qq(
+        target_type="private", target_id="123456", text="default channel",
+        bot_uin=None))
+
+    assert sent == {"ok": True, "message_id": "plugin-message-1"}
+    assert offline["ok"] is False
+    assert default["ok"] is True
+    assert requests == [
+        ("/api/qq/send", {"target_type": "private", "target_id": "123456",
+                           "text": "fixed text", "bot_uin": "987654"}),
+        ("/api/qq/send", {"target_type": "group", "target_id": "654321",
+                           "text": "fixed text", "bot_uin": "765432"}),
+        ("/api/qq/send", {"target_type": "private", "target_id": "123456",
+                           "text": "default channel"}),
+    ]
 
 
 def test_post_accepts_session_message_and_rejects_empty_schedule(
@@ -742,3 +1024,156 @@ def test_run_records_carry_entry_id(client, fake_worker):
                                  registry_root=scheduler_store.data_root())
     assert runs, "fire 后应有 run 记录"
     assert runs[0].get("entry_id") == job["schedule"][0]["id"]
+
+
+@pytest.mark.parametrize("kind", ["session-message", "session-broadcast", "background-process", "main-lifecycle", "scheduled-task"])
+def test_pin_persists_without_touching_lifecycle(client, kind):
+    job = {"jobId": "job_pin", "kind": kind, "status": "completed", "updatedAt": 7,
+           "createdAt": 1, "name": "pin test", "schedule": {"type": "once", "at": 99}}
+    jobs._create(job, registry_root=scheduler_store.data_root())
+    before = jobs.get("job_pin", registry_root=scheduler_store.data_root())
+    assert client.put("/api/jobs/job_pin/pin", json={"pinned": True}).json()["job"]["pinned"] is True
+    assert client.get("/api/jobs/job_pin").json()["job"]["pinned"] is True
+    assert client.get("/api/jobs", params={"kind": kind, "status": "completed"}).json()["jobs"][0]["pinned"] is True
+    assert jobs.get("job_pin", registry_root=scheduler_store.data_root()) == before
+    assert client.put("/api/jobs/job_pin/pin", json={"pinned": False}).json()["job"]["pinned"] is False
+    assert client.get("/api/jobs/job_pin").json()["job"]["pinned"] is False
+
+
+def test_pin_failure_keeps_disk_and_emits_nothing(client, monkeypatch):
+    jobs._create({"jobId": "job_pin", "status": "running"}, registry_root=scheduler_store.data_root())
+    assert client.put("/api/jobs/job_pin/pin", json={"pinned": True}).json()["ok"]
+    emitted = []
+    monkeypatch.setitem(jobs_api._state, "broadcast", emitted.append)
+    def fail(*args):
+        raise OSError("disk full")
+    monkeypatch.setattr(jobs, "_atomic_write", fail)
+    result = client.put("/api/jobs/job_pin/pin", json={"pinned": False}).json()
+    assert result["error"]["code"] == "persistence_failed"
+    assert emitted == []
+    assert client.get("/api/jobs/job_pin").json()["job"]["pinned"] is True
+
+
+def test_pin_validation_and_independent_owner(client, monkeypatch):
+    remote = {"jobId": "job_remote", "status": "running", "kind": "background-process"}
+    monkeypatch.setattr(jobs_api.pan_bridge, "request", lambda method, *args: remote if method == "get" else {"jobs": [remote]})
+    for body in ({"pinned": 1}, {"pinned": "true"}, {"pinned": None}, {}, {"pinned": True, "status": "completed"}):
+        assert client.put("/api/jobs/job_remote/pin", json=body).json()["error"]["code"] == "invalid_argument"
+    assert client.put("/api/jobs/job_remote/pin", json={"pinned": True}).json()["job"]["executionOwner"] == "independent-job-service"
+    assert client.get("/api/jobs").json()["jobs"][0]["pinned"] is True
+    assert not (scheduler_store.data_root() / "jobs" / "job_remote.json").exists()
+
+
+def test_multiple_pins_filter_and_corrupt_metadata(client):
+    root = scheduler_store.data_root()
+    for name, status in [("a", "running"), ("b", "completed"), ("c", "scheduled")]:
+        jobs._create({"jobId": "job_" + name, "kind": "session-message", "status": status}, registry_root=root)
+    for name in ("b", "c"):
+        assert client.put(f"/api/jobs/job_{name}/pin", json={"pinned": True}).json()["ok"]
+    assert [j["jobId"] for j in client.get("/api/jobs").json()["jobs"]] == ["job_c", "job_b", "job_a"]
+    assert [j["jobId"] for j in client.get("/api/jobs?status=running").json()["jobs"]] == ["job_a"]
+    (root / "pins.json").write_text("broken", encoding="utf-8")
+    assert client.put("/api/jobs/job_a/pin", json={"pinned": True}).json()["error"]["code"] == "pin_metadata_unavailable"
+    assert (root / "pins.json").read_text(encoding="utf-8") == "broken"
+
+
+@pytest.mark.parametrize("failure", ["json", "encoding", "read"])
+@pytest.mark.parametrize("kind", ["session-message", "scheduled-task"])
+def test_pin_metadata_failure_does_not_fail_committed_operations(
+        client, monkeypatch, fake_session_repository, failure, kind):
+    from pathlib import Path
+    fake_session_repository("s")
+    root = scheduler_store.data_root()
+    root.mkdir(parents=True, exist_ok=True)
+    pin_path = root / "pins.json"
+    original = b'{bad json' if failure == "json" else b'\xff\xfe' if failure == "encoding" else b'{"job_existing": true}'
+    pin_path.write_bytes(original)
+    original_read = Path.read_text
+    def read_error(path, *args, **kwargs):
+        if path == pin_path:
+            raise PermissionError("isolated unreadable pins")
+        return original_read(path, *args, **kwargs)
+    if failure == "read":
+        monkeypatch.setattr(Path, "read_text", read_error)
+    events = []
+    monkeypatch.setitem(jobs_api._state, "broadcast", events.append)
+    payload = {"kind": kind, "target": {"sessionId": "s"}, "name": "created once",
+               "text": "x", "schedule": ({"type": "interval", "intervalSeconds": 60}
+                   if kind == "session-message" else [{"kind": "interval", "intervalSec": 60}])}
+    response = client.post("/api/jobs", json=payload)
+    assert response.status_code == 200
+    created = response.json()
+    assert created["ok"] is True
+    job_id = created["job"]["jobId"]
+    assert created["job"]["pinned"] is None
+    assert created["job"]["pinMetadataStatus"] == "unavailable"
+    assert len(list((root / "jobs").glob("job_*.json"))) == 1
+    assert len([ev for ev in events if ev["type"] == "job.created"]) == 1
+    changed = client.patch(f"/api/jobs/{job_id}", json={"name": "modified once"})
+    assert changed.status_code == 200
+    assert changed.json()["ok"] is True
+    assert changed.json()["job"]["name"] == "modified once"
+    assert jobs.get(job_id, registry_root=root)["name"] == "modified once"
+    fetched = client.get(f"/api/jobs/{job_id}")
+    assert fetched.status_code == 200 and fetched.json()["ok"] is True
+    assert fetched.json()["job"]["pinMetadataStatus"] == "unavailable"
+    listed = client.get("/api/jobs", params={"kind": kind, "status": created["job"]["status"]})
+    assert listed.status_code == 200 and listed.json()["ok"] is True
+    assert listed.json()["pinMetadataStatus"] == "unavailable"
+    assert [job["jobId"] for job in listed.json()["jobs"]] == [job_id]
+    before_events = list(events)
+    rejected = client.put(f"/api/jobs/{job_id}/pin", json={"pinned": True})
+    assert rejected.status_code == 200
+    assert rejected.json()["error"]["code"] == "pin_metadata_unavailable"
+    assert "unavailable" in rejected.json()["error"]["message"]
+    assert pin_path.read_bytes() == original
+    assert events == before_events
+    assert len(list((root / "jobs").glob("job_*.json"))) == 1
+
+
+def test_empty_list_exposes_pin_metadata_failure(client):
+    scheduler_store.data_root().mkdir(parents=True, exist_ok=True)
+    (scheduler_store.data_root() / "pins.json").write_bytes(b"\xff")
+    result = client.get("/api/jobs").json()
+    assert result == {"ok": True, "jobs": [], "pinMetadataStatus": "unavailable"}
+
+
+def test_cancelled_pin_request_after_commit_requires_durable_reread(monkeypatch):
+    import threading
+    import httpx
+    from packages.jobs import pins
+    root = scheduler_store.data_root()
+    jobs._create({"jobId": "job_cancel_pin", "status": "running"}, registry_root=root)
+    emitted = []
+    monkeypatch.setitem(jobs_api._state, "broadcast", emitted.append)
+    original = pins.set_pin
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        committed, finished = asyncio.Event(), asyncio.Event()
+        release = threading.Event()
+        def write_then_gate(*args):
+            result = original(*args)
+            loop.call_soon_threadsafe(committed.set)
+            try:
+                assert release.wait(5), "writer gate not released"
+                return result
+            finally:
+                loop.call_soon_threadsafe(finished.set)
+        monkeypatch.setattr(pins, "set_pin", write_then_gate)
+        app = FastAPI()
+        app.include_router(jobs_api.router)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://isolated") as client:
+            request = asyncio.create_task(client.put("/api/jobs/job_cancel_pin/pin", json={"pinned": True}))
+            try:
+                await asyncio.wait_for(committed.wait(), 5)
+                request.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await request
+            finally:
+                release.set()
+            await asyncio.wait_for(finished.wait(), 5)
+            assert pins.read(root) == {"job_cancel_pin": True}
+            reread = (await client.get("/api/jobs/job_cancel_pin")).json()
+            assert reread["ok"] is True and reread["job"]["pinned"] is True
+            assert emitted == []  # interrupted response does not send a rollback/failure event
+    asyncio.run(scenario())

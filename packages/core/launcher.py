@@ -21,6 +21,7 @@ import re
 import shutil
 import signal
 import subprocess
+from packages.jobs.window import command_window_options
 import sys
 import tempfile
 import time
@@ -28,6 +29,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any, Iterable
+
+from packages.core import console_bootstrap, console_logs
 
 
 DEFAULT_PORT = 8768
@@ -233,6 +236,7 @@ def _python_works(argv: list[str], root: Path, timeout: float = 15.0) -> bool:
             [*argv, "-c", "import fastapi, uvicorn, websockets, psutil, httpx; from mcp.server.fastmcp import FastMCP"],
             cwd=str(root), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, timeout=timeout, check=False,
+            **command_window_options(),
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -612,7 +616,8 @@ def _taskkill_verified(record: dict[str, Any], root: Path, log_path: Path | None
         return False
     command = ["taskkill", "/PID", str(int(record["pid"])), "/T", "/F"]
     try:
-        completed = subprocess.run(command, capture_output=True, text=True, timeout=10, check=False)
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=10, check=False,
+                                   **command_window_options())
     except (OSError, subprocess.TimeoutExpired) as exc:
         _write_log(log_path, f"fallback taskkill failed pid={record['pid']}: {exc}")
         return False
@@ -735,12 +740,23 @@ def _creation_flags(hidden: bool) -> int:
     flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
     if hidden:
         flags |= getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    else:
+        # Own a console; never borrow a CLI caller's shared terminal window.
+        flags |= getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
     return flags
 
 
-def _open_redirect(path: Path, mode: str):
+def _ensure_redirect_file(path: Path) -> None:
+    """Create/verify the console log destination without keeping a handle.
+
+    The launcher must not pass this file to the child: a Windows venv
+    ``python.exe`` is a redirector stub that holds every inherited handle for the
+    child's lifetime, which would make the file unrenamable for the whole run.
+    Opening it once here keeps the old early failure (unwritable ``data/logs``)
+    and the empty-file crash marker.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    return path.open(mode, encoding="utf-8")
+    path.open("a", encoding="utf-8").close()
 
 
 def _start_main(root: Path, port: int, python_argv: list[str], hidden: bool,
@@ -751,31 +767,50 @@ def _start_main(root: Path, port: int, python_argv: list[str], hidden: bool,
     # This marker is intentionally part of argv so PID reuse and a similarly
     # named checkout cannot satisfy identity by cwd alone.
     marker = f"--pan-root-marker={root}"
-    argv = [*python_argv, str(main_path), f"--pan-root-marker={root}", f"--pan-port-marker={port}"]
-    stdout_handle = stderr_handle = None
+    console_out = log_path.parent / console_logs.OUT_NAME
+    console_err = log_path.parent / console_logs.ERR_NAME
+    redirect_console = hidden or os.name == "nt"
+    # When redirecting, the console destinations are owned by the child entry
+    # shim (see console_bootstrap): no log file handle crosses the process
+    # boundary, so a venv python.exe redirector cannot pin the file open.  Both
+    # argv shapes keep main.py and both markers visible for process identity.
+    if redirect_console:
+        argv = [*python_argv, "-c", console_bootstrap.SHIM, str(main_path),
+                f"--pan-root-marker={root}", f"--pan-port-marker={port}"]
+    else:
+        argv = [*python_argv, str(main_path),
+                f"--pan-root-marker={root}", f"--pan-port-marker={port}"]
     try:
-        if hidden:
-            stdout_handle = _open_redirect(log_path.parent / "pan-console.out.log", "a")
-            stderr_handle = _open_redirect(log_path.parent / "pan-console.err.log", "a")
+        if redirect_console:
+            _ensure_redirect_file(console_out)
+            _ensure_redirect_file(console_err)
         child_env = os.environ.copy()
+        if os.name == "nt":
+            child_env["PAN_MANAGED_CONSOLE"] = "1"
+        if redirect_console:
+            # The shim redirects with a plain append handle first, which does not
+            # transmit an encoding to child Python interpreters. Pin main +
+            # inherited QQ/WeChat output explicitly.
+            child_env["PYTHONIOENCODING"] = "utf-8:backslashreplace"
+            # Exact destinations for the child's own open + relay; no file handle
+            # crosses the process boundary.
+            child_env[console_bootstrap.ENV_OUT] = str(console_out)
+            child_env[console_bootstrap.ENV_ERR] = str(console_err)
         # Pin the port already selected by the launcher. Pan workers inherit this
         # environment and generate their MCP descriptors later, including after a
         # config reload has changed config.json.
         child_env["PAN_PORT"] = str(port)
         process = subprocess.Popen(
-            argv, cwd=str(root), stdin=subprocess.DEVNULL,
-            stdout=stdout_handle if hidden else None,
-            stderr=stderr_handle if hidden else None,
+            argv, cwd=str(root), stdin=subprocess.DEVNULL if hidden else None,
+            # DEVNULL also covers interpreters whose stdout handle would otherwise
+            # be invalid; the shim redirects to data/logs immediately.
+            stdout=subprocess.DEVNULL if redirect_console else None,
+            stderr=subprocess.DEVNULL if redirect_console else None,
             close_fds=True, creationflags=_creation_flags(hidden),
             env=child_env,
         )
     except OSError as exc:
         raise LauncherError(f"failed to launch Pan Core: {exc}") from exc
-    finally:
-        if stdout_handle is not None:
-            stdout_handle.close()
-        if stderr_handle is not None:
-            stderr_handle.close()
     created = process_create_time(process.pid)
     if created is None:
         process.terminate()
@@ -907,7 +942,8 @@ def _cleanup_stale_children(root: Path, state: dict[str, Any], log_path: Path) -
 
 
 def start_service(root: str | Path | None = None, *, timeout: float = READY_TIMEOUT_SEC,
-                  log_path: Path | None = None) -> dict[str, Any]:
+                  log_path: Path | None = None, hidden: bool | None = None,
+                  python_argv: list[str] | None = None) -> dict[str, Any]:
     root_path = checkout_root(root)
     data = _data_dir(root_path)
     data.mkdir(parents=True, exist_ok=True)
@@ -932,9 +968,10 @@ def start_service(root: str | Path | None = None, *, timeout: float = READY_TIME
         raise PortConflict(
             f"Pan port {port} is already owned by an unverified process PID={owner}; refusing to start"
         )
-    python_argv, source = resolve_python_argv(root_path, probe=True)
-    print(f"[INFO] Pan Python source: {source}")
-    record = _start_main(root_path, port, python_argv, _console_hidden(root_path), log_path)
+    if python_argv is None:
+        python_argv, source = resolve_python_argv(root_path, probe=True)
+        print(f"[INFO] Pan Python source: {source}")
+    record = _start_main(root_path, port, python_argv, _console_hidden(root_path) if hidden is None else hidden, log_path)
     state["main"] = record
     state["port"] = port
     # Capture a QQ child that may have spawned before the readiness barrier so
@@ -973,6 +1010,12 @@ def start_service(root: str | Path | None = None, *, timeout: float = READY_TIME
     refresh_qq_state(root_path, state)
     save_state(root_path, state)
     start_cloudflared(root_path, port, state, log_path=log_path)
+    if (load_config(root_path).get("mcp_remote") or {}).get("enabled") is True:
+        from packages.remote.mcp_runtime import control
+        try:
+            control(root_path, "start")
+        except Exception as exc:
+            _write_log(log_path, f"MCP remote startup failed: {exc}")
     print(f"[OK] Pan Core API ready on 127.0.0.1:{port}, PID={record['pid']}")
     return state
 
@@ -1061,6 +1104,8 @@ def stop_service(root: str | Path, port: int, old_pid: int | None = None,
             raise LauncherError(
                 f"Pan graceful shutdown failed ({coordination_error}); verified fallback failed: {outcome}"
             )
+    from packages.remote.mcp_runtime import control
+    control(root_path, "stop")
     for field in ("qq", "cloudflared"):
         child = state.get(field)
         if not child:

@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Modal } from '@/components/ui/Modal';
 import { Button } from '@/components/ui/Button';
 import { getAvailableCliAdapters, useAdapterStore } from '@/stores/adapterStore';
 import { useSessionStore } from '@/stores/sessionStore';
 import { useUIStore } from '@/stores/uiStore';
 import { getCreationWorkspaceIds } from '@/utils/creationWorkspace';
+import { formatModelLabel } from '@/utils/modelLabel';
 import type {
   CbcProject,
   CbcSessionItem,
@@ -24,6 +25,8 @@ import {
   importOpencodeSession,
   fetchCodexSessions,
   importCodexSession,
+  fetchDshSessions,
+  importDshSession,
 } from '@/services/api';
 
 interface ImportModalProps {
@@ -32,14 +35,44 @@ interface ImportModalProps {
   initialAdapter?: Adapter;
 }
 
-type Adapter = 'cbc' | 'kimi' | 'opencode' | 'codex';
+type Adapter = 'cbc' | 'kimi' | 'opencode' | 'codex' | 'dsh';
 
 const IMPORT_ADAPTERS: Array<{ name: Adapter; label: string }> = [
   { name: 'cbc', label: 'cbc' },
   { name: 'kimi', label: 'kimi' },
   { name: 'opencode', label: 'opencode' },
   { name: 'codex', label: 'codex' },
+  { name: 'dsh', label: 'dsh' },
 ];
+
+// Match native CLI IDs without altering the original item used for import.
+function matchesSession(query: string, ...values: Array<string | undefined>): boolean {
+  const needle = query.trim().toLowerCase();
+  return values.some((value) => (value ?? '').toLowerCase().includes(needle));
+}
+
+function SessionSearch({ value, onChange, scope }: {
+  value: string;
+  onChange: (value: string) => void;
+  scope: string;
+}) {
+  return (
+    <label className="flex flex-col gap-1">
+      <span className="text-xs text-text-secondary">Search loaded sessions</span>
+      <input
+        type="search"
+        aria-label="Search loaded sessions"
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        placeholder="Filter by name, path or CLI session ID…"
+        className="rounded border border-border-muted bg-bg-primary px-3 py-1.5 text-sm text-text-primary outline-none placeholder:text-text-tertiary focus:border-accent"
+      />
+      <span className="text-xs text-text-tertiary">
+        {scope} Matches full or partial native CLI session IDs (not Pan session IDs).
+      </span>
+    </label>
+  );
+}
 
 function formatTime(ts: string): string {
   try {
@@ -90,6 +123,13 @@ export function ImportModal({ open, onClose, initialAdapter = 'cbc' }: ImportMod
   const [codexCwd, setCodexCwd] = useState('');
   const [codexSessions, setCodexSessions] = useState<CodexSessionItem[]>([]);
   const [codexLoading, setCodexLoading] = useState(false);
+  const codexRequest = useRef(0);
+
+  // ── dsh state (native DSH session list; same shape as codex) ──
+  const [dshCwd, setDshCwd] = useState('');
+  const [dshSessions, setDshSessions] = useState<CodexSessionItem[]>([]);
+  const [dshLoading, setDshLoading] = useState(false);
+  const dshRequest = useRef(0);
 
   // ── Import state ──
   const [importingId, setImportingId] = useState<string | null>(null);
@@ -116,6 +156,9 @@ export function ImportModal({ open, onClose, initialAdapter = 'cbc' }: ImportMod
     setCodexCwd('');
     setCodexSessions([]);
     setCodexLoading(false);
+    setDshCwd('');
+    setDshSessions([]);
+    setDshLoading(false);
     setImportingId(null);
   }, [open, loadCliStatus]);
 
@@ -170,6 +213,9 @@ export function ImportModal({ open, onClose, initialAdapter = 'cbc' }: ImportMod
     } else if (next === 'codex') {
       setCodexSessions([]);
       setCodexLoading(false);
+    } else if (next === 'dsh') {
+      setDshSessions([]);
+      setDshLoading(false);
     }
   };
 
@@ -263,24 +309,72 @@ export function ImportModal({ open, onClose, initialAdapter = 'cbc' }: ImportMod
   // ── Load Codex sessions (filtered by optional cwd) ──
   const loadCodex = useCallback(
     (cwd: string) => {
+      const requestId = ++codexRequest.current;
       setCodexLoading(true);
+      setCodexSessions([]);
       fetchCodexSessions(cwd)
-        .then((list) => setCodexSessions(list))
+        .then((list) => {
+          if (requestId === codexRequest.current) setCodexSessions(list);
+        })
         .catch((e) => {
+          if (requestId !== codexRequest.current) return;
           showToast(
             e instanceof Error ? e.message : 'Failed to load Codex sessions',
             'error',
           );
         })
-        .finally(() => setCodexLoading(false));
+        .finally(() => {
+          if (requestId === codexRequest.current) setCodexLoading(false);
+        });
     },
     [showToast],
   );
 
   useEffect(() => {
-    if (open && adapter === 'codex') loadCodex(codexCwd);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, adapter]);
+    if (!open || adapter !== 'codex') return;
+    setCodexSessions([]);
+    setCodexLoading(true);
+    const timer = setTimeout(() => loadCodex(codexCwd), 200);
+    return () => {
+      clearTimeout(timer);
+      ++codexRequest.current;
+    };
+  }, [open, adapter, codexCwd, loadCodex]);
+
+  // ── Load dsh sessions (filtered by optional cwd) ──
+  const loadDsh = useCallback(
+    (cwd: string) => {
+      const requestId = ++dshRequest.current;
+      setDshLoading(true);
+      setDshSessions([]);
+      fetchDshSessions(cwd)
+        .then((list) => {
+          if (requestId === dshRequest.current) setDshSessions(list);
+        })
+        .catch((e) => {
+          if (requestId !== dshRequest.current) return;
+          showToast(
+            e instanceof Error ? e.message : 'Failed to load DSH sessions',
+            'error',
+          );
+        })
+        .finally(() => {
+          if (requestId === dshRequest.current) setDshLoading(false);
+        });
+    },
+    [showToast],
+  );
+
+  useEffect(() => {
+    if (!open || adapter !== 'dsh') return;
+    setDshSessions([]);
+    setDshLoading(true);
+    const timer = setTimeout(() => loadDsh(dshCwd), 200);
+    return () => {
+      clearTimeout(timer);
+      ++dshRequest.current;
+    };
+  }, [open, adapter, dshCwd, loadDsh]);
 
   // ── Import CBC session ──
   const handleImportCbc = async (item: CbcSessionItem) => {
@@ -356,6 +450,28 @@ export function ImportModal({ open, onClose, initialAdapter = 'cbc' }: ImportMod
     try {
       const workspaceIds = await getCreationWorkspaceIds(activeWorkspaceId);
       const result = await importCodexSession(item.session_id, item.workDir, workspaceIds);
+      onClose();
+      await loadSessions();
+      selectSession(result.id);
+      showToast('Session imported');
+    } catch (e) {
+      showToast(
+        e instanceof Error ? e.message : 'Import failed',
+        'error',
+      );
+    } finally {
+      setImportingId(null);
+    }
+  };
+
+  // ── Import dsh session ──
+  const handleImportDsh = async (item: CodexSessionItem) => {
+    if (importingId) return;
+    const activeWorkspaceId = useUIStore.getState().activeWorkspaceId;
+    setImportingId(item.session_id);
+    try {
+      const workspaceIds = await getCreationWorkspaceIds(activeWorkspaceId);
+      const result = await importDshSession(item.session_id, item.workDir, workspaceIds);
       onClose();
       await loadSessions();
       selectSession(result.id);
@@ -499,6 +615,20 @@ export function ImportModal({ open, onClose, initialAdapter = 'cbc' }: ImportMod
           />
         )}
 
+        {/* dsh import — same list shape as codex, so the section is reused. */}
+        {adapter === 'dsh' && (
+          <CodexSection
+            cwd={dshCwd}
+            onCwdChange={setDshCwd}
+            sessions={dshSessions}
+            loading={dshLoading}
+            importingId={importingId}
+            onLoad={() => loadDsh(dshCwd)}
+            onImport={handleImportDsh}
+            nativeLabel="DSH"
+          />
+        )}
+
         {/* Footer */}
         <div className="flex justify-end gap-2 pt-1">
           <Button variant="ghost" onClick={onClose} disabled={!!importingId}>
@@ -543,13 +673,12 @@ function CbcSection({
   importingId,
   onImport,
 }: CbcSectionProps) {
-  // Front-end path filter: narrow the session list by the session's
-  // project_dir (cbc sessions are scoped to a project, so this is the path).
+  // Search within the selected project; preserve native identity and source path.
   const [pathFilter, setPathFilter] = useState('');
   const pathFilterTrim = pathFilter.trim();
   const visibleSessions = pathFilterTrim
     ? cbcSessions.filter((s) =>
-        s.project_dir.toLowerCase().includes(pathFilterTrim.toLowerCase()),
+        matchesSession(pathFilterTrim, s.session_id, s.title, s.project_dir),
       )
     : cbcSessions;
 
@@ -640,18 +769,12 @@ function CbcSection({
           </div>
         )}
 
-      {/* Front-end path filter */}
+      {/* Search the loaded list */}
       {selectedProject && !cbcLoading && cbcSessions.length > 0 && (
-        <input
-          type="text"
-          value={pathFilter}
-          onChange={(e) => setPathFilter(e.target.value)}
-          placeholder="Filter by path (project_dir)…"
-          className="rounded border border-border-muted bg-bg-primary px-3 py-1.5 text-sm text-text-primary outline-none placeholder:text-text-tertiary focus:border-accent"
-        />
+        <SessionSearch value={pathFilter} onChange={setPathFilter} scope="Searches only loaded sessions in the selected project; configured import filters and list limits still apply." />
       )}
 
-      {/* No sessions match the path filter */}
+      {/* No sessions match the search */}
       {selectedProject &&
         !cbcLoading &&
         cbcSessions.length > 0 &&
@@ -695,6 +818,8 @@ function CbcSessionItemRow({
 }) {
   const ts = item.last_timestamp || item.first_timestamp || '';
   const isFork = !!item.forked_from;
+  // 仅显示用：cbc 模型名附加额度倍率后缀，导入 payload 仍用原始 ID。
+  const multipliers = useAdapterStore((s) => s.adapterConfigs.cbc?.modelCreditMultipliers);
 
   return (
     <div
@@ -719,7 +844,7 @@ function CbcSessionItemRow({
         )}
       </div>
       <div className="text-xs text-text-tertiary mt-0.5">
-        {item.message_count} msgs &middot; {item.model} &middot;{' '}
+        {item.message_count} msgs &middot; {formatModelLabel(item.model, multipliers)} &middot;{' '}
         {ts ? formatTime(ts) : '—'}
       </div>
     </div>
@@ -751,12 +876,12 @@ function KimiSection({
   importingId,
   onImport,
 }: KimiSectionProps) {
-  // Front-end path filter: narrow the session list by the session's workDir.
+  // Search within the selected workspace; workDir filtering remains available.
   const [pathFilter, setPathFilter] = useState('');
   const pathFilterTrim = pathFilter.trim();
   const visibleSessions = pathFilterTrim
     ? kimiSessions.filter((s) =>
-        s.workDir.toLowerCase().includes(pathFilterTrim.toLowerCase()),
+        matchesSession(pathFilterTrim, s.session_id, s.title, s.workDir),
       )
     : kimiSessions;
 
@@ -822,18 +947,12 @@ function KimiSection({
           </div>
         )}
 
-      {/* Front-end path filter */}
+      {/* Search the loaded list */}
       {selectedWorkspace && !kimiLoading && kimiSessions.length > 0 && (
-        <input
-          type="text"
-          value={pathFilter}
-          onChange={(e) => setPathFilter(e.target.value)}
-          placeholder="Filter by path (workDir)…"
-          className="rounded border border-border-muted bg-bg-primary px-3 py-1.5 text-sm text-text-primary outline-none placeholder:text-text-tertiary focus:border-accent"
-        />
+        <SessionSearch value={pathFilter} onChange={setPathFilter} scope="Searches only the selected workspace." />
       )}
 
-      {/* No sessions match the path filter */}
+      {/* No sessions match the search */}
       {selectedWorkspace &&
         !kimiLoading &&
         kimiSessions.length > 0 &&
@@ -875,6 +994,8 @@ function KimiSessionItemRow({
   isImporting: boolean;
   onClick: () => void;
 }) {
+  // 仅显示用：模型名附加额度倍率后缀，导入 payload 仍用原始 ID。
+  const multipliers = useAdapterStore((s) => s.adapterConfigs.kimi?.modelCreditMultipliers);
   return (
     <div
       onClick={onClick}
@@ -884,7 +1005,7 @@ function KimiSessionItemRow({
     >
       <div className="text-sm text-text-primary truncate">{item.title}</div>
       <div className="text-xs text-text-tertiary mt-0.5">
-        {item.message_count} msgs &middot; {item.model} &middot;{' '}
+        {item.message_count} msgs &middot; {formatModelLabel(item.model, multipliers)} &middot;{' '}
         {item.updatedAt ? formatTime(item.updatedAt) : '—'}
       </div>
     </div>
@@ -914,6 +1035,10 @@ function OpencodeSection({
   onLoad,
   onImport,
 }: OpencodeSectionProps) {
+  const [query, setQuery] = useState('');
+  const visibleSessions = sessions.filter((item) =>
+    matchesSession(query, item.session_id, item.title, item.workDir),
+  );
   return (
     <>
       {/* Working-directory filter (opencode has no workspace list) */}
@@ -952,10 +1077,14 @@ function OpencodeSection({
         </div>
       )}
 
-      {/* Session list */}
-      {!loading && sessions.length > 0 && (
+      <SessionSearch value={query} onChange={setQuery}
+        scope="Searches only loaded sessions within the working directory filter; clear the directory and load to broaden discovery." />
+      {!loading && sessions.length > 0 && visibleSessions.length === 0 && (
+        <div className="py-2 text-center text-sm text-text-tertiary">No sessions match “{query.trim()}”</div>
+      )}
+      {!loading && visibleSessions.length > 0 && (
         <div className="max-h-64 overflow-y-auto space-y-1 rounded border border-border-muted bg-bg-primary p-1">
-          {sessions.map((item) => (
+          {visibleSessions.map((item) => (
             <OpencodeSessionItemRow
               key={item.session_id}
               item={item}
@@ -982,6 +1111,8 @@ function OpencodeSessionItemRow({
   isImporting: boolean;
   onClick: () => void;
 }) {
+  // 仅显示用：模型名附加额度倍率后缀，导入 payload 仍用原始 ID。
+  const multipliers = useAdapterStore((s) => s.adapterConfigs.opencode?.modelCreditMultipliers);
   return (
     <div
       onClick={onClick}
@@ -993,7 +1124,7 @@ function OpencodeSessionItemRow({
         {item.title || 'Untitled'}
       </div>
       <div className="text-xs text-text-tertiary mt-0.5">
-        {item.message_count} msgs &middot; {item.model || '?'} &middot;{' '}
+        {item.message_count} msgs &middot; {item.model ? formatModelLabel(item.model, multipliers) : '?'} &middot;{' '}
         {item.updatedAt ? formatTime(item.updatedAt) : '—'}
       </div>
     </div>
@@ -1012,6 +1143,8 @@ interface CodexSectionProps {
   importingId: string | null;
   onLoad: () => void;
   onImport: (item: CodexSessionItem) => void;
+  /** Native CLI name shown in the loading/empty copy (dsh reuses this section). */
+  nativeLabel?: string;
 }
 
 function CodexSection({
@@ -1022,7 +1155,12 @@ function CodexSection({
   importingId,
   onLoad,
   onImport,
+  nativeLabel = 'Codex',
 }: CodexSectionProps) {
+  const [query, setQuery] = useState('');
+  const visibleSessions = sessions.filter((item) =>
+    matchesSession(query, item.session_id, item.title, item.workDir),
+  );
   return (
     <>
       <label className="flex flex-col gap-1">
@@ -1048,19 +1186,24 @@ function CodexSection({
 
       {loading && (
         <div className="py-4 text-center text-sm text-text-tertiary">
-          Loading Codex sessions...
+          Loading {nativeLabel} sessions...
         </div>
       )}
 
       {!loading && sessions.length === 0 && (
         <div className="py-4 text-center text-sm text-text-tertiary">
-          No Codex sessions found
+          No {nativeLabel} sessions found
         </div>
       )}
 
-      {!loading && sessions.length > 0 && (
+      <SessionSearch value={query} onChange={setQuery}
+        scope="Searches only loaded sessions within the working directory filter; clear the directory and load to broaden discovery." />
+      {!loading && sessions.length > 0 && visibleSessions.length === 0 && (
+        <div className="py-2 text-center text-sm text-text-tertiary">No sessions match “{query.trim()}”</div>
+      )}
+      {!loading && visibleSessions.length > 0 && (
         <div className="max-h-64 overflow-y-auto space-y-1 rounded border border-border-muted bg-bg-primary p-1">
-          {sessions.map((item) => (
+          {visibleSessions.map((item) => (
             <CodexSessionItemRow
               key={item.session_id}
               item={item}
@@ -1083,6 +1226,8 @@ function CodexSessionItemRow({
   isImporting: boolean;
   onClick: () => void;
 }) {
+  // 仅显示用：模型名附加额度倍率后缀，导入 payload 仍用原始 ID。
+  const multipliers = useAdapterStore((s) => s.adapterConfigs.codex?.modelCreditMultipliers);
   return (
     <div
       onClick={onClick}
@@ -1094,7 +1239,7 @@ function CodexSessionItemRow({
         {item.title || 'Untitled'}
       </div>
       <div className="text-xs text-text-tertiary mt-0.5">
-        {item.message_count} msgs &middot; {item.model || '?'} &middot;{' '}
+        {item.message_count} msgs &middot; {item.model ? formatModelLabel(item.model, multipliers) : '?'} &middot;{' '}
         {item.workDir || '—'} &middot;{' '}
         {item.updatedAt ? formatTime(item.updatedAt) : '—'}
       </div>

@@ -1,33 +1,23 @@
+import { isLocalSessionIdentity, markSessionRemovedDuringCreation } from '@/stores/sessionCreation';
 import { useEffect } from 'react';
+import { lockerRequest } from '@/views/lockerModel';
 import { wsClient } from '@/services/ws';
 import { isMockMode } from '@/demo/mockBackend';
-import { useSessionStore } from '@/stores/sessionStore';
+import { useSessionStore, workerResultMarkerId, markCompletedLiveRows } from '@/stores/sessionStore';
 import { useWorkerStore } from '@/stores/workerStore';
 import { useUIStore } from '@/stores/uiStore';
 import { useQueueStore } from '@/stores/queueStore';
+import { useBookmarkStore } from '@/stores/bookmarkStore';
 import { useAppSettingsStore } from '@/stores/appSettingsStore';
 import { useWorkspaceStore } from '@/stores/workspaceStore';
+import { useJobStore } from '@/stores/jobStore';
 import {
   useAdapterStore,
 } from '@/stores/adapterStore';
 import type { StreamEvent, WorkerEvent, Message, UserInputQuestion } from '@/types';
+import type { Job } from '@/types/jobs';
 import { inheritMessageIdentity, rememberMessageIdentity } from '@/utils/messageIdentity';
-
-// ── Debounced full-list refresh (mirrors legacy app.ts scheduleRefreshSessions) ──
-// WS events can burst (rapid task completions, session updates); firing a full
-// /api/sessions fetch for every one of them re-renders the whole sidebar list
-// per event and — worse — the snapshot can land in the backend's transient
-// "done"/"error" status window before `w.status` is reset to "idle", which
-// would override the locally-set idle WorkerDot. Coalescing to one fetch 300ms
-// after the last event keeps the UI snappy and lets the backend status settle.
-let refreshTimer: ReturnType<typeof setTimeout> | null = null;
-function scheduleRefreshSessions(): void {
-  if (refreshTimer) clearTimeout(refreshTimer);
-  refreshTimer = setTimeout(() => {
-    refreshTimer = null;
-    useSessionStore.getState().loadSessions();
-  }, 300);
-}
+import { openSessionFromNotification } from '@/utils/session-deeplink';
 
 function clearInteractiveRequests(sessionId?: string): void {
   if (!sessionId) return;
@@ -36,6 +26,45 @@ function clearInteractiveRequests(sessionId?: string): void {
   ui.clearUserInputRequests(sessionId);
   ui.clearElicitationRequests(sessionId);
   ui.clearTerminalInteractions(sessionId);
+}
+
+function terminalResultStatus(event: Pick<StreamEvent, 'status' | 'cancelled'>): string {
+  return event.status === 'error'
+    ? 'error'
+    : event.status === 'cancelled' || event.cancelled
+      ? 'cancelled'
+      : 'done';
+}
+
+function appendTerminalResultMarker(
+  sessionId: string,
+  event: StreamEvent,
+  deferUntilCoverage = false,
+): void {
+  if (event.historyTerminalId) return;
+  const status = terminalResultStatus(event);
+  const markerId = workerResultMarkerId(sessionId, event);
+  const marker: Message = {
+    role: 'system',
+    content: `[${status.toUpperCase()}] Task completed`,
+    ...(markerId ? { nativeItemId: markerId } : {}),
+  };
+  const coverage = event.terminalCoverage ?? {
+    ...(typeof event.historyEpoch === 'string' ? { historyEpoch: event.historyEpoch } : {}),
+    ...(typeof event.historyRevision === 'number'
+      ? { historyRevision: event.historyRevision }
+      : {}),
+  };
+  useSessionStore.getState().appendWorkerResultMarker(sessionId, marker, {
+    serverEpoch: event.serverEpoch || event.eventEpoch,
+    workerId: event.workerId,
+    generation: event.generation,
+    taskSeq: typeof event.taskSeq === 'number' ? event.taskSeq : undefined,
+    executionSeq: typeof event.executionSeq === 'number' ? event.executionSeq : undefined,
+    taskId: typeof event.taskId === 'string' ? event.taskId : undefined,
+    terminalKey: event.terminalKey,
+    resultCursor: event.resultCursor,
+  }, coverage, deferUntilCoverage);
 }
 
 function showCodexWarningToast(): boolean {
@@ -67,6 +96,12 @@ export function useWebSocket() {
       return;
     }
 
+    // The first physical open follows the initial HTTP reads below. The
+    // resync snapshot still performs a fresh authoritative read, so repeating
+    // the same two requests immediately on that first open adds only startup
+    // contention. An already-open singleton or any later reconnect keeps the
+    // normal open refresh.
+    let initialConnectionPending = !wsClient.isOpen;
     wsClient.connect();
 
     // 初始加载兜底：StrictMode dev 下 effect 会 setup→cleanup→setup 重跑，
@@ -80,58 +115,61 @@ export function useWebSocket() {
     // handlers on the singleton wsClient.
     const unsubscribers: Array<() => void> = [];
 
-    // ── 流式 lastMessage 卡片预览（throttle）──
-    // worker.stream 对每个回复块广播一次；除当前 session 消息区外，侧边栏所有
-    // session 的卡片预览也要实时跟随。为不因每个 chunk 都更新 store 而拖累列表，
-    // 按 session 做 500ms 节流：窗口内合并到最新文本，到点 flush 一次。result 落地
-    // 时取消 pending，保证最终 lastMessage 以 result 为准（节流 timer 不会迟到
-    // 覆盖 result）。状态放 effect 闭包里，卸载即清，StrictMode 重挂载不残留。
-    const STREAM_PREVIEW_THROTTLE_MS = 500;
-    const streamPreviewPending = new Map<string, string>(); // sessionId → 最新待 flush 文本
-    const streamPreviewLastFlush = new Map<string, number>(); // sessionId → 上次 flush 时间戳
-    const streamPreviewTimers = new Map<string, ReturnType<typeof setTimeout>>();
+    // Lead on the next event-loop turn, then bound follow-up request starts.
+    // Bounded coalescing, not trailing debounce: sustained traffic cannot
+    // postpone the first authoritative read forever. At most one read runs;
+    // traffic during it queues one subsequent read.
+    let active = true;
+    let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+    let refreshInFlight = false;
+    let refreshPending = false;
+    let nextRefreshAt = 0;
+    function scheduleRefreshSessions(): void {
+      refreshPending = true;
+      if (!active || refreshTimer || refreshInFlight) return;
+      refreshTimer = setTimeout(() => {
+        refreshTimer = null;
+        refreshPending = false;
+        refreshInFlight = true;
+        nextRefreshAt = Date.now() + 300;
+        void useSessionStore.getState().loadSessions().finally(() => {
+          refreshInFlight = false;
+          if (active && refreshPending) scheduleRefreshSessions();
+        });
+      }, Math.max(0, nextRefreshAt - Date.now()));
+    }
 
-    const flushStreamPreview = (sessionId: string, now: number): void => {
-      const text = streamPreviewPending.get(sessionId);
-      if (text === undefined) return;
-      useSessionStore.getState().updateSession(sessionId, {
-        lastMessage: text.slice(0, 200),
-      });
-      streamPreviewPending.delete(sessionId);
-      streamPreviewLastFlush.set(sessionId, now);
-    };
+    let historyTimer: ReturnType<typeof setTimeout> | null = null;
+    let historyInFlight = false;
+    let historyPending = false;
+    let historyTarget: string | null = null;
+    let nextHistoryAt = 0;
+    function scheduleSelectedHistory(): void {
+      historyPending = true;
+      historyTarget = useSessionStore.getState().currentSessionId;
+      if (!active || historyTimer || historyInFlight) return;
+      historyTimer = setTimeout(() => {
+        historyTimer = null;
+        historyPending = false;
+        if (!historyTarget || historyTarget !== useSessionStore.getState().currentSessionId) return;
+        historyInFlight = true;
+        nextHistoryAt = Date.now() + 100;
+        void useSessionStore.getState().refreshCurrentSessionHistory().finally(() => {
+          historyInFlight = false;
+          if (active && historyPending) scheduleSelectedHistory();
+        });
+      }, Math.max(0, nextHistoryAt - Date.now()));
+    }
 
-    const throttledLastMessageUpdate = (
-      sessionId: string,
-      text: string,
-    ): void => {
-      // 保留最新文本，窗口内合并
-      streamPreviewPending.set(sessionId, text);
-      const now = Date.now();
-      const last = streamPreviewLastFlush.get(sessionId) ?? 0;
-      if (now - last >= STREAM_PREVIEW_THROTTLE_MS) {
-        flushStreamPreview(sessionId, now);
-      } else if (!streamPreviewTimers.has(sessionId)) {
-        // 距上次 flush 未满 500ms → 排一个尾随 timer，到点 flush 最新文本
-        const delay = STREAM_PREVIEW_THROTTLE_MS - (now - last);
-        streamPreviewTimers.set(
-          sessionId,
-          setTimeout(() => {
-            streamPreviewTimers.delete(sessionId);
-            flushStreamPreview(sessionId, Date.now());
-          }, delay),
-        );
+    // Completed Worker frames carry the authoritative Session summary at the
+    // same server-side history boundary as the frame.  Ingest it for every
+    // Session, including background/unselected ones; projecting the frame only
+    // into currentMessages leaves sidebar cards and history cursors stale until
+    // a later page visit or list refresh.
+    const ingestLiveSessionSummary = (e: StreamEvent): void => {
+      if (e.sessionId && e.session) {
+        useSessionStore.getState().updateSession(e.sessionId, { ...e.session }, true);
       }
-    };
-
-    const cancelStreamPreview = (sessionId: string): void => {
-      streamPreviewPending.delete(sessionId);
-      const timer = streamPreviewTimers.get(sessionId);
-      if (timer !== undefined) {
-        clearTimeout(timer);
-        streamPreviewTimers.delete(sessionId);
-      }
-      streamPreviewLastFlush.delete(sessionId);
     };
 
     let lastInteractiveSyncGeneration: number | null = null;
@@ -151,7 +189,7 @@ export function useWebSocket() {
       const sessionIds = [...new Set([
         ...(state.currentSessionId ? [state.currentSessionId] : []),
         ...Object.keys(state.liveStreamBuffers),
-      ])];
+      ])].filter(id => !isLocalSessionIdentity(id));
       const cursor = typeof wsClient.getEventCursor === 'function'
         ? wsClient.getEventCursor()
         : { eventEpoch: null, eventSeq: 0 };
@@ -165,7 +203,7 @@ export function useWebSocket() {
       }, recovery ? 'recovery' : 'initial');
     };
 
-    const refreshAuthoritativeState = (): void => {
+    const refreshAuthoritativeState = (historyInSnapshot = false): void => {
       // HTTP convergence is deliberately separate from the native-interaction
       // handshake.  resync_required may need a new snapshot on this socket,
       // but must not turn every refresh/snapshot callback into another replay.
@@ -173,23 +211,33 @@ export function useWebSocket() {
       void useSessionStore.getState().loadSessions();
       void useWorkerStore.getState().refresh();
       if (sessionId) {
-        void useSessionStore.getState().refreshCurrentSessionHistory();
+        if (!historyInSnapshot) void useSessionStore.getState().refreshCurrentSessionHistory();
         void useQueueStore.getState().loadAgentQueue(sessionId);
+        void useWorkerStore.getState().refreshDelayedRestart(sessionId).catch(() => {});
       }
     };
 
     // Open handler — refresh sessions and restore live native prompts on connect
     unsubscribers.push(wsClient.on('open', () => {
-      useSessionStore.getState().loadSessions();
-      useWorkerStore.getState().refresh();
+      if (initialConnectionPending) {
+        initialConnectionPending = false;
+      } else {
+        useSessionStore.getState().loadSessions();
+        useWorkerStore.getState().refresh();
+      }
       useAdapterStore.getState().loadAdapterList();
       useAdapterStore.getState().loadConfig('cbc');
+      // Hydrate the unified job store on every open (initial connect and
+      // reconnect): the Jobs page and the nav running-count badge share this
+      // one list, so it must be correct on every route without its own fetch.
+      void useJobStore.getState().loadJobs();
       // An open event is the completion point for a focus-triggered stale
       // reconnect. The snapshot callback finalizes buffered tasks before
       // refreshing history, so a missed terminal cannot leave a partial echo.
       const sessionId = useSessionStore.getState().currentSessionId;
       if (sessionId) {
         void useQueueStore.getState().loadAgentQueue(sessionId);
+        void useWorkerStore.getState().refreshDelayedRestart(sessionId).catch(() => {});
       }
       syncAuthoritativeSnapshot();
       syncInteractiveRequests();
@@ -225,21 +273,90 @@ export function useWebSocket() {
       // and the old partial are rendered as two separate assistant messages.
       for (const [sessionId, detail] of Object.entries(e.details ?? {})) {
         const last = detail.lastResult as Record<string, unknown> | null | undefined;
+        if (!last) continue;
         const buffer = useSessionStore.getState().liveStreamBuffers[sessionId];
-        if (!buffer || !last || typeof last.taskSeq !== 'number') continue;
-        if (last.taskSeq !== buffer.taskSeq) continue;
-        useSessionStore.getState().reconcileWorkerResult(sessionId, {
+        const terminalEvent: StreamEvent = {
+          type: 'worker.result',
+          sessionId,
           result: typeof last.result === 'string' ? last.result : '',
           status: typeof last.status === 'string' ? last.status : 'done',
           historyEpoch: typeof last.historyEpoch === 'string' ? last.historyEpoch : undefined,
           historyRevision: typeof last.historyRevision === 'number' ? last.historyRevision : undefined,
-        }, {
-          serverEpoch: e.serverEpoch || e.eventEpoch,
-          workerId: typeof last.workerId === 'string' ? last.workerId : buffer.workerId,
-          generation: typeof last.generation === 'number' ? last.generation : buffer.generation,
-          taskSeq: last.taskSeq,
+          terminalCoverage: {
+            ...(typeof last.historyEpoch === 'string' ? { historyEpoch: last.historyEpoch } : {}),
+            ...(typeof last.historyRevision === 'number'
+              ? { historyRevision: last.historyRevision }
+              : {}),
+          },
+          terminalKey: typeof last.terminalKey === 'string' ? last.terminalKey : undefined,
+          historyTerminalId: typeof last.historyTerminalId === 'string' ? last.historyTerminalId : undefined,
+          resultCursor: typeof last.resultCursor === 'number' ? last.resultCursor : undefined,
+          taskSeq: typeof last.taskSeq === 'number' ? last.taskSeq : undefined,
+          executionSeq: typeof last.executionSeq === 'number' ? last.executionSeq : undefined,
           taskId: typeof last.taskId === 'string' ? last.taskId : undefined,
+          workerId: typeof last.workerId === 'string' ? last.workerId : undefined,
+          generation: typeof last.generation === 'number' ? last.generation : undefined,
+        };
+        const lastTaskId = typeof last.taskId === 'string' ? last.taskId : undefined;
+        const matchingBuffer = Boolean(buffer
+          && (terminalEvent.executionSeq !== undefined
+            ? buffer.executionSeq === terminalEvent.executionSeq
+            : terminalEvent.taskSeq !== undefined
+            ? buffer.taskSeq === terminalEvent.taskSeq
+              && !(lastTaskId && buffer.taskId && lastTaskId !== buffer.taskId)
+            : lastTaskId && buffer.taskId === lastTaskId)
+          && (terminalEvent.generation === undefined || buffer.generation === undefined
+            || terminalEvent.generation === buffer.generation));
+        if (matchingBuffer && buffer) {
+          const reconciled = useSessionStore.getState().reconcileWorkerResult(sessionId, terminalEvent, {
+            serverEpoch: e.serverEpoch || e.eventEpoch,
+            workerId: terminalEvent.workerId ?? buffer.workerId,
+            generation: terminalEvent.generation ?? buffer.generation,
+            taskSeq: terminalEvent.taskSeq,
+            executionSeq: terminalEvent.executionSeq,
+            taskId: lastTaskId,
+            terminalKey: terminalEvent.terminalKey,
+            resultCursor: terminalEvent.resultCursor,
+          });
+          if (reconciled) appendTerminalResultMarker(sessionId, terminalEvent);
+          else appendTerminalResultMarker(sessionId, terminalEvent, true);
+        } else {
+          // The snapshot may describe an earlier completed task while a newer
+          // task is already streaming, or a seq-less report. Keep the marker
+          // hidden until its durable boundary arrives; never attach it to the
+          // current buffer just because it is the last visible row.
+          appendTerminalResultMarker(sessionId, terminalEvent, true);
+        }
+      }
+      // A snapshot already carries authoritative status and bounded history.
+      // Consume it now; slow follow-up GETs must not gate recovery of the UI.
+      const snapshotSessions = new Map((e.sessions ?? []).map(session => [session.id, session]));
+      useSessionStore.getState().applySessionSnapshots(e.sessions ?? []);
+      for (const worker of e.workers ?? []) {
+        if (typeof worker.sessionId !== 'string' || typeof worker.status !== 'string') continue;
+        handleWorkerUpdate({ type: 'worker.status', sessionId: worker.sessionId,
+          workerId: typeof worker.workerId === 'string' ? worker.workerId : undefined,
+          generation: typeof worker.generation === 'number' ? worker.generation : undefined,
+          taskSeq: typeof worker.taskSeq === 'number' ? worker.taskSeq : undefined,
+          executionSeq: typeof worker.executionSeq === 'number' ? worker.executionSeq : undefined,
+          taskId: typeof worker.taskId === 'string' ? worker.taskId : undefined,
+          serverEpoch: e.serverEpoch || e.eventEpoch,
+          session: snapshotSessions.get(worker.sessionId),
+        }, worker.status);
+      }
+      let selectedHistoryInSnapshot = false;
+      for (const [sessionId, detail] of Object.entries(e.details ?? {})) {
+        if (!Array.isArray(detail.history) || typeof detail.historyStart !== 'number'
+            || typeof detail.historyTotal !== 'number' || typeof detail.historyRevision !== 'number'
+            || typeof detail.historyEpoch !== 'string') continue;
+        const accepted = useSessionStore.getState().applyHistoryPage(sessionId, {
+          history: detail.history as Message[], start: detail.historyStart,
+          total: detail.historyTotal, hasMore: Boolean(detail.historyTruncated),
+          historyEpoch: detail.historyEpoch, historyRevision: detail.historyRevision,
         });
+        if (accepted && sessionId === useSessionStore.getState().currentSessionId) {
+          selectedHistoryInSnapshot = true;
+        }
       }
       const knownSessionIds = [
         ...useSessionStore.getState().sessions.map((session) => session.id),
@@ -249,7 +366,7 @@ export function useWebSocket() {
           .filter((id): id is string => Boolean(id)),
       ];
       useSessionStore.getState().beginUnscopedReplay(knownSessionIds);
-      refreshAuthoritativeState();
+      refreshAuthoritativeState(selectedHistoryInSnapshot);
       syncInteractiveRequests();
     }));
 
@@ -359,15 +476,39 @@ export function useWebSocket() {
     for (const eventType of ['queue.item_added', 'queue.item_updated', 'queue.item_removed', 'queue.item_delivered', 'queue.snapshot']) {
       unsubscribers.push(wsClient.on(eventType, (e: StreamEvent) => {
         useQueueStore.getState().applyQueueEvent(e);
-        refreshAgentQueue(e.sessionId);
+        // Versioned events already update the projection; the queue store
+        // requests a full repair when revisions are missing from the sequence.
+        // Legacy events have no such guarantee and still need a durable GET.
+        const queueEvent = e as Parameters<ReturnType<typeof useQueueStore.getState>['applyQueueEvent']>[0];
+        const completePayload = e.type === 'queue.snapshot'
+          ? Array.isArray(queueEvent.items)
+          : e.type === 'queue.item_delivered'
+            ? Array.isArray(e.queueItemIds)
+            : e.type === 'queue.item_removed'
+              ? typeof queueEvent.queueItemId === 'string'
+              : !!e.item;
+        if (e.queueRevision === undefined || !completePayload) refreshAgentQueue(e.sessionId);
+        // 队列事件附带的最新 Session 摘要（queuePendingCount / queueAllLocked /
+        // queueRevision）就地合入卡片徽标；缺失时由既有防抖列表刷新兜底。
+        if ((e.type !== 'queue.item_delivered' || !Array.isArray(e.messages) || !e.messages.length)
+            && e.sessionId && e.session) {
+          useSessionStore.getState().updateSession(e.sessionId, { ...e.session }, true);
+        }
       }));
     }
     unsubscribers.push(wsClient.on('queue.item_delivered', (e: StreamEvent) => {
       if (!e.sessionId || !Array.isArray(e.messages)) return;
-      useSessionStore.getState().appendDeliveredMessages(e.sessionId, e.messages);
+      useSessionStore.getState().appendDeliveredMessages(e.sessionId, e.messages, {
+        workerId: e.workerId, generation: e.generation, executionSeq: e.executionSeq,
+      }, e.session);
     }));
 
     // Worker spawned / restarted / reconfigured
+    unsubscribers.push(wsClient.on('worker.delayed_restart', (e: StreamEvent) => {
+      if (e.delayedRestart && e.delayedRestart.sessionId === e.sessionId) {
+        useWorkerStore.getState().applyDelayedRestart(e.delayedRestart);
+      }
+    }));
     unsubscribers.push(wsClient.on('worker.spawned', (e: StreamEvent) => {
       if (!isCurrentWorkerEvent(e)) return;
       if (e.sessionId) {
@@ -405,7 +546,6 @@ export function useWebSocket() {
     unsubscribers.push(wsClient.on('worker.destroyed', (e: StreamEvent) => {
       if (!isCurrentWorkerEvent(e, true)) return;
       if (e.sessionId) clearNativeTurnAliases(e.sessionId);
-      if (e.sessionId) cancelStreamPreview(e.sessionId);
       clearInteractiveRequests(e.sessionId);
       if (!handleWorkerUpdate(e, null, true)) return;
       refreshAgentQueue(e.sessionId);
@@ -418,7 +558,6 @@ export function useWebSocket() {
     unsubscribers.push(wsClient.on('worker.crashed', (e: StreamEvent) => {
       if (!isCurrentWorkerEvent(e, true)) return;
       if (e.sessionId) clearNativeTurnAliases(e.sessionId);
-      if (e.sessionId) cancelStreamPreview(e.sessionId);
       clearInteractiveRequests(e.sessionId);
       if (!handleWorkerUpdate(e, null, true)) return;
       refreshAgentQueue(e.sessionId);
@@ -428,6 +567,7 @@ export function useWebSocket() {
 
     // Worker status update
     unsubscribers.push(wsClient.on('worker.status', (e: StreamEvent) => {
+      ingestLiveSessionSummary(e);
       if (!handleWorkerUpdate(e, e.status ?? 'idle')) return;
       // A task/report remains in the durable server queue until the provider
       // hand-off boundary (stream write+drain, or one-shot process creation).
@@ -483,7 +623,15 @@ export function useWebSocket() {
         ) {
           const name = String(status.name || 'server');
           const detail = status.error || status.failureReason || 'startup failed';
-          useUIStore.getState().showToast(`Codex MCP ${name}: ${detail}`, 'error');
+          // 仅对**托管 notion** 追加可操作的恢复入口：授权 URL 的 state/PKCE 只活在
+          // 生成它的进程内存里、回调也必须由本机进程守着，所以只能引导用户跑脚本，
+          // 不能只给一个 URL。其他 MCP（含 notion-stdio 这类静态 token 的）保持原有
+          // 错误文案——否则会误导用户去跑一个治不了它病的命令。
+          const hint = (name === 'notion'
+                        && /unauthor|401|\boauth\b|invalid_grant/i.test(String(detail)))
+            ? ' —— 授权失效可运行 python scripts/notion_auth.py 重新授权'
+            : '';
+          useUIStore.getState().showToast(`Codex MCP ${name}: ${detail}${hint}`, 'error');
         }
       }
       if (e.event.type === 'codex.model_rerouted' && e.sessionId === useSessionStore.getState().currentSessionId) {
@@ -576,15 +724,41 @@ export function useWebSocket() {
       // Persist a transient live suffix for every session. The store projects
       // it into currentMessages only when that session is selected, so A→B→A
       // does not lose deltas while the selected-session viewport changes.
-      appendEvent(e.sessionId, e.event, e);
-      // 卡片预览：所有 session 就地 throttle 更新 lastMessage（无文本事件跳过）
-      const text = extractStreamText(e.event);
-      if (text) throttledLastMessageUpdate(e.sessionId, text);
+      if (appendEvent(e.sessionId, e.event, e)) {
+        const text = extractStreamText(e.event);
+        if (text && !e.session) useSessionStore.getState().updateSession(e.sessionId, {
+          lastMessage: text.slice(0, 200), lastAssistantPreview: text.slice(0, 200),
+          lastDisplayPreview: text.slice(0, 200),
+        });
+      }
+      ingestLiveSessionSummary(e);
     }));
 
     // Result event
+    const seenSourceNotifications = new Set<string>();
+    unsubscribers.push(wsClient.on('notification.source', (e: StreamEvent) => {
+      const ref = e.notificationId;
+      if (typeof ref !== 'string' || seenSourceNotifications.has(ref)) return;
+      seenSourceNotifications.add(ref);
+      if (seenSourceNotifications.size > 1024) seenSourceNotifications.delete(seenSourceNotifications.values().next().value!);
+      if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+      void lockerRequest<{ title: string; body: string; sessionId: string; source: string }>(
+        `/api/notifications/browser-events/${encodeURIComponent(ref)}`,
+      ).then((payload) => {
+        if (!active) return;
+        const notice = new Notification(payload.title, { body: payload.body, tag: `pan-event-${ref}` });
+        notice.onclick = () => { void openSessionFromNotification(payload.sessionId); };
+      }).catch(() => { /* Auth/visibility loss cannot expose private event content. */ });
+    }));
+
     unsubscribers.push(wsClient.on('worker.result', (e: StreamEvent) => {
-      if (!isCurrentWorkerEvent(e)) {
+      ingestLiveSessionSummary(e);
+      // History facts survive stale Worker frames too. Refresh their canonical
+      // page without allowing an old execution to clear the current stream.
+      if (e.historyTerminalId && e.sessionId === useSessionStore.getState().currentSessionId) {
+        scheduleSelectedHistory();
+      }
+      if (!isCurrentWorkerEvent(e, true)) {
         // A terminal event attributed to an older worker generation is dropped
         // (a late result must not clear its replacement), but the drop must not
         // silently strand the card's status dot either: fall back to the
@@ -599,7 +773,14 @@ export function useWebSocket() {
       // never prompt in the background.
       if (notification?.browser && typeof window !== 'undefined' && 'Notification' in window
         && Notification.permission === 'granted') {
-        new Notification(notification.title || 'Pan:', { body: notification.body || '' });
+        const desktopNotification = new Notification(notification.title || 'Pan:', { body: notification.body || '' });
+        // Click → focus Pan and jump to the session that just completed. The
+        // session id lives on the event (not in the notification payload);
+        // the async handler guards against user take-over and reports
+        // deletion / list-unavailable / router failures with a toast.
+        desktopNotification.onclick = () => {
+          void openSessionFromNotification(sessionId);
+        };
       }
       const sessionStore = useSessionStore.getState();
       clearInteractiveRequests(sessionId);
@@ -607,38 +788,17 @@ export function useWebSocket() {
         serverEpoch: e.serverEpoch || e.eventEpoch,
         workerId: e.workerId,
         generation: e.generation,
-        taskSeq: e.taskSeq,
+        taskSeq: typeof e.taskSeq === 'number' ? e.taskSeq : undefined,
+      executionSeq: typeof e.executionSeq === 'number' ? e.executionSeq : undefined,
         taskId: typeof e.taskId === 'string' ? e.taskId : undefined,
+        terminalKey: typeof e.terminalKey === 'string' ? e.terminalKey : undefined,
+        resultCursor: typeof e.resultCursor === 'number' ? e.resultCursor : undefined,
       });
       if (!reconciled) {
         scheduleRefreshSessions();
         return;
       }
-      const afterReconcile = useSessionStore.getState();
-      if (sessionId === afterReconcile.currentSessionId) {
-        const status = e.status === 'error'
-          ? 'error'
-          : e.status === 'cancelled' || e.cancelled
-            ? 'cancelled'
-            : 'done';
-        const resultKey = e.taskSeq === undefined
-          ? undefined
-          : `worker.result:${e.sessionId}:${e.taskSeq}`;
-        const alreadyShown = resultKey
-          ? afterReconcile.currentMessages.some((message) => message.nativeItemId === resultKey)
-          : false;
-        if (!alreadyShown) {
-          afterReconcile.addMessage({
-            role: 'system',
-            content: `[${status.toUpperCase()}] Task completed`,
-            ...(resultKey ? { nativeItemId: resultKey } : {}),
-          });
-        }
-      }
-      // 流式预览节流：result 为最终 lastMessage，先清掉该 session 未 flush 的
-      // pending 文本与尾随 timer，防止其迟到覆盖 result（applyResultToSession
-      // 紧接着以 result 写入 lastMessage）。
-      cancelStreamPreview(sessionId);
+      appendTerminalResultMarker(sessionId, e);
       clearNativeTurnAliases(sessionId);
       handleWorkerUpdate(e, 'idle');
       refreshAgentQueue(e.sessionId);
@@ -670,8 +830,44 @@ export function useWebSocket() {
       applySessionEvent(e);
       scheduleRefreshSessions();
     }));
+    // Bookmark commits are broadcast to every dashboard client (including the
+    // mutating one, whose apply is an idempotent re-apply), so dual tabs
+    // converge without polling.  The projected `bookmarked` flag on later
+    // history/navigation reads stays consistent with this envelope.
+    unsubscribers.push(wsClient.on('bookmarks.changed', (e: StreamEvent) => {
+      const payload = e as StreamEvent & {
+        action?: 'added' | 'removed';
+        messageIds?: string[];
+        revision?: number;
+      };
+      if (payload.action !== 'added' && payload.action !== 'removed') return;
+      useBookmarkStore.getState().applyBookmarkEvent({
+        type: 'bookmarks.changed',
+        sessionId: payload.sessionId ?? '',
+        revision: typeof payload.revision === 'number' ? payload.revision : 0,
+        action: payload.action,
+        messageIds: Array.isArray(payload.messageIds) ? payload.messageIds : [],
+      });
+    }));
+
     unsubscribers.push(wsClient.on('session.updated', (e: StreamEvent) => {
+      const before = useSessionStore.getState();
+      const window = e.sessionId ? before.sessionTranscripts[e.sessionId]?.window : undefined;
+      const selected = before.sessions.find(session => session.id === e.sessionId);
       applySessionEvent(e);
+      if (e.sessionId === before.currentSessionId && !before.initialLoading && (
+        !e.session ||
+        // Summary receipt is not proof that a canonical history window was
+        // loaded. A prior list/status frame can already carry this revision.
+        ((!window || window.rows.size === 0)
+          && (e.session.historyTotal ?? selected?.historyTotal ?? 0) > 0) ||
+        (typeof e.session.historyEpoch === 'string' && window
+          && e.session.historyEpoch !== window.epoch) ||
+        (typeof e.session.historyRevision === 'number'
+          && e.session.historyRevision > (window?.revision ?? selected?.historyRevision ?? 0)) ||
+        (typeof e.session.historyTotal === 'number'
+          && e.session.historyTotal > (window?.total ?? selected?.historyTotal ?? selected?.history.length ?? 0))
+      )) scheduleSelectedHistory();
       scheduleRefreshSessions();
     }));
     unsubscribers.push(wsClient.on('session.created', () => {
@@ -680,10 +876,12 @@ export function useWebSocket() {
     unsubscribers.push(wsClient.on('session.rewind.progress', (e: StreamEvent) => {
       useSessionStore.getState().applyRewindProgress(e);
     }));
-    unsubscribers.push(wsClient.on('session.deleted', () => {
+    unsubscribers.push(wsClient.on('session.deleted', (e: StreamEvent) => {
+      if (e.sessionId) markSessionRemovedDuringCreation(e.sessionId);
       scheduleRefreshSessions();
     }));
-    unsubscribers.push(wsClient.on('sessions.deleted', () => {
+    unsubscribers.push(wsClient.on('sessions.deleted', (e: StreamEvent) => {
+      e.sessionIds?.forEach(markSessionRemovedDuringCreation);
       scheduleRefreshSessions();
     }));
     // Cold-start projection repair is an eventual metadata-only operation.
@@ -718,12 +916,47 @@ export function useWebSocket() {
         useWorkspaceStore.getState().applySessionMembership(e.sessionId, e.workspaceIds);
       }
     }));
+    // Job lifecycle events drive the unified job store. The Jobs page list and
+    // the nav running-count badge read that one store, so this is the only
+    // job.* subscription in the app — no page-local copies, no extra polling.
+    // Incremental payloads carry the full job, so no REST refresh is needed.
+    unsubscribers.push(wsClient.on('job.created', (e: StreamEvent) => {
+      const job = (e as unknown as { job?: Job }).job;
+      if (job) useJobStore.getState().upsertJob(job, { epoch: e.serverEpoch || e.eventEpoch, seq: e.eventSeq });
+    }));
+    unsubscribers.push(wsClient.on('job.updated', (e: StreamEvent) => {
+      const job = (e as unknown as { job?: Job }).job;
+      if (job) useJobStore.getState().upsertJob(job, { epoch: e.serverEpoch || e.eventEpoch, seq: e.eventSeq });
+    }));
+    unsubscribers.push(wsClient.on('job.deleted', (e: StreamEvent) => {
+      const jobId = (e as unknown as { jobId?: string }).jobId;
+      if (jobId) useJobStore.getState().removeJob(jobId, { epoch: e.serverEpoch || e.eventEpoch, seq: e.eventSeq });
+    }));
     // Custom session order persisted (POST /api/sessions/order broadcast). A
     // debounced full-list refresh re-reads the server snapshot; in custom sort
     // mode loadSessions aligns customOrder with the authoritative order, so a
     // reorder from another client is reflected here too.
     unsubscribers.push(wsClient.on('session.orderUpdated', () => {
       scheduleRefreshSessions();
+    }));
+    // Pins have an independent server revision and never use Session.order.
+    // Apply a complete pin snapshot immediately; the debounced list refresh is
+    // still the final authority if the event was missed during reconnect.
+    unsubscribers.push(wsClient.on('session.pinsUpdated', (e: StreamEvent) => {
+      if (typeof e.pinRevision === 'number' && Array.isArray(e.sessionIds)) {
+        useSessionStore.getState().applyPinnedSnapshot({
+          pinRevision: e.pinRevision,
+          sessionIds: e.sessionIds.filter((id): id is string => typeof id === 'string'),
+        });
+      }
+      scheduleRefreshSessions();
+    }));
+    // Global ui settings changed on another client (e.g. the unread-recording
+    // scope set). Re-read the persisted settings so every open client shows
+    // the same choice; unread badges already converge through the backend
+    // projection, this only syncs the settings surface itself.
+    unsubscribers.push(wsClient.on('settings.uiUpdated', () => {
+      void useAppSettingsStore.getState().loadSettings();
     }));
 
     // Error
@@ -735,11 +968,9 @@ export function useWebSocket() {
       // Don't disconnect on unmount — connection is managed by singleton.
       // But DO remove handlers so a remount re-registers cleanly.
       unsubscribers.forEach((unsub) => unsub());
-      // 卸载时清掉流式预览节流 timer，避免迟到 flush 更新卸载后的 store
-      for (const timer of streamPreviewTimers.values()) clearTimeout(timer);
-      streamPreviewTimers.clear();
-      streamPreviewPending.clear();
-      streamPreviewLastFlush.clear();
+      active = false;
+      if (refreshTimer) clearTimeout(refreshTimer);
+      if (historyTimer) clearTimeout(historyTimer);
       for (const timer of queueRefreshTimers.values()) clearTimeout(timer);
       queueRefreshTimers.clear();
       if (recoveryTimer) clearTimeout(recoveryTimer);
@@ -760,7 +991,10 @@ function isCurrentWorkerEvent(e: StreamEvent, terminal = false): boolean {
     e.generation < known.generation
   ) return false;
   // A late terminal event from an older worker must not clear the replacement.
-  if (terminal && known?.id && e.workerId && known.id !== e.workerId) return false;
+  const newerGeneration = e.generation !== undefined && known?.generation !== undefined
+    && e.generation > known.generation;
+  if ((terminal || e.type === 'worker.stream') && known?.id && e.workerId
+      && known.id !== e.workerId && !newerGeneration) return false;
   return true;
 }
 
@@ -777,9 +1011,14 @@ function handleWorkerUpdate(
     status,
     {
       serverEpoch: e.serverEpoch || e.eventEpoch,
+      lastLegalWorkerState: e.session?.lastLegalWorkerState,
+      legalOffline: e.session?.legalOffline,
+      illegalOffline: e.session?.illegalOffline,
+      legalityDiagnostics: e.session?.legalityDiagnostics,
       workerId: e.workerId,
       generation: e.generation,
-      taskSeq: e.taskSeq,
+      taskSeq: typeof e.taskSeq === 'number' ? e.taskSeq : undefined,
+      executionSeq: typeof e.executionSeq === 'number' ? e.executionSeq : undefined,
       taskId: typeof e.taskId === 'string' ? e.taskId : undefined,
     },
     terminal,
@@ -930,11 +1169,11 @@ function extractBlocks(event: WorkerEvent): ExtractedBlock[] {
  *  每个 text 块在消息区各成一条 assistant 消息，预览取最后一个 text 块即
  *  「最新消息」。无 text 块（thinking/tool/meta 等）→ 返回 null。 */
 function extractStreamText(event: WorkerEvent): string | null {
-  if (event.delta && event.stream_text) return event.stream_text;
   let text = '';
   for (const b of extractBlocks(event)) {
-    if (b.role === 'assistant' && b.content) text = b.content;
+    if (b.role === 'assistant' && b.content.trim()) text = b.content;
   }
+  if (text && event.delta && event.stream_text?.trim()) return event.stream_text;
   return text || null;
 }
 
@@ -958,7 +1197,7 @@ function appendEventToMessages(
   sessionId: string,
   event: StreamEvent['event'],
   initialMessages: Message[],
-  scope?: Pick<StreamEvent, 'workerId' | 'generation' | 'taskSeq' | 'taskId'>,
+  scope?: Pick<StreamEvent, 'workerId' | 'generation' | 'taskSeq' | 'executionSeq' | 'taskId'>,
 ): Message[] {
   if (!event) return initialMessages;
   const t = event.type;
@@ -966,6 +1205,10 @@ function appendEventToMessages(
   if (t === 'result') return initialMessages;
   let messages = initialMessages;
   const blocks = extractBlocks(event);
+  // Extract from the same provider envelope before projection, preserving block
+  // order without new identities, requests, or a second stream merger.
+  const rawEvent = event.rawEvent ?? event;
+  const rawBlocks = extractBlocks(rawEvent);
   // A single native event may contain thinking, text, and tool blocks for the
   // same item. Each block must consume a different existing row; otherwise a
   // repeated findIndex() updates the first row and later blocks drift into it.
@@ -986,6 +1229,9 @@ function appendEventToMessages(
   // according to the adapter's event semantics, never according to the
   // render timing or the current viewport position.
   for (const [blockIndex, b] of blocks.entries()) {
+    const rawBody = rawBlocks[blockIndex]?.content ?? b.content;
+    const rawCumulative = cumulativeStreamText !== undefined
+      ? rawEvent.stream_text ?? cumulativeStreamText : undefined;
     // A Codex assistant reply is one logical message for the whole turn. The
     // native bridge can expose different item ids for its delta and completed
     // notifications (and an interleaved tool can become the last message), so
@@ -996,8 +1242,10 @@ function appendEventToMessages(
       ? String(event.turn_id)
       : undefined;
     const turnId = b.role === 'assistant' ? eventTurnId : undefined;
-    const scopeSuffix = eventTurnId && scope?.taskSeq !== undefined
-      ? `:seq:${scope.taskSeq}`
+    const scopeSuffix = eventTurnId && scope?.executionSeq !== undefined
+      ? `:execution:${scope.executionSeq}`
+      : eventTurnId && scope?.taskSeq !== undefined
+        ? `:seq:${scope.taskSeq}`
       : eventTurnId && scope?.taskId
         ? `:task:${scope.taskId}`
         : '';
@@ -1141,7 +1389,7 @@ function appendEventToMessages(
       itemId && aliasedItemId && target?.nativeItemId === aliasedItemId && itemId !== aliasedItemId,
     );
     if (event.replace && target && (target.role === b.role || nativeIndex >= 0)) {
-      const updated = { ...target, role: b.role, content: b.content, ...(eventTs ? { ts: eventTs } : {}) };
+      const updated = { ...target, role: b.role, content: b.content, ...(event.rawEvent || target.rawContent !== undefined ? { rawContent: rawBody } : {}), ...(eventTs ? { ts: eventTs } : {}) };
       if (blockId && !updated.blockId) updated.blockId = blockId;
       inheritMessageIdentity(updated, target);
       messages = messages.map((message, index) => index === targetIndex ? updated : message);
@@ -1162,6 +1410,9 @@ function appendEventToMessages(
         const updated = {
           ...target,
           content,
+          ...(event.rawEvent || target.rawContent !== undefined ? { rawContent: event.replace ? rawBody
+            : cumulativeContent !== undefined ? rawCumulative
+            : (target.rawContent ?? target.content) + rawBody } : {}),
           ...(nativeItemId && !target?.nativeItemId ? { nativeItemId } : {}),
           ...(blockId && !target?.blockId ? { blockId } : {}),
         };
@@ -1177,6 +1428,8 @@ function appendEventToMessages(
           content: cumulativeStreamText !== undefined
             && (b.role === 'assistant' || b.role === 'thinking')
             ? cumulativeStreamText : b.content,
+          ...(event.rawEvent ? { rawContent: rawCumulative !== undefined
+            && (b.role === 'assistant' || b.role === 'thinking') ? rawCumulative : rawBody } : {}),
           ...(nativeItemId ? { nativeItemId } : {}),
           ...(blockId ? { blockId } : {}),
         };
@@ -1209,6 +1462,7 @@ function appendEventToMessages(
           ...target,
           role: b.role,
           content: b.content,
+          ...(event.rawEvent || target.rawContent !== undefined ? { rawContent: rawBody } : {}),
           ...(nativeItemId && !target.nativeItemId ? { nativeItemId } : {}),
           ...(eventTs ? { ts: eventTs } : {}),
         };
@@ -1220,8 +1474,8 @@ function appendEventToMessages(
     }
     if (event.final && target && (target.role === b.role || nativeIndex >= 0)
         && target.content === b.content) {
-      if (target.role !== b.role) {
-        const updated = { ...target, role: b.role };
+      if (target.role !== b.role || (event.rawEvent && target.rawContent !== rawBody)) {
+        const updated = { ...target, role: b.role, ...(event.rawEvent ? { rawContent: rawBody } : {}) };
         inheritMessageIdentity(updated, target);
         messages = messages.map((message, index) => index === targetIndex ? updated : message);
       }
@@ -1242,7 +1496,7 @@ function appendEventToMessages(
     if (b.role === 'assistant') {
       const message = {
         role: 'assistant',
-        content: b.content,
+        content: b.content, ...(event.rawEvent ? { rawContent: rawBody } : {}),
         ...(nativeItemId ? { nativeItemId } : {}),
         ...(blockId ? { blockId } : {}),
         ...(eventTs ? { ts: eventTs } : {}),
@@ -1253,7 +1507,7 @@ function appendEventToMessages(
     } else if (b.role === 'thinking') {
       const message = {
         role: 'thinking',
-        content: b.content,
+        content: b.content, ...(event.rawEvent ? { rawContent: rawBody } : {}),
         ...(nativeItemId ? { nativeItemId } : {}),
         ...(blockId ? { blockId } : {}),
       };
@@ -1263,7 +1517,7 @@ function appendEventToMessages(
     } else if (b.role === 'tool') {
       const message = {
         role: 'tool',
-        content: b.content,
+        content: b.content, ...(event.rawEvent ? { rawContent: rawBody } : {}),
         ...(nativeItemId ? { nativeItemId } : {}),
         ...(blockId ? { blockId } : {}),
       };
@@ -1310,6 +1564,7 @@ function appendEvent(sessionId: string, event: StreamEvent['event'], meta: Strea
     workerId: meta.workerId,
     generation: meta.generation,
     taskSeq: typeof meta.taskSeq === 'number' ? meta.taskSeq : undefined,
+    executionSeq: typeof meta.executionSeq === 'number' ? meta.executionSeq : undefined,
     taskId: typeof meta.taskId === 'string' && meta.taskId ? meta.taskId : undefined,
     replayed: meta.replayed === true,
     turnId: event.turn_id,
@@ -1322,12 +1577,38 @@ function appendEvent(sessionId: string, event: StreamEvent['event'], meta: Strea
   // not mutate the transient alias table and then make a later native item
   // look like a current task, even when applyLiveStream would reject it.
   if (!store.canApplyLiveStream(sessionId, scope)) return false;
-  const before = store.getLiveStreamMessages(sessionId);
+  const before = store.getLiveStreamMessages(sessionId, scope);
   // The native alias table is only a transient accelerator. If the durable
   // live buffer is gone (result/restart or a fresh client state), an alias
   // from an earlier turn must not attach a new event to that old turn.
   if (before.length === 0) clearNativeTurnAliases(sessionId);
-  const messages = appendEventToMessages(sessionId, event, before, meta);
+  let messages = appendEventToMessages(sessionId, event, before, meta);
+  if (event.turn_id) {
+    const unchanged = new Set(before);
+    messages = messages.map(row => {
+      if (unchanged.has(row) || row.turnId === event.turn_id) return row;
+      const next = { ...row, turnId: event.turn_id };
+      inheritMessageIdentity(next, row);
+      return next;
+    });
+  }
+  if (event.type === 'codex.plan' || event.type === 'codex.diff') {
+    // These are replaceable turn summaries, not canonical tool/thinking
+    // items. Preserve that provenance so DONE can seal them even if older
+    // history needed for ordinary runtime convergence has not loaded yet.
+    const kind = event.type === 'codex.plan' ? 'plan' : 'diff';
+    const unchanged = new Set(before);
+    messages = messages.map(row => {
+      if (unchanged.has(row) || row.nativeAggregate === kind) return row;
+      const next: Message = { ...row, nativeAggregate: kind };
+      inheritMessageIdentity(next, row);
+      return next;
+    });
+  }
+  if (event.final) {
+    const blocks = extractBlocks(event);
+    markCompletedLiveRows(messages.filter(row => blocks.some(block => block.role === row.role && block.content === row.content)));
+  }
   const accepted = store.applyLiveStream(sessionId, messages, scope);
   return accepted;
 }

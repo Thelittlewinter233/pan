@@ -1,4 +1,6 @@
-import { useMemo, useState } from 'react';
+import { QqContactName, QqContactSearch } from '@/components/shared/QqContactSearch';
+import { matchesQqContact } from '@/utils/qqContactSearch';
+import { useEffect, useMemo, useState } from 'react';
 import { Check, Plus } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { useSessionStore } from '@/stores/sessionStore';
@@ -26,19 +28,37 @@ import type {
   SessionMessageSchedule,
 } from '@/types/jobs';
 import { scheduleEntries } from '@/types/jobs';
+import { fetchQqChannels, fetchQqContacts } from '@/services/api';
+import type { QqChannelInfo, QqContact } from '@/types';
 
 export type JobFormMode = 'create' | 'edit';
-type TemplateId = 'scheduled' | 'resume_legal_running' | 'custom';
+type TemplateId = 'scheduled' | 'scheduled_qq' | 'resume_legal_running' | 'custom';
 type MessageScheduleKind = SessionMessageSchedule['type'];
+
+interface QqJobContact {
+  contact: QqContact;
+  botUin: string;
+  botName: string;
+  connected: boolean;
+}
+
+interface QqJobTarget {
+  targetType: 'user' | 'group';
+  targetId: string;
+  botUin: string;
+  botName: string;
+  peerName: string;
+}
 
 const TEMPLATES: { id: TemplateId; label: string; hint: string }[] = [
   { id: 'scheduled', label: '创建定时任务', hint: '按计划执行 Session action 或 shell 命令' },
-  { id: 'resume_legal_running', label: '唤醒所有合法 running 的 Session', hint: '每次触发时重新筛选合法状态为 running 且没有活 Worker 的 Session，并发送“继续”' },
+  { id: 'scheduled_qq', label: 'Scheduled QQ message', hint: 'Send text to a selected QQ contact on a schedule' },
+  { id: 'resume_legal_running', label: '恢复所有 Illegal / 待恢复 Session', hint: '每次触发时重新筛选 Illegal / 待恢复且没有活 Worker 的 Session，将 Behavior 中的唤醒消息解锁并放到队首' },
   { id: 'custom', label: '自定义', hint: '选择可创建 Job 类型与适用字段' },
 ];
 
 const CREATABLE_KINDS: { kind: Exclude<JobKind, 'main-lifecycle'>; label: string; hint: string }[] = [
-  { kind: 'scheduled-task', label: '定时任务', hint: 'assign、send_session 或计划 shell 命令' },
+  { kind: 'scheduled-task', label: '定时任务', hint: 'assign、send_session、send_qq 或计划 shell 命令' },
   { kind: 'session-message', label: '定时消息', hint: '按计划向一个 Session 发送文本' },
   { kind: 'session-broadcast', label: '群发消息', hint: '按计划向多个 Session 发送文本' },
   { kind: 'background-process', label: '后台进程', hint: '立即运行 argv 命令，不经 shell' },
@@ -91,6 +111,7 @@ function normalizeMessageSchedule(job?: Job): SessionMessageSchedule {
  */
 export function NewJobForm({
   mode = 'create',
+  broadcastTargets,
   initialJob,
   submitting = false,
   kindMetas = [],
@@ -98,6 +119,8 @@ export function NewJobForm({
   onSave,
 }: {
   mode?: JobFormMode;
+  /** Fixed click-time targets for the compact selected-Session composer. */
+  broadcastTargets?: readonly string[];
   initialJob?: Job;
   submitting?: boolean;
   kindMetas?: JobKindMeta[];
@@ -107,9 +130,9 @@ export function NewJobForm({
   const editing = mode === 'edit' && !!initialJob;
   const sessions = useSessionStore((s) => s.sessions);
   const [template, setTemplate] = useState<TemplateId>('scheduled');
-  const [kind, setKind] = useState<JobKind>(initialJob?.kind ?? 'scheduled-task');
+  const [kind, setKind] = useState<JobKind>(broadcastTargets ? 'session-broadcast' : initialJob?.kind ?? 'scheduled-task');
   const initialAction = initialJob?.action;
-  const [actionApi, setActionApi] = useState<'assign' | 'send_session' | 'shell' | 'resume_legal_running'>(
+  const [actionApi, setActionApi] = useState<'assign' | 'send_session' | 'send_qq' | 'shell' | 'resume_legal_running'>(
     initialAction?.api ?? 'assign',
   );
 
@@ -117,11 +140,23 @@ export function NewJobForm({
   const [description, setDescription] = useState(initialJob?.description ?? '');
   const [targetSessionId, setTargetSessionId] = useState(initialJob?.target.sessionId ?? '');
   const [targetSessionIds, setTargetSessionIds] = useState<string[]>(
-    initialJob?.target.sessionIds
+    broadcastTargets ? [...broadcastTargets] : initialJob?.target.sessionIds
       ? [...initialJob.target.sessionIds]
       : initialJob?.target.sessionId ? [initialJob.target.sessionId] : [],
   );
   const [text, setText] = useState(initialJob?.text ?? '');
+  const initialQqArgs = initialAction?.api === 'send_qq' ? initialAction.args : null;
+  const [qqTarget, setQqTarget] = useState<QqJobTarget | null>(() => initialQqArgs ? ({
+    targetType: initialQqArgs.targetType,
+    targetId: initialQqArgs.targetId,
+    botUin: initialQqArgs.botUin ?? '',
+    botName: initialQqArgs.botUin ? `Bot ${initialQqArgs.botUin}` : 'Default channel',
+    peerName: '',
+  }) : null);
+  const [qqContacts, setQqContacts] = useState<QqJobContact[]>([]);
+  const [qqLoading, setQqLoading] = useState(false);
+  const [qqSearch, setQqSearch] = useState('');
+  const [qqLoadError, setQqLoadError] = useState('');
   const [entries, setEntries] = useState<ScheduleEntryDraft[]>(() =>
     initialJob && scheduleEntries(initialJob.schedule).length > 0
       ? scheduleEntries(initialJob.schedule).map(scheduleEntryToDraft)
@@ -139,6 +174,7 @@ export function NewJobForm({
   const shellArgs = initialAction?.api === 'shell' ? initialAction.args : null;
   const [shellCommand, setShellCommand] = useState(shellArgs?.command ?? initialJob?.shellCommand ?? '');
   const [cwd, setCwd] = useState(shellArgs?.cwd ?? initialJob?.cwd ?? '');
+  const [hideWindow, setHideWindow] = useState(shellArgs?.hideWindow ?? initialJob?.hideWindow ?? true);
   const [executable, setExecutable] = useState(initialJob?.argv?.[0] ?? '');
   const [argumentsList, setArgumentsList] = useState<string[]>(
     initialJob?.argv?.slice(1) ?? [],
@@ -170,10 +206,63 @@ export function NewJobForm({
   const [cwdError, setCwdError] = useState('');
   const [formError, setFormError] = useState('');
 
+  useEffect(() => {
+    if (kind !== 'scheduled-task' || actionApi !== 'send_qq') return undefined;
+    let cancelled = false;
+    setQqLoading(true);
+    setQqLoadError('');
+    setQqSearch('');
+    const load = async () => {
+      let channels: QqChannelInfo[] = [];
+      let channelsError = '';
+      try {
+        channels = await fetchQqChannels();
+      } catch (error) {
+        channelsError = error instanceof Error ? error.message : 'Failed to load QQ channels';
+      }
+      if (cancelled) return;
+      const targets = channels.length > 0
+        ? channels
+        : [{ name: '', bot_uin: '', connected: false }];
+      const perBot = await Promise.all(targets.map(async (bot) => {
+        try {
+          const contacts = await fetchQqContacts(bot.bot_uin || undefined);
+          return contacts.map((contact): QqJobContact => ({
+            contact,
+            botUin: bot.bot_uin,
+            botName: bot.name,
+            connected: bot.connected,
+          }));
+        } catch {
+          return [];
+        }
+      }));
+      if (cancelled) return;
+      const valid = perBot.flat().filter((item) =>
+        /^[1-9][0-9]{4,19}$/.test(item.contact.peerUin)
+        && (item.contact.chatType === 1 || item.contact.chatType === 2));
+      setQqContacts(valid);
+      setQqLoadError(valid.length === 0
+        ? channelsError || 'No valid QQ contacts are available for the configured bots.'
+        : '');
+      setQqLoading(false);
+    };
+    void load();
+    return () => { cancelled = true; };
+  }, [kind, actionApi]);
+
   const sessionOptions = useMemo(
     () => sessions.filter((s) => !s.id.startsWith('__pending_')),
     [sessions],
   );
+  const filteredQqContacts = useMemo(() => {
+    return qqContacts.filter(({ contact }) => matchesQqContact(qqSearch, contact.peerName, contact.peerUin));
+  }, [qqContacts, qqSearch]);
+  const selectedQqContact = qqTarget
+    ? qqContacts.find((item) => item.contact.peerUin === qqTarget.targetId
+      && (item.contact.chatType === 2 ? 'group' : 'user') === qqTarget.targetType
+      && item.botUin === qqTarget.botUin)
+    : undefined;
   const createableKindMetas = kindMetas.filter((meta) => meta.creatable);
   const kindOptions = createableKindMetas.length > 0
     ? CREATABLE_KINDS.filter((option) =>
@@ -213,6 +302,7 @@ export function NewJobForm({
 
   const handleCreate = () => {
     setFormError('');
+    if (name.trim().length > 200) { setNameError('Name must be at most 200 characters'); return; }
     const common = {
       name: name.trim() || undefined,
       description: description.trim(),
@@ -236,7 +326,7 @@ export function NewJobForm({
           ...common,
           kind,
           target: { sessionId: targetSessionId.trim() || null },
-          action: { api: 'shell', args: { command: shellCommand, cwd: cwd.trim() } },
+          action: { api: 'shell', args: { command: shellCommand, cwd: cwd.trim(), hideWindow } },
           schedule: entries.map(buildScheduleSpec),
           misfirePolicy,
           maxRuns: max,
@@ -253,6 +343,37 @@ export function NewJobForm({
           target: { sessionId: null },
           action: { api: 'resume_legal_running' },
           text: '继续',
+          schedule: entries.map(buildScheduleSpec),
+          misfirePolicy,
+          maxRuns: max,
+          enabled,
+          paused,
+        };
+        onCreate?.(input);
+        return;
+      }
+      if (actionApi === 'send_qq') {
+        if (!qqTarget) {
+          setTargetError('Choose a QQ contact');
+          return;
+        }
+        if (!text.trim()) {
+          setTextError('Message text is required');
+          return;
+        }
+        const input: ScheduledTaskCreateInput = {
+          ...common,
+          kind,
+          target: { sessionId: null },
+          action: {
+            api: 'send_qq',
+            args: {
+              targetType: qqTarget.targetType,
+              targetId: qqTarget.targetId,
+              ...(qqTarget.botUin ? { botUin: qqTarget.botUin } : {}),
+            },
+          },
+          text: text.trim(),
           schedule: entries.map(buildScheduleSpec),
           misfirePolicy,
           maxRuns: max,
@@ -350,6 +471,7 @@ export function NewJobForm({
         kind,
         target: { sessionId: sid },
         argv: [executable, ...argumentsList],
+        hideWindow,
         cwd: cwd.trim(),
         label: label.trim() || undefined,
       };
@@ -377,11 +499,33 @@ export function NewJobForm({
         setFormError('Max runs must be a positive whole number or empty.');
         return;
       }
-      patch.action = actionApi === 'shell'
-        ? { api: 'shell', args: { command: shellCommand, cwd: cwd.trim() } }
-        : { api: actionApi };
+      if (actionApi === 'send_qq') {
+        if (!qqTarget) {
+          setTargetError('Choose a QQ contact');
+          return;
+        }
+        patch.action = {
+          api: 'send_qq',
+          args: {
+            targetType: qqTarget.targetType,
+            targetId: qqTarget.targetId,
+            ...(qqTarget.botUin ? { botUin: qqTarget.botUin } : {}),
+          },
+        };
+      } else {
+        patch.action = actionApi === 'shell'
+          ? { api: 'shell', args: { command: shellCommand, cwd: cwd.trim(), hideWindow } }
+          : { api: actionApi };
+      }
       if (actionApi === 'resume_legal_running') {
         patch.text = '继续';
+        patch.target = { sessionId: null };
+      } else if (actionApi === 'send_qq') {
+        if (!text.trim()) {
+          setTextError('Message text is required');
+          return;
+        }
+        patch.text = text.trim();
         patch.target = { sessionId: null };
       } else if (actionApi === 'shell') {
         if (!shellCommand.trim() || !cwd.trim()) {
@@ -395,7 +539,9 @@ export function NewJobForm({
         }
         patch.text = text.trim();
       }
-      patch.target = { sessionId: targetSessionId.trim() || null };
+      if (actionApi !== 'resume_legal_running' && actionApi !== 'send_qq') {
+        patch.target = { sessionId: targetSessionId.trim() || null };
+      }
       patch.schedule = entries.map(buildScheduleSpec);
       patch.maxRuns = max;
       patch.misfirePolicy = misfirePolicy;
@@ -467,6 +613,71 @@ export function NewJobForm({
       </select>
       {targetError && <span className="text-[11px] text-danger">{targetError}</span>}
     </Field>
+  );
+
+  const qqTargetPicker = (
+    <div className="flex flex-col gap-1.5">
+      <span className="text-[11px] text-text-tertiary">QQ contact *</span>
+      <QqContactSearch value={qqSearch} onChange={setQqSearch} />
+      {qqTarget && (
+        <div className="rounded border border-accent/40 bg-accent/5 px-2.5 py-2 text-[11px] text-text-secondary">
+          Selected: <span className="font-medium text-text-primary">
+            {selectedQqContact?.contact.peerName || qqTarget.peerName || qqTarget.targetId}
+          </span>
+          {' · '}{qqTarget.targetType === 'group' ? 'Group' : 'User'} {qqTarget.targetId}
+          {' · '}{qqTarget.botUin ? `Bot ${qqTarget.botUin}` : 'Default bot'}
+        </div>
+      )}
+      <div className="max-h-52 overflow-y-auto rounded border border-border-default bg-bg-tertiary p-1.5">
+        {qqLoading ? (
+          <div className="py-4 text-center text-xs text-text-tertiary">Loading QQ contacts…</div>
+        ) : filteredQqContacts.length === 0 ? (
+          <div className="py-4 text-center text-xs text-text-tertiary">
+            {qqLoadError || (qqSearch ? 'No contacts match this search.' : 'No valid QQ contacts available.')}
+          </div>
+        ) : filteredQqContacts.map((item) => {
+          const targetType = item.contact.chatType === 2 ? 'group' : 'user';
+          const selected = qqTarget?.targetType === targetType
+            && qqTarget.targetId === item.contact.peerUin
+            && qqTarget.botUin === item.botUin;
+          return (
+            <button
+              key={`${item.botUin || item.botName}: ${targetType}:${item.contact.peerUin}`}
+              type="button"
+              aria-pressed={selected}
+              onClick={() => {
+                setQqTarget({
+                  targetType,
+                  targetId: item.contact.peerUin,
+                  botUin: item.botUin,
+                  botName: item.botName,
+                  peerName: item.contact.peerName,
+                });
+                if (targetError) setTargetError('');
+              }}
+              className={`flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs transition-colors ${selected
+                ? 'bg-accent/15 text-accent'
+                : 'text-text-primary hover:bg-bg-hover'}`}
+            >
+              <span className="min-w-0 flex-1 truncate">
+                <QqContactName name={item.contact.peerName} number={item.contact.peerUin} />
+                <span className="ml-1 text-[10px] text-text-tertiary">{item.contact.peerUin}</span>
+              </span>
+              <span className="shrink-0 rounded border border-border-default bg-bg-primary px-1 py-px text-[10px] text-text-secondary">
+                {item.contact.chatType === 2 ? 'group' : 'user'}
+              </span>
+              <span className="shrink-0 rounded border border-border-default bg-bg-primary px-1 py-px text-[10px] text-text-secondary">
+                {item.botUin || item.botName || 'default'}
+              </span>
+              <span className={`shrink-0 text-[10px] ${item.connected ? 'text-success' : 'text-text-tertiary'}`}>
+                {item.connected ? 'online' : 'offline'}
+              </span>
+            </button>
+          );
+        })}
+      </div>
+      {targetError && <span className="text-[11px] text-danger">{targetError}</span>}
+    </div>
   );
 
   const messageTargetSelect = (
@@ -599,8 +810,8 @@ export function NewJobForm({
     </div>
   );
 
-  const templateSelector = !editing && (
-    <div className="flex gap-1.5">
+  const templateSelector = !editing && !broadcastTargets && (
+    <div className="grid grid-cols-2 gap-1.5 md:grid-cols-4">
       {TEMPLATES.map((item) => (
         <button
           key={item.id}
@@ -612,6 +823,10 @@ export function NewJobForm({
             if (item.id === 'scheduled') {
               setKind('scheduled-task');
               setActionApi('assign');
+            } else if (item.id === 'scheduled_qq') {
+              setKind('scheduled-task');
+              setActionApi('send_qq');
+              setTargetSessionId('');
             } else if (item.id === 'resume_legal_running') {
               setKind('scheduled-task');
               setActionApi('resume_legal_running');
@@ -634,7 +849,7 @@ export function NewJobForm({
     <div className="flex flex-col gap-3">
       {templateSelector}
 
-      {editing ? (
+      {broadcastTargets ? null : editing ? (
         <Field label="Job kind (fixed)">
           <input aria-label="Job kind" value={initialJob?.kind ?? ''} readOnly className={inputClass} />
         </Field>
@@ -671,31 +886,35 @@ export function NewJobForm({
         </Field>
       ) : null}
 
-      <Field label={editing ? 'Name *' : 'Name'}>
-        <input
-          aria-label="Name"
-          value={name}
-          onChange={(e) => {
-            setName(e.target.value);
-            if (nameError) setNameError('');
-          }}
-          placeholder={editing ? 'Required' : 'Blank uses server-generated job-N'}
-          className={inputClass}
-        />
-        {nameError && <span className="text-[11px] text-danger">{nameError}</span>}
-      </Field>
+      {!broadcastTargets && (
+        <>
+          <Field label={editing ? 'Name *' : 'Name'}>
+            <input
+              aria-label="Name"
+              value={name}
+              onChange={(e) => {
+                setName(e.target.value);
+                if (nameError) setNameError('');
+              }}
+              placeholder={editing ? 'Required' : 'Blank uses server-generated job-N'}
+              className={inputClass}
+            />
+            {nameError && <span className="text-[11px] text-danger">{nameError}</span>}
+          </Field>
 
-      <Field label="Description">
-        <input
-          aria-label="Description"
-          value={description}
-          onChange={(e) => setDescription(e.target.value)}
-          placeholder="Optional"
-          className={inputClass}
-        />
-      </Field>
+          <Field label="Description">
+            <input
+              aria-label="Description"
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              placeholder="Optional"
+              className={inputClass}
+            />
+          </Field>
 
-      {sourceNote}
+          {sourceNote}
+        </>
+      )}
 
       {kind === 'scheduled-task' && (
         <>
@@ -708,14 +927,33 @@ export function NewJobForm({
             >
               <option value="assign">Assign task to Session</option>
               <option value="send_session">Send Session message</option>
-              <option value="resume_legal_running">唤醒所有合法 running 的 Session</option>
+              <option value="send_qq">Scheduled QQ message</option>
+              <option value="resume_legal_running">恢复所有 Illegal / 待恢复 Session</option>
               <option value="shell">Run shell command on Pan server</option>
             </select>
           </Field>
-          {actionApi === 'resume_legal_running' ? (
+          {actionApi === 'send_qq' ? (
+            <>
+              {qqTargetPicker}
+              <Field label="QQ message text *">
+                <textarea
+                  aria-label="QQ message text"
+                  value={text}
+                  onChange={(e) => {
+                    setText(e.target.value);
+                    if (textError) setTextError('');
+                  }}
+                  rows={3}
+                  placeholder="Text sent to the selected QQ contact"
+                  className={inputClass + ' resize-y'}
+                />
+                {textError && <span className="text-[11px] text-danger">{textError}</span>}
+              </Field>
+            </>
+          ) : actionApi === 'resume_legal_running' ? (
             <div className="rounded border border-border-default bg-bg-tertiary px-2.5 py-2 text-[11px] text-text-secondary">
-              每次 Job 触发时，服务端都会重新扫描持久合法状态为 running 且当前没有活 Worker 的 Session，
-              再通过正常消息投递发送正文“继续”。创建时不会固定 Session ID，也不会运行 shell 命令。
+              每次 Job 触发时，服务端都会重新扫描Illegal / 待恢复且当前没有活 Worker 的 Session，
+              再执行专用唤醒操作：发送 Behavior 中的唤醒消息、解除其 Illegal 锁并移到队首。创建时不会固定 Session ID，也不会运行 shell 命令。
             </div>
           ) : actionApi === 'shell' ? (
             <>
@@ -824,7 +1062,7 @@ export function NewJobForm({
 
       {(kind === 'session-message' || kind === 'session-broadcast') && (
         <>
-          {kind === 'session-message' ? kindTargetSelect : messageTargetSelect}
+          {broadcastTargets ? <p className="text-xs text-text-secondary">{targetSessionIds.length} selected Sessions · targets fixed when opened</p> : kind === 'session-message' ? kindTargetSelect : messageTargetSelect}
           <Field label="Message text *">
             <textarea
               aria-label="Message text"
@@ -839,9 +1077,9 @@ export function NewJobForm({
             {textError && <span className="text-[11px] text-danger">{textError}</span>}
           </Field>
           {messageScheduleEditor}
-          <div className="text-[11px] text-text-tertiary">
+          {!broadcastTargets && <div className="text-[11px] text-text-tertiary">
             Source is server-assigned. These message Jobs do not expose maxRuns, pause, or per-entry schedule controls.
-          </div>
+          </div>}
         </>
       )}
 
@@ -944,6 +1182,12 @@ export function NewJobForm({
         </div>
       )}
 
+      {((kind === 'background-process' && !editing) || (kind === 'scheduled-task' && actionApi === 'shell')) && (
+        <label className="flex items-center gap-2 text-xs text-text-secondary">
+          <input type="checkbox" checked={hideWindow} onChange={(event) => setHideWindow(event.target.checked)} />
+          Hide command window (Windows)
+        </label>
+      )}
       {formError && <span className="text-[11px] text-danger">{formError}</span>}
       <div className="flex items-center gap-2">
         <Button

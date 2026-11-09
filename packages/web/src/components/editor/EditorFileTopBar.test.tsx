@@ -6,8 +6,9 @@ import { EditorFileTopBar, getDisplayPath } from './EditorFileTopBar';
 import { EditorConfirmationModal } from './EditorConfirmationModal';
 import { useEditorStore } from '@/stores/editorStore';
 import { useSessionStore } from '@/stores/sessionStore';
+import { resetPlatformStoreForTests, usePlatformStore } from '@/stores/platformStore';
 import { useUIStore } from '@/stores/uiStore';
-import { writeFile } from '@/services/api';
+import { writeFile, openFileExternally, revealFileExternally } from '@/services/api';
 
 vi.mock('@/services/api', () => ({
   listFiles: vi.fn(async () => []),
@@ -15,6 +16,8 @@ vi.mock('@/services/api', () => ({
   writeFile: vi.fn(async () => undefined),
   renameFs: vi.fn(async () => undefined),
   deleteFs: vi.fn(async () => undefined),
+  openFileExternally: vi.fn(async () => undefined),
+  revealFileExternally: vi.fn(async () => undefined),
 }));
 
 function mockMatchMedia(matches: boolean) {
@@ -35,6 +38,7 @@ function mockMatchMedia(matches: boolean) {
 
 beforeEach(() => {
   mockMatchMedia(true);
+  resetPlatformStoreForTests();
   useEditorStore.setState({
     sessionId: 's1',
     openPaths: ['src/one.ts', 'src/two.ts'],
@@ -282,6 +286,240 @@ describe('EditorFileTopBar', () => {
 
     expect(useUIStore.getState().toastQueue).toEqual([]);
     expect(screen.queryByRole('button', { name: '完整路径已复制' })).toBeNull();
+  });
+});
+
+describe('EditorFileTopBar external open', () => {
+  const renderBar = (path = 'src/one.ts', props: { previewFailed?: boolean } = {}) =>
+    render(
+      <MemoryRouter initialEntries={['/editor']}>
+        <EditorFileTopBar operationPath={path} {...props} />
+      </MemoryRouter>,
+    );
+
+  beforeEach(() => {
+    vi.mocked(openFileExternally).mockReset();
+    vi.mocked(openFileExternally).mockResolvedValue(undefined);
+  });
+
+  it('opens the current file with the system default handler', async () => {
+    renderBar();
+
+    fireEvent.click(screen.getByRole('button', { name: '用系统默认方式打开' }));
+
+    await waitFor(() => expect(openFileExternally).toHaveBeenCalledWith('s1', 'src/one.ts'));
+  });
+
+  it('opens the on-disk version of an unsaved buffer and says so', async () => {
+    useEditorStore.setState({ dirty: new Set(['src/one.ts']) });
+    vi.mocked(writeFile).mockClear();
+    renderBar();
+
+    const button = screen.getByRole('button', {
+      name: '用系统默认方式打开',
+    }) as HTMLButtonElement;
+    expect(button.disabled).toBe(false);
+    expect(button.title).toContain('磁盘上的版本');
+    fireEvent.click(button);
+    await waitFor(() => expect(openFileExternally).toHaveBeenCalledWith('s1', 'src/one.ts'));
+    await waitFor(() =>
+      expect(useUIStore.getState().toastQueue.at(-1)?.message).toBe(
+        '已打开磁盘上的版本，未保存的修改未写入',
+      ),
+    );
+    expect(writeFile).not.toHaveBeenCalled();
+  });
+
+  it('keeps both OS actions available for a failed read-only preview', () => {
+    renderBar('huge.bin', { previewFailed: true });
+
+    for (const name of ['用系统默认方式打开', '在系统资源管理器中定位']) {
+      const button = screen.getByRole('button', { name }) as HTMLButtonElement;
+      expect(button.disabled).toBe(false);
+    }
+  });
+
+  it('disables the action for attachment previews without a real path', () => {
+    renderBar('attachment:s1:att_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+
+    const button = screen.getByRole('button', {
+      name: '用系统默认方式打开',
+    }) as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+    expect(button.title).toBe('该文件没有可用的本地路径');
+    fireEvent.click(button);
+    expect(openFileExternally).not.toHaveBeenCalled();
+  });
+
+  it('shows the server error in place when opening fails', async () => {
+    vi.mocked(openFileExternally).mockRejectedValueOnce(
+      new Error('no system file opener is available'),
+    );
+    renderBar();
+
+    fireEvent.click(screen.getByRole('button', { name: '用系统默认方式打开' }));
+
+    await waitFor(() =>
+      expect(useUIStore.getState().toastQueue.at(-1)).toMatchObject({
+        message: '打开失败：no system file opener is available',
+        type: 'error',
+      }),
+    );
+  });
+
+  it('keeps the path truncatable so the extra action fits a 390px bar', () => {
+    renderBar();
+    const bar = screen.getByTestId('editor-file-topbar');
+    const path = bar.firstElementChild as HTMLElement;
+
+    expect(path.className).toContain('min-w-0');
+    expect(path.className).toContain('flex-1');
+    expect(path.className).toContain('truncate');
+    for (const button of bar.querySelectorAll('button')) {
+      expect(button.className).toContain('shrink-0');
+    }
+  });
+});
+
+describe('EditorFileTopBar reveal in file manager', () => {
+  const renderBar = (path = 'src/one.ts') =>
+    render(
+      <MemoryRouter initialEntries={['/editor']}>
+        <EditorFileTopBar operationPath={path} />
+      </MemoryRouter>,
+    );
+
+  beforeEach(() => {
+    vi.mocked(revealFileExternally).mockReset();
+    vi.mocked(revealFileExternally).mockResolvedValue(undefined);
+  });
+
+  it('reveals the current file in the system file manager', async () => {
+    renderBar();
+
+    fireEvent.click(screen.getByRole('button', { name: '在系统资源管理器中定位' }));
+
+    await waitFor(() =>
+      expect(revealFileExternally).toHaveBeenCalledWith('s1', 'src/one.ts'),
+    );
+  });
+
+  it('reveals the disk file even when the buffer has unsaved changes', async () => {
+    useEditorStore.setState({ dirty: new Set(['src/one.ts']) });
+    renderBar();
+
+    const button = screen.getByRole('button', {
+      name: '在系统资源管理器中定位',
+    }) as HTMLButtonElement;
+    expect(button.disabled).toBe(false);
+    fireEvent.click(button);
+
+    await waitFor(() =>
+      expect(revealFileExternally).toHaveBeenCalledWith('s1', 'src/one.ts'),
+    );
+  });
+
+  it('disables reveal when the runtime file-manager capability is false', () => {
+    usePlatformStore.setState({
+      platform: 'windows',
+      capabilities: { 'fileManager.reveal': false },
+      loaded: true,
+    });
+    renderBar();
+
+    const reveal = screen.getByRole('button', {
+      name: '在系统资源管理器中定位',
+    }) as HTMLButtonElement;
+    const open = screen.getByRole('button', {
+      name: '用系统默认方式打开',
+    }) as HTMLButtonElement;
+    expect(reveal.disabled).toBe(true);
+    expect(reveal.title).toBe(
+      '无法在系统资源管理器中定位：当前环境没有可用的资源管理器',
+    );
+    expect(open.disabled).toBe(false);
+    fireEvent.click(reveal);
+    expect(revealFileExternally).not.toHaveBeenCalled();
+  });
+
+  it('uses the desktop-file-manager reason on Linux', () => {
+    usePlatformStore.setState({
+      platform: 'linux',
+      capabilities: { 'fileManager.reveal': false },
+      loaded: true,
+    });
+    renderBar();
+
+    const reveal = screen.getByRole('button', {
+      name: '在系统资源管理器中定位',
+    }) as HTMLButtonElement;
+    expect(reveal.disabled).toBe(true);
+    expect(reveal.title).toBe(
+      '无法在系统资源管理器中定位：当前环境没有可用的桌面文件管理器',
+    );
+  });
+
+  it('uses a platform-specific reason for an unknown platform', () => {
+    usePlatformStore.setState({
+      platform: 'freebsd',
+      capabilities: { 'fileManager.reveal': false },
+      loaded: true,
+    });
+    renderBar();
+
+    const reveal = screen.getByRole('button', {
+      name: '在系统资源管理器中定位',
+    }) as HTMLButtonElement;
+    expect(reveal.disabled).toBe(true);
+    expect(reveal.title).toBe(
+      '无法在系统资源管理器中定位：当前平台不支持在系统资源管理器中定位',
+    );
+  });
+
+  it('keeps reveal available when the capability probe is unavailable', async () => {
+    usePlatformStore.setState({ platform: null, capabilities: null, loaded: true });
+    renderBar();
+
+    const reveal = screen.getByRole('button', {
+      name: '在系统资源管理器中定位',
+    }) as HTMLButtonElement;
+    expect(reveal.disabled).toBe(false);
+    fireEvent.click(reveal);
+    await waitFor(() =>
+      expect(revealFileExternally).toHaveBeenCalledWith('s1', 'src/one.ts'),
+    );
+  });
+
+  it('disables reveal for attachment previews without a real path', () => {
+    renderBar('attachment:s1:att_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+
+    const button = screen.getByRole('button', {
+      name: '在系统资源管理器中定位',
+    }) as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+    expect(button.title).toBe('该文件没有可用的本地路径');
+    fireEvent.click(button);
+    expect(revealFileExternally).not.toHaveBeenCalled();
+  });
+
+  it('shows the server error in place when reveal fails', async () => {
+    vi.mocked(revealFileExternally).mockRejectedValueOnce(
+      new Error('501: no system file manager is available'),
+    );
+    renderBar();
+
+    const reveal = screen.getByRole('button', {
+      name: '在系统资源管理器中定位',
+    }) as HTMLButtonElement;
+    expect(reveal.disabled).toBe(false);
+    fireEvent.click(reveal);
+
+    await waitFor(() =>
+      expect(useUIStore.getState().toastQueue.at(-1)).toMatchObject({
+        message: '定位失败：501: no system file manager is available',
+        type: 'error',
+      }),
+    );
   });
 });
 

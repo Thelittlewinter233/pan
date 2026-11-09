@@ -129,7 +129,7 @@ def test_create_max_thinking_tokens_rejected(monkeypatch):
 def test_codex_context_settings_are_optional_and_not_synthesized(monkeypatch):
     _cleanup()
     _patch_caps(monkeypatch)
-    monkeypatch.setattr(srv, "_resolve_mcp_server_configs", lambda _: [])
+    monkeypatch.setattr(srv, "_character_manager", _manifest_manager())
     suffix = uuid.uuid4().hex[:8]
     with patch.object(srv, "broadcast", new=AsyncMock()):
         default = asyncio.run(srv.api_create_session(
@@ -270,13 +270,15 @@ def test_codex_context_restore_deletes_keys_and_marks_idle_worker_for_respawn(mo
               model="gpt-5.1-codex",
               adapter_config={"model_context_window": 64000,
                               "model_auto_compact_token_limit": 60800})
-    live = type("Live", (), {"worker_id": "worker-context-idle", "status": "idle", "process": object(),
-                              "pending_restart": False})()
+    live = worker.Worker(worker_id="worker-context-idle", session_id=s.id,
+                         adapter=CodexAdapter(), status="idle", process=object())
+    worker.workers[live.worker_id] = live
+    monkeypatch.setattr(worker, "_delayed_restarts", {})
     monkeypatch.setattr(srv.worker, "find_alive_worker_by_session", lambda _: live)
     created = []
 
     def fake_create_task(coro):
-        created.append(coro)
+        created.append(coro.cr_code.co_name)
         coro.close()
         return object()
 
@@ -292,8 +294,9 @@ def test_codex_context_restore_deletes_keys_and_marks_idle_worker_for_respawn(mo
     persisted = json.loads(_sess._path(s.id).read_text(encoding="utf-8"))
     assert "model_context_window" not in persisted["adapter_config"]
     assert "model_auto_compact_token_limit" not in persisted["adapter_config"]
-    assert live.pending_restart is False
-    assert len(created) == 1
+    assert live.status == "restarting"
+    assert result["delayedRestart"]["status"] == "restarting"
+    assert created.count("_respawn_worker") == 1
     argv = CodexAdapter().build_spawn_args(s)
     assert "model_context_window" not in " ".join(argv)
     assert "model_auto_compact_token_limit" not in " ".join(argv)
@@ -305,8 +308,10 @@ def test_codex_context_update_marks_running_worker_pending_restart(monkeypatch):
     _patch_caps(monkeypatch)
     s = _make("ses-context-running", "context-running", adapter="codex",
               model="gpt-5.1-codex")
-    live = type("Live", (), {"worker_id": "worker-context-running", "status": "running", "process": object(),
-                              "pending_restart": False})()
+    live = worker.Worker(worker_id="worker-context-running", session_id=s.id,
+                         adapter=CodexAdapter(), status="running", process=object())
+    worker.workers[live.worker_id] = live
+    monkeypatch.setattr(worker, "_delayed_restarts", {})
     monkeypatch.setattr(srv.worker, "find_alive_worker_by_session", lambda _: live)
     with patch.object(srv, "broadcast", new=AsyncMock()):
         result = asyncio.run(srv.api_update_session("ses-context-running", {
@@ -315,6 +320,8 @@ def test_codex_context_update_marks_running_worker_pending_restart(monkeypatch):
         }))
     assert result["requireRestart"] is True
     assert live.pending_restart is True
+    assert result["delayedRestart"]["status"] == "pending"
+    assert result["delayedRestart"]["generation"] == live.generation
     assert s.adapter_config["model_context_window"] == 64000
     assert s.adapter_config["model_auto_compact_token_limit"] == 60800
     _cleanup()
@@ -535,6 +542,17 @@ def test_mcp_non_string_name_rejected(monkeypatch):
     monkeypatch.setattr(srv, "_character_manager", _manifest_manager())
     with pytest.raises(ValueError, match="Invalid MCP server name"):
         srv._resolve_mcp_server_configs([123])
+    _cleanup()
+
+
+@pytest.mark.parametrize("name", [123, {}, [], "", " "])
+def test_mcp_invalid_names_rejected_before_hashing_without_config_mutation(monkeypatch, name):
+    monkeypatch.setattr(srv, "_character_manager", _manifest_manager())
+    s = _make("ses-invalid-mcp-name", "invalid-name")
+    before = dict(s.adapter_config)
+    with pytest.raises(ValueError, match="Invalid MCP server name"):
+        srv._apply_mcp_servers(s, [name])
+    assert s.adapter_config == before
     _cleanup()
 
 

@@ -1,21 +1,41 @@
 # Background Job Runner MVP
 
-Background Jobs are durable process records, not Workers. An Agent Worker may
-start and disappear while the Runner process continues. The Runner never uses
-Pan stdout, worker pipes, or a live WebSocket for job facts; command output is
-appended to `data/background_jobs/logs/<job_id>.log`.
+Background Jobs are durable records, not Workers. An Agent Worker may start and
+disappear while a process Runner or the Session-message scheduler continues.
+Process Jobs never use a shell. Session-message Jobs never interpret their
+`text` as a command: they call the same `worker.send_session` path as
+`agent_send`.
 
-## Lifecycle
+## Windows command window boundary
+
+Process Job commands default to `hideWindow=true`, including old records without
+the field. Explicit `hideWindow=false` (MCP `hide_window=False`) creates a visible
+console. The runtime-independent `packages.jobs.window.command_window_options`
+helper is also used at owned background pipe/auxiliary launch sites: Worker
+streams and one-shot input, Python bridges spawning CLIs, bot Python processes,
+cloudflared, capability probes, and selected test harnesses.
+
+This is a policy for each controlled creation edge, not enforcement over
+arbitrary third-party descendants. A descendant can allocate/show its own
+console or GUI. Detached runners retain their independent lifecycle; Windows
+ignores `CREATE_NO_WINDOW` when combined with `DETACHED_PROCESS` or
+`CREATE_NEW_CONSOLE`. Native ConPTY and explicit takeover/user console launches
+retain their existing primitives and visibility. No window scanning, post-hoc
+hiding, global Python injection, or third-party setting changes are involved.
+
+## Lifecycle details
 
 `POST /api/background-jobs` writes a job record before starting an independent
 `python -m packages.core.background_runner` process. The record contains the
-stable `jobId`, target Session, argv, a short command summary, resolved cwd,
-log path, PID, and process creation time. The Runner starts the requested argv
-without a shell, streams stdout/stderr to the log, and writes `completed` or
-`failed` to the same job record. Cancellation validates PID creation time and
-kills the complete descendant tree on Windows (psutil is required for a safe
-kill); when identity cannot be verified, cancellation is rejected rather than
-killing an unrelated reused PID.
+stable `jobId`, `creatorSessionId` (the creating/owning Agent, when present),
+`targetSessionId` (the only Session that receives the terminal notice), argv,
+a short command summary, resolved cwd, log path, PID, and process creation
+time. The Runner starts the requested argv without a shell, streams
+stdout/stderr to the log, and writes `completed` or `failed` to the same job
+record. Cancellation validates PID creation time and kills the complete
+descendant tree on Windows (psutil is required for a safe kill); when identity
+cannot be verified, cancellation is rejected rather than killing an
+unrelated reused PID.
 
 Pan's lifespan starts a small recovery loop. It first reconciles `starting` /
 `running` records: a live Runner with a matching PID creation time is left
@@ -40,21 +60,58 @@ updates.
 
 HTTP endpoints are:
 
-- `POST /api/background-jobs` with `{targetSessionId, argv, cwd, label?}`
+- `POST /api/background-jobs` with `{targetSessionId, creatorSessionId?, argv, cwd, label?}`
 - `GET /api/background-jobs` (optional `targetSessionId`), and `GET /api/background-jobs/{jobId}`
 - `POST /api/background-jobs/{jobId}/cancel` and `/retry`
 
-MCP exposes `agent_background_start/get/list/cancel/retry`. `start` defaults
-to the current MCP Agent Session. Ordinary Agents do not need to construct
-callback payloads or retry notices; `agent_notify` remains available for
-low-level compatibility.
+MCP exposes `agent_background_start/get/list/cancel/retry` for OS-process Jobs
+and `agent_message_job_create/get/list/update/cancel` for time-based Session
+messages and scheduled broadcasts. A message Job has one target Session; a
+broadcast Job has an ordered, deduplicated `targetSessionIds` list. Both have
+a description, text, creator `creatorSessionId` (with `sourceSessionId` retained
+as message provenance), and a normalized schedule:
+
+- one-time: `{"type":"once","at":"<ISO-8601>"}` or
+  `{"type":"once","delaySeconds":N}`;
+- recurring interval: `{"type":"interval","intervalSeconds":N}`;
+- recurring weekly: `{"type":"weekly","weekday":0..6,"time":"HH:MM"}`
+  (Monday is 0; the server's local timezone is used unless `timezone` is
+  supplied as `UTC` or an IANA zone).
+
+`pending`/`scheduled`/`running`/`completed`/`failed`/`cancelled` are persisted
+states. The service recovery loop claims due records under the same per-Job
+cross-process lock as the process Registry, so a restart sends one missed
+occurrence and persists the next occurrence. Missed recurring occurrences are
+not replayed in a burst; the next interval/weekly occurrence is calculated
+from the recovery send time. A cancelled Job never schedules another send;
+an already in-flight send cannot be retracted.
+
+The immediate selected-Session fan-out API is `POST /api/sessions/broadcast`
+and MCP `agent_send_many`. It calls the ordinary send path once per unique
+Session and reports per-target results. A scheduled broadcast uses the same
+durable scheduler and calls the same send path once per target in persisted
+order. It records `lastDelivery.results` for every target; a mixed occurrence
+is a completed/scheduled Job with `lastDelivery.status="partial"` and a
+per-target error summary, while an all-failed one-shot is `failed`. Recurring
+Jobs remain `scheduled` after a partial or all-failed occurrence and calculate
+only the next occurrence from the completed/recovery time.
+
+The creator is audit/permission metadata, not a delivery target. A Job created
+by agent A for agent B stores `creatorSessionId=A` and
+`targetSessionId=B` (or the ordered `targetSessionIds` list); scheduled message
+Jobs do not create an automatic terminal notice back to A. The independent
+process-Job terminal notice remains routed to its persisted target and carries
+a structured `envelope` with `jobId`, status, target(s), and creator metadata.
+System Jobs have a null creator and render with source `automation`.
 
 ## Security and product decisions
 
-This local MVP accepts an argv array, never a shell string, and only permits a
-cwd inside the Pan project directory. It does not yet provide a command
-allowlist, result-file contract, or remote/tunnel authentication. These are
-product decisions before enabling external work directories or remote control.
+Background-process Jobs accept an argv array, never a shell string, and permit
+any existing directory as cwd, including sibling worktrees. Relative paths are
+resolved against the service process cwd; agents should pass absolute paths.
+Scheduled shell actions share this directory validation. This is an explicitly
+authorized local agent capability, not a directory sandbox. Command allowlists,
+result-file contracts and remote/tunnel authentication remain separate work.
 Only terminal Jobs may be retried; retrying a `starting`/`running` Job is
 rejected and the caller must cancel it first. `sourceSessionId` remains
 metadata and is not an authentication credential;
@@ -62,7 +119,75 @@ future callbacks must add a short-lived token or signed event boundary.
 
 The current API follows Pan's existing loopback/no-auth model. No new remote
 binding or tunnel exposure is introduced. A retry creates a new Job ID and
-keeps the original terminal event identity intact.
+keeps the original terminal event identity intact for the original Job. The
+retry inherits `creatorSessionId`, while its terminal notice is routed only to
+its `targetSessionId`.
+
+## Agent usage policy (guidance, not mechanism)
+
+The following is agent-facing usage guidance for `agent_background_*` OS-process
+Jobs only — the ones that execute OS commands with terminal notices on an
+independent Runner. It does not apply to Session-message/broadcast Jobs
+(`agent_message_job_*`), Scheduler tasks, or ordinary `agent_assign`/`agent_send`
+dispatch, and it changes no runtime mechanism. The read/cancel/retry tools stay
+available; this policy only defines when and how to use them.
+
+- Selection threshold: process Jobs exist to carry long work without polling.
+  Use them for commands expected to run **longer than about 3 minutes**. The
+  3-minute figure is a general selection threshold, not a runtime timeout and
+  not a hard ban on short tasks or extra API validation.
+- No polling after start: after starting a Job with completion notification,
+  agents must not poll for progress — no looping `agent_background_get`/
+  `agent_background_list`, no log reading/tailing, no sleep/watch/PID checks to
+  keep waiting. Once startup success, the notification target, and necessary
+  state records are confirmed, and no other independent work remains, the agent
+  ends its turn and goes idle; the terminal notice wakes it to read results and
+  logs for acceptance.
+- Real-time observation is a reason not to use a process Job: choose a
+  foreground/interactive execution style when progress must be watched live.
+  Do not combine a background Job with polling.
+- Retained uses: verifying results after the terminal notice, and one-off
+  diagnostics/cancellation/error recovery explicitly requested by the user
+  (`agent_background_get`/`cancel`/`retry`). These do not license routine
+  progress polling.
+- Unavailable notifications are fixed, not worked around: if the terminal
+  notice path is unavailable, fix notification delivery or use a non-background
+  execution style; do not add a polling fallback on top of a background Job.
+
+## Terminal notice envelope
+
+Process Job terminal states (`completed`, `failed`, `cancelled`, including an
+orphaned Runner reconciled to `failed`) are projected through the existing
+`queue_pending`/`enqueue_notice` path. The durable queue item carries these
+structured fields; consumers must not parse them back out of `result` text:
+
+```json
+{
+  "type": "notice",
+  "source": "automation",
+  "noticeKind": "background_job_terminal",
+  "jobId": "job_...",
+  "status": "completed",
+  "targetSessionId": "ses_target",
+  "targetSessionIds": ["ses_target"],
+  "creatorSessionId": "ses_creator",
+  "eventId": "job_...:terminal"
+}
+```
+
+`creatorSessionId` is audit/ownership metadata only. It does not add a second
+delivery target, and a missing creator remains absent/null. The formatted
+Agent message starts with `////by pan system`, including when no creator is
+known. The existing `agent_notify` path has no `noticeKind` and continues to
+render its Agent source with the existing `@@@@by agent` format. Agent-created
+Session-message Jobs still use normal `agent_send` semantics and retain
+`sourceSessionId` plus the `////by agent : <creatorSessionId> | <title>`
+message prefix.
+
+Legacy Job JSON without `creatorSessionId` remains readable and is exposed as
+`null` at read time without rewriting the file. Service lifecycle Jobs remain
+system-level Registry records with no target Session and are never projected
+into `queue_pending`.
 
 ## Service lifecycle Jobs
 
@@ -81,9 +206,9 @@ blocks a duplicate and a supervisor failure remains visible. Readiness is
 accepted only when the target port is owned by a new process whose creation
 time, checkout marker, Pan entry marker, and `/api/health` response all verify.
 
-The PowerShell file remains a detached two-hop launcher, but its second hop
-delegates stop/start and these checks to `packages.core.main_lifecycle`. The
-helper invokes the existing checkout-scoped `stop_pan.bat` and `start_pan.bat`;
-it does not recursively kill its own supervisor. Exit integration can attach
-to `create_service_job` and `transition_service_job` later without changing
-the Session or background-process contracts.
+The detached supervisor invokes `packages.core.main_lifecycle`, which directly
+delegates process identity, graceful exit, verified fallback, start and
+readiness to `packages.core.launcher`. No stop/start batch script is part of
+the lifecycle path, and the supervisor is kept outside the old Pan process
+tree. Exit uses the same durable Job contract without changing Session or
+background-process semantics.

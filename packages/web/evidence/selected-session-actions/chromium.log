@@ -1,0 +1,47 @@
+[
+  {
+    "width": 1280,
+    "passed": true,
+    "cases": [
+      "partial read / generation race",
+      "Bell on validation / off API",
+      "workspace snapshot / manager detach cancellation / partial failure / retry",
+      "broadcast snapshot / save failure / retry / duplicate guard / pending escape",
+      "weekly controls / cancel",
+      "delayed restart intent / start-vs-restart action / pending block / settle retry",
+      "restart snapshot switch / in-flight duplicate guard",
+      "kill confirmation dismissal / worker-backed request / no-worker no-op / disabled boundary / partial failure retry",
+      "menu viewport / escape"
+    ]
+  },
+  {
+    "width": 390,
+    "passed": true,
+    "cases": [
+      "partial read / generation race",
+      "Bell on validation / off API",
+      "workspace snapshot / manager detach cancellation / partial failure / retry",
+      "broadcast snapshot / save failure / retry / duplicate guard / pending escape",
+      "weekly controls / cancel",
+      "delayed restart intent / start-vs-restart action / pending block / settle retry",
+      "restart snapshot switch / in-flight duplicate guard",
+      "kill confirmation dismissal / worker-backed request / no-worker no-op / disabled boundary / partial failure retry",
+      "menu viewport / escape"
+    ]
+  },
+  {
+    "width": 320,
+    "passed": true,
+    "cases": [
+      "partial read / generation race",
+      "Bell on validation / off API",
+      "workspace snapshot / manager detach cancellation / partial failure / retry",
+      "broadcast snapshot / save failure / retry / duplicate guard / pending escape",
+      "weekly controls / cancel",
+      "delayed restart intent / start-vs-restart action / pending block / settle retry",
+      "restart snapshot switch / in-flight duplicate guard",
+      "kill confirmation dismissal / worker-backed request / no-worker no-op / disabled boundary / partial failure retry",
+      "menu viewport / escape"
+    ]
+  }
+]

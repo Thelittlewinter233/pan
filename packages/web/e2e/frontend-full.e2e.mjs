@@ -5,12 +5,12 @@
  */
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
+import { createWriteStream } from 'node:fs';
 import path from 'node:path';
 import net from 'node:net';
 import { spawn, spawnSync } from 'node:child_process';
 import process from 'node:process';
-import { Buffer } from 'node:buffer';
-import { setTimeout } from 'node:timers';
+import { setTimeout, clearTimeout } from 'node:timers';
 import { chromium } from '@playwright/test';
 
 const root = path.resolve(import.meta.dirname, '../../..');
@@ -21,10 +21,18 @@ const base = `http://127.0.0.1:${port}`;
 const evidence = { root, runtime, port, stages: [], processes: [], errors: [], requests: [], frames: [] };
 await fs.mkdir(runtime, { recursive: true });
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+async function bounded(work, timeout, label) {
+  let timer;
+  try {
+    return await Promise.race([work(), new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`Timed out: ${label}`)), timeout);
+    })]);
+  } finally { clearTimeout(timer); }
+}
 async function poll(read, test, label, timeout = 15000) {
   let last;
   for (const end = Date.now() + timeout; Date.now() < end; await sleep(80)) {
-    last = await read();
+    last = await bounded(read, Math.max(1, end - Date.now()), label);
     if (test(last)) return last;
   }
   throw new Error(`${label}: ${JSON.stringify(last).slice(0, 2500)}`);
@@ -49,10 +57,10 @@ async function start() {
   server = spawn(python, [path.join(import.meta.dirname, 'frontend-full.server.py')], {
     cwd: root, windowsHide: true, env: { ...process.env, PAN_PORT: String(port), PAN_E2E_RUNTIME: runtime }, stdio: ['ignore', 'pipe', 'pipe'],
   });
-  const logs = [];
-  server.stdout.on('data', b => logs.push(b));
-  server.stderr.on('data', b => logs.push(b));
-  server.on('exit', () => fs.writeFile(path.join(runtime, `server-${server?.pid}.log`), Buffer.concat(logs)));
+  const serverLog = createWriteStream(path.join(runtime, `server-${server.pid}.log`));
+  server.stdout.on('data', b => serverLog.write(b));
+  server.stderr.on('data', b => serverLog.write(b));
+  server.on('exit', () => serverLog.end());
   await poll(async () => { try { return await api('/api/sessions?summary=1'); } catch { return null; } }, x => !!x, 'server ready', 30000);
   const identity = JSON.parse(await fs.readFile(path.join(runtime, 'server-identity.json')));
   assert.equal(path.resolve(identity.checkout), root);
@@ -97,17 +105,29 @@ async function canonical(id) {
 async function equalCanonical(label) {
   const current = await state();
   const expected = projection(await canonical(current.id));
-  const result = await poll(state, s => JSON.stringify(projection(s.rows)) === JSON.stringify(expected.slice(s.start)), label);
+  await poll(state, s => JSON.stringify(projection(s.rows)) === JSON.stringify(expected.slice(s.start)), label);
   const violations = await page.evaluate(() => window.__transientViolations || []);
   assert.deepEqual(violations, [], 'no transient duplicate reply before convergence');
   // Compare virtual DOM rows by their actual display index, including the
   // collapsed thinking/tool-group summaries. Also check visual geometry:
   // correct store order is insufficient if measured rows overlap on screen.
   await page.waitForTimeout(80);
-  const dom = await page.locator('main [data-index]').evaluateAll(rows => rows.map(el => ({
-    index: Number(el.dataset.index), text: el.textContent,
-    top: el.getBoundingClientRect().top, bottom: el.getBoundingClientRect().bottom,
-  })));
+  // Pagination can advance during the render wait. Capture the store and DOM
+  // in one browser task so indexes refer to the same history window.
+  const { result, dom } = await page.evaluate(() => {
+    const s = window.__panSessionStore.getState();
+    return {
+      result: { id: s.currentSessionId, rows: s.currentMessages,
+        total: s.sessions.find(x => x.id === s.currentSessionId)?.historyTotal,
+        start: s.historyLoadEnd, more: s.hasMoreMessages },
+      dom: [...document.querySelectorAll('main [data-index]')].map(el => ({
+        index: Number(el.dataset.index), text: el.textContent,
+        top: el.getBoundingClientRect().top, bottom: el.getBoundingClientRect().bottom,
+      })),
+    };
+  });
+  assert.equal(result.id, current.id, 'canonical check stays on the selected Session');
+  assert.deepEqual(projection(result.rows), expected.slice(result.start), 'sampled window matches canonical history');
   assert.ok(dom.length > 0, 'rendered rows');
   const grouped = [];
   for (const row of result.rows) {
@@ -249,6 +269,11 @@ async function assertLiveVisualOrder(label, snapshots) {
 }
 const ids = {};
 const faults = {
+  missedResult: false,
+  missedResultInjected: false,
+  dropNextRunning: false,
+  droppedRunning: false,
+  transientBeforeResult: false,
   duplicate: false,
   reorder: false,
   held: null,
@@ -277,6 +302,50 @@ try {
     upstream.onMessage(message => {
       if (faults.backgroundDeadSocket === ws) return;
       const e = JSON.parse(String(message));
+      const omitApplicationEvent = () => ws.send(JSON.stringify({
+        // Consume transport cursors without dispatching a lifecycle handler.
+        // Raw packet loss exercises resync instead (covered separately below).
+        type: '__e2e.omitted_application_event',
+        serverEpoch: e.serverEpoch, eventEpoch: e.eventEpoch, eventSeq: e.eventSeq,
+        sourceCursorStart: e.sourceCursorStart, sourceCursorEnd: e.sourceCursorEnd,
+        deliveryEpoch: e.deliveryEpoch, deliverySeq: e.deliverySeq,
+      }));
+      if (faults.missedResult && e.type === 'worker.result'
+          && String(e.result || '').includes('answer:missed-result-first')) {
+        faults.missedResult = false;
+        faults.missedResultInjected = true;
+        ws.send(JSON.stringify({ type: 'worker.stream', sessionId: e.sessionId,
+          workerId: e.workerId, generation: e.generation, executionSeq: e.executionSeq,
+          taskSeq: e.taskSeq, serverEpoch: e.serverEpoch, event: {
+            type: 'content.part', role: 'assistant', delta: true, item_id: 'missed-result-orphan',
+            part: { type: 'text', text: 'orphan-progress-missed-result' },
+          } }));
+        omitApplicationEvent();
+        return; // Transport receives the cursor, application misses the result.
+      }
+      if (faults.dropNextRunning && e.type === 'worker.status' && e.status === 'running'
+          && e.sessionId === ids['E2E-A']) {
+        faults.dropNextRunning = false;
+        faults.droppedRunning = true;
+        omitApplicationEvent();
+        return;
+      }
+      if (faults.transientBeforeResult && e.type === 'worker.result'
+          && String(e.result || '').includes('answer:terminal-transient')) {
+        faults.transientBeforeResult = false;
+        // This fixture frame is unsequenced: copying the result's delivery
+        // cursor would consume it and make the real result look duplicated.
+        ws.send(JSON.stringify({ type: 'worker.stream', sessionId: e.sessionId,
+          workerId: e.workerId, generation: e.generation, taskSeq: e.taskSeq,
+          executionSeq: e.executionSeq,
+          taskId: e.taskId, serverEpoch: e.serverEpoch, event: {
+          type: 'assistant', item_id: 'ephemeral-fixture-item',
+          message: { content: [
+            { type: 'thinking', thinking: 'ephemeral-fixture-reasoning' },
+            { type: 'tool_use', name: 'ephemeral-fixture-tool', input: { progress: true } },
+          ] },
+        } }));
+      }
       if (faults.delaySnapshot && e.type === 'resync.snapshot') {
         faults.delaySnapshot = false;
         setTimeout(() => ws.send(message), 450);
@@ -297,17 +366,24 @@ try {
     });
   });
   await context.route('**/api/sessions/*/history?*', async route => {
-    const response = await route.fetch();
-    if (faults.historyDelay > 0) {
-      faults.delayedHistory++;
-      await sleep(faults.historyDelay);
-      faults.completedDelayedHistory++;
+    try {
+      const response = await route.fetch();
+      if (faults.historyDelay > 0) {
+        faults.delayedHistory++;
+        await sleep(faults.historyDelay);
+        faults.completedDelayedHistory++;
+      }
+      await route.fulfill({ response });
+    } catch (error) {
+      // Speculative reads and superseded selections may be aborted by the
+      // browser. Preserve all other fixture/transport failures as failures.
+      if (!/route\.(fetch|fulfill):.*(?:aborted|Target page, context or browser has been closed)/s.test(String(error))) throw error;
     }
-    await route.fulfill({ response });
   });
   await context.route('**://fonts.googleapis.com/**', r => r.abort());
   await context.route('**://fonts.gstatic.com/**', r => r.abort());
   page = await context.newPage();
+  page.setDefaultTimeout(15000);
   await page.addInitScript(() => {
     window.__perf = { frames: [], longTasks: [] };
     let last = performance.now();
@@ -327,7 +403,9 @@ try {
   await page.evaluate(() => {
     window.__transcriptTrace = [];
     window.__transientViolations = [];
+    window.__ephemeralSeen = false;
     window.__panSessionStore.subscribe(s => {
+      if (s.currentMessages.some(m => m.content.includes('ephemeral-fixture'))) window.__ephemeralSeen = true;
       const seen = new Set();
       for (const m of s.currentMessages) {
         if (m.role !== 'assistant' || !m.content.startsWith('answer:')) continue;
@@ -342,6 +420,12 @@ try {
       const t = s.sessionTranscripts[s.currentSessionId];
       if (!t) return;
       const trace = { at: Date.now(), id: s.currentSessionId, anchor: t.anchorOffset, total: t.window.total,
+        live: s.liveStreamBuffers[s.currentSessionId] ? {
+          workerId: s.liveStreamBuffers[s.currentSessionId].workerId,
+          generation: s.liveStreamBuffers[s.currentSessionId].generation,
+          executionSeq: s.liveStreamBuffers[s.currentSessionId].executionSeq,
+          taskKey: s.liveStreamBuffers[s.currentSessionId].taskKey,
+        } : null,
         runtime: t.runtime.map(m => [m.role, m.content.slice(0,60)]),
         tail: s.currentMessages.slice(-16).map(m => [m.role,m.content.slice(0,60)]) };
       window.__transcriptTrace.push(trace);
@@ -373,6 +457,42 @@ try {
     await equalCanonical(`B compound ${turn}`);
   }
   await select('E2E-A');
+  faults.transientBeforeResult = true;
+  await send('terminal-transient');
+  await poll(() => api(`/api/sessions/${ids['E2E-A']}`), s => s.lastResult?.result?.includes('answer:terminal-transient'), 'terminal-transient durable final');
+  await equalCanonical('non-durable tool/thinking disappear after terminal coverage without reload');
+  assert.equal(faults.transientBeforeResult, false, 'ephemeral transport frames actually injected');
+  assert.equal(await page.evaluate(() => window.__ephemeralSeen), true, 'ephemeral rows were displayed before canonical convergence');
+  assert.ok(!(await state()).rows.some(m => m.content.includes('ephemeral-fixture')), 'no non-durable tail blocks remain');
+  faults.missedResult = true;
+  await send('missed-result-first');
+  await poll(() => Promise.resolve(faults.missedResultInjected), value => value, 'terminal application event deliberately omitted');
+  assert.equal(await page.evaluate(id => !!window.__panSessionStore.getState().liveStreamBuffers[id], ids['E2E-A']), true,
+    'missing terminal really leaves the previous live buffer alive');
+  faults.dropNextRunning = true;
+  await send('missed-result-second');
+  await poll(() => api(`/api/sessions/${ids['E2E-A']}`), s => s.lastResult?.result?.includes('answer:missed-result-second'),
+    'next execution reaches durable completion after missed result/running');
+  assert.equal(faults.droppedRunning, true, 'the next running event was actually dropped');
+  await equalCanonical('missed terminal and next running: new stream retires old provisional rows without reload');
+  assert.ok(!(await state()).rows.some(row => row.nativeItemId === 'missed-result-orphan'), 'no old runtime item behind DONE');
+  // Real durable notice queue + provider stdin + WS, staying in the selected
+  // Session throughout. Assert a delta is rendered before terminal persistence.
+  for (const [noticeKind, label] of [
+    ['background_job_terminal', 'system-notice-live'],
+    [null, 'report-notice-live'],
+  ]) {
+    await api('/__e2e/notice', { sessionId: ids['E2E-A'], sourceSessionId: ids['E2E-B'], text: label, noticeKind });
+    await poll(state, s => s.rows.some(m => m.role === 'assistant' && m.content.includes(label)), `${label} live without selection change`);
+    await poll(() => page.locator('main .msg.assistant').filter({ hasText: label }).count(), count => count > 0, `${label} rendered before done`);
+    assert.equal((await api(`/api/sessions/${ids['E2E-A']}`)).workerStatus, 'running', `${label} visible while running`);
+    await poll(() => api(`/api/sessions/${ids['E2E-A']}`), s => s.lastResult?.result?.includes(label), `${label} terminal`);
+    await equalCanonical(`${label} canonical without reload`);
+  }
+  await send('queued-after-notices');
+  await poll(state, s => s.rows.some(m => m.content.includes('answer:queued-after-notices')), 'queued task streams after report turns');
+  await poll(() => api(`/api/sessions/${ids['E2E-A']}`), s => s.lastResult?.result?.includes('answer:queued-after-notices'), 'queued task after notices terminal');
+  await equalCanonical('ordinary queue task after notices');
   faults.historyDelay = 700;
   faults.duplicate = true;
   faults.reorder = true;
@@ -431,7 +551,7 @@ try {
   // assistant text must remain after its own tool blocks in both the store and
   // the rendered virtual rows.
   await select('E2E-A');
-  await page.getByTitle('Scroll to bottom').click().catch(() => {});
+  await page.getByTitle('Scroll to bottom').click({ timeout: 2000 }).catch(() => {});
   await poll(() => scroller.evaluate(el => el.scrollHeight - el.scrollTop - el.clientHeight), d => d <= 2, 'switch-delta before stream');
   faults.historyDelay = 650;
   const switchVisualSnapshots = [];
@@ -469,7 +589,7 @@ try {
   // contain exactly one assistant row for the turn, and it must converge to the
   // single canonical reply after completion.
   await select('E2E-A');
-  await page.getByTitle('Scroll to bottom').click().catch(() => {});
+  if (await page.getByTitle('Scroll to bottom').isVisible()) await page.getByTitle('Scroll to bottom').click();
   const backgroundLiveLabel = 'background-live-select';
   const backgroundLiveSamples = [];
   evidence.backgroundLiveSamples = backgroundLiveSamples;
@@ -493,7 +613,7 @@ try {
   await select('E2E-A');
 
   const assertSingleBackgroundReply = async () => {
-    const sample = await page.evaluate(({ sessionId, label }) => {
+    const sample = await page.evaluate(({ label }) => {
       const store = window.__panSessionStore.getState();
       const rows = store.currentMessages.filter(message => message.role === 'assistant'
         && String(message.content).includes(`answer:${label}`));
@@ -501,7 +621,7 @@ try {
         .filter(element => element.textContent.includes(`answer:${label}`))
         .map(element => ({ index: Number(element.dataset.index), text: element.textContent }));
       return { sessionId: store.currentSessionId, rows, dom };
-    }, { sessionId: ids['E2E-A'], label: backgroundLiveLabel });
+    }, { label: backgroundLiveLabel });
     assert.equal(sample.sessionId, ids['E2E-A'], 'the streaming Session is selected');
     assert.equal(sample.rows.length, 1, `store has one ${backgroundLiveLabel} assistant row`);
     assert.equal(sample.dom.length, 1, `DOM has one ${backgroundLiveLabel} assistant row`);
@@ -609,7 +729,8 @@ try {
   await select('E2E-A');
   await page.bringToFront();
   await poll(() => page.evaluate(() => document.visibilityState), s => s === 'visible', 'page foreground before background stream');
-  await page.getByTitle('Scroll to bottom').click().catch(() => {});
+  console.log('BACKGROUND selected A');
+  await page.getByTitle('Scroll to bottom').click({ timeout: 2000 }).catch(() => {});
   await send('background-resume');
   await poll(state, s => s.rows.some(m => m.role === 'tool' && m.content.includes('background-resume')), 'background stream tool visible');
   assert.ok(socketRoute, 'background test needs the live WebSocket route');
@@ -626,23 +747,37 @@ try {
     Object.defineProperty(document, 'hidden', { value: true, configurable: true });
     document.dispatchEvent(new window.Event('visibilitychange'));
   });
-  await pageLifecycle.send('Page.setWebLifecycleState', { state: 'frozen' });
+  console.log('BACKGROUND visibility signaled');
   assert.equal(await page.evaluate(() => document.visibilityState), 'hidden', 'page enters browser background');
+  // A frozen renderer cannot execute page.evaluate. Assert before freezing;
+  // only the test process's HTTP polling runs until the page is made active.
+  await pageLifecycle.send('Page.setWebLifecycleState', { state: 'frozen' });
+  console.log('BACKGROUND frozen');
   await poll(() => api(`/api/sessions/${ids['E2E-A']}`), s => s.lastResult?.result?.includes('answer:background-resume'), 'background worker completes while page hidden');
+  console.log('BACKGROUND worker completed');
   await sleep(500);
   await pageLifecycle.send('Page.setWebLifecycleState', { state: 'active' });
-  await page.evaluate(() => {
+  console.log('BACKGROUND activated');
+  // Bring the fixture tab forward before signaling visibility, matching an
+  // actual return to a browser tab.
+  await bounded(() => page.bringToFront(), 15000, 'background bringToFront');
+  console.log('BACKGROUND front');
+  await bounded(() => page.evaluate(() => {
     Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true });
     Object.defineProperty(document, 'hidden', { value: false, configurable: true });
     document.dispatchEvent(new window.Event('visibilitychange'));
-  });
-  await page.bringToFront();
+  }), 15000, 'background visibilitychange');
+  console.log('BACKGROUND visibility restored');
   const resumedAt = Date.now();
   await poll(() => page.evaluate(() => document.visibilityState), s => s === 'visible', 'page resumes from browser background');
+  console.log('BACKGROUND visibility asserted');
   await poll(() => Promise.resolve(socketConnectionCount), count => count > socketsBeforeBackground, 'background resume opens a new websocket');
+  console.log('BACKGROUND socket asserted');
   await poll(state, s => s.rows.some(m => m.role === 'assistant' && m.content.includes('answer:background-resume')), 'background resume converges without reload', 12000);
+  console.log('BACKGROUND transcript asserted');
   faults.backgroundDeadSocket = null;
-  await backgroundPage.close();
+  await bounded(() => backgroundPage.close(), 10000, 'background fixture close');
+  console.log('BACKGROUND fixture closed');
   evidence.stages.push({
     label: 'background tab resume replaces half-open websocket without reload',
     resumedAt,
@@ -652,7 +787,7 @@ try {
 
   // The same invariant while follow-bottom is active. A growing delta must
   // move the viewport, never reorder or repaint the already-rendered tool row.
-  await page.getByTitle('Scroll to bottom').click().catch(() => {});
+  if (await page.getByTitle('Scroll to bottom').isVisible()) await page.getByTitle('Scroll to bottom').click();
   await poll(() => scroller.evaluate(el => el.scrollHeight - el.scrollTop - el.clientHeight), d => d <= 2, 'visual-order pinned before stream');
   const pinnedVisualSnapshots = [];
   evidence.pinnedVisualSnapshots = pinnedVisualSnapshots;
@@ -669,7 +804,7 @@ try {
 
   // Stress the variable-height case with a real expandable multi-tool group,
   // then keep moving the reader while the answer delta grows underneath it.
-  await page.getByTitle('Scroll to bottom').click().catch(() => {});
+  if (await page.getByTitle('Scroll to bottom').isVisible()) await page.getByTitle('Scroll to bottom').click();
   await poll(() => scroller.evaluate(el => el.scrollHeight - el.scrollTop - el.clientHeight), d => d <= 2, 'visual-order stress before stream');
   const stressVisualSnapshots = [];
   evidence.stressVisualSnapshots = stressVisualSnapshots;
@@ -708,9 +843,9 @@ try {
   let editRow = page.locator('.queue-row-in').filter({ hasText: 'edit-me' });
   await editRow.hover();
   await editRow.getByTitle('编辑', { exact: true }).click();
-  await page.locator('.queue-row-in textarea').fill('edited-message');
-  await page.getByTitle('保存', { exact: true }).click();
-  await page.locator('.queue-row-in textarea').waitFor({ state: 'detached' });
+  await page.getByTestId('queue-rich-text-composer').fill('edited-message');
+  await page.getByRole('button', { name: '保存队列编辑', exact: true }).click();
+  await page.getByTestId('queue-rich-text-composer').waitFor({ state: 'detached' });
   await page.locator('.queue-row-in').filter({ hasText: 'edited-message' }).waitFor();
   const deleteRow = page.locator('.queue-row-in').filter({ hasText: 'delete-me' });
   await deleteRow.hover();
@@ -728,6 +863,27 @@ try {
   // Fully load 5000 canonical rows using the same wheel/pagination UI as a user.
   await select('E2E-LONG');
   await page.evaluate(() => window.__stopTranscriptTrace?.());
+  await scroller.hover({ position: { x: 120, y: 80 } });
+  // In this disposable fixture only, disable pagination while genuine wheel
+  // input establishes a stationary top and its reading anchor. Programmatic
+  // jumps alone deliberately retain the previous reading/follow anchor.
+  await page.evaluate(() => window.__panSessionStore.setState({ hasMoreMessages: false }));
+  await page.mouse.wheel(0, -1000000);
+  await poll(() => scroller.evaluate(el => el.scrollTop), top => top === 0,
+    'genuine wheel establishes stationary top');
+  await sleep(500);
+  await page.evaluate(() => window.__panSessionStore.setState({ hasMoreMessages: true }));
+  const clampedBefore = (await state()).start;
+  await sleep(180);
+  assert.equal(await scroller.evaluate(el => el.scrollTop), 0, 'stationary top is established');
+  assert.equal((await state()).start, clampedBefore,
+    'restoring page availability alone does not fetch a history page');
+  const clampedStarted = Date.now();
+  await page.mouse.wheel(0, -700);
+  await poll(state, s => s.start < clampedBefore,
+    'upward wheel at the clamped top loads history without moving down first', 5000);
+  evidence.stages.push({ label: 'clamped-top upward wheel loads older history',
+    before: clampedBefore, after: (await state()).start, elapsedMs: Date.now() - clampedStarted });
   for (let i = 0; i < 110 && (await state()).start > 0; i++) {
     const before = (await state()).start;
     await scroller.hover();
@@ -743,13 +899,50 @@ try {
   const perfStart = Date.now();
   await send('long-stream');
   await poll(state, s => s.rows.some(m => m.content.includes('answer:long-stream')), 'long stream live');
-  await scroller.hover();
+  // Record actual wheel/scroll geometry so a follow failure can be separated
+  // from a transient virtual-height change without weakening the assertion.
+  await scroller.evaluate(el => {
+    const trace = [];
+    const record = (kind, event) => trace.push({ kind, at: performance.now(), top: el.scrollTop,
+      height: el.scrollHeight, client: el.clientHeight,
+      innerWindow: event?.target instanceof window.Element && !!event.target.closest('[data-testid="non-body-group-window"]') });
+    const wheel = event => record('wheel', event);
+    const scroll = () => record('scroll');
+    const topDescriptor = Object.getOwnPropertyDescriptor(window.Element.prototype, 'scrollTop');
+    const originalScrollTo = el.scrollTo;
+    Object.defineProperty(el, 'scrollTop', { configurable: true,
+      get: () => topDescriptor.get.call(el),
+      set: value => {
+        trace.push({ kind: 'scrollTop assignment', at: performance.now(), value, stack: new Error().stack });
+        topDescriptor.set.call(el, value);
+      },
+    });
+    el.scrollTo = function (...args) {
+      trace.push({ kind: 'scrollTo', at: performance.now(), args, stack: new Error().stack });
+      return originalScrollTo.apply(this, args);
+    };
+    record('before');
+    el.addEventListener('wheel', wheel);
+    el.addEventListener('scroll', scroll);
+    window.__stopLongScrollTrace = () => {
+      record('after');
+      el.removeEventListener('wheel', wheel);
+      el.removeEventListener('scroll', scroll);
+      delete el.scrollTop;
+      el.scrollTo = originalScrollTo;
+      return trace;
+    };
+  });
+  // Target the outer transcript rather than an inner tool/thinking window.
+  await scroller.hover({ position: { x: 120, y: 80 } });
   await page.mouse.wheel(0, -700);
-  await sleep(350);
+  await poll(() => scroller.evaluate(el => el.scrollHeight - el.scrollTop - el.clientHeight), d => d > 100, 'wheel opts out of follow');
   const away = await scroller.evaluate(el => el.scrollHeight - el.scrollTop - el.clientHeight);
   assert.ok(away > 100, 'wheel opts out of follow');
   await sleep(450);
-  assert.ok(await scroller.evaluate(el => el.scrollHeight - el.scrollTop - el.clientHeight) > 100, 'stream does not pull reader down');
+  evidence.longScroll = await page.evaluate(() => window.__stopLongScrollTrace());
+  assert.ok(await scroller.evaluate(el => el.scrollHeight - el.scrollTop - el.clientHeight) > 100,
+    `stream does not pull reader down: ${JSON.stringify(evidence.longScroll)}`);
   await page.getByTitle('Scroll to bottom').click();
   await poll(() => scroller.evaluate(el => el.scrollHeight - el.scrollTop - el.clientHeight), d => d <= 2, 'return to bottom');
   await poll(() => api(`/api/sessions/${ids['E2E-LONG']}`), s => s.lastResult?.result?.includes('answer:long-stream'), 'long stream final');
@@ -808,7 +1001,7 @@ try {
 
   const reservationMarker = path.join(runtime, 'handoff-reservation-paused-once');
   await poll(() => fs.stat(reservationMarker).then(() => true).catch(() => false),
-    Boolean, 'queue history/receipt persisted before the CLI hand-off');
+    Boolean, 'queue reservation persisted before the CLI hand-off');
   const historyFile = path.join(runtime, 'sessions', `${ids['E2E-A']}.history.jsonl`);
   const countPersistedAgentRows = async () => {
     const contents = await fs.readFile(historyFile, 'utf8');
@@ -818,8 +1011,26 @@ try {
       return row.role === 'user' && String(row.content).includes(recoveryLabel);
     }).length;
   };
-  assert.equal(await countPersistedAgentRows(), 1,
-    'the reservation boundary appends one durable agent history row');
+  assert.equal(await countPersistedAgentRows(), 0,
+    'reservation must not claim a user history receipt before provider hand-off');
+  const reservedQueue = await api(`/api/sessions/${ids['E2E-A']}/queue`);
+  assert.ok(!reservedQueue.items.some(item => item.queueItemId === recoveryQueueItem.queueItemId),
+    'reading the queue must not reopen a live handoff as an editable pending row');
+  const persistedReservation = JSON.parse(await fs.readFile(targetSessionFile, 'utf8'));
+  // Another Session save may capture the in-memory writing phase while the
+  // gate is held. Both states are unfinished handoffs; neither may be queued
+  // again by a GET, nor appear as a committed user history receipt.
+  const persistedHandoff = persistedReservation.queue_pending.find(item =>
+    item.queueItemId === recoveryQueueItem.queueItemId);
+  assert.ok(persistedHandoff && ['reserved', 'writing'].includes(persistedHandoff.deliveryState),
+    'the unfinished handoff remains durable without being requeued');
+  assert.ok(typeof persistedHandoff.reservedBy === 'string' && persistedHandoff.reservedBy.length > 0);
+  assert.ok(Number.isInteger(persistedHandoff.reservedGeneration));
+  const persistedLedger = persistedReservation.queue_delivery_ledger[recoveryQueueItem.queueItemId];
+  assert.equal(persistedLedger.reservedBy, persistedHandoff.reservedBy);
+  assert.equal(persistedLedger.reservedGeneration, persistedHandoff.reservedGeneration);
+  assert.equal(persistedLedger.deliveryState,
+    'reserved', 'the ledger retains the uncommitted reservation');
 
   const socketsBeforeCrash = socketConnectionCount;
   await stop();
@@ -839,7 +1050,7 @@ try {
     s => s.lastResult?.result?.includes(recoveryLabel),
     'recovered agent message reaches CLI and completes');
   assert.equal(await countPersistedAgentRows(), 1,
-    'reserved-state recovery does not append a second JSONL user row');
+    'reserved-state recovery appends exactly one JSONL user row after hand-off');
   const cliReceiptFile = path.join(runtime, 'crash-recovery-cli-inputs.jsonl');
   const cliReceipts = await fs.readFile(cliReceiptFile, 'utf8');
   assert.equal(cliReceipts.trim().split(/\r?\n/).length, 1,
@@ -879,17 +1090,63 @@ try {
   await sleep(3000);
   await select('E2E-A');
   await equalCanonical('cold server restart and websocket reconnect');
+  // Replay the observed bootstrap ordering in this disposable browser only:
+  // running precedes the first history response, leaving a zero start offset.
+  // The real HTTP tail supplies canonical identities and the terminal version.
+  const recoveredTail = await api(`/api/sessions/${ids['E2E-A']}/history?limit=50`);
+  const earlyBoundary = await page.evaluate(({ id, history }) => {
+    const store = window.__panSessionStore;
+    const meta = { workerId: 'fixture-bootstrap-worker', generation: 1, taskSeq: 901, executionSeq: 2 };
+    const final = history.history.at(-1);
+    if (final?.role !== 'assistant') throw new Error('fixture must end with canonical assistant');
+    store.setState(state => ({ currentSessionId: id, currentMessages: [],
+      sessions: state.sessions.map(session => session.id === id
+        ? { ...session, history: [], historyTotal: 0 } : session),
+      sessionTranscripts: Object.fromEntries(Object.entries(state.sessionTranscripts).filter(([key]) => key !== id)),
+      liveStreamBuffers: {}, terminalWatermarks: {},
+    }));
+    store.getState().applyWorkerStatus(id, 'running', meta);
+    store.getState().applyHistoryPage(id, history);
+    store.getState().applyLiveStream(id, [
+      { ...final }, { role: 'thinking', content: '', nativeItemId: 'bootstrap-orphan-thinking' },
+    ], meta);
+    const start = store.getState().liveStreamBuffers[id].historyStartOffset;
+    const coverage = { historyEpoch: history.historyEpoch, historyRevision: history.historyRevision };
+    store.getState().reconcileWorkerResult(id, { status: 'done', result: final.content, terminalCoverage: coverage }, meta);
+    store.getState().appendWorkerResultMarker(id,
+      { role: 'system', content: '[DONE] Task completed', nativeItemId: 'worker.result:bootstrap-fixture' }, meta, coverage);
+    return { start, orphan: store.getState().currentMessages.some(row => row.nativeItemId === 'bootstrap-orphan-thinking') };
+  }, { id: ids['E2E-A'], history: recoveredTail });
+  assert.equal(earlyBoundary.start, 0, 'running really captures an unknown initial boundary');
+  assert.equal(earlyBoundary.orphan, false, 'completed native thinking must not survive the bounded history proof');
+  await poll(() => page.locator('[data-message-identity*="bootstrap-orphan-thinking"]').count(), count => count === 0,
+    'orphan block disappears in actual Chromium DOM');
+  await equalCanonical('browser store replay: running before first history removes stale thinking');
+  const restartProjection = await page.evaluate(id => {
+    const store = window.__panSessionStore;
+    const meta = { workerId: 'fixture-interrupted-worker', generation: 3, taskSeq: 132, executionSeq: 9 };
+    store.getState().applyWorkerStatus(id, 'running', meta);
+    store.getState().applyLiveStream(id, [{ role: 'assistant', content: 'interrupted prefix', nativeItemId: 'restart-orphan-body' }], meta);
+    const before = store.getState().currentMessages.some(row => row.nativeItemId === 'restart-orphan-body');
+    store.getState().clearLiveStream(id);
+    return { before, after: store.getState().currentMessages.some(row => row.nativeItemId === 'restart-orphan-body') };
+  }, ids['E2E-A']);
+  assert.equal(restartProjection.before, true);
+  assert.equal(restartProjection.after, false);
+  await poll(() => page.locator('[data-message-identity*="restart-orphan-body"]').count(), count => count === 0,
+    'interrupted body disappears from Chromium after lifecycle replacement');
+  await equalCanonical('browser store replay: restart discards unfinished body and preserves canonical history');
   await page.screenshot({ path: path.join(runtime, 'final.png') });
   assert.deepEqual(evidence.errors, []);
   evidence.pass = true;
 } catch (error) {
   evidence.failure = String(error.stack || error);
-  if (page) {
-    evidence.failedState = await state().catch(() => null);
-    evidence.transcriptTrace = await page.evaluate(() => window.__transcriptTrace).catch(() => null);
-    await page.screenshot({ path: path.join(runtime, 'failure.png') }).catch(() => {});
-  }
   console.error(error);
+  if (page) {
+    evidence.failedState = await bounded(state, 3000, 'failure state').catch(() => null);
+    evidence.transcriptTrace = await bounded(() => page.evaluate(() => window.__transcriptTrace), 3000, 'failure trace').catch(() => null);
+    await bounded(() => page.screenshot({ path: path.join(runtime, 'failure.png') }), 3000, 'failure screenshot').catch(() => {});
+  }
   process.exitCode = 1;
 } finally {
   if (browser) await browser.close();

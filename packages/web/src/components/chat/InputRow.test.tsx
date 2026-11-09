@@ -1,12 +1,14 @@
 // @vitest-environment jsdom
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { render, fireEvent, screen, cleanup, waitFor } from '@testing-library/react';
+import { render as renderComponent, fireEvent, screen, cleanup, waitFor } from '@testing-library/react';
+import { MemoryRouter } from 'react-router-dom';
 import { InputRow } from './InputRow';
 import { useSessionStore } from '@/stores/sessionStore';
 import { useQueueStore } from '@/stores/queueStore';
 import { useUIStore } from '@/stores/uiStore';
 import { useAdapterStore } from '@/stores/adapterStore';
 import {
+  ApiRequestError,
   enqueueSessionMessage,
   fetchSessionQueue,
   fetchDirectories,
@@ -17,11 +19,20 @@ import {
   updateSessionQueueItem,
   uploadSessionAttachment,
   registerServerFileAttachment,
+  pickNativeServerFiles,
 } from '@/services/api';
 import { wsClient } from '@/services/ws';
 import { useWorkerStore } from '@/stores/workerStore';
+import { resetDraftStateForTests } from '@/stores/composerDraftStore';
 import type { AdapterConfig } from '@/types';
 import { ATTACHMENT_DRAG_MIME } from '@/utils/attachmentDrag';
+import { requestLockedComposerEnqueue } from '@/shortcuts/composerBridge';
+import { useAppSettingsStore } from '@/stores/appSettingsStore';
+import { setShortcutRecording, useGlobalShortcuts } from '@/shortcuts/useGlobalShortcuts';
+
+// Attachment navigation now requires the same Router context as the Chat route.
+const render = (element: Parameters<typeof renderComponent>[0]) =>
+  renderComponent(<MemoryRouter>{element}</MemoryRouter>);
 
 vi.mock('@/services/ws', () => ({
   wsClient: {
@@ -43,7 +54,10 @@ vi.mock('@/services/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/services/api')>();
   return {
     ...actual,
+    pickNativeServerFiles: vi.fn(),
     ...queueApi,
+    getSessionDraft: vi.fn(async () => ({ revision: 0, draft: null, updatedAt: null })),
+    putSessionDraft: vi.fn(async (_id, draft) => ({ revision: 1, draft, updatedAt: null })),
     patchSession: vi.fn(async () => ({})),
     fetchSessions: vi.fn(async () => []),
     fetchDirectories: vi.fn(async () => ({
@@ -135,7 +149,12 @@ function deferred<T>() {
 }
 
 beforeEach(() => {
+  useAppSettingsStore.setState({ shortcuts: {} });
+  setShortcutRecording(false);
   localStorage.clear();
+  // The draft store is module-scoped and now also feeds remount restoration,
+  // so a previous case's recorded draft must not leak into this one.
+  resetDraftStateForTests();
   useSessionStore.setState({
     currentSessionId: null,
     currentMessages: [],
@@ -145,6 +164,7 @@ beforeEach(() => {
   useWorkerStore.setState({ workers: {}, currentWorkerId: null, currentWorker: null });
   useQueueStore.setState({
     queues: {},
+    queueSelection: {},
     edits: {},
     batchSend: {},
     sendingId: null,
@@ -160,7 +180,11 @@ beforeEach(() => {
   vi.mocked(patchSession).mockClear();
   vi.mocked(sendSession).mockClear();
   vi.mocked(enqueueSessionMessage).mockClear();
-  queueApi.acquireSessionQueueItemEdit.mockReset().mockResolvedValue({ expiresAt: Date.now() + 300_000 });
+  queueApi.acquireSessionQueueItemEdit.mockReset().mockImplementation(async (sessionId: string, id: string) => {
+    const row = (useQueueStore.getState().queues[sessionId] ?? useQueueStore.getState().agentQueues[sessionId] ?? []).find(item => item.id === id);
+    if (!row) throw new Error(`Missing queue lease fixture: ${sessionId}/${id}`);
+    return { expiresAt: Math.floor(Date.now() / 1000) + 300, text: row.text, revision: row.meta?.revision ?? 1, bodyFormat: 'text' };
+  });
   queueApi.fetchSessionQueue.mockReset().mockRejectedValue(new Error('offline'));
   queueApi.releaseSessionQueueItemEdit.mockReset().mockResolvedValue(undefined);
   queueApi.updateSessionQueueItem.mockReset().mockResolvedValue({
@@ -173,10 +197,75 @@ beforeEach(() => {
   });
   vi.mocked(uploadSessionAttachment).mockClear();
   vi.mocked(registerServerFileAttachment).mockClear();
+  vi.mocked(pickNativeServerFiles).mockReset();
   vi.mocked(spawnWorker).mockClear();
   vi.mocked(steerSessionWorker).mockClear();
   vi.mocked(wsClient.send).mockReset().mockReturnValue(true);
   Object.defineProperty(wsClient, 'isOpen', { value: true, configurable: true });
+});
+
+describe('composer keyboard actions', () => {
+  function setup(shortcuts: Record<string, string | null> = {}) {
+    setBusySession();
+    useSessionStore.getState().updateSession('s1', { adapter: 'codex' });
+    useWorkerStore.setState({ workers: { s1: { id: 'w-live', sessionId: 's1', status: 'running' } } });
+    useAppSettingsStore.setState({ shortcuts });
+    render(<InputRow />);
+    const input = screen.getByPlaceholderText(/Type a message/);
+    fireEvent.change(input, { target: { value: 'keyboard draft' } });
+    return input;
+  }
+
+  it('routes configured Steer through the existing button transaction exactly once', async () => {
+    const input = setup({ 'composer.steer': 'Mod+4' });
+    fireEvent.keyDown(input, { key: '4', code: 'Digit4', ctrlKey: true });
+    await waitFor(() => expect(steerSessionWorker).toHaveBeenCalledWith('s1', 'keyboard draft', expect.stringMatching(/^steer:/)));
+    expect(steerSessionWorker).toHaveBeenCalledTimes(1);
+    expect(enqueueSessionMessage).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { isComposing: true }, { keyCode: 229 }, { repeat: true },
+  ])('does not send during IME or repeat: %j', async (flags) => {
+    const input = setup({ 'composer.steer': 'Mod+Enter' });
+    fireEvent.keyDown(input, { key: 'Enter', code: 'Enter', ctrlKey: true, ...flags });
+    await Promise.resolve();
+    expect(steerSessionWorker).not.toHaveBeenCalled();
+    expect(enqueueSessionMessage).not.toHaveBeenCalled();
+  });
+
+  it('disables ambiguous composer/global bindings, including Ctrl/Mod aliases', () => {
+    const input = setup({ 'composer.send': 'Mod+Enter', 'queue.enqueueLocked': 'Ctrl+Enter' });
+    fireEvent.keyDown(input, { key: 'Enter', code: 'Enter', ctrlKey: true });
+    expect(enqueueSessionMessage).not.toHaveBeenCalled();
+    expect(steerSessionWorker).not.toHaveBeenCalled();
+  });
+
+  it('uses the normal locked send mode and does not let hidden Steer bypass it', async () => {
+    const input = setup({ 'composer.steer': 'Mod+4' });
+    useQueueStore.getState().setLockedComposerMode('s1', true);
+    // Store changes must settle before checking the mounted button visibility.
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Steer' })).toBeNull());
+    fireEvent.keyDown(input, { key: '4', code: 'Digit4', ctrlKey: true });
+    expect(steerSessionWorker).not.toHaveBeenCalled();
+    fireEvent.keyDown(input, { key: 'Enter', code: 'Enter' });
+    await waitFor(() => expect(enqueueSessionMessage).toHaveBeenCalledWith('s1', 'keyboard draft', expect.any(String), expect.any(Array), true));
+  });
+
+  it('does not repeat an unknown Steer admission and suppresses keys during recording', async () => {
+    const input = setup({ 'composer.steer': 'Mod+4' });
+    setShortcutRecording(true);
+    fireEvent.keyDown(input, { key: '4', code: 'Digit4', ctrlKey: true });
+    expect(steerSessionWorker).not.toHaveBeenCalled();
+    setShortcutRecording(false);
+    vi.mocked(steerSessionWorker).mockRejectedValueOnce(new Error('network disconnected'));
+    fireEvent.keyDown(input, { key: '4', code: 'Digit4', ctrlKey: true });
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Steer' }).getAttribute('aria-busy')).toBe('true'));
+    fireEvent.change(input, { target: { value: 'newer draft' } });
+    fireEvent.keyDown(input, { key: '4', code: 'Digit4', ctrlKey: true });
+    expect(steerSessionWorker).toHaveBeenCalledTimes(1);
+    expect(enqueueSessionMessage).not.toHaveBeenCalled();
+  });
 });
 
 afterEach(() => {
@@ -188,6 +277,27 @@ afterEach(() => {
 });
 
 describe('InputRow send queue wiring', () => {
+  it.skip('uses the CBC stream capability for direct Steer and hides it for native TUI/oneshot', () => {
+    setBusySession();
+    useAdapterStore.setState({ adapters: [{ name: 'cbc', defaultModel: 'hy3', supportsResume: true,
+      supportsFork: true, supportsSteer: true }] });
+    useWorkerStore.setState({ workers: { s1: { id: 'w1', sessionId: 's1', status: 'running' } } });
+    const view = render(<InputRow />);
+    useSessionStore.setState({ sessions: useSessionStore.getState().sessions.map(s => ({ ...s, nativeControl: false, outputMode: 'oneshot' })) });
+    view.rerender(<MemoryRouter><InputRow /></MemoryRouter>);
+    expect(screen.queryByRole('button', { name: 'Steer' })).toBeNull();
+  });
+  it('keeps CBC stream Steer and native TUI capability boundaries', () => {
+    setBusySession();
+    useAdapterStore.setState({ adapters: [{ name: 'cbc', defaultModel: 'hy3', supportsResume: true,
+      supportsFork: true, supportsSteer: true }] });
+    useWorkerStore.setState({ workers: { s1: { id: 'w1', sessionId: 's1', status: 'running' } } });
+    const view = render(<InputRow />);
+    expect(screen.getByRole('button', { name: 'Steer' })).toBeTruthy();
+    useSessionStore.setState({ sessions: useSessionStore.getState().sessions.map(s => ({ ...s, nativeControl: true })) });
+    view.rerender(<MemoryRouter><InputRow /></MemoryRouter>);
+    expect(screen.queryByRole('button', { name: 'Steer' })).toBeNull();
+  });
   it('keeps Codex Steer visible and routes by sessionId when the session summary is stale', async () => {
     useSessionStore.setState({
       currentSessionId: 's1',
@@ -350,9 +460,229 @@ describe('InputRow send queue wiring', () => {
         '请阅读 [report.txt](/api/fs/read?session_id=s1&path=D%3A%5Cattachments%5Creport.txt&download=1)',
         expect.any(String),
         expect.any(Array),
+        false,
       ),
     );
     await waitFor(() => expect(screen.queryByTestId('server-attachments')).toBeNull());
+  });
+
+  it('stages native multi-selection in the original modal and registers only on confirmation', async () => {
+    setBusySession();
+    vi.mocked(pickNativeServerFiles).mockResolvedValue({ status: 'selected', paths: [
+      'D:\\attachments\\one.txt', 'D:\\attachments\\two.txt',
+    ] });
+    render(<InputRow />);
+    fireEvent.click(screen.getByRole('button', { name: '添加附件' }));
+    fireEvent.click(screen.getByRole('button', { name: /服务端附件$/ }));
+    fireEvent.click(screen.getByRole('button', { name: 'Open server file picker' }));
+    await screen.findByText('D:\\attachments\\one.txt');
+    expect(registerServerFileAttachment).not.toHaveBeenCalled();
+    expect(enqueueSessionMessage).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm selected attachments' }));
+    await waitFor(() => expect(registerServerFileAttachment).toHaveBeenCalledTimes(2));
+    await waitFor(() => {
+      const chips = screen.getByTestId('server-attachments').textContent;
+      expect(chips).toContain('one.txt');
+      expect(chips).toContain('two.txt');
+    });
+    expect(enqueueSessionMessage).not.toHaveBeenCalled();
+  });
+
+  it('enqueues pasted URLs as standard Markdown links in order', async () => {
+    setBusySession();
+    render(<InputRow />);
+    fireEvent.change(screen.getByPlaceholderText(/Type a message/), {
+      target: { value: '请阅读 ' },
+    });
+    const editor = screen.getByTestId('rich-text-composer');
+    const text = editor.querySelector('span')?.firstChild;
+    const range = document.createRange();
+    range.setStart(text!, text!.textContent!.length);
+    range.collapse(true);
+    window.getSelection()?.removeAllRanges();
+    window.getSelection()?.addRange(range);
+
+    fireEvent.paste(editor, {
+      clipboardData: {
+        files: [],
+        items: [],
+        types: ['text/plain'],
+        getData: (type: string) =>
+          type === 'text/plain'
+            ? '见 https://one.test/a?q=1#h 和 https://two.test/b 结束'
+            : '',
+      } as unknown as DataTransfer,
+    });
+
+    expect(editor.querySelectorAll('[data-composer-url]')).toHaveLength(2);
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+
+    await waitFor(() =>
+      expect(enqueueSessionMessage).toHaveBeenCalledWith(
+        's1',
+        '请阅读 见 [https://one.test/a?q=1#h](https://one.test/a?q=1#h) 和 '
+          + '[https://two.test/b](https://two.test/b) 结束',
+        expect.any(String),
+        [
+          { type: 'text', text: '请阅读 见 ' },
+          { type: 'text', text: '[https://one.test/a?q=1#h](https://one.test/a?q=1#h)' },
+          { type: 'text', text: ' 和 ' },
+          { type: 'text', text: '[https://two.test/b](https://two.test/b)' },
+          { type: 'text', text: ' 结束' },
+        ],
+        false,
+      ),
+    );
+  });
+
+  it('sends intentionally repeated URLs twice instead of deduplicating by URL', async () => {
+    setBusySession();
+    render(<InputRow />);
+    const editor = screen.getByTestId('rich-text-composer');
+    const caret = document.createRange();
+    caret.setStart(editor, 0);
+    caret.collapse(true);
+    window.getSelection()?.removeAllRanges();
+    window.getSelection()?.addRange(caret);
+    const pasteOnce = () =>
+      fireEvent.paste(editor, {
+        clipboardData: {
+          files: [],
+          items: [],
+          types: ['text/plain'],
+          getData: (type: string) => (type === 'text/plain' ? 'https://dup.test/a' : ''),
+        } as unknown as DataTransfer,
+      });
+    pasteOnce();
+    pasteOnce();
+
+    expect(editor.querySelectorAll('[data-composer-url]')).toHaveLength(2);
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+
+    await waitFor(() =>
+      expect(enqueueSessionMessage).toHaveBeenCalledWith(
+        's1',
+        '[https://dup.test/a](https://dup.test/a)[https://dup.test/a](https://dup.test/a)',
+        expect.any(String),
+        [
+          { type: 'text', text: '[https://dup.test/a](https://dup.test/a)' },
+          { type: 'text', text: '[https://dup.test/a](https://dup.test/a)' },
+        ],
+        false,
+      ),
+    );
+  });
+
+  it('preserves an HTML link title in the outbound Markdown payload', async () => {
+    setBusySession();
+    render(<InputRow />);
+    const editor = screen.getByTestId('rich-text-composer');
+    const caret = document.createRange();
+    caret.setStart(editor, 0);
+    caret.collapse(true);
+    window.getSelection()?.removeAllRanges();
+    window.getSelection()?.addRange(caret);
+
+    fireEvent.paste(editor, {
+      clipboardData: {
+        files: [],
+        items: [],
+        types: ['text/html', 'text/plain'],
+        getData: (type: string) =>
+          type === 'text/html'
+            ? '<p>见 <a href="https://example.test/docs?q=1&amp;x=2#h">文档</a></p>'
+            : '见 https://example.test/docs?q=1&x=2#h',
+      } as unknown as DataTransfer,
+    });
+
+    expect(
+      screen.getByRole('group', { name: /链接 文档/ }),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+
+    await waitFor(() =>
+      expect(enqueueSessionMessage).toHaveBeenCalledWith(
+        's1',
+        '见 [文档](https://example.test/docs?q=1&x=2#h)',
+        expect.any(String),
+        [
+          { type: 'text', text: '见 ' },
+          { type: 'text', text: '[文档](https://example.test/docs?q=1&x=2#h)' },
+        ],
+        false,
+      ),
+    );
+  });
+
+  it('serializes URL nodes to Markdown in the queue editor body', async () => {
+    setBusySession();
+    useQueueStore.setState({
+      edits: {
+        s1: {
+          id: 'q-url-edit',
+          text: 'before',
+          originalText: 'before',
+          index: 0,
+          createdAt: 1,
+          editToken: 7,
+          acquiring: false,
+          kind: 'task',
+          bodyFormat: 'text',
+          revision: 1,
+        },
+      },
+    });
+    render(<InputRow />);
+    const editor = await screen.findByTestId('queue-rich-text-composer');
+    const text = editor.querySelector('span')?.firstChild;
+    const caret = document.createRange();
+    caret.setStart(text!, 6);
+    caret.collapse(true);
+    window.getSelection()?.removeAllRanges();
+    window.getSelection()?.addRange(caret);
+
+    fireEvent.paste(editor, {
+      clipboardData: {
+        files: [],
+        items: [],
+        types: ['text/plain'],
+        getData: (type: string) =>
+          type === 'text/plain' ? ' https://queue.test/a?x=1#h' : '',
+      } as unknown as DataTransfer,
+    });
+
+    expect(useQueueStore.getState().edits.s1?.text).toBe(
+      'before [https://queue.test/a?x=1#h](https://queue.test/a?x=1#h)',
+    );
+  });
+
+  it('restores a URL-only submission after an explicit enqueue rejection', async () => {
+    setBusySession();
+    vi.mocked(enqueueSessionMessage).mockRejectedValueOnce(new ApiRequestError(409, 'rejected'));
+    render(<InputRow />);
+    const editor = screen.getByTestId('rich-text-composer');
+    const caret = document.createRange();
+    caret.setStart(editor, 0);
+    caret.collapse(true);
+    window.getSelection()?.removeAllRanges();
+    window.getSelection()?.addRange(caret);
+
+    fireEvent.paste(editor, {
+      clipboardData: {
+        files: [],
+        items: [],
+        types: ['text/plain'],
+        getData: (type: string) =>
+          type === 'text/plain' ? 'https://fail.test/a?q=1#h' : '',
+      } as unknown as DataTransfer,
+    });
+    expect(editor.querySelector('[data-composer-url]')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+
+    await waitFor(() =>
+      expect(editor.querySelector('[data-composer-url]')).toBeTruthy(),
+    );
+    expect(editor.textContent).toContain('https://fail.test/a?q=1#h');
   });
 
   it('drops a message attachment into the editor and queues it at the text caret', async () => {
@@ -393,6 +723,7 @@ describe('InputRow send queue wiring', () => {
         '请先 [接口说明.md](/api/attachments/upload_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.md?session_id=s1)后续',
         expect.any(String),
         expect.any(Array),
+        false,
       ),
     );
   });
@@ -549,6 +880,7 @@ describe('InputRow send queue wiring', () => {
         ),
         expect.any(String),
         expect.any(Array),
+        false,
       ),
     );
     expect(uploadSessionAttachment).not.toHaveBeenCalled();
@@ -734,6 +1066,7 @@ describe('InputRow send queue wiring', () => {
         '审阅 [main.ts](/api/fs/read?session_id=s1&path=D%3A%5Cproject%5Csrc%5Cmain.ts&download=1)',
         expect.any(String),
         expect.any(Array),
+        false,
       ),
     );
     expect(fetchDirectories).toHaveBeenCalledWith('D:\\project\\src', true);
@@ -871,6 +1204,7 @@ describe('InputRow send queue wiring', () => {
         '合并发送 [report.txt](/api/fs/read?session_id=s1&path=D%3A%5Cattachments%5Creport.txt&download=1) [client.txt](/api/attachments/upload_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.txt?session_id=s1)',
         expect.any(String),
         expect.any(Array),
+        false,
       ),
     );
   });
@@ -915,6 +1249,28 @@ describe('InputRow send queue wiring', () => {
     );
   });
 
+  it('restores an interrupted upload as retryable after switching away and ignores its late response', async () => {
+    setBusySession();
+    const first = useSessionStore.getState().sessions[0]!;
+    useSessionStore.setState({ sessions: [first, { ...first, id: 's2', name: 'Other' }] });
+    const upload = deferred<Awaited<ReturnType<typeof uploadSessionAttachment>>>();
+    vi.mocked(uploadSessionAttachment).mockReturnValueOnce(upload.promise);
+    render(<InputRow />);
+    fireEvent.change(screen.getByTestId('client-attachment-input'), {
+      target: { files: [new File(['original bytes'], 'interrupted.txt', { type: 'text/plain' })] },
+    });
+    await waitFor(() => expect(screen.getByTestId('attachment-upload-progress').textContent).toContain('上传中'));
+    useSessionStore.setState({ currentSessionId: 's2', currentMessages: [] });
+    await waitFor(() => expect(screen.queryByTestId('server-attachments')).toBeNull());
+    upload.resolve({ ok: true, filename: 'interrupted.txt', path: 'ignored-late', size: 14 });
+    await Promise.resolve();
+    expect(screen.queryByTestId('server-attachments')).toBeNull();
+    useSessionStore.setState({ currentSessionId: 's1', currentMessages: [] });
+    await waitFor(() => expect(screen.getByRole('button', { name: '重试上传 interrupted.txt' })).toBeTruthy());
+    expect(screen.getByTestId('attachment-upload-progress').textContent).toContain('失败');
+    expect((screen.getByRole('button', { name: 'Send' }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
   it('keeps failed uploads visible with a retry action', async () => {
     setBusySession();
     vi.mocked(uploadSessionAttachment)
@@ -953,11 +1309,12 @@ describe('InputRow send queue wiring', () => {
       expect(useQueueStore.getState().queues['s1']?.[0]?.text).toBe('queued msg'),
     );
     expect((textarea as HTMLTextAreaElement).value).toBe('');
-    // Successful enqueue is visible immediately, correlated by the server
-    // queue id; a later delivery event must merge idempotently.
-    expect(useSessionStore.getState().currentMessages).toEqual([{
-      role: 'user', content: 'queued msg', queueItemIds: ['q-queued-msg'],
-    }]);
+    // Successful enqueue is visible in the queue immediately. The transcript
+    // starts only at provider hand-off, correlated by the same server queue id.
+    expect(useSessionStore.getState().currentMessages).toEqual([]);
+    expect(useQueueStore.getState().queues.s1?.[0]).toMatchObject({
+      id: 'q-queued-msg', text: 'queued msg',
+    });
 
     // ^ 按钮角标显示 1（面板头部的计数也在 DOM 中，用 getAllByText）
     expect(screen.getAllByText('1').length).toBeGreaterThan(0);
@@ -1025,12 +1382,14 @@ describe('InputRow send queue wiring', () => {
     const row = screen.getByText('before').closest('.queue-row-in');
     expect(row).toBeTruthy();
     fireEvent.click(row!.querySelector('[title="编辑"]')!);
-    const editBox = await screen.findByDisplayValue('before') as HTMLTextAreaElement;
-    await waitFor(() => expect(editBox.disabled).toBe(false));
+    // 编辑器为复用的 RichTextComposer：仅在 lease 取得完整正文后挂载。
+    const editBox = await screen.findByTestId('queue-rich-text-composer');
+    await waitFor(() => expect(editBox.textContent).toBe('before'));
+    await waitFor(() => expect(useQueueStore.getState().edits.s1?.acquiring).toBe(false));
     expect(screen.getByTestId('queue-count-badge').textContent).toBe('1');
     expect(useQueueStore.getState().queues.s1?.map((entry) => entry.id)).toEqual(['q-count-edit']);
 
-    fireEvent.change(editBox, { target: { value: 'after' } });
+    useQueueStore.getState().updateEditDraft('after');
     useQueueStore.getState().saveEdit();
     useQueueStore.getState().saveEdit();
     await waitFor(() => expect(useQueueStore.getState().edits.s1).toBeNull());
@@ -1041,7 +1400,7 @@ describe('InputRow send queue wiring', () => {
     expect(screen.getByTestId('queue-count-badge').textContent).toBe('1');
     expect(fetchSessionQueue).toHaveBeenCalledWith('s1');
     expect(updateSessionQueueItem).toHaveBeenCalledWith(
-      's1', 'q-count-edit', 'after', 1, expect.any(String),
+      's1', 'q-count-edit', 'after', 1, expect.any(String), undefined, [{ type: 'text', text: 'after' }],
     );
   });
 
@@ -1084,6 +1443,7 @@ describe('InputRow send queue wiring', () => {
       'live path msg',
       expect.any(String),
       expect.any(Array),
+      false,
     );
     expect(useSessionStore.getState().currentMessages).toEqual([]);
   });
@@ -1101,8 +1461,8 @@ describe('InputRow send queue wiring', () => {
       { s1: { id: 'w-other', sessionId: 's2', status: 'running' as const } },
     ],
   ])('keeps one optimistic row for %s', async (_name, workers) => {
-    // The summary deliberately says running in every case; only the
-    // current-session runtime registry is authoritative for this decision.
+    // The summary deliberately says running in every case. Each runtime shape
+    // must keep the pending input in the queue until actual provider hand-off.
     setBusySession();
     useWorkerStore.setState({ workers });
     render(<InputRow />);
@@ -1115,9 +1475,10 @@ describe('InputRow send queue wiring', () => {
     await waitFor(() =>
       expect(useQueueStore.getState().queues.s1?.[0]?.text).toBe('fallback path msg'),
     );
-    expect(useSessionStore.getState().currentMessages).toEqual([{
-      role: 'user', content: 'fallback path msg', queueItemIds: ['q-fallback-path-msg'],
-    }]);
+    expect(useSessionStore.getState().currentMessages).toEqual([]);
+    expect(useQueueStore.getState().queues.s1?.[0]).toMatchObject({
+      id: 'q-fallback-path-msg', text: 'fallback path msg',
+    });
   });
 
   it('does not render a stale localStorage queue after a page reload', async () => {
@@ -1164,9 +1525,10 @@ describe('InputRow send queue wiring', () => {
     await waitFor(() =>
       expect(useQueueStore.getState().queues['s1']?.[0]?.text).toBe('direct msg'),
     );
-    expect(useSessionStore.getState().currentMessages).toEqual([{
-      role: 'user', content: 'direct msg', queueItemIds: ['q-direct-msg'],
-    }]);
+    expect(useSessionStore.getState().currentMessages).toEqual([]);
+    expect(useQueueStore.getState().queues.s1?.[0]).toMatchObject({
+      id: 'q-direct-msg', text: 'direct msg',
+    });
   });
 
   it('uses the durable HTTP enqueue path when WS is unavailable', async () => {
@@ -1202,11 +1564,13 @@ describe('InputRow send queue wiring', () => {
         'survive reconnect',
         expect.any(String),
         expect.any(Array),
+        false,
       ),
     );
-    expect(useSessionStore.getState().currentMessages).toEqual([{
-      role: 'user', content: 'survive reconnect', queueItemIds: ['q-survive-reconnect'],
-    }]);
+    expect(useSessionStore.getState().currentMessages).toEqual([]);
+    expect(useQueueStore.getState().queues.s1?.[0]).toMatchObject({
+      id: 'q-survive-reconnect', text: 'survive reconnect',
+    });
   });
 
   it('clears optimistically and restores the complete draft when enqueue fails', async () => {
@@ -1220,9 +1584,26 @@ describe('InputRow send queue wiring', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Send' }));
     expect(textarea.value).toBe('');
 
-    request.reject(new Error('network result unknown'));
+    request.reject(new ApiRequestError(409, 'submission rejected'));
     await waitFor(() => expect(textarea.value).toBe('retry this message'));
     expect(enqueueSessionMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps an unconfirmed send cleared and blocks retransmission', async () => {
+    setBusySession();
+    const request = deferred<Awaited<ReturnType<typeof enqueueSessionMessage>>>();
+    vi.mocked(enqueueSessionMessage).mockReturnValueOnce(request.promise);
+    render(<InputRow />);
+    const textarea = screen.getByPlaceholderText(/Type a message/) as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: 'unknown receipt' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+    expect(textarea.value).toBe('');
+    request.reject(new Error('network result unknown'));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Send' }).getAttribute('aria-busy')).toBe('true'));
+    fireEvent.change(textarea, { target: { value: 'new draft' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+    expect(enqueueSessionMessage).toHaveBeenCalledTimes(1);
+    expect(textarea.value).toBe('new draft');
   });
 
   it('does not let a pending send overwrite input typed after the optimistic clear', async () => {
@@ -1370,6 +1751,7 @@ describe('InputRow send queue wiring', () => {
         'belongs to s1',
         expect.any(String),
         expect.any(Array),
+        false,
       ),
     );
     expect(textarea.value).toBe('belongs to s2');
@@ -1473,7 +1855,7 @@ describe('InputRow responsive composer controls', () => {
     const anchor = screen.getByTestId('send-queue-anchor');
     expect(anchor.className).toContain('absolute');
     expect(anchor.className).toContain('bottom-full');
-    expect(anchor.className).toContain('z-20');
+    expect(anchor.className).toContain('z-40');
     expect(root.getAttribute('style')).toContain('height: 120px');
     expect(screen.getByPlaceholderText(/Type a message/)).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Send' })).toBeTruthy();
@@ -1826,6 +2208,70 @@ describe('InputRow ModelPill search', () => {
   });
 });
 
+describe('InputRow locked-message shortcut bridge', () => {
+  it('uses the normal send transaction with locked=true for text and URL nodes', async () => {
+    setBusySession();
+    render(<InputRow />);
+    fireEvent.change(screen.getByPlaceholderText(/Type a message/), {
+      target: { value: 'hold ' },
+    });
+    const editor = screen.getByTestId('rich-text-composer');
+    const text = editor.querySelector('span')?.firstChild;
+    const range = document.createRange();
+    range.setStart(text!, text!.textContent!.length);
+    range.collapse(true);
+    window.getSelection()?.removeAllRanges();
+    window.getSelection()?.addRange(range);
+    fireEvent.paste(editor, {
+      clipboardData: {
+        files: [],
+        items: [],
+        types: ['text/plain'],
+        getData: (type: string) =>
+          type === 'text/plain' ? 'https://locked.test/a then https://locked.test/b' : '',
+      } as unknown as DataTransfer,
+    });
+
+    expect(requestLockedComposerEnqueue('other-session')).toBe(false);
+    expect(requestLockedComposerEnqueue('s1')).toBe(true);
+
+    await waitFor(() =>
+      expect(enqueueSessionMessage).toHaveBeenCalledWith(
+        's1',
+        'hold [https://locked.test/a](https://locked.test/a) then [https://locked.test/b](https://locked.test/b)',
+        expect.any(String),
+        [
+          { type: 'text', text: 'hold ' },
+          { type: 'text', text: '[https://locked.test/a](https://locked.test/a)' },
+          { type: 'text', text: ' then ' },
+          { type: 'text', text: '[https://locked.test/b](https://locked.test/b)' },
+        ],
+        true,
+      ),
+    );
+  });
+
+  it('restores the draft and attachments when a locked enqueue is rejected (no retry)', async () => {
+    setBusySession();
+    render(<InputRow />);
+    vi.mocked(enqueueSessionMessage).mockRejectedValueOnce(
+      new ApiRequestError(409, 'locked enqueue rejected'),
+    );
+    fireEvent.change(screen.getByPlaceholderText(/Type a message/), {
+      target: { value: 'keep this draft' },
+    });
+
+    expect(requestLockedComposerEnqueue('s1')).toBe(true);
+
+    await waitFor(() =>
+      expect((screen.getByPlaceholderText(/Type a message/) as HTMLTextAreaElement).value)
+        .toBe('keep this draft'),
+    );
+    expect(enqueueSessionMessage).toHaveBeenCalledTimes(1);
+    expect(useQueueStore.getState().lockedComposerModes.s1 ?? false).toBe(false);
+  });
+});
+
 describe('InputRow PermissionPill', () => {
   it('keeps the collapsed Codex permission pill to the short label', () => {
     useSessionStore.setState({
@@ -1857,5 +2303,94 @@ describe('InputRow PermissionPill', () => {
     expect(pill.textContent).toBe('read-only');
     fireEvent.click(pill);
     expect(screen.getByText('read-only (auto)')).toBeTruthy();
+  });
+});
+
+describe('reminding card composer', () => {
+  it('toggles card mode, keeps draft on Escape/toggle, changes kind and clears on Session switch', async () => {
+    setBusySession(); render(<InputRow />);
+    const input = screen.getByPlaceholderText(/Type a message/);
+    fireEvent.change(input, {target: {value: 'question draft'}});
+    fireEvent.click(screen.getAllByTestId('new-reminding-card')[0]!);
+    expect(screen.getByRole('button', {name: 'create'})).toBeTruthy();
+    fireEvent.click(screen.getByRole('radio', {name: 'Task'}));
+    expect(screen.getByRole('button', {name: 'create'})).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', {name: 'cancel'}));
+    expect(screen.getByRole('button', {name: 'Send'})).toBeTruthy();
+    expect((input as HTMLTextAreaElement).value).toBe('question draft');
+    fireEvent.click(screen.getAllByTestId('new-reminding-card')[0]!);
+    expect(screen.getByRole('button', {name: 'create'})).toBeTruthy();
+    fireEvent.click(screen.getAllByTestId('new-reminding-card')[0]!);
+    expect((input as HTMLTextAreaElement).value).toBe('question draft');
+    useSessionStore.setState({currentSessionId: 's2', inputDrafts: {s1: 'question draft', s2: 'ordinary s2'}});
+    await waitFor(() => expect((screen.getByPlaceholderText(/Type a message/) as HTMLTextAreaElement).value).toBe('ordinary s2'));
+    expect(useSessionStore.getState().inputDrafts.s1).toBe('');
+    expect(screen.queryByLabelText('Card type')).toBeNull();
+  });
+  it('sends a user task with the existing uploaded attachment identity without enqueue or Steer', async () => {
+    setBusySession();
+    const fetcher = vi.fn(async (_path: string, _init?: RequestInit) => ({ok: true, json: async () => ({card: {id: 'uc'}})}));
+    vi.stubGlobal('fetch', fetcher);
+    render(<InputRow />);
+    fireEvent.click(screen.getAllByTestId('new-reminding-card')[0]!);
+    fireEvent.click(screen.getByRole('radio', {name: 'Task'}));
+    fireEvent.change(screen.getByPlaceholderText(/Type a message/), {target: {value: 'task body'}});
+    fireEvent.change(screen.getByTestId('client-attachment-input'), {target: {files: [new File(['evidence'], 'evidence.txt', {type:'text/plain'})]}});
+    await waitFor(() => expect(screen.getByTestId('attachment-upload-progress').textContent).toContain('已完成'));
+    fireEvent.click(screen.getByRole('button', {name: 'create'}));
+    await waitFor(() => expect(fetcher).toHaveBeenCalledWith('/api/reminding-cards', expect.anything()));
+    const request = fetcher.mock.calls.find((args) => String(args[0]) === '/api/reminding-cards')!;
+    const body = JSON.parse(String((request[1] as RequestInit).body));
+    expect(body).toMatchObject({ownerSessionId:'s1', kind:'task', body:'task body', requestKey:expect.any(String),
+      attachments:[{id:expect.any(String), name:'evidence.txt'}]});
+    expect(enqueueSessionMessage).not.toHaveBeenCalled(); expect(steerSessionWorker).not.toHaveBeenCalled();
+  });
+});
+
+function QueueShortcutHarness() {
+  useGlobalShortcuts(() => {});
+  return null;
+}
+
+describe('queue panel keyboard scope', () => {
+  it('keeps composer focus while expanding and edits the selected row with Alt+Enter', async () => {
+    setBusySession();
+    const first = {
+      id: 'q-kb-1', queueItemId: 'q-kb-1', text: 'first', source: 'user' as const,
+      kind: 'task' as const, createdAt: 1, meta: { dispatchState: 'queued' as const, revision: 1 },
+    };
+    const second = {
+      id: 'q-kb-2', queueItemId: 'q-kb-2', text: 'second', source: 'user' as const,
+      kind: 'task' as const, createdAt: 2, meta: { dispatchState: 'queued' as const, revision: 1 },
+    };
+    useQueueStore.setState({ queues: { s1: [first, second] }, panelOpen: false });
+    render(<><QueueShortcutHarness /><InputRow /></>);
+
+    const editor = screen.getByTestId('rich-text-composer');
+    editor.focus();
+    expect(document.activeElement).toBe(editor);
+
+    const toggle = screen.getByRole('button', { name: /发送队列/ });
+    // A real browser focuses the button on mousedown; the guarded toggle keeps
+    // the caret in the composer instead.
+    expect(fireEvent.mouseDown(toggle)).toBe(false);
+    fireEvent.click(toggle);
+    expect(useQueueStore.getState().panelOpen).toBe(true);
+    expect(document.activeElement).toBe(editor);
+
+    // Alt+Down only highlights; the queue order and text stay untouched.
+    fireEvent.keyDown(editor, { key: 'ArrowDown', code: 'ArrowDown', altKey: true });
+    expect(useQueueStore.getState().queueSelection.s1).toBe('q-kb-1');
+    fireEvent.keyDown(editor, { key: 'ArrowDown', code: 'ArrowDown', altKey: true });
+    expect(useQueueStore.getState().queueSelection.s1).toBe('q-kb-2');
+    expect(useQueueStore.getState().queues.s1?.map((entry) => entry.id)).toEqual(['q-kb-1', 'q-kb-2']);
+    expect(enqueueSessionMessage).not.toHaveBeenCalled();
+
+    // Alt+Enter runs the existing edit flow and hands focus to the edit box.
+    fireEvent.keyDown(editor, { key: 'Enter', code: 'Enter', altKey: true });
+    await waitFor(() => expect(useQueueStore.getState().edits.s1?.id).toBe('q-kb-2'));
+    const editBox = await screen.findByTestId('queue-rich-text-composer');
+    await waitFor(() => expect(editBox.textContent).toBe('second'));
+    await waitFor(() => expect(document.activeElement).toBe(editBox));
   });
 });

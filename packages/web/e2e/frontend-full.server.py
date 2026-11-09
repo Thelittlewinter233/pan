@@ -10,7 +10,7 @@ sys.path.insert(0, str(ROOT))
 spec = importlib.util.spec_from_file_location('browser_fixture', Path(__file__).with_name('server.py'))
 fixture = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fixture)
-assert fixture.PORT in (8765, 8767), 'use only isolated test ports'
+assert fixture.PORT == 8765, 'use only the isolated full-chain test port'
 
 from packages.core.adapters.cbc.adapter import CbcAdapter
 from packages.core.adapters.claude.adapter import ClaudeAdapter
@@ -29,16 +29,17 @@ _reserve_queue_unit = worker_module._reserve_queue_unit
 _CRASH_RECOVERY_LABEL = 'crash-recovery-history-idempotency'
 
 
-async def _reserve_with_crash_gate(worker, session, items, text):
-    history_added = await _reserve_queue_unit(worker, session, items, text)
+async def _reserve_with_crash_gate(worker, session, items, text, expected_revisions=None):
+    history_added = await _reserve_queue_unit(
+        worker, session, items, text, expected_revisions=expected_revisions)
     is_target = any(
         _CRASH_RECOVERY_LABEL in str(item.get('text') or '')
         for item in items
     )
     marker = fixture.RUNTIME / 'handoff-reservation-paused-once'
     if is_target and not marker.exists():
-        # _reserve_queue_unit has durably written the user's history row and
-        # reserved queue receipt, but the provider callback has not started.
+        # _reserve_queue_unit has durably reserved the queue item; history is
+        # written only after hand-off. The provider callback has not started.
         # The browser harness kills this Pan process at that exact boundary.
         marker.write_text('reserved', encoding='utf-8')
         release = fixture.RUNTIME / 'release-handoff-reservation'
@@ -64,6 +65,20 @@ worker_module._queue_item_backoff = _fast_crash_fixture_retry
 worker_module._GLOBAL_WATCHDOG_TICK_SEC = .5
 
 def seed():
+    from fastapi import Body
+    from packages.web import server
+
+    @server.app.post('/__e2e/notice')
+    async def notice(payload: dict = Body(...)):
+        return await worker_module.enqueue_notice(
+            payload['sessionId'], payload['text'],
+            source='automation' if payload.get('noticeKind') else 'agent',
+            source_session_id=payload.get('sourceSessionId') if not payload.get('noticeKind') else None,
+            notice_kind=payload.get('noticeKind'),
+            notice_status='done',
+            job_id='e2e-job-notice' if payload.get('noticeKind') else None,
+        )
+
     fixture.SESSION_DIR.mkdir(parents=True, exist_ok=True)
     # Cold restart must reopen the identical files, never reseed/replace them.
     if list(fixture.SESSION_DIR.glob('*.json')):

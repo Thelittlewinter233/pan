@@ -18,6 +18,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import packages.core.config as config
@@ -40,13 +42,28 @@ def _read(p):
 
 
 _UI_DEFAULTS = {
+    "autoReport": {"system": False, "ma": True, "user": False, "plugins": {},
+                   "summary": {"system": False, "ma": False, "user": False, "plugins": {}}},
     "defaultGroupBy": "none",
+    "showGroupBy": False,
+    "showSidebarCollapseHandle": True,
     "defaultNewSessionToCurrentWorkspace": True,
     "showMetaAgent": True,
     "showTaskAgent": True,
     "showQQ": True,
+    # App Settings → Behavior: user-kill error reports default off (old
+    # configs without the key fall back to the same False).
+    "reportWorkerKillErrors": False,
+    # App Settings → Behavior: automatic Force send is opt-in per source.
+    "autoForceSend": {"system": False, "ma": False, "report": False},
     "notifications": {
         "codexWarningToast": True,
+        "completionBridge": {
+            "system": True, "browser": False, "qqReport": False,
+            "qqSubscribe": False, "qqTargets": [],
+        },
+        # Legacy default: every Session records done unread.
+        "unreadRecording": ["all"],
     },
 }
 
@@ -83,6 +100,7 @@ def test_get_ui_merges_partial_config(tmp_path, monkeypatch):
     assert r["showMetaAgent"] is True
     assert r["showTaskAgent"] is True
     assert r["defaultGroupBy"] == "none"
+    assert r["showGroupBy"] is False
     assert r["notifications"]["codexWarningToast"] is True
 
 
@@ -133,6 +151,68 @@ def test_put_default_new_session_workspace_setting_persists(tmp_path, monkeypatc
     assert asyncio.run(srv.api_get_settings_ui())["defaultNewSessionToCurrentWorkspace"] is False
 
 
+def test_put_ui_report_worker_kill_errors_persists(tmp_path, monkeypatch):
+    """Behavior 开关可持久化，且旧配置缺省为关闭。"""
+    p = _use_temp_config(tmp_path, monkeypatch)
+    _write(p, {"port": 1234})  # old config without the key
+
+    # Absent key → default off.
+    assert asyncio.run(srv.api_get_settings_ui())["reportWorkerKillErrors"] is False
+
+    r = asyncio.run(srv.api_put_settings_ui({"reportWorkerKillErrors": True}))
+    assert r["reportWorkerKillErrors"] is True
+    assert _read(p)["ui"]["reportWorkerKillErrors"] is True
+    assert _read(p)["port"] == 1234  # untouched
+    assert asyncio.run(srv.api_get_settings_ui())["reportWorkerKillErrors"] is True
+
+
+def test_put_ui_auto_force_send_defaults_off_and_persists(tmp_path, monkeypatch):
+    """Three independent Behavior switches default off and round-trip."""
+    p = _use_temp_config(tmp_path, monkeypatch)
+    _write(p, {"port": 1234})  # old config without the key
+
+    assert asyncio.run(srv.api_get_settings_ui())["autoForceSend"] == {
+        "system": False, "ma": False, "report": False,
+    }
+
+    r = asyncio.run(srv.api_put_settings_ui({
+        "autoForceSend": {"ma": True, "report": True},
+    }))
+    assert r["autoForceSend"] == {"system": False, "ma": True, "report": True}
+    assert _read(p)["ui"]["autoForceSend"] == {
+        "system": False, "ma": True, "report": True,
+    }
+    assert _read(p)["port"] == 1234  # untouched
+    # Refresh path: a fresh GET reflects the persisted values.
+    assert asyncio.run(srv.api_get_settings_ui())["autoForceSend"] == {
+        "system": False, "ma": True, "report": True,
+    }
+
+    r = asyncio.run(srv.api_put_settings_ui({
+        "autoForceSend": {"system": True, "ma": False},
+    }))
+    assert r["autoForceSend"] == {"system": True, "ma": False, "report": True}
+
+
+def test_put_ui_auto_force_send_rejects_invalid_shapes(tmp_path, monkeypatch):
+    p = _use_temp_config(tmp_path, monkeypatch)
+    _write(p, {"port": 1234})
+
+    for invalid in (
+        {"ma": "yes"},
+        {"ma": 1},
+        {"unknown": True},
+        {"system": None},
+        [],
+        "on",
+    ):
+        with pytest.raises(srv.HTTPException) as excinfo:
+            asyncio.run(srv.api_put_settings_ui({"autoForceSend": invalid}))
+        assert excinfo.value.status_code == 422
+    # Nothing was partially written.
+    assert _read(p) == {"port": 1234}
+
+
 def test_put_ui_full_replacement(tmp_path, monkeypatch):
     p = _use_temp_config(tmp_path, monkeypatch)
     _write(
@@ -167,6 +247,35 @@ def test_put_ui_unknown_keys_kept_forward_compat(tmp_path, monkeypatch):
     r = asyncio.run(srv.api_put_settings_ui({"futureField": "x"}))
     assert r["futureField"] == "x"
     assert _read(p)["ui"]["futureField"] == "x"
+
+
+def test_put_ui_shortcuts_round_trip_stable_ids_and_explicit_clear(tmp_path, monkeypatch):
+    """Shortcut bindings are keyed by stable action ids, not array positions.
+
+    A ``null`` value is an intentional "cleared" override and must survive the
+    round trip; a later PUT replaces the whole shortcuts object, matching the
+    frontend's full-map write.
+    """
+    p = _use_temp_config(tmp_path, monkeypatch)
+    shortcuts = {
+        "app.toggleSidebar": "Mod+Shift+B",
+        "panel:builtin:chat": "Mod+1",
+        "panel:plugin:alpha/one": None,
+        "queue.lockAll": "Mod+Shift+L",
+        "composer.send": "Enter",
+        "composer.newline": "Shift+Enter",
+        "composer.steer": "Mod+4",
+    }
+    response = asyncio.run(srv.api_put_settings_ui({"shortcuts": shortcuts}))
+    assert response["shortcuts"] == shortcuts
+    assert _read(p)["ui"]["shortcuts"] == shortcuts
+    assert asyncio.run(srv.api_get_settings_ui())["shortcuts"] == shortcuts
+
+    replacement = {"session.toggleNotification": "Mod+Shift+N"}
+    response = asyncio.run(srv.api_put_settings_ui({"shortcuts": replacement}))
+    assert response["shortcuts"] == replacement
+    assert _read(p)["ui"]["shortcuts"] == replacement
+    assert _read(p)["ui"]["showQQ"] is True  # unrelated default untouched
 
 
 # ── save_config atomicity ──

@@ -1,18 +1,26 @@
-import React, { createContext, memo, useContext, useRef, useState } from 'react';
+import React, { createContext, memo, useContext, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import ReactMarkdown, { defaultUrlTransform, type ExtraProps } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import remarkMath from 'remark-math';
 import rehypeHighlight from 'rehype-highlight';
 import rehypeKatex from 'rehype-katex';
+import { CodeWindow } from './CodeWindow';
+import { needsCodeWindow, rehypeBoundCodeHighlight, diffLineClass } from './codePresentation';
 import { Copy, Check, File as FileIcon } from 'lucide-react';
 import { useSessionStore } from '@/stores/sessionStore';
 import { useEditorStore } from '@/stores/editorStore';
 import { useUIStore } from '@/stores/uiStore';
 import { parseMarkdownFileLink } from '@/utils/markdownFileLinks';
+import { resolveEditorFileLink } from '@/utils/editorFileLinks';
 import { normalizeLegacyAttachmentLinks } from '@/utils/attachmentMarkdown';
 import { isSafeAttachmentHref, serverAttachmentDownloadHref } from '@/utils/attachmentMarkdown';
 import { writeAttachmentDragPayload } from '@/utils/attachmentDrag';
 import 'highlight.js/styles/github-dark.css';
+import 'katex/dist/katex.min.css';
+import './markdownMath.css';
+import { SearchTextContext, searchTextPlugin } from './searchText';
+import { beginForegroundRequest } from '@/services/foregroundActivity';
 
 type CodeProps = React.JSX.IntrinsicElements['code'] & ExtraProps;
 type PreProps = React.JSX.IntrinsicElements['pre'] & ExtraProps;
@@ -25,6 +33,8 @@ function transformMarkdownUrl(value: string): string {
   return parseMarkdownFileLink(value) ? value : defaultUrlTransform(value);
 }
 
+const SourceSessionContext = createContext<string | undefined>(undefined);
+
 const RASTER_IMAGE_MIMES = new Set([
   'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/bmp', 'image/avif',
 ]);
@@ -35,10 +45,15 @@ function looksLikeImageLink(href: string, label: React.ReactNode): boolean {
     || extensionPattern.test(extractLinkText(label));
 }
 
-function MarkdownLink({ href, children, attachmentId, node: _node, ...props }: LinkProps & { attachmentId?: string }) {
+const AttachmentDownloadContext = createContext<((href: string) => Promise<void>) | undefined>(undefined);
+
+function MarkdownLink({ href, children, attachmentId, sourcePath, node: _node, ...props }: LinkProps & { attachmentId?: string; sourcePath?: string }) {
   const navigate = useNavigate();
-  const sessionId = useSessionStore((s) => s.currentSessionId);
-  const workdir = useSessionStore((s) => s.sessions.find(x => x.id === s.currentSessionId)?.workdir);
+  const sourceSessionId = useContext(SourceSessionContext);
+  const downloadAttachment = useContext(AttachmentDownloadContext);
+  const currentSessionId = useSessionStore((s) => s.currentSessionId);
+  const sessionId = sourceSessionId ?? currentSessionId;
+  const workdir = useSessionStore((s) => s.sessions.find(x => x.id === sessionId)?.workdir);
   const showToast = useUIStore((s) => s.showToast);
   const draggedRef = useRef(false);
   const dragResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -47,6 +62,15 @@ function MarkdownLink({ href, children, attachmentId, node: _node, ...props }: L
     isSafeAttachmentHref(href)
     || !!fileLink?.serverAttachmentId
   );
+
+  const prepareEditorRoot = (id: string, directory: string): void => {
+    const editor = useEditorStore.getState();
+    if (editor.sessionId !== id || editor.workdir !== directory) {
+      // setRoot updates the identity synchronously. Let its directory read run
+      // alongside the file read so a large tree cannot delay opening a link.
+      void editor.setRoot(id, directory);
+    }
+  };
 
   const handleClick = async (event: React.MouseEvent<HTMLAnchorElement>) => {
     if (draggedRef.current) {
@@ -57,6 +81,11 @@ function MarkdownLink({ href, children, attachmentId, node: _node, ...props }: L
       return;
     }
     if (!href) return;
+    if (downloadAttachment && isSafeAttachmentHref(href)) {
+      event.preventDefault();
+      await downloadAttachment(href);
+      return;
+    }
     const fileLink = parseMarkdownFileLink(href);
 
     // Resolve image identity and MIME through the server-owned attachment
@@ -73,6 +102,7 @@ function MarkdownLink({ href, children, attachmentId, node: _node, ...props }: L
         showToast('当前没有可用的 Editor 工作目录，无法预览图片', 'error');
         return;
       }
+      const finishRequest = beginForegroundRequest();
       try {
         const response = await fetch(
           `/api/attachments/editor/${encodeURIComponent(attachmentId)}`
@@ -88,7 +118,7 @@ function MarkdownLink({ href, children, attachmentId, node: _node, ...props }: L
           window.location.assign(href);
           return;
         }
-        await useEditorStore.getState().setRoot(sessionId, workdir);
+        prepareEditorRoot(sessionId, workdir);
         const displayName = typeof metadata.displayName === 'string' ? metadata.displayName : 'attachment';
         const downloadHref = `/api/attachments/ref/${encodeURIComponent(attachmentId)}`
           + `?session_id=${encodeURIComponent(sourceSessionId)}`;
@@ -99,6 +129,8 @@ function MarkdownLink({ href, children, attachmentId, node: _node, ...props }: L
         if (opened) navigate('/editor');
       } catch (error) {
         showToast(`打开图片失败：${error instanceof Error ? error.message : '图片引用已失效'}`, 'error');
+      } finally {
+        finishRequest();
       }
       return;
     }
@@ -114,32 +146,55 @@ function MarkdownLink({ href, children, attachmentId, node: _node, ...props }: L
       return;
     }
 
-    let editorPath = fileLink.path;
-    if (fileLink.serverAttachmentId) {
-      try {
-        const response = await fetch(
-          `/api/attachments/editor/${encodeURIComponent(fileLink.serverAttachmentId)}`
-          + `?session_id=${encodeURIComponent(fileLink.serverSessionId || sessionId)}`,
-        );
-        const metadata = await response.json() as { ok?: boolean; path?: unknown };
-        if (!response.ok || metadata.ok === false || typeof metadata.path !== 'string') {
-          throw new Error('文件引用已失效');
-        }
-        editorPath = metadata.path;
-      } catch (error) {
-        showToast(`打开文件失败：${error instanceof Error ? error.message : '文件引用已失效'}`, 'error');
-        return;
-      }
-    }
+    let stale = false;
+    const isCurrent = () => {
+      const state = useSessionStore.getState();
+      return !stale && (sourceSessionId !== undefined || state.currentSessionId === sessionId)
+        && state.sessions.find((item) => item.id === sessionId)?.workdir === workdir;
+    };
 
-    // Keep the existing editor root in sync before opening. This also covers
-    // links clicked in Chat/DetailPanel before EditorView has mounted.
-    await useEditorStore.getState().setRoot(sessionId, workdir);
-    const location = fileLink.location && editorPath
-      ? { ...fileLink.location, path: editorPath }
-      : fileLink.location;
-    const opened = await useEditorStore.getState().openFile(editorPath, location);
-    if (opened) navigate('/editor');
+    const unsubscribe = useSessionStore.subscribe(() => {
+      if (!isCurrent()) stale = true;
+    });
+    try {
+      let editorPath = !fileLink.serverAttachmentId
+        ? resolveEditorFileLink(href, sourcePath ?? `${workdir.replace(/\\/g, '/')}/`, workdir)?.path ?? fileLink.path
+        : fileLink.path;
+      if (fileLink.serverAttachmentId) {
+        const finishRequest = beginForegroundRequest();
+        try {
+          const response = await fetch(
+            `/api/attachments/editor/${encodeURIComponent(fileLink.serverAttachmentId)}`
+            + `?session_id=${encodeURIComponent(fileLink.serverSessionId || sessionId)}`,
+          );
+          const metadata = await response.json() as { ok?: boolean; path?: unknown };
+          if (!response.ok || metadata.ok === false || typeof metadata.path !== 'string') {
+            throw new Error('文件引用已失效');
+          }
+          editorPath = metadata.path;
+        } catch (error) {
+          showToast(`打开文件失败：${error instanceof Error ? error.message : '文件引用已失效'}`, 'error');
+          return;
+        } finally {
+          finishRequest();
+        }
+      }
+
+      // Keep the existing editor root in sync before opening. This also covers
+      // links clicked in Chat/DetailPanel before EditorView has mounted.
+      if (!isCurrent()) return;
+      prepareEditorRoot(sessionId, workdir);
+      const location = fileLink.location && editorPath
+        ? { ...fileLink.location, path: editorPath }
+        : fileLink.location;
+      const editor = useEditorStore.getState();
+      const opened = fileLink.serverAttachmentId
+        ? await editor.openFile(editorPath, location, isCurrent)
+        : await editor.openPath(editorPath, location, isCurrent);
+      if (opened && isCurrent()) navigate('/editor');
+    } finally {
+      unsubscribe();
+    }
   };
 
   const handleDragStart = (event: React.DragEvent<HTMLAnchorElement>) => {
@@ -224,15 +279,21 @@ function extractAttachmentSessionId(href: string): string | undefined {
 const PreContext = createContext(false);
 
 interface MarkdownRendererProps {
+  /** Explicit container origin; never borrow the currently selected Chat. */
+  sourceSessionId?: string;
   content: string;
   className?: string;
   attachmentIds?: string[];
+  onAttachmentDownload?: (href: string) => Promise<void>;
+  /** Editor document context; Chat links retain their session-root semantics. */
+  sourcePath?: string;
 }
 
 // Keep plugin identity stable so react-markdown does not rebuild its unified
 // pipeline when an unrelated message or sidebar state changes.
-const REMARK_PLUGINS = [remarkGfm];
-const REHYPE_PLUGINS = [rehypeHighlight, rehypeKatex];
+const REMARK_PLUGINS = [remarkGfm, remarkMath];
+const REHYPE_PLUGINS = [rehypeBoundCodeHighlight, rehypeHighlight, rehypeKatex];
+
 
 /** Recursively extract plain text from React nodes (handles hljs spans). */
 function extractCodeText(node: React.ReactNode): string {
@@ -257,6 +318,7 @@ function CopyButton({ codeText }: { codeText: string }) {
   return (
     <button
       onClick={handleCopy}
+      aria-label="Copy code"
       className="text-[10px] text-text-tertiary hover:text-text-primary cursor-pointer transition-colors"
     >
       {copied ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
@@ -269,12 +331,7 @@ function DiffLines({ codeText, node: _node, ...rest }: { codeText: string; node?
     <pre className="p-3 overflow-x-auto m-0">
       <code className="text-xs font-mono leading-relaxed block" {...rest}>
         {codeText.split('\n').map((line: string, i: number) => {
-          let lineClass = '';
-          if (line.startsWith('+') && !line.startsWith('+++')) {
-            lineClass = 'bg-green-500/10 border-l-2 border-green-500 pl-2 -ml-2';
-          } else if (line.startsWith('-') && !line.startsWith('---')) {
-            lineClass = 'bg-red-500/10 border-l-2 border-red-500 pl-2 -ml-2';
-          }
+          const lineClass = diffLineClass(line);
           return (
             <div key={i} className={lineClass} style={{ minHeight: '1.25em' }}>
               {line || '\u00A0'}
@@ -293,6 +350,7 @@ function CodeBlock({
   ...props
 }: CodeProps) {
   const isInPre = useContext(PreContext);
+  const search = useContext(SearchTextContext);
   // Support hyphenated language names (e.g. "shell-session")
   const match = /language-([\w-]+)/.exec(className || '');
   const language = match ? match[1] : null;
@@ -318,7 +376,9 @@ function CodeBlock({
         </span>
         <CopyButton codeText={codeText} />
       </div>
-      {language === 'diff' ? (
+      {needsCodeWindow(codeText) && !search.query ? (
+        <CodeWindow text={codeText} language={langLabel} />
+      ) : language === 'diff' && !search.query ? (
         <DiffLines codeText={codeText} {...props} />
       ) : (
         <pre className="p-3 overflow-x-auto m-0">
@@ -335,33 +395,39 @@ function PreBlock({ children }: PreProps) {
   return <PreContext.Provider value={true}>{children}</PreContext.Provider>;
 }
 
-export const MarkdownRenderer = memo(function MarkdownRenderer({ content, className = '', attachmentIds = [] }: MarkdownRendererProps) {
+export const MarkdownRenderer = memo(function MarkdownRenderer({ content, className = '', attachmentIds = [], sourcePath, sourceSessionId, onAttachmentDownload }: MarkdownRendererProps) {
   // Historical Markdown does not depend on the live session object. Subscribing
   // to it reparsed every visible history row on every streamed token.
   const sessionId = useSessionStore((s) => s.currentSessionId);
+  const search = useContext(SearchTextContext);
+  const plugins = useMemo(() => search.query ? [...REHYPE_PLUGINS, searchTextPlugin(search.query, search.occurrence)] : REHYPE_PLUGINS, [search.query, search.occurrence]);
   if (!content) return null;
-  const renderedContent = normalizeLegacyAttachmentLinks(content, sessionId ?? undefined);
+  const renderedContent = normalizeLegacyAttachmentLinks(content, sourceSessionId ?? sessionId ?? undefined);
   let attachmentIndex = 0;
 
   return (
-    <div className={`prose-kimi max-w-none break-words ${className}`}>
-      <ReactMarkdown
-        remarkPlugins={REMARK_PLUGINS}
-        rehypePlugins={REHYPE_PLUGINS}
-        components={{
-          code: CodeBlock,
-          pre: PreBlock,
-          a: (props) => {
-            const attachmentId = props.href && isSafeAttachmentHref(props.href)
-              ? attachmentIds[attachmentIndex++]
-              : undefined;
-            return <MarkdownLink {...props} attachmentId={attachmentId} />;
-          },
-        }}
-        urlTransform={transformMarkdownUrl}
-      >
-        {renderedContent}
-      </ReactMarkdown>
-    </div>
+    <SourceSessionContext.Provider value={sourceSessionId}>
+      <AttachmentDownloadContext.Provider value={onAttachmentDownload}>
+        <div className={`prose-kimi max-w-none break-words ${className}`}>
+          <ReactMarkdown
+            remarkPlugins={REMARK_PLUGINS}
+            rehypePlugins={plugins}
+            components={{
+              code: CodeBlock,
+              pre: PreBlock,
+              a: (props) => {
+                const attachmentId = props.href && isSafeAttachmentHref(props.href)
+                  ? attachmentIds[attachmentIndex++]
+                  : undefined;
+                return <MarkdownLink {...props} attachmentId={attachmentId} sourcePath={sourcePath} />;
+              },
+            }}
+            urlTransform={transformMarkdownUrl}
+          >
+            {renderedContent}
+          </ReactMarkdown>
+        </div>
+      </AttachmentDownloadContext.Provider>
+    </SourceSessionContext.Provider>
   );
 });

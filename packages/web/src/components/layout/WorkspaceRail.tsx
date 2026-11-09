@@ -1,20 +1,37 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
+  CheckCheck,
   ChevronsLeft,
   ChevronsRight,
   Folder,
   Layers,
   MoreHorizontal,
+  PanelLeft,
+  PanelLeftClose,
   Pencil,
   Plus,
   Trash2,
 } from 'lucide-react';
 import { Modal } from '@/components/ui/Modal';
+import { SearchInput } from '@/components/ui/SearchInput';
 import { useSessionStore } from '@/stores/sessionStore';
+import { useAppSettingsStore } from '@/stores/appSettingsStore';
 import { useUIStore } from '@/stores/uiStore';
+import { useHistorySearchViewStore } from '@/stores/historySearchViewStore';
 import { CREATE_WORKSPACE_DROP_TARGET_ID, useWorkspaceStore } from '@/stores/workspaceStore';
-import { ALL_WORKSPACES, effectiveWorkspaceIds } from '@/utils/sessionFilters';
-import type { Workspace } from '@/types';
+import {
+  ALL_WORKSPACES,
+  UNGROUPED_WORKSPACES,
+  computeWorkspaceRowVisibility,
+  createWorkspaceResolver,
+  workspaceMemberIds,
+} from '@/utils/sessionFilters';
+import {
+  describeActionResults,
+  runSelectedSessionAction,
+  snapshotSelectedSessions,
+} from '@/utils/selectedSessionActions';
+import type { Session, Workspace } from '@/types';
 
 const RAIL_WIDTH = 172;
 const DRAG_THRESHOLD_PX = 5;
@@ -32,6 +49,14 @@ const WORKSPACE_COUNT_STATUS_CLASSES: Record<string, string> = {
  * instead of adding another inset to the conversation.
  */
 const HANDLE_WIDTH = 20;
+/**
+ * Desktop-only Sidebar collapse handle, stacked above the workspace handle.
+ * It is deliberately narrower than the workspace handle (16px vs 20px) and
+ * carries no visible text, so it does not compete with the workspace name.
+ * `GAP` is the clear vertical space between the two handles' click targets.
+ */
+const SIDEBAR_HANDLE_WIDTH = 16;
+const SIDEBAR_HANDLE_GAP = 16;
 
 /**
  * Workspace rail: the vertical session-group switcher attached to the right of
@@ -67,16 +92,30 @@ export function WorkspaceRail({
   const sessions = useSessionStore((s) => s.sessions);
   const expanded = useUIStore((s) => s.railExpanded);
   const setRailExpanded = useUIStore((s) => s.setRailExpanded);
+  const sidebarCollapsed = useUIStore((s) => s.sidebarCollapsed);
+  const toggleSidebar = useUIStore((s) => s.toggleSidebar);
+  const showSidebarCollapseHandle = useAppSettingsStore((s) => s.showSidebarCollapseHandle);
   const isExpanded = mobileDrawer ? mobileExpanded : expanded;
   const activeWorkspaceId = useUIStore((s) => s.activeWorkspaceId);
   const setActiveWorkspace = useUIStore((s) => s.setActiveWorkspace);
   const showToast = useUIStore((s) => s.showToast);
+  const workspaceSearchQuery = useUIStore((s) => s.workspaceSearchQuery);
+  const setWorkspaceSearchQuery = useUIStore((s) => s.setWorkspaceSearchQuery);
+  const specialFilters = useUIStore((s) => s.specialFilters);
+  const adapterFilters = useUIStore((s) => s.adapterFilters);
+  // Global history search hit Sessions (null while no global search runs).
+  // The rail keeps only real Workspaces that contain at least one hit Session;
+  // 'all' still lists every hit. Pure view filtering — no backend or
+  // persistence involvement.
+  const matchingSessionIds = useHistorySearchViewStore((s) => s.matchingSessionIds);
 
   const [editing, setEditing] = useState<{ id: string | '__new__'; value: string } | null>(null);
   const [menuFor, setMenuFor] = useState<{ workspace: Workspace; x: number; y: number } | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Workspace | null>(null);
   const [dropHint, setDropHint] = useState<{ id: string; place: 'before' | 'after' } | null>(null);
   const [draggingId, setDraggingId] = useState<string | null>(null);
+  const [readAllBusy, setReadAllBusy] = useState(false);
+  const readAllBusyRef = useRef(false);
   const nameErrorShown = useRef(false);
 
   useEffect(() => {
@@ -84,32 +123,99 @@ export function WorkspaceRail({
   }, [loaded, loadWorkspaces]);
 
   // The remembered workspace may have been deleted elsewhere → fall back.
+  // 'all' and the virtual 'ungrouped' scope are not workspace ids, so they are
+  // never "missing" and must survive this reconciliation.
   useEffect(() => {
     if (!loaded) return;
+    if (activeWorkspaceId === UNGROUPED_WORKSPACES) return;
     if (activeWorkspaceId !== ALL_WORKSPACES && !workspaces.some((w) => w.id === activeWorkspaceId)) {
       setActiveWorkspace(ALL_WORKSPACES);
     }
   }, [loaded, workspaces, activeWorkspaceId, setActiveWorkspace]);
 
   const memberStats = useMemo(() => {
-    const stats = new Map<string, { count: number; workerStatus: string | null }>();
+    const resolveWorkspace = createWorkspaceResolver(sessions);
+    const stats = new Map<string, { count: number; workerStatus: string | null; unread: boolean }>();
+    // Effective member sessions per workspace (manager inheritance applied) —
+    // the complete source used for shared status aggregation.
+    const members = new Map<string, Session[]>();
+    const ungroupedMembers: Session[] = [];
+    let ungroupedCount = 0;
+    let ungroupedUnread = false;
+    let anyUnread = false;
     for (const session of sessions) {
-      for (const id of effectiveWorkspaceIds(session, sessions)) {
-        const current = stats.get(id) ?? { count: 0, workerStatus: null };
+      const effective = resolveWorkspace(session);
+      const unread = Number.isFinite(session.unreadDoneCount) && Math.floor(session.unreadDoneCount ?? 0) > 0;
+      anyUnread ||= unread;
+      // Same rule as the 'ungrouped' scope filter: a child of a managed root
+      // inherits the root's membership, so it is NOT counted here.
+      if (effective.length === 0) {
+        ungroupedCount += 1;
+        ungroupedUnread ||= unread;
+        ungroupedMembers.push(session);
+      }
+      for (const id of effective) {
+        const current = stats.get(id) ?? { count: 0, workerStatus: null, unread: false };
         current.count += 1;
+        current.unread ||= unread;
         const candidate = session.workerStatus ?? '';
         if ((WORKSPACE_STATUS_RANK[candidate] ?? 0) > (WORKSPACE_STATUS_RANK[current.workerStatus ?? ''] ?? 0)) {
           current.workerStatus = candidate;
         }
         stats.set(id, current);
+        const list = members.get(id);
+        if (list) list.push(session);
+        else members.set(id, [session]);
       }
     }
-    return stats;
+    return { stats, members, ungroupedMembers, ungroupedCount, ungroupedUnread, anyUnread };
   }, [sessions]);
+
+  // Status + adapter filters are shared; aggregate over the full effective membership.
+  const rowVisibility = useMemo(
+    () =>
+      computeWorkspaceRowVisibility(workspaces, sessions, {
+        expanded: isExpanded,
+        searchQuery: workspaceSearchQuery,
+        specialFilters,
+        adapterFilters,
+        membersByWorkspace: memberStats.members,
+        ungroupedMembers: memberStats.ungroupedMembers,
+        matchingSessionIds,
+      }),
+    [isExpanded, workspaces, sessions, workspaceSearchQuery, specialFilters, adapterFilters, memberStats, matchingSessionIds],
+  );
 
   const activeName = activeWorkspaceId === ALL_WORKSPACES
     ? '全部'
+    : activeWorkspaceId === UNGROUPED_WORKSPACES
+    ? '无工作区'
     : workspaces.find((w) => w.id === activeWorkspaceId)?.name ?? '全部';
+
+  /**
+   * Distance from the rail's vertical centre line to the bottom edge of the
+   * Sidebar collapse handle. The workspace handle is vertically centred and
+   * grows with the active workspace name, so its half-height is measured
+   * (and re-measured when that name/viewport changes) instead of hard-coded;
+   * this keeps a real `SIDEBAR_HANDLE_GAP` between the two click targets.
+   */
+  const workspaceHandleRef = useRef<HTMLButtonElement>(null);
+  const [sidebarHandleClearance, setSidebarHandleClearance] = useState(
+    SIDEBAR_HANDLE_GAP + 32,
+  );
+  useLayoutEffect(() => {
+    if (mobileDrawer) return;
+    const handle = workspaceHandleRef.current;
+    if (!handle) return;
+    const measure = () => {
+      setSidebarHandleClearance(handle.offsetHeight / 2 + SIDEBAR_HANDLE_GAP);
+    };
+    measure();
+    if (typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(handle);
+    return () => observer.disconnect();
+  }, [mobileDrawer, sidebarCollapsed]);
 
   const switchTo = useCallback((id: string) => {
     if (id === activeWorkspaceId) return;
@@ -166,6 +272,38 @@ export function WorkspaceRail({
     if (target) setDeleteTarget(target);
   };
 
+  /**
+   * Mark every Session of one Workspace read ("Read all").
+   *
+   * The target set is a snapshot taken HERE, at click time: the workspace's
+   * effective members (management-tree inheritance applied by
+   * `workspaceMemberIds`), never the rows currently visible under the shared
+   * search/status filters. The existing bulk ACK helper runs per target with
+   * each Session's observed done generation, so unread that arrives after the
+   * click stays unread, and failures surface per Session instead of being
+   * silently dropped. `readAllBusyRef` makes a second click a no-op.
+   */
+  const readAllInWorkspace = async (workspace: Workspace) => {
+    if (readAllBusyRef.current) return;
+    readAllBusyRef.current = true;
+    setReadAllBusy(true);
+    setMenuFor(null);
+    try {
+      const sessions = useSessionStore.getState().sessions;
+      const targets = snapshotSelectedSessions(workspaceMemberIds(sessions, workspace.id), sessions);
+      const results = await runSelectedSessionAction(targets, 'read');
+      showToast(
+        describeActionResults(results),
+        results.some((result) => result.error) ? 'error' : 'info',
+      );
+    } catch (e) {
+      showToast(e instanceof Error ? e.message : 'Read all failed', 'error');
+    } finally {
+      readAllBusyRef.current = false;
+      setReadAllBusy(false);
+    }
+  };
+
   const confirmDelete = async () => {
     const target = deleteTarget;
     setDeleteTarget(null);
@@ -209,7 +347,10 @@ export function WorkspaceRail({
     if (!drag?.active) return;
     for (const el of document.querySelectorAll<HTMLElement>('[data-workspace-tab-id]')) {
       const id = el.dataset.workspaceTabId!;
-      if (id === drag.id || id === ALL_WORKSPACES || id === CREATE_WORKSPACE_DROP_TARGET_ID) continue;
+      // 'all' and the virtual 'ungrouped' scope are not persisted workspace
+      // rows: they must never receive a reorder hint, or the sentinel would be
+      // spliced into the order sent to the backend.
+      if (id === drag.id || id === ALL_WORKSPACES || id === UNGROUPED_WORKSPACES || id === CREATE_WORKSPACE_DROP_TARGET_ID) continue;
       const rect = el.getBoundingClientRect();
       if (lastYRef.current >= rect.top && lastYRef.current < rect.bottom) {
         setCurrentDropHint({ id, place: lastYRef.current < rect.top + rect.height / 2 ? 'before' : 'after' });
@@ -396,7 +537,14 @@ export function WorkspaceRail({
           )}
         </div>
 
+        {isExpanded && (
+          <div className="flex border-b border-border-muted px-2 py-1.5">
+            <SearchInput value={workspaceSearchQuery} onChange={setWorkspaceSearchQuery} placeholder="Search workspaces" label="workspace" />
+          </div>
+        )}
+
         <div ref={tabScrollRef} data-testid="workspace-tab-scroll" className="flex-1 overflow-y-auto p-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+          {rowVisibility.showAll && (
           <div
             data-workspace-tab-id={ALL_WORKSPACES}
             role="button"
@@ -408,14 +556,46 @@ export function WorkspaceRail({
           >
             <Layers size={mobileDrawer ? 11 : 12} className="shrink-0" />
             <span className="min-w-0 flex-1 truncate">全部</span>
+            <WorkspaceUnreadDot unread={memberStats.anyUnread} id="all" />
             <span className={`shrink-0 rounded-full border border-border-muted bg-bg-tertiary ${mobileDrawer ? 'px-1 text-[9px]' : 'px-1.5 text-[10px]'} leading-4 text-text-tertiary`}>
               {sessions.length}
             </span>
           </div>
+          )}
 
-          {workspaces.map((workspace) => {
+          {/* Virtual "no workspace" scope, pinned directly under "全部".
+              It is a read-only aggregation over sessions whose EFFECTIVE
+              membership is empty (manager inheritance applied) — never a real
+              Workspace row, so it carries no id the backend could receive:
+              the scope key is the UNGROUPED_WORKSPACES sentinel, and
+              `updateDropHint` skips it so it can never join the persisted
+              workspace order. */}
+          {rowVisibility.showUngrouped && (
+          <div
+            data-workspace-tab-id={UNGROUPED_WORKSPACES}
+            data-testid="workspace-tab-ungrouped"
+            role="button"
+            tabIndex={0}
+            className={tabClass(activeWorkspaceId === UNGROUPED_WORKSPACES, false, null)}
+            title="没有归属任何工作区的会话（虚拟视图，不产生归属）"
+            onClick={() => switchTo(UNGROUPED_WORKSPACES)}
+            onKeyDown={(e) => { if (e.key === 'Enter') switchTo(UNGROUPED_WORKSPACES); }}
+          >
+            <Layers size={mobileDrawer ? 11 : 12} className="shrink-0" />
+            <span className="min-w-0 flex-1 truncate">无工作区</span>
+            <WorkspaceUnreadDot unread={memberStats.ungroupedUnread} id="ungrouped" />
+            <span
+              data-testid="workspace-count-ungrouped"
+              className={`shrink-0 rounded-full border border-border-muted bg-bg-tertiary ${mobileDrawer ? 'px-1 text-[9px]' : 'px-1.5 text-[10px]'} leading-4 text-text-tertiary`}
+            >
+              {memberStats.ungroupedCount}
+            </span>
+          </div>
+          )}
+
+          {rowVisibility.workspaces.map((workspace) => {
             const isEditing = editing?.id === workspace.id;
-            const memberStat = memberStats.get(workspace.id);
+            const memberStat = memberStats.stats.get(workspace.id);
             if (isEditing) {
               return (
                 <div key={workspace.id} className="flex items-center gap-1.5 px-2 py-1">
@@ -459,6 +639,7 @@ export function WorkspaceRail({
               >
                 <Folder size={mobileDrawer ? 11 : 12} className="shrink-0" />
                 <span className="min-w-0 flex-1 truncate">{workspace.name}</span>
+                <WorkspaceUnreadDot unread={memberStat?.unread ?? false} id={workspace.id} />
                 <span
                   data-testid={`workspace-count-${workspace.id}`}
                   data-worker-status={memberStat?.workerStatus ?? 'offline'}
@@ -468,8 +649,13 @@ export function WorkspaceRail({
                 </span>
                 <button
                   type="button"
-                  className="hidden rounded p-0.5 text-text-tertiary group-hover:block hover:bg-bg-tertiary hover:text-text-primary"
+                  className={mobileDrawer
+                    // Touch has no hover: keep the menu trigger reachable in
+                    // the mobile drawer while desktop keeps the hover reveal.
+                    ? 'flex min-h-8 min-w-8 shrink-0 items-center justify-center rounded p-0.5 text-text-tertiary transition-colors hover:bg-bg-tertiary hover:text-text-primary'
+                    : 'hidden rounded p-0.5 text-text-tertiary group-hover:block hover:bg-bg-tertiary hover:text-text-primary'}
                   title="更多"
+                  aria-label={`工作区 ${workspace.name} 菜单`}
                   onPointerDown={(e) => e.stopPropagation()}
                   onClick={(e) => {
                     e.stopPropagation();
@@ -519,9 +705,35 @@ export function WorkspaceRail({
         </div>
       </div>}
 
+      {/* Desktop-only Sidebar collapse/expand handle, stacked above the
+          workspace handle. It has no visible text but keeps an accessible
+          name and native keyboard focus; the workspace handle below is
+          unchanged, and the header/nav controls remain as secondary entries.
+          Shown in both sidebar states (App Settings → Appearance can hide it). */}
+      {!mobileDrawer && showSidebarCollapseHandle && (
+        <button
+          type="button"
+          data-testid="sidebar-collapse-handle"
+          className="absolute right-0 z-40 flex translate-x-full items-center justify-center rounded-r-md border border-l-0 border-border-default bg-bg-tertiary py-2 text-text-secondary shadow-lg transition-colors hover:bg-bg-hover hover:text-text-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+          style={{
+            width: SIDEBAR_HANDLE_WIDTH,
+            bottom: `calc(50% + ${sidebarHandleClearance}px)`,
+          }}
+          aria-label={sidebarCollapsed ? '展开侧边栏' : '收起侧边栏'}
+          title={sidebarCollapsed ? '展开侧边栏' : '收起侧边栏'}
+          onClick={toggleSidebar}
+        >
+          {sidebarCollapsed
+            ? <PanelLeft size={11} aria-hidden="true" />
+            : <PanelLeftClose size={11} aria-hidden="true" />}
+        </button>
+      )}
+
       {/* Floating handle: pinned to the panel's right edge, vertically centered */}
       {(!mobileDrawer || !isExpanded) && <button
+        ref={workspaceHandleRef}
         type="button"
+        data-testid={mobileDrawer ? undefined : 'workspace-rail-handle'}
         className={mobileDrawer
           ? 'absolute left-0 top-1/2 flex min-h-11 min-w-11 -translate-y-1/2 flex-col items-center justify-center gap-1 rounded-r-lg border border-l-0 border-border-default bg-bg-tertiary text-text-secondary shadow-lg transition-colors hover:bg-bg-hover hover:text-text-primary'
           : 'absolute right-0 top-1/2 z-40 flex -translate-y-1/2 translate-x-full flex-col items-center gap-1.5 rounded-r-lg border border-l-0 border-border-default bg-bg-tertiary px-0.5 py-2.5 text-text-secondary shadow-lg transition-colors hover:bg-bg-hover hover:text-text-primary'}
@@ -549,6 +761,17 @@ export function WorkspaceRail({
           >
             <button
               type="button"
+              data-testid={`workspace-read-all-${menuFor.workspace.id}`}
+              disabled={readAllBusy || (memberStats.stats.get(menuFor.workspace.id)?.count ?? 0) === 0}
+              className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-text-primary transition-colors hover:bg-accent/20 disabled:cursor-not-allowed disabled:opacity-50"
+              aria-busy={readAllBusy}
+              onClick={() => void readAllInWorkspace(menuFor.workspace)}
+            >
+              <CheckCheck size={12} className="text-text-tertiary" />
+              Read all
+            </button>
+            <button
+              type="button"
               className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-text-primary transition-colors hover:bg-accent/20"
               onClick={() => { nameErrorShown.current = false; setEditing({ id: menuFor.workspace.id, value: menuFor.workspace.name }); setMenuFor(null); }}
             >
@@ -573,8 +796,8 @@ export function WorkspaceRail({
             <p className="text-xs leading-relaxed text-text-secondary">
               确定删除工作区「<span className="text-text-primary">{deleteTarget.name}</span>」？
               会话不会被删除，只会解除归属（变为未分组）。
-              {(memberStats.get(deleteTarget.id)?.count ?? 0) > 0 && (
-                <> 当前有 <span className="text-text-primary">{memberStats.get(deleteTarget.id)?.count}</span> 个会话在该工作区。</>
+              {(memberStats.stats.get(deleteTarget.id)?.count ?? 0) > 0 && (
+                <> 当前有 <span className="text-text-primary">{memberStats.stats.get(deleteTarget.id)?.count}</span> 个会话在该工作区。</>
               )}
             </p>
             <div className="flex justify-end gap-2">
@@ -598,4 +821,10 @@ export function WorkspaceRail({
       </Modal>
     </div>
   );
+}
+
+function WorkspaceUnreadDot({ unread, id }: { unread: boolean; id: string }) {
+  return <span className="flex w-2 shrink-0 items-center justify-center">
+    {unread && <span className="h-1.5 w-1.5 rounded-full bg-yellow-400" role="img" aria-label="工作区有未读消息" title="工作区有未读消息" data-testid={`workspace-unread-${id}`} />}
+  </span>;
 }

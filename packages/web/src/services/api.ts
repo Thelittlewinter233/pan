@@ -1,3 +1,16 @@
+import { beginForegroundRequest, foregroundActivity, subscribeForegroundActivity } from './foregroundActivity';
+
+/** Read one canonical body, before display-time Markdown link projection. */
+export async function fetchSessionMessageText(sessionId: string, messageId: string): Promise<string> {
+  const data = await request<{
+    ok?: boolean; sessionId?: string; message?: { messageId?: string; content?: string };
+  }>(`/api/sessions/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(messageId)}`);
+  if (!data.ok || data.sessionId !== sessionId || data.message?.messageId !== messageId
+      || typeof data.message.content !== 'string') {
+    throw new Error('Message body is unavailable');
+  }
+  return data.message.content;
+}
 import type {
   Session,
   SessionUsageView,
@@ -5,8 +18,9 @@ import type {
   ApiSessionsResponse,
   ApiSessionResponse,
   ApiSessionHistoryResponse,
-  ApiSessionSearchResponse,
+  ApiHistorySearchResponse,
   ApiGenericResponse,
+  ApiDelayedRestartResponse,
   AdapterConfig,
   ApiConfigResponse,
   ApiDataCatalogResponse,
@@ -20,6 +34,12 @@ import type {
   ApiBatchDeleteResponse,
   SessionTemplate,
   ApiSessionTemplatesResponse,
+  ApiSessionTemplateTargetsResponse,
+  ApiSessionTemplateSaveResponse,
+  SessionTemplateManifestTarget,
+  SessionTemplateSaveInput,
+  PanAccess,
+  PluginBinding,
   CbcProject,
   CbcSessionItem,
   KimiWorkspace,
@@ -36,12 +56,19 @@ import type {
   FsEntry,
   ApiClaimResponse,
   ApiSessionOrderResponse,
+  ApiSessionPinResponse,
+  ApiSessionUnreadAckResponse,
+  ApiSessionUnreadActionResponse,
+  ApiReapplyUnreadRecordingResponse,
   ApiWorkspacesResponse,
   ApiWorkspaceResponse,
   ApiWorkspaceOrderResponse,
   Workspace,
   ApiReportSubscribeResponse,
   ApiReadonlyResponse,
+  ApiSessionReportToManagerResponse,
+  ApiSessionManualReportResponse,
+  ApiSessionMsgBridgeResponse,
   ApiQqContactsResponse,
   ApiQqChannelsResponse,
   ApiQqSubscribeResponse,
@@ -89,8 +116,22 @@ import type {
   JobPatchInput,
   JobRunRecord,
 } from '@/types/jobs';
+import type { ActionRegistry } from '@/types/actions';
 
 const BASE = '/api';
+
+export class ApiRequestError extends Error {
+  readonly status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = 'ApiRequestError';
+    this.status = status;
+  }
+}
+
+/** An explicit application rejection, distinct from an unconfirmed transport outcome. */
+export class SubmissionRejectedError extends Error {}
 
 export interface DirectoryEntry {
   name: string;
@@ -129,10 +170,117 @@ export interface ServerFileAttachmentResponse extends AttachmentRef {
   size: number;
 }
 
-async function request<T>(url: string, options?: RequestInit): Promise<T> {
+/** Optional navigation work yields to real reads without a startup timer. */
+function waitForForeground(signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(new DOMException('Aborted', 'AbortError'));
+  if (foregroundActivity().requests === 0) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const cleanup = () => { unsubscribe(); signal?.removeEventListener('abort', abort); };
+    const abort = () => { cleanup(); reject(new DOMException('Aborted', 'AbortError')); };
+    const check = () => { if (foregroundActivity().requests === 0) { cleanup(); resolve(); } };
+    const unsubscribe = subscribeForegroundActivity(check);
+    signal?.addEventListener('abort', abort, { once: true });
+    check();
+  });
+}
+
+async function request<T>(url: string, options?: RequestInit, background = false): Promise<T> {
+  const protectedPath = /^\/api\/(actions(?:\/|$)|automation(?:\/|$)|jobs(?:\/|$))/.test(url);
+  const authStore = protectedPath ? (await import('@/stores/automationStore')).useAutomationAuth : null;
+  const auth = authStore?.getState();
+  if (protectedPath) options = { ...options, credentials: 'same-origin', headers: {
+    ...options?.headers, ...(auth?.token ? { Authorization: `Bearer ${auth.token}` } : {}),
+  } };
+  const finish = background ? () => {} : beginForegroundRequest();
+  try { return await requestBody<T>(url, options, background); }
+  catch (error) {
+    if (error instanceof ApiRequestError && error.status === 401 && authStore?.getState() === auth) auth?.clear();
+    throw error;
+  }
+  finally { finish(); }
+}
+
+export function actionRequest<T>(path = '', method = 'GET', body?: unknown, signal?: AbortSignal): Promise<T> {
+  return request<T>('/api/' + path, { method, signal, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+}
+
+export async function fetchPluginPanels(): Promise<import('@/types/pluginPanels').PluginPanel[]> {
+  const data = await request<{ panels: import('@/types/pluginPanels').PluginPanel[] }>('/api/plugins/panels');
+  return data.panels;
+}
+
+const localPanelPath = (plugin: string, panel: string) =>
+  `/api/plugin-panels/${encodeURIComponent(plugin)}/${encodeURIComponent(panel)}`;
+
+export async function fetchLocalPluginPanels(): Promise<import('@/types/pluginPanels').LocalPluginPanel[]> {
+  const data = await request<{ panels: import('@/types/pluginPanels').LocalPluginPanel[] }>('/api/plugin-panels');
+  return data.panels;
+}
+
+/** The build command is declared by the plugin manifest; this request only
+ *  names the panel and can never supply one. */
+export function buildLocalPluginPanel(plugin: string, panel: string) {
+  return request<import('@/types/pluginPanels').LocalPluginPanel>(localPanelPath(plugin, panel) + '/build',
+    { method: 'POST' });
+}
+
+export function setLocalPluginPanelEnabled(plugin: string, panel: string, enabled: boolean) {
+  return request<import('@/types/pluginPanels').LocalPluginPanel>(
+    localPanelPath(plugin, panel) + (enabled ? '/enable' : '/disable'), { method: 'POST' });
+}
+
+export function unbuildLocalPluginPanel(plugin: string, panel: string) {
+  return request<import('@/types/pluginPanels').LocalPluginPanel>(localPanelPath(plugin, panel) + '/unbuild',
+    { method: 'POST' });
+}
+
+/** A panel action failure that kept a stable host-provided code. */
+export class PluginPanelError extends Error {
+  readonly code?: string;
+
+  constructor(message: string, code?: string) {
+    super(message);
+    this.name = 'PluginPanelError';
+    this.code = code;
+  }
+}
+
+/** Host errors may carry `{"ok":false,"error":{"code","message"}}` JSON; keep
+ *  the code so callers can react to a known condition instead of matching
+ *  broad message text. Plain-text errors remain plain failures. */
+export function pluginPanelFailure(text: string): PluginPanelError {
+  try {
+    const payload = JSON.parse(text) as { error?: { code?: unknown; message?: unknown } };
+    const code = payload?.error?.code;
+    const message = payload?.error?.message;
+    if (typeof code === 'string' && code) {
+      return new PluginPanelError(typeof message === 'string' && message ? message : text, code);
+    }
+  } catch {
+    // Not structured; keep the original text below.
+  }
+  return new PluginPanelError(text);
+}
+
+export async function invokePluginPanel<T>(plugin: string, panel: string, action: string,
+  args: Record<string, unknown>, requestId?: string): Promise<T> {
+  const result = await request<{ isError?: boolean; structuredContent?: T; content?: { type: string; text?: string }[] }>(
+    `/api/plugins/${encodeURIComponent(plugin)}/panels/${encodeURIComponent(panel)}/actions/${encodeURIComponent(action)}`,
+    { method: 'POST', body: JSON.stringify({ arguments: args, ...(requestId ? { requestId } : {}) }) });
+  if (result.isError || result.structuredContent === undefined) {
+    throw pluginPanelFailure(result.content?.find((item) => item.type === 'text')?.text || '插件未返回有效结果');
+  }
+  return result.structuredContent;
+}
+
+async function requestBody<T>(url: string, options?: RequestInit, background = false): Promise<T> {
+  // Authorization adds headers to formerly headerless JSON requests. Merge
+  // defaults after spreading options so authentication cannot erase JSON type.
+  const headers = new Headers({ 'Content-Type': 'application/json' });
+  new Headers(options?.headers).forEach((value, key) => headers.set(key, value));
   const res = await fetch(url, {
-    headers: { 'Content-Type': 'application/json' },
     ...options,
+    headers: Object.fromEntries(headers),
   });
   if (!res.ok) {
     let detail = '';
@@ -144,10 +292,99 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
       // Some error responses are empty or not JSON; retain the HTTP status below.
     }
     const status = res.statusText ? `HTTP ${res.status}: ${res.statusText}` : `HTTP ${res.status}`;
-    throw new Error(detail ? `${status}: ${detail}` : status);
+    throw new ApiRequestError(res.status, detail ? `${status}: ${detail}` : status);
   }
-  return res.json() as Promise<T>;
+  if (!background) {
+    if (url.includes('/navigation?')) {
+      const text = await res.text();
+      await waitForForeground(options?.signal ?? undefined);
+      const started = performance.now();
+      const value = JSON.parse(text) as T;
+      performance.clearMeasures('message-navigation-decode');
+      performance.measure('message-navigation-decode', { start: started, end: performance.now() });
+      return value;
+    }
+    return res.json() as Promise<T>;
+  }
+  // Bound speculative decode work, including decompressed responses. A
+  // foreground request may abort this read before JSON.parse starts.
+  const reader = res.body?.getReader();
+  if (!reader) throw new Error('No speculative history response body');
+  const decoder = new TextDecoder();
+  const chunks: string[] = [];
+  let bytes = 0;
+  try {
+    while (true) {
+      const chunk = await reader.read();
+      if (options?.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      if (chunk.done) break;
+      bytes += chunk.value.byteLength;
+      if (bytes > 512 * 1024) throw new Error('Speculative history byte budget exceeded');
+      chunks.push(decoder.decode(chunk.value, { stream: true }));
+    }
+    chunks.push(decoder.decode());
+    if (options?.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    return JSON.parse(chunks.join('')) as T;
+  } finally {
+    await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
+  }
 }
+
+export interface QqGatewayPlugin {
+  id: string;
+  name: string;
+  channel: string;
+  wsUrl: string;
+  cwd: string;
+  command: string[];
+  autoStart: boolean;
+  running: boolean;
+  endpointReachable: boolean;
+  installed: boolean;
+  tokenConfigured: boolean;
+}
+
+export interface QqGatewayPluginsResponse {
+  plugins: QqGatewayPlugin[];
+  selected: string;
+  manifestPath: string;
+  legacyMultiChannel: boolean;
+  legacyChannelCount: number;
+  snowlumaAccounts: SnowLumaAccount[];
+}
+
+export interface SnowLumaAccount {
+  bot_uin: string;
+  ws_url: string;
+}
+
+export const fetchQqGatewayPlugins = () =>
+  request<QqGatewayPluginsResponse>(`${BASE}/settings/qq-plugins`);
+
+export const selectQqGatewayPlugin = (id: string) =>
+  request<{ ok: boolean; requiresPanRestart: boolean }>(`${BASE}/settings/qq-plugins/${encodeURIComponent(id)}/select`, { method: 'POST' });
+
+export const startQqGatewayPlugin = (id: string) =>
+  request<{ ok: boolean }>(`${BASE}/settings/qq-plugins/${encodeURIComponent(id)}/start`, { method: 'POST' });
+
+export const stopQqGatewayPlugin = (id: string) =>
+  request<{ ok: boolean }>(`${BASE}/settings/qq-plugins/${encodeURIComponent(id)}/stop`, { method: 'POST' });
+
+export const setQqGatewayPluginAutostart = (id: string, enabled: boolean) =>
+  request<{ ok: boolean }>(`${BASE}/settings/qq-plugins/${encodeURIComponent(id)}/autostart`, {
+    method: 'PUT', body: JSON.stringify({ enabled }),
+  });
+
+export const setQqGatewayPluginToken = (id: string, token: string) =>
+  request<{ ok: boolean; requiresPanRestart: boolean }>(`${BASE}/settings/qq-plugins/${encodeURIComponent(id)}/token`, {
+    method: 'PUT', body: JSON.stringify({ token }),
+  });
+
+export const setSnowLumaAccounts = (accounts: SnowLumaAccount[]) =>
+  request<{ ok: boolean; requiresPanRestart: boolean }>(`${BASE}/settings/qq-plugins/snowluma/accounts`, {
+    method: 'PUT', body: JSON.stringify({ accounts }),
+  });
 
 export async function fetchDirectories(path?: string, includeFiles = false): Promise<DirectoryListResponse> {
   const params = new URLSearchParams();
@@ -172,7 +409,8 @@ export async function uploadSessionAttachment(
   onProgress?: (loaded: number, total: number) => void,
   signal?: AbortSignal,
 ): Promise<SessionAttachmentUploadResponse> {
-  return new Promise((resolve, reject) => {
+  const finishRequest = beginForegroundRequest();
+  return new Promise<SessionAttachmentUploadResponse>((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     let settled = false;
     const finish = (callback: () => void) => {
@@ -219,11 +457,18 @@ export async function uploadSessionAttachment(
     } catch (error) {
       finish(() => reject(error instanceof Error ? error : new Error(String(error))));
     }
-  });
+  }).finally(finishRequest);
 }
 
 /** Register an existing server-side file without sending a client path back in
  * the message protocol. Directories are rejected by the server in phase 1. */
+export async function pickNativeServerFiles(sessionId: string, directory: string) {
+  return request<{ status: 'selected' | 'cancelled' | 'failed' | 'timeout' | 'busy' | 'unavailable'; paths: string[] }>(
+    `${BASE}/sessions/${encodeURIComponent(sessionId)}/attachments/native-picker`,
+    { method: 'POST', body: JSON.stringify({ directory }), signal: AbortSignal.timeout(100_000) },
+  );
+}
+
 export async function registerServerFileAttachment(
   sessionId: string,
   path: string,
@@ -262,11 +507,20 @@ export async function fetchSession(
   return data;
 }
 
-export async function syncSessionLegalWorkerState(
+export async function markSessionSafelyOffline(
   id: string,
 ): Promise<ApiSessionLegalStateSyncResult> {
   return request<ApiSessionLegalStateSyncResult>(
-    `${BASE}/sessions/${encodeURIComponent(id)}/legal-state/sync`,
+    `${BASE}/sessions/${encodeURIComponent(id)}/legality/mark-safe-offline`,
+    { method: 'POST' },
+  );
+}
+
+export async function markSessionIllegal(
+  id: string,
+): Promise<ApiSessionLegalStateSyncResult> {
+  return request<ApiSessionLegalStateSyncResult>(
+    `${BASE}/sessions/${encodeURIComponent(id)}/legality/mark-illegal`,
     { method: 'POST' },
   );
 }
@@ -292,30 +546,20 @@ export async function fetchSessionHistory(
   before: number = 0,
   limit: number = 50,
   signal?: AbortSignal,
+  searchJump = false,
+  background = false,
 ): Promise<ApiSessionHistoryResponse> {
   const data = await request<ApiSessionHistoryResponse>(
-    `${BASE}/sessions/${id}/history?before=${before}&limit=${limit}`,
-    { signal },
+    `${BASE}/sessions/${id}/history?before=${before}&limit=${limit}${searchJump ? '&searchJump=true' : ''}`,
+    background ? { signal, priority: 'low' } : { signal },
+    background,
   );
   if (data.error) throw new Error(data.error);
   return data;
 }
 
-export async function searchSessionHistory(
-  id: string,
-  query: string,
-  limit = 200,
-  signal?: AbortSignal,
-): Promise<ApiSessionSearchResponse> {
-  const params = new URLSearchParams({ q: query, limit: String(limit) });
-  const data = await request<ApiSessionSearchResponse>(
-    `${BASE}/sessions/${encodeURIComponent(id)}/search?${params.toString()}`,
-    { signal },
-  );
-  if (data.error) throw new Error(data.error);
-  return data;
-}
-
+/** Hide one visible history row via the backend sidecar; the transcript is
+ *  never rewritten, so provider resume stays byte-identical. */
 export async function deleteSessionHistoryMessage(sessionId: string, messageId: string): Promise<void> {
   const data = await request<{ ok?: boolean; error?: string | { message?: string } }>(
     `${BASE}/sessions/${encodeURIComponent(sessionId)}/history/${encodeURIComponent(messageId)}`,
@@ -324,6 +568,114 @@ export async function deleteSessionHistoryMessage(sessionId: string, messageId: 
   if (!data.ok) {
     const error = typeof data.error === 'string' ? data.error : data.error?.message;
     throw new Error(error || '消息删除失败');
+  }
+}
+
+/** Compact navigation pages contain no full conversation bodies or attachments. */
+export async function fetchSessionNavigation(id: string, before = 0, limit = 500, signal?: AbortSignal): Promise<ApiSessionHistoryResponse> {
+  await waitForForeground(signal);
+  const data = await requestBody<ApiSessionHistoryResponse>(`${BASE}/sessions/${id}/navigation?before=${before}&limit=${limit}`, { signal, priority: 'low' });
+  if (data.error) throw new Error(data.error);
+  return data;
+}
+
+export async function fetchHistorySearch(
+  query: string,
+  limit = 50,
+  cursor?: string,
+  signal?: AbortSignal,
+  options?: {
+    sessionId?: string;
+    roles?: import('@/types').HistorySearchRole[];
+    countMode?: 'messages' | 'content';
+    matchIndex?: number;
+    viewportStart?: number;
+    viewportEnd?: number;
+    messageId?: string;
+    prepareLegacy?: boolean;
+  },
+): Promise<ApiHistorySearchResponse> {
+  const params = new URLSearchParams({
+    q: query,
+    limit: String(Math.min(100, Math.max(1, Math.floor(Number.isFinite(limit) ? limit : 50)))),
+  });
+  if (cursor) params.set('cursor', cursor);
+  if (options?.sessionId) params.set('sessionId', options.sessionId);
+  if (options?.roles) params.set('roles', options.roles.join(','));
+    if (options?.countMode) params.set('countMode', options.countMode);
+    if (options?.sessionId && options.countMode === 'content' && !cursor && options.prepareLegacy !== false) params.set('prepareLegacy', 'true');
+  if (options?.matchIndex !== undefined) params.set('matchIndex', String(options.matchIndex));
+  if (options?.viewportStart !== undefined) params.set('viewportStart', String(options.viewportStart));
+  if (options?.viewportEnd !== undefined) params.set('viewportEnd', String(options.viewportEnd));
+  if (options?.messageId) params.set('messageId', options.messageId);
+  return request<ApiHistorySearchResponse>(`${BASE}/history/search?${params.toString()}`, { signal });
+}
+
+export interface HistorySearchPreparation {
+  result: ApiHistorySearchResponse;
+  completed: number;
+  total: number;
+  done: boolean;
+  failedSessions: string[];
+}
+
+export async function prepareHistorySearch(
+  query: string, roles: import('@/types').HistorySearchRole[], limit: number,
+  signal: AbortSignal, onProgress: (event: HistorySearchPreparation) => void,
+): Promise<void> {
+  const finish = beginForegroundRequest();
+  try { await prepareHistorySearchBody(query, roles, limit, signal, onProgress); }
+  finally { finish(); }
+}
+
+async function prepareHistorySearchBody(
+  query: string, roles: import('@/types').HistorySearchRole[], limit: number,
+  signal: AbortSignal, onProgress: (event: HistorySearchPreparation) => void,
+): Promise<void> {
+  const response = await fetch(`${BASE}/history/search/prepare`, {
+    method: 'POST', signal, headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ q: query, roles: roles.join(','), limit }),
+  });
+  if (!response.ok) {
+    let detail = '';
+    try {
+      const body = await response.json() as { detail?: unknown; error?: { message?: unknown } };
+      const candidate = body.detail ?? body.error?.message;
+      if (typeof candidate === 'string') detail = candidate;
+    } catch { /* An older server or reverse proxy may return an HTML error. */ }
+    const status = `HTTP ${response.status}`;
+    const message = response.status === 404 || response.status === 405
+      ? `Old-history preparation is unavailable on this server (${status}). Check that the updated backend is running and the request is routed to it. Results are incomplete.`
+      : `Old-history preparation failed (${status})${detail ? `: ${detail}` : '.'} Results are incomplete. Retry search.`;
+    throw new ApiRequestError(response.status, message);
+  }
+  if (!response.body) throw new Error('Search preparation stream is unavailable.');
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let pending = '';
+  let completed = false;
+  try {
+    while (true) {
+      const chunk = await reader.read();
+      if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+      pending += decoder.decode(chunk.value, { stream: !chunk.done });
+      let end: number;
+      while ((end = pending.indexOf('\n')) >= 0) {
+        const line = pending.slice(0, end);
+        pending = pending.slice(end + 1);
+        if (!line.trim()) continue;
+        const event = JSON.parse(line);
+        if (event.error) throw new ApiRequestError(event.error.status, event.error.message);
+        if (!event.result || typeof event.done !== 'boolean') throw new Error('Invalid search preparation event.');
+        completed = event.done;
+        onProgress(event);
+      }
+      if (chunk.done) break;
+    }
+    if (!completed) throw new Error('Search preparation interrupted; results are incomplete.');
+  } finally {
+    await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
   }
 }
 
@@ -358,6 +710,7 @@ export async function fetchRewindJobStatus(
 }
 
 export interface CreateSessionSettings {
+  nativeControl?: boolean;
   model?: string;
   permissionMode?: string;
   alwaysThinkingEnabled?: boolean;
@@ -365,6 +718,10 @@ export interface CreateSessionSettings {
   outputMode?: string;
   modelContextWindow?: number;
   modelAutoCompactTokenLimit?: number;
+  systemPrompt?: string;
+  mcpServers?: string[];
+  pluginBindings?: PluginBinding[];
+  panAccess?: PanAccess;
   workspaceIds?: string[];
 }
 
@@ -378,6 +735,8 @@ export async function createSession(
   const body: Record<string, unknown> = { name, adapter: adapter || 'cbc' };
   if (workdir) body.workdir = workdir;
   if (sessionTemplate) body.sessionTemplate = sessionTemplate;
+  if (typeof settings?.nativeControl === 'boolean')
+    body.nativeControl = settings.nativeControl;
   // Per-adapter settings (backend _create_session applies them). Sent only
   // when provided so the server-side adapter default still applies otherwise.
   if (settings?.model) body.model = settings.model;
@@ -390,6 +749,10 @@ export async function createSession(
     body.modelContextWindow = settings.modelContextWindow;
   if (settings?.modelAutoCompactTokenLimit !== undefined)
     body.modelAutoCompactTokenLimit = settings.modelAutoCompactTokenLimit;
+  if (settings?.systemPrompt !== undefined) body.systemPrompt = settings.systemPrompt;
+  if (settings?.mcpServers !== undefined) body.mcpServers = settings.mcpServers;
+  if (settings?.pluginBindings !== undefined) body.pluginBindings = settings.pluginBindings;
+  if (settings?.panAccess !== undefined) body.panAccess = settings.panAccess;
   if (settings?.workspaceIds !== undefined)
     body.workspaceIds = settings.workspaceIds;
   const data = await request<ApiSessionResponse>(`${BASE}/sessions`, {
@@ -406,11 +769,28 @@ export async function fetchSessionTemplates(): Promise<SessionTemplate[]> {
   return data.sessionTemplates || [];
 }
 
+export async function fetchSessionTemplateTargets(): Promise<SessionTemplateManifestTarget[]> {
+  const data = await request<ApiSessionTemplateTargetsResponse>(`${BASE}/session-templates/targets`);
+  if (data.error) throw new Error(data.error);
+  return data.manifestTargets || [];
+}
+
+export async function saveSessionTemplate(input: SessionTemplateSaveInput): Promise<void> {
+  const data = await request<ApiSessionTemplateSaveResponse>(`${BASE}/session-templates`, {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
+  if (data.error || data.ok !== true) {
+    throw new Error(data.error || 'Session Template 保存失败');
+  }
+}
+
 export interface NewSessionDefaults {
   adapter: string;
   outputMode: string;
   sessionTemplate: string;
   workdir: string;
+  pluginBindings?: PluginBinding[];
 }
 
 export async function fetchNewSessionDefaults(): Promise<NewSessionDefaults | null> {
@@ -475,6 +855,25 @@ export async function renameSession(id: string, name: string): Promise<ApiGeneri
   return data;
 }
 
+export interface HandoffOptions {
+  handoffPrompt: string;
+  targetSessionId?: string;
+  copySettings?: boolean;
+  adapter?: string;
+  overrideOriginalPrompt?: boolean;
+  originalPrompt?: string;
+}
+
+export async function handoffSession(id: string, options: HandoffOptions): Promise<{
+  ok: boolean; session: Session; archivedSession: Session;
+}> {
+  const data = await request<{ ok: boolean; session: Session; archivedSession: Session; error?: string }>(
+    `${BASE}/sessions/${id}/handoff`, { method: 'POST', body: JSON.stringify(options) },
+  );
+  if (data.error) throw new Error(data.error);
+  return data;
+}
+
 export async function branchSession(id: string, name: string): Promise<Session> {
   const data = await request<ApiSessionResponse>(`${BASE}/sessions/${id}/branch`, {
     method: 'POST',
@@ -486,12 +885,91 @@ export async function branchSession(id: string, name: string): Promise<Session> 
 
 // ── Agent queue (session.queue_pending, normalized) ──
 
-export async function fetchSessionQueue(sessionId: string): Promise<AgentQueueItem[] & { queueRevision?: number }> {
-  const data = await request<ApiSessionQueueResponse>(`${BASE}/sessions/${sessionId}/queue`);
-  if (data.error) throw new Error(data.error);
-  const items = data.items || [];
+export type SessionQueueItems = AgentQueueItem[] & {
+  queueRevision?: number;
+  agentReportsPaused?: boolean;
+  queuePaused?: boolean;
+};
+
+function attachQueueSnapshot(items: AgentQueueItem[], data: ApiSessionQueueResponse): SessionQueueItems {
   Object.defineProperty(items, 'queueRevision', { value: data.queueRevision, enumerable: false });
-  return items;
+  Object.defineProperty(items, 'agentReportsPaused', { value: data.agentReportsPaused, enumerable: false });
+  Object.defineProperty(items, 'queuePaused', { value: data.queuePaused, enumerable: false });
+  return items as SessionQueueItems;
+}
+
+function queueResponseError(error: ApiSessionQueueResponse['error'], fallback: string): string {
+  return typeof error === 'string' ? error : error?.message || fallback;
+}
+
+export async function fetchSessionQueue(sessionId: string): Promise<SessionQueueItems> {
+  const data = await request<ApiSessionQueueResponse>(`${BASE}/sessions/${sessionId}/queue`);
+  if (data.error) throw new Error(queueResponseError(data.error, 'Could not load queue'));
+  return attachQueueSnapshot(data.items || [], data);
+}
+
+export async function setSessionQueuePaused(sessionId: string, paused: boolean): Promise<SessionQueueItems> {
+  const data = await request<ApiSessionQueueResponse>(
+    `${BASE}/sessions/${sessionId}/queue/paused`,
+    { method: 'PATCH', body: JSON.stringify({ paused }) },
+  );
+  if (data.ok === false || data.error) {
+    throw new Error(queueResponseError(data.error, 'Could not update queue pause state'));
+  }
+  return attachQueueSnapshot(data.items || [], data);
+}
+
+export async function steerSessionQueueItem(sessionId: string, itemId: string, expectedRevision: number): Promise<void> {
+  const data = await request<ApiSessionQueueResponse>(
+    `${BASE}/sessions/${sessionId}/queue/${encodeURIComponent(itemId)}/steer`,
+    { method: 'POST', body: JSON.stringify({ expectedRevision }) },
+  );
+  if (data.ok !== true || data.error) {
+    throw new Error(queueResponseError(data.error, 'Queue Steer was not confirmed'));
+  }
+}
+
+export async function setSessionAgentReportsPaused(
+  sessionId: string,
+  paused: boolean,
+): Promise<SessionQueueItems> {
+  const data = await request<ApiSessionQueueResponse>(
+    `${BASE}/sessions/${sessionId}/queue/reports-paused`,
+    { method: 'PATCH', body: JSON.stringify({ paused }) },
+  );
+  if (data.ok === false || data.error) {
+    throw new Error(queueResponseError(data.error, 'Could not update report pause state'));
+  }
+  return attachQueueSnapshot(data.items || [], data);
+}
+
+export async function setSessionQueueItemLocked(
+  sessionId: string,
+  itemId: string,
+  locked: boolean,
+): Promise<SessionQueueItems> {
+  const data = await request<ApiSessionQueueResponse>(
+    `${BASE}/sessions/${sessionId}/queue/${encodeURIComponent(itemId)}/lock`,
+    { method: 'PATCH', body: JSON.stringify({ locked }) },
+  );
+  if (data.ok === false || data.error) {
+    throw new Error(queueResponseError(data.error, 'Queue item lock update failed'));
+  }
+  return attachQueueSnapshot(data.items || [], data);
+}
+
+export async function setSessionQueueItemsLocked(
+  sessionId: string,
+  locked: boolean,
+): Promise<SessionQueueItems> {
+  const data = await request<ApiSessionQueueResponse>(
+    `${BASE}/sessions/${sessionId}/queue/locks`,
+    { method: 'PATCH', body: JSON.stringify({ locked }) },
+  );
+  if (data.ok === false || data.error) {
+    throw new Error(queueResponseError(data.error, 'Queue locks update failed'));
+  }
+  return attachQueueSnapshot(data.items || [], data);
 }
 
 export async function enqueueSessionMessage(
@@ -499,22 +977,41 @@ export async function enqueueSessionMessage(
   text: string,
   clientMessageId: string,
   parts?: MessagePart[],
-): Promise<{ item: AgentQueueItem; queueRevision?: number; duplicate?: boolean }> {
+  locked = false,
+): Promise<{
+  item: AgentQueueItem;
+  items?: AgentQueueItem[];
+  queueRevision?: number;
+  agentReportsPaused?: boolean;
+  queuePaused?: boolean;
+  duplicate?: boolean;
+}> {
   const data = await request<{
     ok?: boolean;
     item?: AgentQueueItem;
+    items?: AgentQueueItem[];
     queueRevision?: number;
+    agentReportsPaused?: boolean;
+  queuePaused?: boolean;
     duplicate?: boolean;
     error?: { message?: string } | string;
   }>(`${BASE}/sessions/${sessionId}/queue`, {
     method: 'POST',
-    body: JSON.stringify({ text, clientMessageId, ...(parts ? { parts } : {}) }),
+    body: JSON.stringify({ text, clientMessageId, ...(parts ? { parts } : {}), ...(locked ? { locked: true } : {}) }),
   });
   if (!data.ok || !data.item) {
     const error = typeof data.error === 'string' ? data.error : data.error?.message;
-    throw new Error(error || '消息尚未入队');
+    if (data.ok === false || data.error) throw new SubmissionRejectedError(error || '消息尚未入队');
+    throw new Error('消息入队回执不完整，结果未确认');
   }
-  return { item: data.item, queueRevision: data.queueRevision, duplicate: data.duplicate };
+  return {
+    item: data.item,
+    items: data.items,
+    queueRevision: data.queueRevision,
+    agentReportsPaused: data.agentReportsPaused,
+    queuePaused: data.queuePaused,
+    duplicate: data.duplicate,
+  };
 }
 
 export async function updateSessionQueueItem(
@@ -523,6 +1020,10 @@ export async function updateSessionQueueItem(
   text: string,
   expectedRevision?: number,
   editToken?: string,
+  /** New attachment references only; the server resolves every other field
+   *  from the Session attachment registry. */
+  parts?: Array<{ type: 'attachment'; attachmentId: string }>,
+  composerParts?: Array<{ type: 'text'; text: string } | { type: 'attachment'; attachmentId: string; occurrenceId: string }>,
 ): Promise<Omit<ApiSessionQueueResponse, 'error'> & {
   item?: AgentQueueItem;
   error?: { code?: string; message?: string } | string;
@@ -532,7 +1033,7 @@ export async function updateSessionQueueItem(
     error?: { code?: string; message?: string } | string;
   }>(`${BASE}/sessions/${sessionId}/queue/${itemId}`, {
     method: 'PATCH',
-    body: JSON.stringify({ text, expectedRevision, editToken }),
+    body: JSON.stringify({ text, expectedRevision, editToken, ...(composerParts ? { composerParts } : parts?.length ? { parts } : {}) }),
   });
   if (data.ok === false || data.error) {
     const error = typeof data.error === 'string' ? data.error : data.error?.message;
@@ -546,20 +1047,33 @@ export async function acquireSessionQueueItemEdit(
   itemId: string,
   editToken: string,
   expectedRevision?: number,
-): Promise<{ expiresAt: number }> {
+  includeBody = false,
+): Promise<{
+  expiresAt: number;
+  text?: string;
+  bodyFormat?: 'text' | 'json' | 'parts';
+  revision?: number;
+}> {
   const data = await request<{
     ok?: boolean;
     expiresAt?: number;
+    text?: string;
+    bodyFormat?: 'text' | 'json' | 'parts';
+    revision?: number;
     error?: { message?: string } | string;
   }>(`${BASE}/sessions/${sessionId}/queue/${itemId}/edit`, {
     method: 'POST',
-    body: JSON.stringify({ editToken, expectedRevision }),
+    body: JSON.stringify({ editToken, expectedRevision, includeBody }),
   });
   if (!data.ok || typeof data.expiresAt !== 'number') {
     const error = typeof data.error === 'string' ? data.error : data.error?.message;
     throw new Error(error || '无法锁定正在编辑的队列消息');
   }
-  return { expiresAt: data.expiresAt };
+  if (includeBody && (typeof data.text !== 'string' || typeof data.revision !== 'number'
+      || !['text', 'json', 'parts'].includes(data.bodyFormat || ''))) {
+    throw new Error('编辑接口未返回完整正文；为避免覆盖预览内容，已停止编辑');
+  }
+  return { expiresAt: data.expiresAt, text: data.text, bodyFormat: data.bodyFormat, revision: data.revision };
 }
 
 export async function releaseSessionQueueItemEdit(
@@ -627,15 +1141,13 @@ export async function reorderSessionQueue(
   sessionId: string,
   order: string[],
   expectedQueueRevision?: number,
-): Promise<AgentQueueItem[] & { queueRevision?: number }> {
+): Promise<SessionQueueItems> {
   const data = await request<ApiSessionQueueResponse>(`${BASE}/sessions/${sessionId}/queue/order`, {
     method: 'PATCH',
     body: JSON.stringify({ orderedIds: order, expectedQueueRevision }),
   });
-  if (data.error) throw new Error(data.error);
-  const items = data.items || [];
-  Object.defineProperty(items, 'queueRevision', { value: data.queueRevision, enumerable: false });
-  return items;
+  if (data.error) throw new Error(queueResponseError(data.error, 'Could not reorder queue'));
+  return attachQueueSnapshot(data.items || [], data);
 }
 
 /** Send a message to a session, queuing it server-side when no worker exists. */
@@ -670,6 +1182,277 @@ export async function reorderSessions(
     throw err;
   }
   return { ok: true, order: data.order || [] };
+}
+
+/** One persisted composer attachment occurrence.
+ *
+ * A local `File` is deliberately absent: bytes that were never uploaded cannot
+ * be recovered after a reload, so a draft never claims they can.  Only
+ * server-owned identities (`attachmentId` for an uploaded file, `path` for a
+ * server file) plus display metadata round-trip. */
+export interface ApiSessionDraftAttachment {
+  localFileId?: string;
+  occurrenceId: string;
+  displayName: string;
+  attachmentId?: string;
+  path?: string;
+  href?: string;
+  mimeType?: string;
+  fileKey?: string;
+  source?: 'upload' | 'server_file';
+  location?: { line: number; endLine?: number };
+}
+
+/** One ordered ComposerValue part.  Attachment occurrences keep their identity
+ *  so the restored inline structure and its order are exact; a URL node is
+ *  self-contained (address + local occurrence id + optional visible title). */
+export type ApiSessionDraftPart =
+  | { type: 'text'; value: string }
+  | { type: 'attachment'; attachmentId: string; occurrenceId?: string }
+  | { type: 'url'; id: string; url: string; label?: string };
+
+export interface ApiSessionDraft {
+  text: string;
+  parts: ApiSessionDraftPart[];
+  attachments: ApiSessionDraftAttachment[];
+}
+
+export interface ApiSessionDraftState {
+  revision: number;
+  draft: ApiSessionDraft | null;
+  updatedAt: string | null;
+}
+
+/** Read one Session's unsent composer draft.  Resolves to revision 0 / null
+ *  draft when the Session has none — a missing draft is an empty composer. */
+export async function getSessionDraft(
+  sessionId: string,
+): Promise<ApiSessionDraftState> {
+  const data = await request<ApiSessionDraftState & { ok?: boolean; error?: { message?: string } }>(
+    `${BASE}/sessions/${encodeURIComponent(sessionId)}/draft`,
+  );
+  if (data.error) throw new Error(data.error.message || 'Draft read failed');
+  return {
+    revision: typeof data.revision === 'number' ? data.revision : 0,
+    draft: data.draft ?? null,
+    updatedAt: typeof data.updatedAt === 'string' ? data.updatedAt : null,
+  };
+}
+
+export class DraftConflictError extends Error {
+  /** The authoritative server draft at conflict time, or null if cleared. */
+  readonly current: ApiSessionDraft | null;
+  readonly currentRevision: number;
+
+  constructor(current: ApiSessionDraft | null, currentRevision: number) {
+    super('Draft changed elsewhere');
+    this.name = 'DraftConflictError';
+    this.current = current;
+    this.currentRevision = currentRevision;
+  }
+}
+
+/** Compare-and-set one Session's composer draft.
+ *
+ *  `baseRevision === null` asserts "create only if absent", which is how a
+ *  first save refuses to clobber a draft another client already wrote.  A
+ *  `null` draft is a versioned tombstone (composer cleared), not a delete. */
+export async function putSessionDraft(
+  sessionId: string,
+  draft: ApiSessionDraft | null,
+  baseRevision: number | null,
+): Promise<ApiSessionDraftState> {
+  const data = await request<
+    ApiSessionDraftState & { ok?: boolean; error?: { code?: string; message?: string } }
+  >(`${BASE}/sessions/${encodeURIComponent(sessionId)}/draft`, {
+    method: 'PUT',
+    body: JSON.stringify({ draft, baseRevision }),
+  });
+  if (data.error) {
+    if (data.error.code === 'draft_conflict') {
+      throw new DraftConflictError(data.draft ?? null, data.revision ?? 0);
+    }
+    throw new Error(data.error.message || 'Draft save failed');
+  }
+  if (typeof data.revision !== 'number') throw new Error('Draft save failed');
+  return { revision: data.revision, draft: data.draft ?? null, updatedAt: data.updatedAt ?? null };
+}
+
+// ── Message bookmarks ──
+
+export interface ApiBookmarkEntry {
+  messageId: string;
+  createdAt: string;
+}
+
+export interface ApiSessionBookmarks {
+  sessionId: string;
+  revision: number;
+  updatedAt: string | null;
+  bookmarks: Record<string, ApiBookmarkEntry>;
+  /** Bookmarked ids whose target row no longer resolves in this Session's
+   *  history (for example after an ambiguous reimport re-id).  Kept on disk,
+   *  excluded from projection, reported here instead of silently dropped. */
+  dangling: string[];
+}
+
+export interface ApiBookmarkMutation {
+  sessionId: string;
+  messageId: string;
+  /** The resulting bookmark state for the target. */
+  bookmarked: boolean;
+  /** False when the request repeated the state already on disk (idempotent
+   *  no-op: no write, no revision bump, no broadcast). */
+  changed: boolean;
+  revision: number;
+  updatedAt: string | null;
+  bookmarks: Record<string, ApiBookmarkEntry>;
+}
+
+export class BookmarkRequestError extends Error {
+  readonly code: string;
+  constructor(code: string, message: string) {
+    super(message);
+    this.name = 'BookmarkRequestError';
+    this.code = code;
+  }
+}
+
+function bookmarkEnvelope(
+  data: (ApiSessionBookmarks | ApiBookmarkMutation) & { ok?: boolean; error?: { code?: string; message?: string } },
+): void {
+  if (data.error) throw new BookmarkRequestError(data.error.code ?? 'bookmark_failed', data.error.message ?? 'Bookmark request failed');
+}
+
+/** Read one Session's bookmarks for a cold load.  A damaged sidecar is
+ *  reported as `bookmarks_unreadable`, never as an empty set. */
+export async function fetchSessionBookmarks(sessionId: string): Promise<ApiSessionBookmarks> {
+  const data = await request<ApiSessionBookmarks & { ok?: boolean; error?: { code?: string; message?: string } }>(
+    `${BASE}/sessions/${encodeURIComponent(sessionId)}/bookmarks`,
+  );
+  bookmarkEnvelope(data);
+  return {
+    sessionId: data.sessionId ?? sessionId,
+    revision: typeof data.revision === 'number' ? data.revision : 0,
+    updatedAt: typeof data.updatedAt === 'string' ? data.updatedAt : null,
+    bookmarks: data.bookmarks ?? {},
+    dangling: Array.isArray(data.dangling) ? data.dangling : [],
+  };
+}
+
+/** Bookmark one message.  Only durable Pan identities that resolve in this
+ *  Session's history are accepted; the call is idempotent. */
+export async function addSessionBookmark(sessionId: string, messageId: string): Promise<ApiBookmarkMutation> {
+  const data = await request<ApiBookmarkMutation & { ok?: boolean; error?: { code?: string; message?: string } }>(
+    `${BASE}/sessions/${encodeURIComponent(sessionId)}/bookmarks/${encodeURIComponent(messageId)}`,
+    { method: 'PUT', body: JSON.stringify({}) },
+  );
+  bookmarkEnvelope(data);
+  return data;
+}
+
+/** Remove one bookmark.  Idempotent; dangling entries stay removable. */
+export async function removeSessionBookmark(sessionId: string, messageId: string): Promise<ApiBookmarkMutation> {
+  const data = await request<ApiBookmarkMutation & { ok?: boolean; error?: { code?: string; message?: string } }>(
+    `${BASE}/sessions/${encodeURIComponent(sessionId)}/bookmarks/${encodeURIComponent(messageId)}`,
+    { method: 'DELETE', body: JSON.stringify({}) },
+  );
+  bookmarkEnvelope(data);
+  return data;
+}
+
+/** Persist one shared Session pin toggle; pin metadata is separate from order. */
+export async function setSessionPinned(
+  sessionId: string,
+  pinned: boolean,
+): Promise<ApiSessionPinResponse & { ok: true; pinRevision: number; sessionIds: string[] }> {
+  const data = await request<ApiSessionPinResponse>(
+    `${BASE}/sessions/${encodeURIComponent(sessionId)}/pin`,
+    { method: 'POST', body: JSON.stringify({ pinned }) },
+  );
+  if (data.ok !== true || typeof data.pinRevision !== 'number' || !Array.isArray(data.sessionIds)) {
+    throw new Error(data.error?.message || 'Pin update failed');
+  }
+  return data as ApiSessionPinResponse & { ok: true; pinRevision: number; sessionIds: string[] };
+}
+
+/** Acknowledge (advance the read cursor of) one Session's unread done badge.
+ *  `observedGeneration` is the done generation the caller actually saw — the
+ *  only race boundary (the server advances max(read, observed); duplicate /
+ *  delayed / retried cursors are idempotent and never clear newer
+ *  generations). Returns the authoritative count + cursor pair. */
+export async function ackSessionUnreadDone(
+  sessionId: string,
+  observedGeneration: number,
+): Promise<ApiSessionUnreadAckResponse
+  & { ok: true; unreadDoneCount: number; unreadDoneGeneration: number; unreadDoneReadGeneration: number }> {
+  const data = await request<ApiSessionUnreadAckResponse>(
+    `${BASE}/sessions/${encodeURIComponent(sessionId)}/unread-done/ack`,
+    { method: 'POST', body: JSON.stringify({ observed: observedGeneration }) },
+  );
+  if (data.ok !== true || typeof data.unreadDoneCount !== 'number'
+      || typeof data.unreadDoneGeneration !== 'number'
+      || typeof data.unreadDoneReadGeneration !== 'number') {
+    throw new Error(data.error?.message || 'Unread ack failed');
+  }
+  return data as ApiSessionUnreadAckResponse
+    & { ok: true; unreadDoneCount: number; unreadDoneGeneration: number; unreadDoneReadGeneration: number };
+}
+
+/** Apply one Session-menu unread action.
+ *
+ *  - `enable-tracking` persists a per-Session "record" override (expectedExcluded
+ *    must be true): the Session records from new events on; a later global
+ *    apply clears the override.
+ *  - `mark-unread` records a fresh marker (expectedGeneration = the generation
+ *    the caller saw) while the Session records and count is 0.
+ *  - `clear-unread` clears up to the observed generation while the Session
+ *    keeps recording. A stale expectation fails with state_changed so the
+ *    caller refreshes instead of applying a wrong action. */
+export async function sessionUnreadAction(
+  sessionId: string,
+  action: 'enable-tracking' | 'mark-unread' | 'clear-unread',
+  expected: { expectedExcluded?: true; expectedGeneration?: number },
+): Promise<ApiSessionUnreadActionResponse
+  & { ok: true; unreadTracking: boolean; unreadDoneCount: number }> {
+  const data = await request<ApiSessionUnreadActionResponse>(
+    `${BASE}/sessions/${encodeURIComponent(sessionId)}/unread-action`,
+    { method: 'POST', body: JSON.stringify({ action, ...expected }) },
+  );
+  if (data.ok !== true || typeof data.unreadTracking !== 'boolean'
+      || typeof data.unreadDoneCount !== 'number') {
+    throw new Error(data.error?.message || 'Unread action failed');
+  }
+  return data as ApiSessionUnreadActionResponse
+    & { ok: true; unreadTracking: boolean; unreadDoneCount: number };
+}
+
+/** Re-apply the persisted unread-recording policy to every Session, clearing
+ *  per-Session overrides even when the scope set did not change. */
+export async function reapplyUnreadRecordingSettings(): Promise<ApiReapplyUnreadRecordingResponse> {
+  const data = await request<ApiReapplyUnreadRecordingResponse>(
+    `${BASE}/settings/unread-recording/reapply`,
+    { method: 'POST' },
+  );
+  if (data.ok !== true) {
+    throw new Error(data.error?.message || 'Could not reapply unread recording settings');
+  }
+  return data;
+}
+
+/** Reorder only the supplied currently pinned IDs; omitted pins keep their slots. */
+export async function reorderPinnedSessions(
+  sessionIds: string[],
+  pinRevision: number,
+): Promise<ApiSessionPinResponse & { ok: true; pinRevision: number; sessionIds: string[] }> {
+  const data = await request<ApiSessionPinResponse>(`${BASE}/sessions/pins/order`, {
+    method: 'POST',
+    body: JSON.stringify({ sessionIds, pinRevision }),
+  });
+  if (data.ok !== true || typeof data.pinRevision !== 'number' || !Array.isArray(data.sessionIds)) {
+    throw new Error(data.error?.message || 'Pinned Session reorder failed');
+  }
+  return data as ApiSessionPinResponse & { ok: true; pinRevision: number; sessionIds: string[] };
 }
 
 /* ── Workspaces: durable named session groups (sidebar rail) ── */
@@ -829,10 +1612,12 @@ export async function setSessionReadonly(
   managerId: string,
   sessionId: string,
   enabled: boolean,
+  expectedCurrent?: boolean,
 ): Promise<ApiReadonlyResponse> {
   const data = await request<ApiReadonlyResponse>(`${BASE}/readonly`, {
     method: 'POST',
-    body: JSON.stringify({ managerId, sessionId, readonlySession: enabled }),
+    body: JSON.stringify({ managerId, sessionId, readonlySession: enabled,
+      ...(expectedCurrent === undefined ? {} : { expectedReadonlySession: expectedCurrent }) }),
   });
   if (data.ok === false || data.error) {
     throw new Error(
@@ -842,7 +1627,95 @@ export async function setSessionReadonly(
   return data;
 }
 
+/** Toggle only the current direct manager's completion-report subscription. */
+export async function setReportsToManager(
+  sessionId: string,
+  managerId: string,
+  enabled: boolean,
+): Promise<ApiSessionReportToManagerResponse & { ok: true; reportsToManager: boolean }> {
+  const data = await request<ApiSessionReportToManagerResponse>(
+    `${BASE}/sessions/${encodeURIComponent(sessionId)}/report-to-manager`,
+    { method: 'PUT', body: JSON.stringify({ managerId, enabled, expectedEnabled: !enabled }) },
+  );
+  if (data.ok !== true || typeof data.reportsToManager !== 'boolean') {
+    throw new Error(data.error?.message || 'Report subscription update failed');
+  }
+  return data as ApiSessionReportToManagerResponse & { ok: true; reportsToManager: boolean };
+}
+
+/**
+ * Explicitly report one task's completion to the Session's manager, reusing the
+ * automatic report's queue target and content semantics.  Works regardless of
+ * the manager's report subscription and never modifies it.
+ *
+ * Throws {@link ManualReportRejectedError} for a definite server-side
+ * rejection (nothing was sent — retrying is a fresh attempt).  Transport
+ * failures throw {@link ApiRequestError} / TypeError: the outcome is then
+ * unconfirmed and a retry must rely on the server's idempotency key.
+ */
+export class ManualReportRejectedError extends Error {
+  readonly retryable: boolean;
+  constructor(message: string, retryable: boolean) {
+    super(message);
+    this.name = 'ManualReportRejectedError';
+    this.retryable = retryable;
+  }
+}
+
+export async function reportTaskManually(
+  sessionId: string,
+  taskId: string | null,
+  taskSeq: number | null,
+  messageId: string,
+  resultCursor?: number,
+): Promise<ApiSessionManualReportResponse> {
+  // The run identity travels verbatim: taskId/taskSeq for formal tasks, and
+  // the durable resultCursor for a plain run whose terminal has no taskSeq.
+  // This function never picks an identity on its own — an identity-less
+  // request is refused by the server (`no_run_identity`) instead of being
+  // turned into "report the latest terminal".
+  const requestBody: Record<string, unknown> = { taskId, taskSeq, messageId };
+  if (typeof resultCursor === 'number') requestBody.resultCursor = resultCursor;
+  const data = await request<ApiSessionManualReportResponse>(
+    `${BASE}/sessions/${encodeURIComponent(sessionId)}/manual-report`,
+    { method: 'POST', body: JSON.stringify(requestBody) },
+  );
+  if (data.ok !== true || typeof data.queueItemId !== 'string') {
+    throw new ManualReportRejectedError(
+      data.error?.message || '汇报失败',
+      data.retryable === true,
+    );
+  }
+  return data;
+}
+
+/** Atomically clear all bridge connections, or activate saved completion defaults. */
+export async function setSessionMsgBridge(
+  sessionId: string,
+  enabled: boolean,
+): Promise<ApiSessionMsgBridgeResponse & { ok: true; msgBridgeEnabled: boolean }> {
+  const data = await request<ApiSessionMsgBridgeResponse>(
+    `${BASE}/sessions/${encodeURIComponent(sessionId)}/msg-bridge`,
+    { method: 'PUT', body: JSON.stringify({ enabled, expectedEnabled: !enabled }) },
+  );
+  if (data.ok !== true || typeof data.msgBridgeEnabled !== 'boolean') {
+    throw new Error(data.error?.message || 'msgBridge update failed');
+  }
+  return data as ApiSessionMsgBridgeResponse & { ok: true; msgBridgeEnabled: boolean };
+}
+
 // ── QQ postbox (subscribe inbox reminders) ──
+
+export async function setQqReport(sessionId: string, target: string, enabled: boolean): Promise<{ qqReportTargets: string[] }> {
+  const data = await request<{ ok?: boolean; qqReportTargets?: string[]; error?: { message?: string } }>(
+    `${BASE}/sessions/${encodeURIComponent(sessionId)}/qq-report`,
+    { method: 'PUT', body: JSON.stringify({ target, enabled, expectedEnabled: !enabled }) },
+  );
+  if (data.ok !== true || !Array.isArray(data.qqReportTargets)) {
+    throw new Error(data.error?.message || 'QQ report update failed');
+  }
+  return { qqReportTargets: data.qqReportTargets };
+}
 
 export async function qqSubscribe(
   sessionId: string,
@@ -940,6 +1813,16 @@ export async function killSessionWorker(sessionId: string): Promise<ApiGenericRe
   return data;
 }
 
+/** Accept an idle-boundary restart, or read its current observable state. */
+export async function requestDelayedRestart(sessionId: string, method: 'GET' | 'POST' = 'POST') {
+  const data = await request<ApiDelayedRestartResponse>(
+    `${BASE}/sessions/${encodeURIComponent(sessionId)}/worker/delayed-restart`,
+    { method },
+  );
+  if (data.error) throw new Error(data.error);
+  return data.delayedRestart;
+}
+
 /** Restart the live worker for a session, or start one when it has gone away. */
 export async function restartOrStartWorker(
   sessionId: string,
@@ -997,7 +1880,12 @@ export async function steerSessionWorker(
     `${BASE}/sessions/${encodeURIComponent(sessionId)}/worker/steer`,
     { method: 'POST', body: JSON.stringify({ text, ...(messageId ? { messageId } : {}) }) },
   );
-  if (data.error) throw new Error(data.error);
+  if (data.error) {
+    if (data.outcome !== 'rejected') {
+      throw new Error(data.error);
+    }
+    throw new SubmissionRejectedError(data.error);
+  }
   return data;
 }
 
@@ -1031,6 +1919,10 @@ export async function takeoverWorker(workerId: string): Promise<ApiGenericRespon
   });
   if (data.error) throw new Error(data.error);
   return data;
+}
+
+export async function fetchTakeoverReadiness(sessionId: string): Promise<{ ready: boolean; reason: string | null }> {
+  return request(`${BASE}/sessions/${encodeURIComponent(sessionId)}/worker/takeover-readiness`);
 }
 
 export async function takeoverSessionWorker(sessionId: string): Promise<ApiGenericResponse> {
@@ -1067,6 +1959,7 @@ export async function fetchAdapterConfig(adapter: string): Promise<AdapterConfig
     defaultModel: data.defaultModel || 'deepseek-v4-flash',
     effortValues: data.effortValues || [],
     modelEfforts: data.modelEfforts || {},
+    modelCreditMultipliers: data.modelCreditMultipliers || {},
     permissionModes: data.permissionModes || [],
     defaultPermissionMode: data.defaultPermissionMode || '',
     supportedSettings: data.supportedSettings || ['model', 'permissionMode', 'thinking', 'effort'],
@@ -1130,15 +2023,35 @@ export async function restartRemoteTunnel(): Promise<ApiRemoteRestartResponse> {
   return data;
 }
 
+// ── Platform capabilities ──
+
+/**
+ * Platform descriptor exposed by the server that owns the filesystem and the
+ * processes. Capability keys are the contract; the UI must treat a missing
+ * endpoint or a missing key as "available" so a Windows dashboard keeps
+ * working against a server that predates the endpoint.
+ */
+export interface PlatformInfoResponse {
+  platform: string;
+  capabilities: Record<string, boolean>;
+}
+
+export async function fetchPlatformInfo(): Promise<PlatformInfoResponse> {
+  return request<PlatformInfoResponse>(`${BASE}/platform`);
+}
+
 // ── Main Pan service restart ──
 
 export async function fetchMainRestartStatus(): Promise<ApiMainRestartStatusResponse> {
   return request<ApiMainRestartStatusResponse>(`${BASE}/main/restart/status`);
 }
 
-export async function restartMainService(): Promise<ApiMainRestartResponse> {
+export async function restartMainService(
+  options?: { markRunningSessionsOffline: boolean },
+): Promise<ApiMainRestartResponse> {
   const data = await request<ApiMainRestartResponse>(`${BASE}/main/restart`, {
     method: 'POST',
+    body: JSON.stringify(options ? { options } : {}),
   });
   if (!data.ok) throw new Error(data.error || `Pan restart ${data.status}`);
   return data;
@@ -1275,6 +2188,7 @@ export async function fetchCodexSessions(cwd: string): Promise<CodexSessionItem[
   const query = cwd ? `?cwd=${encodeURIComponent(cwd)}` : '';
   const data = await request<{ sessions: CodexSessionItem[] }>(
     `${BASE}/adapters/codex/sessions${query}`,
+    { cache: 'no-store' },
   );
   return data.sessions || [];
 }
@@ -1292,13 +2206,59 @@ export async function importCodexSession(sessionId: string, cwd: string, workspa
   return data;
 }
 
+// ── Import: dsh (generic adapter sessions endpoints) ──
+
+/**
+ * DSH 的 sessions provider 与 codex 返回同形列表（session_id/title/workDir/…），
+ * 因此复用 CodexSessionItem。空 cwd = 全部项目。
+ */
+export async function fetchDshSessions(cwd: string): Promise<CodexSessionItem[]> {
+  const query = cwd ? `?cwd=${encodeURIComponent(cwd)}` : '';
+  const data = await request<{ sessions: CodexSessionItem[] }>(
+    `${BASE}/adapters/dsh/sessions${query}`,
+    { cache: 'no-store' },
+  );
+  return data.sessions || [];
+}
+
+export async function importDshSession(sessionId: string, cwd: string, workspaceIds?: string[]): Promise<Session> {
+  const data = await request<ApiSessionResponse>(`${BASE}/adapters/dsh/sessions/import`, {
+    method: 'POST',
+    body: JSON.stringify({
+      session_id: sessionId,
+      ...(cwd ? { cwd } : {}),
+      ...(workspaceIds !== undefined ? { workspaceIds } : {}),
+    }),
+  });
+  if (data.error) throw new Error(data.error);
+  return data;
+}
+
 // ── Reimport ──
 
+export interface ReimportConflict {
+  sessionId: string;
+  historyRevision: number;
+  count: number;
+  items: { position: number; messageId?: string; source: string; reason: string; preview: string }[];
+  omittedCount: number;
+  confirmationToken: string;
+  stale: boolean;
+}
+
+export class ReimportError extends Error {
+  constructor(message: string, public code?: string, public conflict?: ReimportConflict) {
+    super(message);
+    this.name = 'ReimportError';
+  }
+}
+
 export async function reimportSession(
-  _id: string,
+  id: string,
   adapter: string,
   cliSessionId: string,
   workdir?: string,
+  confirmationToken?: string,
 ): Promise<Session> {
   const url =
     adapter === 'kimi'
@@ -1308,13 +2268,14 @@ export async function reimportSession(
         : adapter === 'cbc'
           ? `${BASE}/cbc/sessions/import`
           : `${BASE}/adapters/${encodeURIComponent(adapter)}/sessions/import`;
-  const body: Record<string, string> = { session_id: cliSessionId };
+  const body: Record<string, string | boolean> = { session_id: cliSessionId };
   if (workdir) body.cwd = workdir;
-  const data = await request<ApiSessionResponse>(url, {
+  if (confirmationToken) Object.assign(body, { force: true, panSessionId: id, confirmationToken });
+  const data = await request<ApiSessionResponse & { errorCode?: string; conflict?: ReimportConflict }>(url, {
     method: 'POST',
     body: JSON.stringify(body),
   });
-  if (data.error) throw new Error(data.error);
+  if (data.error) throw new ReimportError(data.error, data.errorCode, data.conflict);
   return data;
 }
 
@@ -1337,6 +2298,24 @@ export async function readFile(sessionId: string, path: string): Promise<string>
   const data = await request<ApiFsReadResponse>(`${BASE}/fs/read?${params.toString()}`);
   if (data.error) throw new Error(data.error);
   return data.content;
+}
+
+/** Ask the Pan server to open one Editor file with the OS default handler. */
+export async function openFileExternally(sessionId: string, path: string): Promise<void> {
+  const data = await request<ApiFsGenericResponse>(`${BASE}/editor/open-external`, {
+    method: 'POST',
+    body: JSON.stringify({ session_id: sessionId, path }),
+  });
+  if (data.error) throw new Error(data.error);
+}
+
+/** Ask the Pan server to reveal one Editor file in the OS file manager. */
+export async function revealFileExternally(sessionId: string, path: string): Promise<void> {
+  const data = await request<ApiFsGenericResponse>(`${BASE}/editor/reveal-external`, {
+    method: 'POST',
+    body: JSON.stringify({ session_id: sessionId, path }),
+  });
+  if (data.error) throw new Error(data.error);
 }
 
 export async function writeFile(
@@ -1376,6 +2355,19 @@ export async function deleteFs(sessionId: string, path: string): Promise<ApiFsGe
 
 // ── App settings (config.json ui) ──
 
+export interface PluginMessageSource {
+  id: string;
+  label: string;
+  defaultEnabled: boolean;
+  effectiveEnabled: boolean;
+  /** Effective prompt-summary switch; never inherited from defaultEnabled. */
+  effectiveSummaryEnabled: boolean;
+}
+
+export async function fetchPluginMessageSources(): Promise<{ sources: PluginMessageSource[] }> {
+  return request(`${BASE}/plugins/message-sources`);
+}
+
 export async function fetchUiSettings(): Promise<Record<string, unknown>> {
   const data = await request<Record<string, unknown>>(`${BASE}/settings/ui`);
   return data || {};
@@ -1384,6 +2376,10 @@ export async function fetchUiSettings(): Promise<Record<string, unknown>> {
 export async function updateUiSettings(
   patch: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
+  if ('errorNotificationExclusions' in patch) {
+    const { lockerRequest } = await import('@/views/lockerModel');
+    return lockerRequest(`${BASE}/settings/ui`, 'PUT', patch);
+  }
   const data = await request<Record<string, unknown>>(`${BASE}/settings/ui`, {
     method: 'PUT',
     body: JSON.stringify(patch),
@@ -1553,7 +2549,7 @@ export async function fetchSchedulerStatus(): Promise<SchedulerStatus> {
 
 // ── Jobs (unified /api/jobs/*; PLAN §5) ──
 
-interface ApiJobsResponse { ok?: boolean; jobs?: Job[]; error?: SchedulerApiError; }
+interface ApiJobsResponse { ok?: boolean; jobs?: Job[]; pinMetadataStatus?: 'available' | 'unavailable'; error?: SchedulerApiError; }
 interface ApiJobResponse { ok?: boolean; job?: Job; error?: SchedulerApiError; }
 interface ApiJobKindsResponse { ok?: boolean; kinds?: JobKindMeta[]; error?: SchedulerApiError; }
 interface ApiJobRunsResponse { ok?: boolean; runs?: JobRunRecord[]; error?: SchedulerApiError; }
@@ -1643,9 +2639,12 @@ export async function updateCompletedJobRetentionSettings(
 }
 
 /** GET /api/jobs — 全 kind 列表（客户端排序/筛选）。 */
-export async function fetchJobs(): Promise<Job[]> {
+export async function fetchJobs(
+  onPinMetadataStatus?: (status: 'available' | 'unavailable') => void,
+): Promise<Job[]> {
   const data = await request<ApiJobsResponse>(`${BASE}/jobs`);
   if (data.error) throwSchedulerError(data.error);
+  onPinMetadataStatus?.(data.pinMetadataStatus === 'unavailable' ? 'unavailable' : 'available');
   return data.jobs || [];
 }
 
@@ -1686,6 +2685,67 @@ export async function patchJob(jobId: string, patch: JobPatchInput): Promise<Job
   return data.job;
 }
 
+/** Unified Job API. The legacy endpoints remain available for old records. */
+export async function fetchActionRegistry(): Promise<ActionRegistry> {
+  return request<ActionRegistry>(`${BASE}/actions`);
+}
+
+async function protectedJobRequest<T>(path: string, method: string, body?: unknown): Promise<T> {
+  const { automationRequest, AutomationError } = await import('@/stores/automationStore');
+  try { return await automationRequest<T>(path, method, body); }
+  catch (error) { if (error instanceof AutomationError) throw new ApiRequestError(error.status, error.message); throw error; }
+}
+
+export async function createActionJob(config: import('@/types/jobs').UnifiedJobConfig): Promise<Job> {
+  const data = await protectedJobRequest<{ job?: Job; error?: SchedulerApiError }>('jobs/action-jobs', 'POST', { config });
+  if (data.error) throwSchedulerError(data.error);
+  if (!data.job) throw new Error('unified job missing in response');
+  return fetchJob(data.job.jobId);
+}
+
+export async function updateActionJob(jobId: string, config: import('@/types/jobs').UnifiedJobConfig, expectedRevision: number): Promise<Job> {
+  const data = await protectedJobRequest<{ job?: Job; error?: SchedulerApiError }>(`jobs/action-jobs/${encodeURIComponent(jobId)}`, 'PUT', { config, expectedRevision });
+  if (data.error) throwSchedulerError(data.error);
+  if (!data.job) throw new Error('unified job missing in response');
+  return fetchJob(data.job.jobId);
+}
+
+export interface CompleteJobTemplate {
+  id: string; name: string; description?: string; revision: number; usable: boolean;
+  config: import('@/types/jobs').UnifiedJobConfig;
+}
+
+export async function fetchCompleteJobTemplates(): Promise<CompleteJobTemplate[]> {
+  const data = await request<{ templates: CompleteJobTemplate[] }>(`${BASE}/jobs/job-templates`);
+  return data.templates;
+}
+
+export async function saveCompleteJobTemplate(item: Partial<CompleteJobTemplate>, expectedRevision: number): Promise<CompleteJobTemplate> {
+  const data = await protectedJobRequest<{ item: CompleteJobTemplate }>(`jobs/job-templates${item.id ? '/' + encodeURIComponent(item.id) : ''}`, item.id ? 'PUT' : 'POST', { item, expectedRevision });
+  return data.item;
+}
+
+export async function instantiateCompleteJobTemplate(template: CompleteJobTemplate, idempotencyKey: string): Promise<Job> {
+  const data = await protectedJobRequest<{ job: Job }>(`jobs/job-templates/${encodeURIComponent(template.id)}/instantiate`, 'POST', { expectedRevision: template.revision, idempotencyKey });
+  return fetchJob(data.job.jobId);
+}
+
+export async function deleteCompleteJobTemplate(template: CompleteJobTemplate): Promise<void> {
+  await protectedJobRequest(`jobs/job-templates/${encodeURIComponent(template.id)}?expectedRevision=${template.revision}`, 'DELETE');
+}
+
+export async function fetchActionJobSchema(actionId?: string): Promise<unknown> {
+  return request<unknown>(`${BASE}/jobs/action-jobs/schema${actionId ? `?actionId=${encodeURIComponent(actionId)}` : ''}`);
+}
+
+export async function mutateActionJob(job: Job, operation: 'run-now' | 'cancel' | 'delete' | 'retry' | 'confirm-recovery'): Promise<void> {
+  if (job.configRevision == null) throw new ApiRequestError(409, 'Missing configuration revision; reload first');
+  const path = `jobs/action-jobs/${encodeURIComponent(job.jobId)}`;
+  await protectedJobRequest(operation === 'delete' ? `${path}?expectedRevision=${job.configRevision}` : `${path}/${operation}`,
+    operation === 'delete' ? 'DELETE' : 'POST', operation === 'delete' ? undefined : { expectedRevision: job.configRevision,
+      ...(['retry','confirm-recovery'].includes(operation) ? { confirm: true } : {}) });
+}
+
 /** DELETE /api/jobs/{id}。 */
 export async function deleteJob(jobId: string): Promise<void> {
   const data = await request<ApiJobDeleteResponse>(
@@ -1713,4 +2773,58 @@ export async function runJobNow(jobId: string): Promise<Job> {
   if (data.error) throwSchedulerError(data.error);
   if (!data.job) throw new Error('job missing in response');
   return data.job;
+}
+
+/** Persist Pan-owned presentation metadata for every Job kind/owner. */
+export async function pinJob(jobId: string, pinned: boolean): Promise<Job> {
+  const data = await request<ApiJobResponse>(`${BASE}/jobs/${encodeURIComponent(jobId)}/pin`, {
+    method: 'PUT', body: JSON.stringify({ pinned }),
+  });
+  if (data.error) throwSchedulerError(data.error);
+  if (!data.job) throw new Error('job missing in response');
+  return data.job;
+}
+
+export interface WorkdirRetentionResult {
+  candidates: Array<{ name: string; path: string; modifiedAt: string; entries: number }>;
+  results: Array<{ name: string; deleted: boolean; reason?: string }>;
+  scanned: number;
+  deleted: number;
+  skipped: number;
+  skipReasons: Record<string, number>;
+  error: string | null;
+}
+
+export function scanWorkdirs(days: number, names?: string[]): Promise<WorkdirRetentionResult> {
+  return request(`${BASE}/settings/workdir-retention/${names ? 'delete' : 'preview'}`, {
+    method: 'POST', body: JSON.stringify(names ? { days, names } : { days }),
+  });
+}
+
+/** Explicit wake is separate from broadcast and uses the server's Behavior setting. */
+export async function wakeSessions(sessionIds: string[], clientMessageId: string = crypto.randomUUID()): Promise<void> {
+  const data = await request<{ok: boolean; results: {sessionId: string; status: string; result?: string; error?: {message?: string}}[]}>(
+    `${BASE}/sessions/wake`, { method: 'POST', body: JSON.stringify({ sessionIds, clientMessageId }) },
+  );
+  if (!data.ok) throw new Error(data.results.filter(row => row.status !== 'queued')
+    .map(row => `${row.sessionId}: ${row.result || row.error?.message || 'Wake failed'}`).join('; '));
+}
+
+/** Request cancellation through the existing process/message lifecycle, never DELETE. */
+export async function cancelJob(jobId: string): Promise<void> {
+  const data = await request<{ error?: { code: string; message: string } }>(`${BASE}/background-jobs/${encodeURIComponent(jobId)}/cancel`, { method: 'POST' });
+  if (data.error) throwSchedulerError(data.error);
+}
+
+/** Original background registry records, without unified compatibility projections. */
+export async function fetchLegacyJob(jobId: string): Promise<Record<string, unknown>> {
+  const data = await request<Record<string, unknown> & { error?: SchedulerApiError }>(`${BASE}/background-jobs/${encodeURIComponent(jobId)}`);
+  if (data.error) throwSchedulerError(data.error);
+  return data;
+}
+
+/** Legacy retry creates another background-process Job; it is not an Attempt. */
+export async function retryLegacyJob(jobId: string): Promise<void> {
+  const data = await request<{ error?: SchedulerApiError }>(`${BASE}/background-jobs/${encodeURIComponent(jobId)}/retry`, { method: 'POST' });
+  if (data.error) throwSchedulerError(data.error);
 }

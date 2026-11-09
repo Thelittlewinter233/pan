@@ -30,8 +30,20 @@ def _make_event(event_type: str, **fields) -> bytes:
 
 
 def _no_ts(entries):
-    """剥掉 append_history 打的 ts 字段，便于断言消息本体。"""
-    return [{k: v for k, v in e.items() if k != "ts"} for e in entries]
+    """剥掉 append_history 打的 ts 与 messageId 字段，便于断言消息本体。
+
+    messageId 是追加边界分配的身份元数据（``Session.append_history``），不属
+    于消息业务形状；身份本身由 ``_message_ids`` 显式断言，保持身份契约覆盖。
+    """
+    return [
+        {k: v for k, v in e.items() if k not in ("ts", "messageId")}
+        for e in entries
+    ]
+
+
+def _message_ids(entries):
+    """取出每行的 Pan 消息身份，供身份契约显式断言。"""
+    return [e.get("messageId") for e in entries]
 
 
 def _assistant_event(text: str = None) -> bytes:
@@ -161,22 +173,35 @@ def test_stream_block_count_cap_flushes(monkeypatch):
 
 
 def test_result_flushes_debounced_blocks_through_read_stdout(monkeypatch):
-    """集成：assistant 块防抖 + result 强制 flush → 全程恰好 1 次落盘。"""
+    """Ready 后 assistant 块防抖 + result 强制 flush 恰好 1 次落盘。"""
     _cleanup()
     s, w = _make_worker()
     saved = []
 
-    async def fake_save(sess):
-        saved.append(len(sess.history))
+    # Readiness now has its own durable legality commit. Establish it before
+    # measuring streaming history writes so the result-flush contract is exact.
+    asyncio.run(worker._activate_offline_worker(w, ready_proof=True))
+    original_save = _sess._save_body
 
-    monkeypatch.setattr(_sess, "save_async", fake_save)
+    def fake_save(sess, *, offline_override=None):
+        saved.append(len(sess.history))
+        return original_save(sess, offline_override=offline_override)
+
+    monkeypatch.setattr(_sess, "_save_body", fake_save)
     w.process = MockProcess([_assistant_event(text="hi"), _result_event(result="hi")])
 
     asyncio.run(worker._read_stdout(w))
 
-    assert _no_ts(s.history) == [{"role": "assistant", "content": "hi"}], s.history
+    assert _no_ts(s.history[:1]) == [{"role": "assistant", "content": "hi"}], s.history
+    assert len(s.history) == 2 and s.history[1]["terminal"]["status"] == "done"
+    assert s.history[1]["terminal"]["anchorMessageId"] == s.history[0]["messageId"]
+    # 落盘的 assistant 正文必须带 Pan 身份（防抖 + result flush 不影响身份分配）。
+    (assistant_id,) = _message_ids(s.history[:1])
+    assert _sess.is_pan_message_id(assistant_id), (
+        f"streamed assistant history must carry a Pan messageId, got {assistant_id!r}"
+    )
     assert s.last_result["status"] == "done"
-    assert saved == [1], f"expected exactly 1 save (result flush), got {saved}"
+    assert saved == [2], f"expected one atomic save of body and terminal, got {saved}"
     _cleanup()
 
 

@@ -3,15 +3,17 @@ import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { Profiler } from 'react';
 import { MemoryRouter } from 'react-router-dom';
+import { SearchTextContext } from './searchText';
 import { MarkdownRenderer } from './MarkdownRenderer';
 import { parseMarkdownFileLink } from '@/utils/markdownFileLinks';
 import { useEditorStore } from '@/stores/editorStore';
 import { useSessionStore } from '@/stores/sessionStore';
 import { useUIStore } from '@/stores/uiStore';
-import { listFiles, readFile } from '@/services/api';
+import { listFiles, readFile, fetchDirectories } from '@/services/api';
 
 vi.mock('@/services/api', () => ({
   listFiles: vi.fn(async () => []),
+  fetchDirectories: vi.fn(async () => { throw new Error('Not a directory'); }),
   readFile: vi.fn(async () => 'line 1\nline 2'),
   writeFile: vi.fn(async () => undefined),
   renameFs: vi.fn(async () => undefined),
@@ -20,12 +22,14 @@ vi.mock('@/services/api', () => ({
 
 afterEach(() => {
   cleanup();
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 
 beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(listFiles).mockResolvedValue([]);
+  vi.mocked(fetchDirectories).mockRejectedValue(new Error('Not a directory'));
   vi.mocked(readFile).mockResolvedValue('line 1\nline 2');
   useSessionStore.setState({
     currentSessionId: 's1',
@@ -46,6 +50,127 @@ beforeEach(() => {
 });
 
 describe('MarkdownRenderer', () => {
+  it.each([
+    ['same.md', 'D:/project/pan/same.md'],
+    ['./文档%20说明.md', 'D:/project/pan/文档 说明.md'],
+    ['../shared/guide.md#标题', 'D:/project/shared/guide.md'],
+    ['C:\\other\\guide.md:2', 'C:/other/guide.md'],
+  ])('resolves Chat %s against the Session cwd, independently of the Editor file', async (href, expected) => {
+    useEditorStore.setState({ activePath: 'E:/unrelated/docs/index.md' });
+    render(<MemoryRouter><MarkdownRenderer content={`[open](${href})`} /></MemoryRouter>);
+    fireEvent.click(screen.getByRole('link', { name: 'open' }));
+    await waitFor(() => expect(readFile).toHaveBeenCalledWith('s1', expected));
+  });
+
+  it.each(['./目录%20名称/', '../目录%20名称'])('opens relative directory %s as an Editor root without reading it as a file', async (href) => {
+    const path = href.startsWith('../') ? 'D:/project/目录 名称' : 'D:/project/pan/目录 名称';
+    vi.mocked(fetchDirectories).mockResolvedValue({ current: path, parent: null, entries: [] });
+    render(<MemoryRouter><MarkdownRenderer content={`[directory](${href})`} /></MemoryRouter>);
+    fireEvent.click(screen.getByRole('link', { name: 'directory' }));
+    await waitFor(() => expect(useEditorStore.getState().selectedPath).toBe(path));
+    expect(useEditorStore.getState().roots.some((root) => root.kind === 'temp' && root.path === path)).toBe(true);
+    expect(readFile).not.toHaveBeenCalled();
+  });
+
+  it('resolves the same history link against each Session cwd', async () => {
+    render(<MemoryRouter><MarkdownRenderer content="[open](./same.md)" /></MemoryRouter>);
+    fireEvent.click(screen.getByRole('link', { name: 'open' }));
+    await waitFor(() => expect(readFile).toHaveBeenCalledWith('s1', 'D:/project/pan/same.md'));
+    act(() => useSessionStore.setState((state) => ({
+      currentSessionId: 's2',
+      sessions: [...state.sessions, { ...state.sessions[0]!, id: 's2', workdir: 'E:/second' }],
+    })));
+    fireEvent.click(screen.getByRole('link', { name: 'open' }));
+    await waitFor(() => expect(readFile).toHaveBeenCalledWith('s2', 'E:/second/same.md'));
+    expect(useEditorStore.getState().activePath).toBe('E:/second/same.md');
+  });
+
+  it('drops a directory result after switching away and back to the original Session', async () => {
+    let resolve!: (value: Awaited<ReturnType<typeof fetchDirectories>>) => void;
+    vi.mocked(fetchDirectories).mockImplementationOnce(() => new Promise((done) => { resolve = done; }));
+    render(<MemoryRouter><MarkdownRenderer content="[open](../directory/)" /></MemoryRouter>);
+    fireEvent.click(screen.getByRole('link', { name: 'open' }));
+    await waitFor(() => expect(fetchDirectories).toHaveBeenCalled());
+    act(() => { useSessionStore.setState({ currentSessionId: 's2' }); useSessionStore.setState({ currentSessionId: 's1' }); });
+    await act(async () => resolve({ current: 'D:/project/directory', parent: null, entries: [] }));
+    expect(useEditorStore.getState().selectedPath).not.toBe('D:/project/directory');
+    expect(useEditorStore.getState().roots.some((root) => root.path === 'D:/project/directory')).toBe(false);
+    expect(readFile).not.toHaveBeenCalled();
+  });
+
+  it('drops a file read after switching to a Session with another cwd', async () => {
+    let resolve!: (value: string) => void;
+    vi.mocked(readFile).mockImplementationOnce(() => new Promise((done) => { resolve = done; }));
+    render(<MemoryRouter><MarkdownRenderer content="[open](./slow.md)" /></MemoryRouter>);
+    fireEvent.click(screen.getByRole('link', { name: 'open' }));
+    await waitFor(() => expect(readFile).toHaveBeenCalled());
+    act(() => useSessionStore.setState((state) => ({ currentSessionId: 's2', sessions: [...state.sessions, { ...state.sessions[0]!, id: 's2', workdir: 'E:/second' }] })));
+    await act(async () => resolve('old file'));
+    expect(useEditorStore.getState().openPaths).not.toContain('D:/project/pan/slow.md');
+  });
+  it('preserves the entire large plain paragraph, selection text, and subsequent rich Markdown', () => {
+    const content='large plain-body '+ 'x'.repeat(2_000_000);
+    const view=render(<MarkdownRenderer content={content} />);
+    expect(view.container.querySelector('p')?.textContent).toBe(content);
+    expect(view.container.querySelectorAll('p')).toHaveLength(1);
+    view.rerender(<MarkdownRenderer content={`${content} **bold**`} />);
+    expect(view.container.querySelector('strong')?.textContent).toBe('bold');
+    expect(view.container.textContent).toBe(content+' bold');
+  });
+
+  it('keeps search marks and attachment handling on the ordinary pipeline for a large plain paragraph', () => {
+    const content='search needle '+ 'x'.repeat(65536);
+    const view=render(<SearchTextContext.Provider value={{query:'needle',occurrence:0}}><MarkdownRenderer content={content} /></SearchTextContext.Provider>);
+    expect(view.container.querySelector('mark')?.textContent).toBe('needle');
+    expect(view.container.textContent).toBe(content);
+    view.rerender(<MarkdownRenderer content={content} attachmentIds={['attachment']} />);
+    expect(view.container.querySelectorAll('p > span')).toHaveLength(0);
+    expect(view.container.textContent).toBe(content);
+  });
+
+  it('bounds giant highlighted code and copies the entire latest payload', async () => {
+    vi.spyOn(HTMLElement.prototype, 'offsetHeight', 'get').mockReturnValue(320);
+    vi.spyOn(HTMLElement.prototype, 'offsetWidth', 'get').mockReturnValue(800);
+    const writeText = vi.fn(async () => undefined);
+    vi.stubGlobal('navigator', { clipboard: { writeText } });
+    const text = Array.from({ length: 2000 }, (_, i) => `const value${i} = ${i};`).join('\n');
+    const { container, rerender } = render(<MarkdownRenderer content={`\`\`\`typescript\n${text}\n\`\`\``} />);
+    expect(screen.getByRole('region', { name: 'typescript code' })).toBeTruthy();
+    expect(container.querySelectorAll('[data-code-line]').length).toBeGreaterThan(0);
+    expect(container.querySelectorAll('[data-code-line]').length).toBeLessThan(100);
+    expect(container.querySelector('.hljs-keyword')).toBeNull();
+    expect(container.textContent).not.toContain('value1999');
+    const latest = `${text}\nconst finalDelta = true;`;
+    rerender(<MarkdownRenderer content={`\`\`\`typescript\n${latest}\n\`\`\``} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Copy code' }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith(latest));
+  });
+
+  it('keeps addition and deletion colors in a bounded diff without coloring file headers', () => {
+    vi.spyOn(HTMLElement.prototype, 'offsetHeight', 'get').mockReturnValue(320);
+    vi.spyOn(HTMLElement.prototype, 'offsetWidth', 'get').mockReturnValue(800);
+    const text = ['+++ file.ts', '--- file.ts', '+added', '-removed', ...Array(250).fill(' context')].join('\n');
+    const { container } = render(<MarkdownRenderer content={`\`\`\`diff\n${text}\n\`\`\``} />);
+    expect(container.querySelector('[data-code-line="0"]')?.className).toBe('');
+    expect(container.querySelector('[data-code-line="1"]')?.className).toBe('');
+    expect(container.querySelector('[data-code-line="2"]')?.className).toContain('bg-green');
+    expect(container.querySelector('[data-code-line="3"]')?.className).toContain('bg-red');
+    expect(container.querySelectorAll('[data-code-line]').length).toBeLessThan(100);
+  });
+
+  it('bounds a huge single line without requiring a language annotation', () => {
+    render(<MarkdownRenderer content={`\`\`\`\n${'x'.repeat(20_000)}\n\`\`\``} />);
+    expect(screen.getByRole('region', { name: 'code code' })).toBeTruthy();
+  });
+
+  it('keeps the code window mounted when a streamed fence closes', () => {
+    const text = Array(250).fill('const value = 1;').join('\n');
+    const { rerender } = render(<MarkdownRenderer content={`\`\`\`js\n${text}`} />);
+    const viewport = screen.getByTestId('large-code-window');
+    rerender(<MarkdownRenderer content={`\`\`\`js\n${text}\n\`\`\``} />);
+    expect(screen.getByTestId('large-code-window')).toBe(viewport);
+  });
+
   it('does not reparse historical Markdown when another message streams', () => {
     const commits = vi.fn();
     render(<Profiler id="historical-markdown" onRender={commits}>
@@ -310,13 +435,24 @@ describe('MarkdownRenderer', () => {
     );
 
     fireEvent.click(screen.getByRole('link', { name: 'open' }));
-    await waitFor(() => expect(readFile).toHaveBeenCalledWith('s1', 'docs/My File.md'));
+    await waitFor(() => expect(readFile).toHaveBeenCalledWith('s1', 'D:/project/pan/docs/My File.md'));
     expect(useEditorStore.getState()).toMatchObject({
       sessionId: 's1',
       workdir: 'D:\\project\\pan',
-      activePath: 'docs/My File.md',
-      pendingLocation: { path: 'docs/My File.md', line: 42, endLine: 48 },
+      activePath: 'D:/project/pan/docs/My File.md',
+      pendingLocation: { path: 'D:/project/pan/docs/My File.md', line: 42, endLine: 48 },
     });
+  });
+
+  it('uses the Editor preview document directory when supplied and preserves line targets', async () => {
+    render(
+      <MemoryRouter>
+        <MarkdownRenderer sourcePath="D:/project/pan/docs/index.md" content="[open](./CHECKLIST.md#L2)" />
+      </MemoryRouter>,
+    );
+    fireEvent.click(screen.getByRole('link', { name: 'open' }));
+    await waitFor(() => expect(readFile).toHaveBeenCalledWith('s1', 'D:/project/pan/docs/CHECKLIST.md'));
+    expect(useEditorStore.getState().pendingLocation).toEqual({ path: 'D:/project/pan/docs/CHECKLIST.md', line: 2 });
   });
 
   it('opens a root-relative Windows drive href without the synthetic leading slash', async () => {
@@ -345,9 +481,9 @@ describe('MarkdownRenderer', () => {
     );
 
     fireEvent.click(screen.getByRole('link', { name: 'open' }));
-    await waitFor(() => expect(readFile).toHaveBeenCalledWith('s1', 'docs/My File.md'));
+    await waitFor(() => expect(readFile).toHaveBeenCalledWith('s1', 'D:/project/pan/docs/My File.md'));
     expect(useEditorStore.getState().pendingLocation).toEqual({
-      path: 'docs/My File.md', line: 42, endLine: 48,
+      path: 'D:/project/pan/docs/My File.md', line: 42, endLine: 48,
     });
   });
 
@@ -363,4 +499,26 @@ describe('MarkdownRenderer', () => {
     await waitFor(() => expect(useUIStore.getState().toastQueue.at(-1)?.message).toContain('文件不存在'));
     expect(useUIStore.getState().toastQueue.at(-1)?.type).toBe('error');
   });
+
+  it('renders a composer URL-node Markdown link with escaped parentheses', () => {
+    const view = render(
+      <MemoryRouter initialEntries={['/']}>
+        <MarkdownRenderer content={'[Docs](https://example.test/a\\(b\\)?q=1&x=2#h)'} />
+      </MemoryRouter>,
+    );
+    const anchor = view.container.querySelector('a');
+    expect(anchor?.textContent).toBe('Docs');
+    expect(anchor?.getAttribute('href')).toBe('https://example.test/a(b)?q=1&x=2#h');
+  });
+});
+
+
+it('resolves Locker links against its explicit source while another Chat stays selected', async () => {
+  const current=useSessionStore.getState().sessions[0];
+  if (!current) throw new Error('Missing current Session fixture');
+  useSessionStore.setState({ sessions: [current, { ...current, id: 'locker-source', workdir: 'E:/locker' }] });
+  render(<MemoryRouter><MarkdownRenderer sourceSessionId="locker-source" content="[open](./card.md)" /></MemoryRouter>);
+  fireEvent.click(screen.getByRole('link', { name: 'open' }));
+  await waitFor(() => expect(readFile).toHaveBeenCalledWith('locker-source', 'E:/locker/card.md'));
+  expect(useSessionStore.getState().currentSessionId).toBe('s1');
 });

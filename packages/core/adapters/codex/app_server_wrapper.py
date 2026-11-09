@@ -29,8 +29,18 @@ from pathlib import Path
 from queue import Empty, Queue
 from typing import Any
 
+# These bridges also run by absolute filename from a Session workdir.
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+from packages.jobs.window import command_window_options
+
 
 _APPROVAL_TIMEOUT_SEC = 120.0
+_STDOUT_LOCK = threading.Lock()
+_STARTUP_OUTPUT: list[tuple[bool, bytes]] | None = None
+_STARTUP_BYTES = 0
+_STARTUP_OVERFLOW = False
+_LAUNCH_OUTPUT_SECRETS: tuple[bytes, ...] = ()
 _INTERACTIVE_APPROVAL_METHODS = {
     "item/commandExecution/requestApproval",
     "item/fileChange/requestApproval",
@@ -64,15 +74,51 @@ _CANCELLED_TURN_STATUSES = {"interrupted", "cancelled", "canceled"}
 
 def _write_stdout(event: dict[str, Any]) -> None:
     raw = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
-    sys.stdout.buffer.write(raw.encode("utf-8", errors="replace") + b"\n")
-    sys.stdout.buffer.flush()
+    _write_output(False, raw.encode("utf-8", errors="replace") + b"\n")
 
 
 def _write_stderr(text: str) -> None:
     if not text:
         return
-    sys.stderr.buffer.write(text.encode("utf-8", errors="replace"))
-    sys.stderr.buffer.flush()
+    _write_output(True, text.encode("utf-8", errors="replace"))
+
+
+def _write_output(stderr: bool, raw: bytes) -> None:
+    global _STARTUP_BYTES, _STARTUP_OVERFLOW
+    for secret in _LAUNCH_OUTPUT_SECRETS:
+        raw = raw.replace(secret, b'[private-launch-redacted]')
+    with _STDOUT_LOCK:
+        if _STARTUP_OUTPUT is not None:
+            if _STARTUP_BYTES + len(raw) > 64 * 1024:
+                _STARTUP_OVERFLOW = True
+                return
+            _STARTUP_BYTES += len(raw)
+            _STARTUP_OUTPUT.append((stderr, raw))
+            return
+        stream = sys.stderr.buffer if stderr else sys.stdout.buffer
+        stream.write(raw)
+        stream.flush()
+
+
+def _write_launch_receipt(event: dict[str, Any]) -> None:
+    """Keep native diagnostics out of the authenticated startup frame sequence.
+
+    Only the trusted attester calls this function. Native notifications cannot
+    mark themselves as receipts. Overflow rejects startup before confirmation.
+    """
+    global _STARTUP_OUTPUT
+    raw = json.dumps(event, separators=(",", ":")).encode("utf-8") + b"\n"
+    with _STDOUT_LOCK:
+        if _STARTUP_OVERFLOW:
+            raise RuntimeError("Fixed launch startup output overflow")
+        sys.stdout.buffer.write(raw)
+        sys.stdout.buffer.flush()
+        if event["type"] == "provider.launch.verified" and _STARTUP_OUTPUT is not None:
+            for stderr, pending in _STARTUP_OUTPUT:
+                stream = sys.stderr.buffer if stderr else sys.stdout.buffer
+                stream.write(pending)
+                stream.flush()
+            _STARTUP_OUTPUT = None
 
 
 def _json_value(raw: str) -> Any:
@@ -205,11 +251,27 @@ def _item_event(item: dict[str, Any]) -> dict[str, Any] | None:
 
 class AppServer:
     def __init__(self, node: str, codex_js: str, cwd: str,
-                 extra_options: list[str]) -> None:
+                 extra_options: list[str], *, native_control: bool = False,
+                 native_passthrough: bool = False) -> None:
         self.node = node
         self.codex_js = codex_js
         self.cwd = cwd
         self.extra_options = extra_options
+        self.native_control = native_control
+        self.native_passthrough = native_passthrough is True
+        self._native_policy_lock = threading.RLock()
+        self._native_transport = None
+        self._native_disconnect_reason = None
+        self._resident_tui = None
+        self._open_requests = {}
+        self._reply_routes = {}
+        self._thread_resume_info = {}
+        self._thread_has_turns = False
+        if __package__:
+            from .control_owner import ControlOwner
+        else:
+            from control_owner import ControlOwner
+        self.control_owner = ControlOwner()
         self.config = _parse_extra_options(extra_options)
         self.process: subprocess.Popen[bytes] | None = None
         self.incoming: Queue[dict[str, Any] | None] = Queue()
@@ -221,8 +283,59 @@ class AppServer:
         self.auto_approve = "--dangerously-bypass-approvals-and-sandbox" in extra_options
         self._stdin_closed = False
         self.control_queue: Queue[dict[str, Any] | None] | None = None
+        self._turn_active = threading.Event()
+        # Set before forwarding a native turn/start, not after its notification.
+        # This closes the handoff window in which Pan could admit a queued turn.
+        self._native_turn_pending = threading.Event()
+        self._native_admission_lock = threading.RLock()
+        self._native_admission = None
+        self._aux_admissions = {}
+        self.native_admission_timeout = 5.0
+        self._steer_requests: dict[int, str] = {}
+        self._steer_requests_lock = threading.Lock()
+
+    def native_admission_receipt(self, message):
+        with self._native_admission_lock:
+            admission = self._aux_admissions.get(message.get("requestId")) or self._native_admission
+            if admission is not None and admission.id == message.get("requestId"):
+                admission.acknowledge(message)
+
+    def reserve_auxiliary_admission(self, thread_id, generation, emit, operation):
+        from packages.core.adapters.codex.native_admission import NativeAdmission
+        with self._native_admission_lock:
+            admission = NativeAdmission(thread_id, generation, emit, operation)
+            self._aux_admissions[admission.id] = admission
+            return admission
+
+    def reserve_native_admission(self, thread_id, generation, emit, operation="turn/start"):
+        from packages.core.adapters.codex.native_admission import NativeAdmission
+        with self._native_admission_lock:
+            if self._turn_active.is_set() or self._native_turn_pending.is_set():
+                raise RuntimeError("Turn already executing")
+            admission = NativeAdmission(thread_id, generation, emit, operation)
+            self._native_admission = admission
+            self._native_turn_pending.set()
+            return admission
+
+    def retire_native_reservation(self, admission):
+        with self._native_admission_lock:
+            self._aux_admissions.pop(admission.id, None)
+            if self._native_admission is admission:
+                self._native_turn_pending.clear()
+                self._native_admission = None
 
     def _send(self, message: dict[str, Any]) -> None:
+        if self._native_transport is not None:
+            def write():
+                with self._write_lock:
+                    self._raw_send(message)
+            # Read-only observation continues in native mode. Unknown RPCs
+            # and replies are writes: fail closed rather than guessing.
+            if message.get("method") in {"thread/read", "thread/list", "account/read", "model/list"}:
+                write()
+            else:
+                self.control_owner.write("pan", write)
+            return
         if not self.process or self.process.stdin is None:
             raise RuntimeError("app-server is not running")
         # Node's stdio reader on Windows can inherit the active console/code
@@ -234,6 +347,21 @@ class AppServer:
             self.process.stdin.write(raw.encode("utf-8"))
             self.process.stdin.flush()
 
+    def _raw_send(self, message):
+        route = self._reply_routes.get(str(message.get("id"))) if "method" not in message else None
+        if route is not None:
+            original, transport = route
+            transport.send({**message, "id": original})
+            self._reply_routes.pop(str(message["id"]), None)
+        else:
+            self._native_transport.send(message)
+        if "method" not in message:
+            pending = self._open_requests.pop(str(message.get("id")), None)
+            if pending is not None:
+                pending[1]["resolved"] = True
+            if self._resident_tui is not None:
+                self._resident_tui.resolve_request(message.get("id"))
+
     def _request(self, method: str, params: dict[str, Any]) -> int:
         self._request_id += 1
         request_id = self._request_id
@@ -241,18 +369,39 @@ class AppServer:
         return request_id
 
     def start(self) -> None:
+        transport_args = ["--stdio"]
+        if self.native_control:
+            if __package__:
+                from .native_transport import NativeTransport
+            else:
+                from native_transport import NativeTransport
+
+            self._native_transport = NativeTransport()
+            transport_args = self._native_transport.server_args()
         command = [self.node, self.codex_js, *_server_options(self.extra_options),
-                   "app-server", "--stdio"]
-        self.process = subprocess.Popen(
+                   "app-server", *transport_args]
+        if self.native_control:
+            if __package__:
+                from .owned_kernel import OwnedKernel
+            else:
+                from owned_kernel import OwnedKernel
+            self.process = OwnedKernel(command, self.cwd or None)
+        else:
+            self.process = subprocess.Popen(
             command,
             cwd=self.cwd or None,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
+            stdin=subprocess.DEVNULL if self.native_control else subprocess.PIPE,
+            stdout=subprocess.DEVNULL if self.native_control else subprocess.PIPE,
             stderr=subprocess.PIPE,
             close_fds=True,
-        )
-        threading.Thread(target=self._read_stdout, daemon=True).start()
+            **command_window_options(),
+            )
         threading.Thread(target=self._pump_stderr, daemon=True).start()
+        if self._native_transport is not None:
+            self._native_transport.connect(self.process.poll)
+            threading.Thread(target=self._read_native, daemon=True).start()
+        else:
+            threading.Thread(target=self._read_stdout, daemon=True).start()
 
         initialize_id = self._request("initialize", {
             "clientInfo": {"name": "pan", "version": "0.1.0"},
@@ -261,6 +410,9 @@ class AppServer:
         self._wait_response(initialize_id)
         self._send({"method": "initialized", "params": {}})
 
+        from packages.core.adapters.codex.provider_launch import attest
+        attest(self, _write_launch_receipt)
+
         params = self._thread_params()
         if self._initial_thread_id:
             # ``threadSource`` and developer instructions are start-only
@@ -268,15 +420,23 @@ class AppServer:
             params.pop("threadSource", None)
             params.pop("developerInstructions", None)
             params["threadId"] = self._initial_thread_id
+            # Pan already persists display history. Resume the model context,
+            # not a second copy of every tool output; the resident TUI reads
+            # historical turns separately when it attaches.
+            params["excludeTurns"] = True
             response_id = self._request("thread/resume", params)
         else:
             response_id = self._request("thread/start", params)
         response = self._wait_response(response_id)
         result = response.get("result") or {}
         thread = result.get("thread") or {}
+        self._thread_resume_info = dict(result)
+        self._thread_has_turns = bool(thread.get("turns") or self._initial_thread_id)
         self.thread_id = thread.get("id") or self._initial_thread_id
         if not self.thread_id:
             raise RuntimeError(f"app-server returned no thread id: {response}")
+        from packages.core.adapters.codex.provider_launch import attest_thread
+        attest_thread(self, result)
         self._emit_thread_started(thread)
 
     @property
@@ -285,6 +445,8 @@ class AppServer:
 
     def _thread_params(self) -> dict[str, Any]:
         params: dict[str, Any] = {"cwd": self.cwd, "threadSource": "pan"}
+        from packages.core.adapters.codex.provider_launch import thread_params
+        thread_params(self, params)
         model = self.config.get("model")
         if model:
             params["model"] = str(model)
@@ -314,8 +476,40 @@ class AppServer:
                     value = json.loads(line.decode("utf-8", errors="replace"))
                 except json.JSONDecodeError:
                     continue
-                if isinstance(value, dict):
+                if isinstance(value, dict) and not self._emit_steer_receipt(value):
                     self.incoming.put(value)
+        finally:
+            self.incoming.put(None)
+
+    def _read_native(self) -> None:
+        try:
+            for message in self._native_transport.messages():
+                if message.get("method") == "turn/started":
+                    self._thread_has_turns = True
+                    params = message.get("params") or {}
+                    turn_id = (params.get("turn") or {}).get("id")
+                    with self._native_admission_lock:
+                        admission = self._native_admission
+                        if admission is not None and params.get("threadId", self.thread_id) == admission.thread_id:
+                            admission.started(turn_id)
+                if self._resident_tui is not None and "method" in message and "id" not in message:
+                    self._resident_tui.observe(message)
+                # Detached resources belong to auxiliary collectors, never the
+                # foreground accumulator or observational turn admission.
+                if ((message.get("params") or {}).get("threadId", self.thread_id) != self.thread_id):
+                    continue
+                if not self._emit_steer_receipt(message):
+                    self.incoming.put(message)
+        except Exception as exc:
+            # Never leak header/token or raw transport errors into history.
+            sent = getattr(exc, "sent", None)
+            received = getattr(exc, "rcvd", None)
+            oversized = any(getattr(frame, "code", None) == 1009
+                            for frame in (sent, received))
+            self._native_disconnect_reason = (
+                "Codex native transport message exceeded the bounded receive limit"
+                if oversized else "Codex native transport disconnected")
+            _write_stderr("[codex app-server] native transport disconnected\n")
         finally:
             self.incoming.put(None)
 
@@ -336,9 +530,26 @@ class AppServer:
         except Empty as exc:
             raise TimeoutError("timed out waiting for Codex app-server") from exc
         if message is None:
-            code = self.process.returncode if self.process else None
+            code = self.process.poll() if self.process else None
+            if self._native_transport is not None and code is None:
+                raise RuntimeError(self._native_disconnect_reason or
+                                   "Codex native transport disconnected while app-server is still running")
             raise RuntimeError(f"Codex app-server exited (returncode={code})")
         return message
+
+    def _emit_steer_receipt(self, message: dict[str, Any]) -> bool:
+        # The reader continues while idle. A late RPC response therefore
+        # settles its original request without holding a completed turn open.
+        with self._steer_requests_lock:
+            request_id = self._steer_requests.pop(message.get("id"), None)
+        if request_id is None:
+            return False
+        receipt = {"type": "pan.steer_receipt", "requestId": request_id,
+                   "ok": "error" not in message, "outcome": "rejected" if "error" in message else "accepted"}
+        if "error" in message:
+            receipt["error"] = self._error_text(message["error"])
+        _write_stdout(receipt)
+        return True
 
     def _wait_response(self, request_id: int) -> dict[str, Any]:
         while True:
@@ -360,11 +571,21 @@ class AppServer:
         if self.thread_started_emitted:
             return
         self.thread_started_emitted = True
-        _write_stdout({"type": "thread.started", "thread_id": self.thread_id,
-                       "thread": thread})
+        # This is an identity/ready notification, not a history transport.
+        # Old servers may still include turns despite metadata-only resume;
+        # never forward these over Worker's bounded stdout init channel.
+        # Keep live-resume metadata for TUI; history is read on demand there.
+        _write_stdout({"type": "thread.started", "thread_id": self.thread_id})
 
     def _handle_server_message(self, message: dict[str, Any], state: dict[str, Any] | None) -> None:
         method = message.get("method")
+        if state is not None and state.get("external_turn") and state.get("admission") is not None:
+            admission = state["admission"]
+            params = message.get("params") or {}
+            turn_id = params.get("turnId") or (params.get("turn") or {}).get("id")
+            if (params.get("threadId", admission.thread_id) != admission.thread_id
+                    or (turn_id is not None and turn_id != admission.turn_id)):
+                return  # Buffered notifications cannot terminate a newer admission.
         if ((method and method.endswith("/requestApproval")) or method in (
             "applyPatchApproval", "execCommandApproval",
             "currentTime/read",
@@ -457,6 +678,9 @@ class AppServer:
         if method == "serverRequest/resolved":
             params = message.get("params") or {}
             request_id = params.get("requestId", params.get("request_id"))
+            self._open_requests.pop(str(request_id), None)
+            if self._resident_tui is not None:
+                self._resident_tui.resolve_request(request_id)
             if state is not None and request_id is not None:
                 (state.get("pending_requests") or {}).pop(str(request_id), None)
             _write_stdout({
@@ -666,6 +890,39 @@ class AppServer:
         if method == "item/completed":
             params = message.get("params") or {}
             item = params.get("item") or {}
+            if state is not None and item.get("id") is not None:
+                key = (params.get("turnId") or state.get("turn_id"), str(item["id"]))
+                completed = state.setdefault("completed_items", set())
+                if key in completed:
+                    return
+                completed.add(key)
+            if (state is not None and state.get("external_turn")
+                    and str(item.get("type") or "").replace("_", "").lower() == "usermessage"):
+                content = item.get("content") or []
+                text = "\n".join(part["text"] for part in content
+                                 if isinstance(part, dict) and isinstance(part.get("text"), str))
+                if text or content:
+                    _write_stdout({"type": "pan.native_user", "text": text, "item_id": item.get("id"),
+                                   "turn_id": params.get("turnId") or state.get("turn_id"),
+                                   "thread_id": params.get("threadId") or self.thread_id,
+                                   "nativeContent": content,
+                                   **(state["admission"].identity() if state.get("admission") else {})})
+            item_type = str(item.get("type") or "").replace("_", "").lower()
+            item_status = str(item.get("status") or "").lower()
+            item_error = item.get("error")
+            if item_error or item_status in {"failed", "error"}:
+                # Keep tool/item failures observable without changing the
+                # existing history block or task-terminal semantics.
+                _write_stdout({
+                    "type": "codex.item_error",
+                    "item": item,
+                    "item_type": item_type,
+                    "item_id": item.get("id"),
+                    "item_status": item_status or None,
+                    "error": item_error,
+                    "thread_id": params.get("threadId"),
+                    "turn_id": params.get("turnId", params.get("turn_id")),
+                })
             event = _item_event(item)
             if event is not None:
                 if state is not None and str(item.get("type") or "").replace("_", "").lower() == "agentmessage":
@@ -690,6 +947,13 @@ class AppServer:
                 params = message.get("params") or {}
                 turn = params.get("turn") or {}
                 items = turn.get("items") or []
+                # A terminal snapshot can contain items whose individual
+                # completion was missed at an attach boundary. Reconcile by
+                # turn/item identity; equal bodies are distinct messages.
+                for item in items:
+                    self._handle_server_message({"method": "item/completed", "params": {
+                        "threadId": params.get("threadId", self.thread_id),
+                        "turnId": turn.get("id") or state.get("turn_id"), "item": item}}, state)
                 for item in reversed(items):
                     if str(item.get("type") or "").replace("_", "").lower() == "agentmessage":
                         state["last_text"] = _text_from_item(item)
@@ -698,18 +962,32 @@ class AppServer:
                 turn_error = turn.get("error")
                 if turn_error:
                     error = turn_error
+                    state["error_payload"] = turn_error
                 elif status in ("completed", "complete"):
                     # The completed turn notification is authoritative: a
                     # successful turn must not inherit transient in-turn
                     # error notices (e.g. "Reconnecting... 2/5" emitted by
                     # the native client while falling back from WebSockets
                     # to HTTPS), otherwise correct results get flagged
-                    # as errors.
+                    # as errors.  Report the recovery as a structured CLI
+                    # fact, then clear it as before.
+                    recovered = state.get("error_payload")
+                    if recovered is not None:
+                        _write_stdout({
+                            "type": "codex.transient_error_recovered",
+                            "error": recovered,
+                            "error_text": state.get("error") or "",
+                            "turn_status": status,
+                            "thread_id": params.get("threadId", self.thread_id),
+                            "turn_id": (params.get("turnId", params.get("turn_id"))
+                                        or turn.get("id")),
+                        })
+                    state["error_payload"] = None
                     error = None
                 else:
                     # Non-successful completion without an explicit turn
                     # error: fall back to any error notification captured
-                    # during the turn.
+                    # during the turn.  Keep its raw payload for Pan.
                     error = state.get("error")
                 state["done"] = True
                 state["turn_status"] = status
@@ -725,6 +1003,7 @@ class AppServer:
             error_text = self._error_text(error)
             if state is not None:
                 state["error"] = error_text
+                state["error_payload"] = error
             _write_stdout({
                 "type": "codex.turn_error",
                 "error": error,
@@ -743,6 +1022,10 @@ class AppServer:
         method = str(message.get("method") or "")
         request_id = message.get("id")
         params = message.get("params") or {}
+        if method == "currentTime/read" and self._native_transport is not None:
+            with self._write_lock:
+                self._raw_send({"id": request_id, "result": {"currentTimeAt": int(time.time())}})
+            return
         if method == _INTERACTIVE_ELICITATION_METHOD:
             event_type = "codex.elicitation"
         elif "Approval" in method or "approval" in method:
@@ -751,6 +1034,7 @@ class AppServer:
             event_type = "codex.user_input"
         _write_stdout({"type": event_type, "method": method, "request_id": request_id,
                        "params": params})
+        native_owned = self.native_control and self.control_owner.snapshot()["mode"] == "native"
 
         # In interactive permission modes, keep the native JSON-RPC request
         # open until Pan sends the matching response control.  This is the same pause
@@ -761,7 +1045,7 @@ class AppServer:
         interactive_permission = method == _INTERACTIVE_PERMISSION_METHOD and not self.auto_approve
         interactive_elicitation = method == _INTERACTIVE_ELICITATION_METHOD
         if (state is not None and request_id is not None
-                and (interactive_approval or interactive_user_input or interactive_permission
+                and (native_owned or interactive_approval or interactive_user_input or interactive_permission
                      or interactive_elicitation)):
             if interactive_user_input:
                 fallback_result: dict[str, Any] = {"answers": {}}
@@ -789,6 +1073,10 @@ class AppServer:
                 "fallback_result": fallback_result,
                 "deadline": time.monotonic() + timeout_sec,
             }
+            if self.native_control:
+                self._open_requests[str(request_id)] = (message, state["pending_requests"][str(request_id)])
+            if native_owned and self._resident_tui is not None:
+                self._resident_tui.offer_request(message)
             return
 
         if method == "item/tool/requestUserInput":
@@ -824,9 +1112,14 @@ class AppServer:
         self._send({"id": request_id, "result": result})
 
     def _safe_decline_expired(self, state: dict[str, Any]) -> None:
+        if self.native_control and self.control_owner.snapshot()["mode"] != "pan":
+            return
         pending = state.get("pending_requests") or {}
         now = time.monotonic()
         for key, request in list(pending.items()):
+            if request.get("resolved"):
+                pending.pop(key, None)
+                continue
             if now < float(request.get("deadline") or 0):
                 continue
             try:
@@ -885,17 +1178,33 @@ class AppServer:
                 except (OSError, RuntimeError):
                     state["error"] = "failed to interrupt Codex turn"
             elif kind == "steer" and control.get("text"):
-                if not state.get("turn_id"):
+                request_id = control.get("requestId")
+                if state.get("done") or not state.get("turn_id"):
+                    if request_id:
+                        _write_stdout({"type": "pan.steer_receipt", "requestId": request_id,
+                                       "ok": False, "outcome": "rejected", "error": "No active Codex turn"})
+                        continue
                     state["steer_pending"] = str(control["text"])
                     continue
                 try:
-                    self._request("turn/steer", {
-                        "threadId": self.thread_id,
-                        "expectedTurnId": state["turn_id"],
-                        "input": [{"type": "text", "text": str(control["text"])}],
-                    })
+                    with self._steer_requests_lock:
+                        if len(self._steer_requests) >= 128:
+                            if request_id:
+                                _write_stdout({"type": "pan.steer_receipt", "requestId": request_id,
+                                               "ok": False, "outcome": "rejected", "error": "Too many unconfirmed Steer requests"})
+                            continue
+                        rpc_id = self._request("turn/steer", {
+                            "threadId": self.thread_id,
+                            "expectedTurnId": state["turn_id"],
+                            "input": [{"type": "text", "text": str(control["text"])}],
+                        })
+                        if request_id:
+                            self._steer_requests[rpc_id] = request_id
                 except (OSError, RuntimeError):
                     _write_stderr("[codex app-server bridge] failed to steer turn\n")
+                    if request_id:
+                        _write_stdout({"type": "pan.steer_receipt", "requestId": request_id,
+                                       "ok": False, "outcome": "unknown", "error": "Steer outcome unknown: Codex turn/steer request write failed"})
             elif kind == "approval_response":
                 request_id = control.get("request_id", control.get("requestId"))
                 pending = (state.get("pending_requests") or {}).pop(str(request_id), None)
@@ -992,6 +1301,14 @@ class AppServer:
 
     def run_turn(self, text: str, effort: str | None = None,
                  control_queue: Queue[dict[str, Any] | None] | None = None) -> None:
+        self._turn_active.set()
+        try:
+            self._run_turn(text, effort, control_queue)
+        finally:
+            self._turn_active.clear()
+
+    def _run_turn(self, text: str, effort: str | None = None,
+                  control_queue: Queue[dict[str, Any] | None] | None = None) -> None:
         # A tokenUsage notification is emitted per turn. Do not accidentally
         # attach the previous turn's snapshot to a result if the native server
         # finishes a turn without sending a fresh usage notification.
@@ -1024,11 +1341,14 @@ class AppServer:
                 message = self._next(timeout=0.2)
             except TimeoutError:
                 continue
+            if self._emit_steer_receipt(message):
+                continue
             if message.get("id") == response_id:
                 if "error" in message:
                     state["done"] = True
                     state["is_error"] = True
                     state["error"] = self._error_text(message["error"])
+                    state["error_payload"] = message["error"]
                 else:
                     turn = (message.get("result") or {}).get("turn") or {}
                     state["turn_id"] = turn.get("id")
@@ -1039,12 +1359,46 @@ class AppServer:
         result = state["last_text"]
         if state["is_error"] and not result:
             result = state["error"] or "Codex turn failed"
-        _write_stdout({"type": "result", "is_error": bool(state["is_error"]),
-                       "cancelled": bool(state.get("is_cancelled")),
-                       "turn_status": state.get("turn_status", "completed"),
-                       "result": result, "usage": self.last_usage})
+        # Reject late controls from the completed turn before emitting result.
+        # The stdin reader rejects controls while idle, so none leak into the
+        # next FIFO turn after a terminal race.
+        self._turn_active.clear()
+        self._drain_controls(state, control_queue)
+        payload = {"type": "result", "is_error": bool(state["is_error"]),
+                   "cancelled": bool(state.get("is_cancelled")),
+                   "turn_status": state.get("turn_status", "completed"),
+                   "result": result, "usage": self.last_usage}
+        if state["is_error"]:
+            # Pan must receive the provider error beside assistant text.  A
+            # failed turn without a provider error object still needs a
+            # non-assistant error identity: derive it from the turn status,
+            # never from ``last_text``.
+            raw_error = state.get("error_payload")
+            if raw_error is None:
+                raw_error = {
+                    "message": state.get("error") or "Codex turn failed",
+                    "source": "codex_turn_status",
+                    "turnStatus": state.get("turn_status"),
+                }
+                payload["error_source"] = "codex_turn_status"
+            else:
+                payload["error_source"] = "codex_error_payload"
+            payload["error"] = raw_error
+            if state.get("error"):
+                payload["error_text"] = state["error"]
+        _write_stdout(payload)
 
     def close(self) -> None:
+        if self._resident_tui is not None:
+            try:
+                self._resident_tui.close()
+            except Exception:
+                _write_stderr("[codex app-server] resident TUI cleanup unconfirmed\n")
+        if self._native_transport is not None:
+            try:
+                self._native_transport.close()
+            except Exception:
+                _write_stderr("[codex app-server] native transport close failed\n")
         process = self.process
         if process is None:
             return
@@ -1065,15 +1419,31 @@ class AppServer:
                 process.wait(timeout=2)
             except (OSError, subprocess.TimeoutExpired):
                 pass
+        if self.native_control:
+            process.close()
 
 
 def _read_pan_stdin(task_queue: Queue[dict[str, Any] | None],
-                    control_queue: Queue[dict[str, Any] | None]) -> None:
+                    control_queue: Queue[dict[str, Any] | None],
+                    turn_active: threading.Event | None = None,
+                    mode_handler=None, native_handler=None, admission_handler=None) -> None:
+    # The reader must never wait on owner/policy locks: an ACK may be behind
+    # a blocked mode/input operation. Preserve their order on one executor.
+    callbacks = Queue()
+    def controls():
+        while True:
+            operation = callbacks.get()
+            if operation is None:
+                return
+            handler, value = operation
+            handler(value)
+    threading.Thread(target=controls, daemon=True).start()
     stream = getattr(sys.stdin, "buffer", sys.stdin)
     while True:
         line = stream.readline()
         if not line:
-            task_queue.put(None)
+            callbacks.put((task_queue.put, None))
+            callbacks.put(None)
             return
         try:
             message = json.loads(line.decode("utf-8", errors="replace") if isinstance(line, bytes) else line)
@@ -1081,20 +1451,49 @@ def _read_pan_stdin(task_queue: Queue[dict[str, Any] | None],
             continue
         if not isinstance(message, dict):
             continue
+        if message.get("type") == "native_admission":
+            if admission_handler is not None:
+                admission_handler(message)
+            continue
+        if message.get("type") == "control_mode":
+            if mode_handler is not None:
+                callbacks.put((mode_handler, message))
+            continue
+        if message.get("type") in {"native_input", "native_resize", "native_passthrough"}:
+            if native_handler is not None:
+                callbacks.put((native_handler, message))
+            continue
         if message.get("type") in (
                 "interrupt", "steer", "approval_response", "user_input_response",
                 "permission_response", "elicitation_response", "terminal_input",
                 "terminal_terminate"):
-            control_queue.put(message)
+            if (message.get("type") == "steer" and message.get("requestId")
+                    and turn_active is not None and not turn_active.is_set()):
+                _write_stdout({"type": "pan.steer_receipt", "requestId": message["requestId"],
+                               "ok": False, "outcome": "rejected", "error": "No active Codex turn"})
+            else:
+                callbacks.put((control_queue.put, message))
         elif message.get("text"):
-            task_queue.put(message)
+            callbacks.put((task_queue.put, message))
 
 
 def main(argv: list[str] | None = None) -> int:
+    from packages.core.adapters.codex.provider_launch import bootstrap
+    bootstrap()
+    # Bootstrap itself must precede the gate. The parent is now retaining the
+    # interpreter and its Job before any native process/reader can emit output.
+    from packages.core.adapters.codex.provider_launch import ENV
+    global _STARTUP_OUTPUT, _STARTUP_BYTES, _STARTUP_OVERFLOW, _LAUNCH_OUTPUT_SECRETS
+    if os.environ.get(ENV):
+        _STARTUP_OUTPUT, _STARTUP_BYTES, _STARTUP_OVERFLOW = [], 0, False
+        _LAUNCH_OUTPUT_SECRETS = tuple(value.encode('utf-8') for key, value in os.environ.items()
+                                       if key.startswith('PAN_CODEX_LAUNCH_TOKEN_') and value)
     parser = argparse.ArgumentParser(description="Pan bridge for Codex app-server")
     parser.add_argument("--codex-path", required=True)
     parser.add_argument("--node-path", default="node")
     parser.add_argument("--thread-id", default=None)
+    parser.add_argument("--native-control", action="store_true")
+    parser.add_argument("--native-passthrough", action="store_true")
     parser.add_argument("--codex-extra-args", default="[]")
     parser.add_argument("--system-prompt", default=None)
     parser.add_argument("--system-prompt-file", default=None)
@@ -1106,33 +1505,187 @@ def main(argv: list[str] | None = None) -> int:
     except json.JSONDecodeError:
         extra = []
 
+    from packages.core.adapters.codex.provider_launch import options as fixed_provider_options
+    extra.extend(fixed_provider_options())
+
     system_prompt = args.system_prompt
     if args.system_prompt_file:
         system_prompt = _read_system_prompt_file(args.system_prompt_file)
 
     app = AppServer(args.node_path, args.codex_path,
-                    os.environ.get("PAN_CODEX_CWD") or os.getcwd(), extra)
+                    os.environ.get("PAN_CODEX_CWD") or os.getcwd(), extra,
+                    native_control=args.native_control, native_passthrough=args.native_passthrough)
     app.initial_thread_id = args.thread_id
     if system_prompt and not args.thread_id:
         app.config["developer_instructions"] = system_prompt
     pan_queue: Queue[dict[str, Any] | None] = Queue()
     control_queue: Queue[dict[str, Any] | None] = Queue()
     app.control_queue = control_queue
+    def mode_handler(message):
+        receipt = {"type": "pan.control_mode", "requestId": message.get("requestId"), "ok": False}
+        try:
+            if not app.native_control or not app.thread_id:
+                raise RuntimeError("Native control transport is not ready")
+            if message.get("mode") == "native" and app._resident_tui is None:
+                if __package__:
+                    from .resident_tui import ResidentTui
+                else:
+                    from resident_tui import ResidentTui
+                candidate = ResidentTui(app, _write_stdout)
+                try:
+                    candidate.start()
+                except Exception:
+                    # Keep the object if cleanup fails: never lose its owner.
+                    app._resident_tui = candidate
+                    candidate.close()
+                    app._resident_tui = None
+                    raise RuntimeError("Native TUI startup failed") from None
+                app._resident_tui = candidate
+            if message.get("mode") == "native" and (not app._resident_tui.ready.is_set() or app._resident_tui.backend.wait_dead(0)):
+                raise RuntimeError("Native TUI startup unconfirmed")
+            receipt.update(app.control_owner.switch(message.get("mode"), message.get("generation")))
+            receipt["ok"] = True
+            receipt["thread_id"] = app.thread_id
+            receipt["kernel_pid"] = app.process.pid
+            identity = app.process.backend.identity if hasattr(app.process, "backend") else None
+            receipt["kernel_filetime"] = str(identity.created_at_filetime) if identity else None
+            receipt["tui_pid"] = app._resident_tui.backend.pid if app._resident_tui else None
+            receipt["native_busy"] = app._native_turn_pending.is_set()
+            if app._resident_tui is not None:
+                app._resident_tui.mode_changed()
+            if receipt["mode"] == "pan":
+                for pending, record in list(app._open_requests.values()):
+                    record["deadline"] = time.monotonic() + _APPROVAL_TIMEOUT_SEC
+                    method = pending["method"]
+                    event_type = ("codex.elicitation" if method == _INTERACTIVE_ELICITATION_METHOD
+                                  else "approval.request" if "approval" in method.lower() else "codex.user_input")
+                    _write_stdout({"type": event_type, "method": method, "request_id": pending["id"], "params": pending.get("params", {})})
+        except RuntimeError:
+            receipt.update(app.control_owner.snapshot())
+            receipt["error"] = "Control mode rejected"
+        _write_stdout(receipt)
+    def native_handler(message):
+        receipt = {"type": "pan.native_write", "requestId": message.get("requestId"), "ok": False}
+        try:
+            if message["type"] == "native_passthrough":
+                if not app.native_control or type(message.get("enabled")) is not bool:
+                    raise RuntimeError("Invalid native policy")
+                with app._native_policy_lock:
+                    app.native_passthrough = message["enabled"]
+                receipt["ok"] = True
+                _write_stdout(receipt)
+                return
+            if app._resident_tui is None:
+                raise RuntimeError("Native TUI is not ready")
+            if message["type"] == "native_input":
+                app._resident_tui.input(message.get("text"), message.get("generation"))
+            else:
+                app._resident_tui.resize(message.get("rows"), message.get("cols"), message.get("generation"))
+            receipt["ok"] = True
+        except Exception:
+            receipt["error"] = "native-operation-rejected"
+        _write_stdout(receipt)
     reader = threading.Thread(target=_read_pan_stdin,
-                              args=(pan_queue, control_queue), daemon=True)
-    reader.start()
+                              args=(pan_queue, control_queue, app._turn_active, mode_handler, native_handler,
+                                    app.native_admission_receipt), daemon=True)
     try:
         app.start()
+        # A failed startup must not leave a daemon holding buffered stdin
+        # during interpreter shutdown and obscure the kernel's real error.
+        reader.start()
+        external = None
         while True:
-            message = pan_queue.get()
+            try:
+                message = pan_queue.get(timeout=.05)
+            except Empty:
+                if app.native_control:
+                    try:
+                        event = app._next(timeout=.01)
+                    except TimeoutError:
+                        continue
+                    if event.get("method") == "turn/started":
+                        turn = (event.get("params") or {}).get("turn") or {}
+                        admission = app._native_admission
+                        if admission is None:
+                            # Preserve existing passthrough execution/reporting.
+                            # It is explicitly observational, never pre-admission.
+                            from packages.core.adapters.codex.native_admission import NativeAdmission
+                            snapshot = app.control_owner.snapshot()
+                            admission = NativeAdmission(app.thread_id, snapshot["generation"], _write_stdout,
+                                                        operation="observed-turn")
+                            admission.state = "sending"
+                            app._native_admission = admission
+                        if not admission.started(turn.get("id")):
+                            _write_stdout({"type": "pan.native_error", "error": "native-turn-identity-conflict"})
+                            continue
+                        if external is not None:
+                            continue  # Duplicate started cannot reset the active result accumulator.
+                        external = {"admission": admission, "last_text": "", "error": "", "done": False, "is_error": False,
+                                    "item_cumulative": {}, "turn_id": turn.get("id"), "external_turn": True}
+                        app._turn_active.set()
+                        _write_stdout({"type": "pan.native_turn_started", "turn_id": turn.get("id"),
+                                       **admission.identity(), "observedAfterStart": admission.operation == "observed-turn",
+                                       "threadId": admission.thread_id, "controlGeneration": admission.generation})
+                    app._handle_server_message(event, external)
+                    if external is not None:
+                        app._drain_controls(external, control_queue)
+                        if external["done"]:
+                            external_result = {
+                                "type": "result", "external_turn": True,
+                                "is_error": bool(external.get("is_error")),
+                                "cancelled": bool(external.get("is_cancelled")),
+                                "turn_status": external.get("turn_status"),
+                                "result": (external.get("last_text")
+                                           or external.get("error") or ""),
+                                "usage": app.last_usage,
+                                "turn_id": external["admission"].turn_id,
+                                **external["admission"].identity(),
+                            }
+                            if external.get("is_error"):
+                                raw_error = external.get("error_payload")
+                                if raw_error is None:
+                                    raw_error = {
+                                        "message": (external.get("error")
+                                                    or "Codex turn failed"),
+                                        "source": "codex_turn_status",
+                                        "turnStatus": external.get("turn_status"),
+                                    }
+                                    external_result["error_source"] = "codex_turn_status"
+                                else:
+                                    external_result["error_source"] = "codex_error_payload"
+                                external_result["error"] = raw_error
+                                if external.get("error"):
+                                    external_result["error_text"] = external["error"]
+                            _write_stdout(external_result)
+                            app.retire_native_reservation(external["admission"])
+                            app._turn_active.clear()
+                            app._native_turn_pending.clear()
+                            external = None
+                continue
             if message is None:
                 break
             effort = app.config.get("model_reasoning_effort")
+            if external is not None or app._native_turn_pending.is_set() or app.control_owner.snapshot()["mode"] != "pan":
+                # The Worker gate must prevent this. Do not create a second turn
+                # or manufacture a result paired with the executing native turn.
+                _write_stdout({"type": "pan.native_error", "error": "pan-turn-not-admitted"})
+                continue
             app.run_turn(str(message.get("text") or ""),
                          str(effort) if effort else None, control_queue)
     except Exception as exc:  # wrapper errors must be visible to Pan, not silent hangs
         _write_stderr(f"[codex app-server bridge] {exc}\n")
-        _write_stdout({"type": "result", "is_error": True, "result": str(exc)})
+        admission = app._native_admission
+        if admission is not None:
+            # A wrapper exception after send is not a safely caught provider
+            # result. Keep False/owner through EOF; only proven no-send cancels.
+            admission.cancel()
+            _write_stdout({"type": "pan.native_error", "error": "native-wrapper-failed"})
+        else:
+            _write_stdout({
+                "type": "result", "is_error": True, "result": str(exc),
+                "error_source": "wrapper_exception",
+                "error": {"message": str(exc), "type": type(exc).__name__},
+            })
         return 1
     finally:
         app.close()
