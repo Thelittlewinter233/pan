@@ -2575,13 +2575,15 @@ def _visible_history_total(s: sess.Session) -> int:
     )
 
 
-def _visible_history_page_lookup(session_id: str, before: int, limit: int):
+def _visible_history_page_lookup(session_id: str, before: int, limit: int,
+                                 search_jump: bool = False):
     """Return a page after hiding rows, with raw indexes for legacy IDs."""
     if not _summary_session_get(session_id):
         return _NOT_FOUND
     hidden = _hidden_history_ids(session_id)
     if not hidden:
-        page = sess.history_page(session_id, before=before, limit=limit)
+        page = sess.history_page(session_id, before=before, limit=limit,
+                                 search_jump=search_jump)
         if page is not None:
             page["rawIndices"] = list(range(
                 page.get("start", 0), page.get("start", 0) + len(page.get("history") or [])
@@ -2597,7 +2599,8 @@ def _visible_history_page_lookup(session_id: str, before: int, limit: int):
         if _history_wire_identity(session_id, row, index, epoch) not in hidden
     ]
     try:
-        bounded_limit = max(1, min(int(limit), sess.HISTORY_PAGE_MAX))
+        cap = sess.HISTORY_SEARCH_JUMP_PAGE_MAX if search_jump else sess.HISTORY_PAGE_MAX
+        bounded_limit = max(1, min(int(limit), cap))
     except (TypeError, ValueError):
         bounded_limit = 50
     try:
@@ -2627,7 +2630,7 @@ def _history_pages_for(session_ids: list[str], limit: int) -> dict:
 def _history_page_lookup(session_id: str, before: int, limit: int,
                          search_jump: bool = False):
     """Read one bounded visible page, with bookmarks, in a blocking store-read call."""
-    page = _visible_history_page_lookup(session_id, before, limit)
+    page = _visible_history_page_lookup(session_id, before, limit, search_jump)
     if page is not None and page is not _NOT_FOUND:
         page['_bookmarkedMessageIds'] = session_bookmarks.bookmarked_message_ids(session_id)
     return page
